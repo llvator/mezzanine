@@ -1,0 +1,13 @@
+{
+  "language": ["rust", "typescript"],
+  "include_tests": false,
+  "include_external": false,
+  "max_depth": 3,
+  "exclude_patterns": [
+    "**/generated/**",
+    "**/fixtures/**"
+  ],
+  "output_dir": ".nao/data",
+  "port": 3000,
+  "debounce_ms": 300
+}

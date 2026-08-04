@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Tracked at scripts/hooks/pre-commit; install via
+# `bash scripts/install_hooks.sh`. The installed hook at
+# `.git/hooks/pre-commit` is a symlink to this file.
+#
+# Behavior: when staged changes touch any Rust source under src/,
+# regenerate the README's repo-health block and re-stage it. Skip
+# entirely when no src/*.rs files are part of this commit — the
+# metrics can't have moved.
+
+set -euo pipefail
+
+# Skip if no Rust source changes are staged.
+if ! git diff --cached --name-only --diff-filter=AMR \
+        | grep -qE '^src/.*\.rs$'; then
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if ! python3 scripts/update_repo_health.py >/dev/null; then
+    echo "pre-commit: scripts/update_repo_health.py failed; commit blocked." >&2
+    exit 1
+fi
+
+# If the script changed README.md, stage it so the metrics travel with
+# this commit. Quiet exit otherwise.
+if ! git diff --quiet -- README.md; then
+    echo "pre-commit: README.md repo-health block refreshed; staging."
+    git add README.md
+fi

@@ -1,0 +1,91 @@
+/* ── Theme custom properties ─────────────────────────────────
+   Default values match the "LLvator" theme, the default in
+   stores/settings.ts — they paint the first frame, so a
+   mismatch here shows up as a flash of the wrong palette. At
+   runtime, applyTheme() overwrites these on <html> so every
+   component picks up the chosen palette. */
+:root {
+  --bg-body: #0a0c0f;
+  --bg-surface: #12161c;
+  --bg-surface-alt: #0e1116;
+  --bg-hover: #19212a;
+  --bg-deep: #07090c;
+  --border: #232a34;
+  --border-subtle: #1a2029;
+  --accent: #ffc107;
+  --accent-fg: #241a00;
+  --text: #e8ecf1;
+  --text-secondary: #aeb8c4;
+  --text-muted: #a3adba;
+  --text-dim: #8e99a7;
+  --text-disabled: #5a636e;
+
+  /* Scrollbars are chrome, not content, so they derive from the palette
+     rather than being themed separately: --text-disabled is the one token
+     every theme places at "visible but recessive", light included. */
+  --scrollbar-thumb: var(--text-disabled);
+  --scrollbar-thumb-hover: var(--text-dim);
+}
+
+/* Tells the browser which way the palette leans, so the chrome it draws
+   for us — overlay scrollbars, scrollbar buttons, form controls — comes
+   out dark on the four dark themes instead of defaulting to light.
+   applyTheme() stamps data-theme on <html>. */
+:root { color-scheme: dark; }
+:root[data-theme='light'] { color-scheme: light; }
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Every scroll container in the app — the sidebar's filter, quality and
+   details panes above all — was left with the browser default, which
+   renders as a pale grey track and a near-white thumb against the dark
+   palettes. Svelte scopes component styles, so this global block is the
+   only place one rule can reach them all.
+
+   Both mechanisms are needed: `scrollbar-color` is the standard and wins
+   wherever it is supported (Firefox, Chrome 121+, Safari 18.2+), and the
+   ::-webkit- rules cover the older WebKit engines that ignore it —
+   including the Electron/WKWebView the VS Code webview runs in. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 5px;
+  /* A transparent border inset by background-clip narrows the visible
+     thumb without shrinking the grab target. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  background: var(--bg-body);
+  color: var(--text);
+  overflow: hidden;
+}
+
+#app {
+  height: 100vh;
+}

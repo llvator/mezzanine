@@ -1,0 +1,13 @@
+src/**
+node_modules/**
+.gitignore
+.vscode/**
+tsconfig.json
+esbuild.mjs
+**/*.map
+**/data.json
+**/data.details.json
+**/data.index.json
+**/data.base-details.json
+**/diff.json
+*.vsix

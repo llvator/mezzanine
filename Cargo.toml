@@ -1,0 +1,114 @@
+[package]
+name = "nao"
+version = "1.0.0"
+edition = "2021"
+description = "Visualize code relationships, dependencies, and quality metrics"
+authors = ["Nao Team"]
+license = "AGPL-3.0-only"
+
+[dependencies]
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Graph data structures
+petgraph = "0.6"
+
+# Code parsing
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+tree-sitter-python = "0.21"
+tree-sitter-typescript = "0.21"
+tree-sitter-java = "0.21"
+tree-sitter-go = "0.21"
+tree-sitter-kotlin = "0.3"
+# Groovy grammar — pulled in for the C parser symbol; the published Rust
+# bindings expose the language as a `tree_sitter_language::LanguageFn`,
+# which only converts to `tree_sitter::Language` in tree-sitter 0.23+.
+# Our `parser/groovy/mod.rs` calls the underlying C function via the
+# `LanguageFn::into_raw` accessor and transmutes the result, avoiding
+# the need to bump every other parser to a new tree-sitter version.
+tree-sitter-groovy = "0.1"
+
+# SQL DDL (SQL-001). Not tree-sitter: `.sql` schemas are parsed for topology,
+# not for control flow, and sqlparser yields a typed DDL AST rather than a tree
+# to hand-walk. It is all-or-nothing per statement, unlike the error-tolerant
+# tree-sitter grammars, which is why `parser/sql/lexer.rs` splits a file into
+# statements first so one unsupported statement cannot cost the whole file.
+sqlparser = "0.62"
+
+# Serialization & Output
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Compression for `nao serve`'s analysis snapshots (SRV-006). The snapshot
+# JSON is ~42% entity-ID strings sharing one long repeated prefix, which
+# zstd removes almost entirely — measured 31x on tinygrad at level 3, for
+# 0.14s to write and 0.12s to read. Kept over a binary format because
+# serde_json + #[serde(default)] survives adding a field to CodeEntity,
+# which a positional encoding would not.
+zstd = "0.13"
+
+# Content hashing for the on-disk parse store (AN-003). Cryptographic
+# strength matters here: the hash is the cache key, so a collision would
+# serve a wrong parse. blake3 is fast and collision-resistant.
+blake3 = "1.5"
+
+# File handling
+walkdir = "2.4"
+ignore = "0.4"
+glob = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async runtime (required for watch/serve command)
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP server + SSE for the watch command
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Filesystem watcher for live reload
+notify = "7"
+notify-debouncer-mini = "0.5"
+
+# SSE stream helpers
+async-stream = "0.3"
+futures-core = "0.3"
+
+# Colors for terminal output
+colored = "2.1"
+
+# Progress bars
+indicatif = "0.17"
+
+# Parallel processing
+rayon = "1.10"
+
+# `build.rs` fingerprints the parser sources so the parse store's cache
+# generation is derived rather than hand-bumped — see the script's header.
+# Same hash the store uses at runtime, so the two agree by construction.
+[build-dependencies]
+blake3 = "1.5"
+
+# `ServiceExt::oneshot` drives a `Router` in-process, so the CORS and token
+# tests exercise the real layer stack without binding a port.
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = []
+
+[[bin]]
+name = "nao"
+path = "src/main.rs"
+
+# Standalone CLI for the Elevator (`.elv`) spec language. Same parser
+# and renderer as `nao analyze -l elevator -f elevator-text`, but with
+# a focused command line for users who only care about the spec, not
+# Nao's full code-visualisation surface.
+[[bin]]
+name = "elevator"
+path = "src/bin/elevator.rs"

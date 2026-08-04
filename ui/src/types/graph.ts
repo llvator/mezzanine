@@ -1,0 +1,412 @@
+export interface D3Field {
+  name: string;
+  type_name: string | null;
+}
+
+export interface EntityMetrics {
+  cyclomatic?: number;
+  cognitive_complexity?: number;
+  max_nesting?: number;
+  loc: number;
+  param_count?: number;
+  fan_in: number;
+  fan_out: number;
+  in_cycle: boolean;
+  /** Number of fields (structs) or variants (enums). */
+  field_count?: number;
+  /** Number of methods/functions contained directly by this entity. */
+  method_count: number;
+  /** Fraction [0, 1] of fields marked pub — structs only. */
+  public_field_ratio?: number;
+  /** Composite "refactor pressure" score computed by the backend.
+   *  Optional for backwards compatibility with older analysis data. */
+  composite_score?: number;
+  /** Instability index: fan_out / (fan_in + fan_out). 0 = stable, 1 = unstable. */
+  instability?: number;
+  /** Number of elements in the return type's outermost tuple. */
+  return_complexity?: number;
+  /** Weighted Methods per Class — sum of CC of directly-contained
+   *  callables. Populated for containers only. */
+  wmc?: number;
+  /** Longest outbound call-chain depth (hops, capped). High values flag
+   *  Law-of-Demeter violations or missing abstractions. */
+  chain_depth?: number;
+  /** PageRank centrality on the dependency subgraph. Normalised so the
+   *  sum across the graph is 1.0 — use relatively (rank), not absolutely. */
+  pagerank?: number;
+  /** Detected code smells (anti-pattern signals). */
+  smells?: string[];
+}
+
+/** An Elevator (`.elv`) code reference: the file or folder an entity
+ *  declares as its implementation. `tag` is the layer partition from
+ *  `cr.<tag>:` (`fe`, `be`, …) and is the empty string for a bare
+ *  `cr:`. Authored in the spec, not derived from the code — treat a
+ *  path as a declaration, not proof. UI-026. */
+export interface CodeRef {
+  tag: string;
+  path: string;
+}
+
+export interface D3Node {
+  id: string;
+  /** Original (unsanitized) entity ID for sidecar detail lookups */
+  original_id: string;
+  name: string;
+  qualified_name: string;
+  kind: string;
+  kind_raw: string;
+  file_path: string;
+  line: number;
+  end_line: number;
+  visibility: string;
+  /** Original (non-sanitized) id of the parent entity, when applicable.
+   * Resolved via `original_id` or `name` lookups in components that want
+   * to display the enclosing type / module. */
+  parent_id: string | null;
+  parameters: string[];
+  return_type: string | null;
+  extends: string[];
+  implements: string[];
+  tags: string[];
+  source_code: string | null;
+  fields: D3Field[];
+  impl_blocks: string[];
+  language: string;
+  metrics?: EntityMetrics;
+  /** Present only on File/Module nodes produced by `collapseGraph`: the raw
+   *  scope rollup, kept alongside the promoted `metrics` so severity scoring
+   *  can reach fields (`cohesion`, `entity_count`, …) that `EntityMetrics`
+   *  has no home for. `collapseGraph` cannot score these itself without
+   *  importing a store and closing an import cycle — see its header. */
+  scope_metrics?: ScopeMetrics;
+  /** Tag-aware display label for synthetic entities (Branch / Loop).
+   * Derived in `transform.ts` from `tags` + `details` so renderers
+   * (EntityInfo, ScopeTree, Sidebar) all read the same string —
+   * UI-003. Falls back to `name` when no specific tag is recognised. */
+  display_label?: string;
+  /** Structured per-entity attributes derived from the parser-emitted
+   * `attributes: ["caught:Foo", "pattern:1", "bean:foo", …]` strings.
+   * Keyed by attribute prefix (`caught`, `pattern`, `bean`, `manager`,
+   * `condition`); extra keys are preserved as-is. UI-006.
+   *
+   * Elevator `cr:` / `cr.<tag>:` attributes are *not* here — they are
+   * surfaced structurally as `codeRefs` instead. */
+  details?: Record<string, string>;
+  /** Elevator code references declared by this entity, parsed out of
+   * the same `attributes` array `details` comes from. Undefined (not
+   * `[]`) when the entity declares none, matching `details` — read it
+   * as `node.codeRefs ?? []`. UI-026. */
+  codeRefs?: CodeRef[];
+
+  // D3 simulation properties (added at runtime)
+  x?: number;
+  y?: number;
+  fx?: number | null;
+  fy?: number | null;
+  index?: number;
+}
+
+export interface D3Link {
+  source: string | D3Node;
+  target: string | D3Node;
+  kind: string;
+  kind_raw: string;
+  /** Passive form for incoming edges (e.g., "defined in"). */
+  incoming_kind: string;
+  order: number | null;
+  /** Number of underlying entity-level edges this link represents. Always
+   * 1 in entity mode; populated by `collapseGraph` at file/module level
+   * to drive stroke-width and the hover breakdown. */
+  weight?: number;
+  /** Per-kind counts of the underlying edges at scope level. Populated
+   * alongside `weight` when `collapseGraph` runs. */
+  breakdown?: Record<string, number>;
+  /** Semantic tags attached to the relationship by the parsers — e.g.
+   * `null_safe` (GR-007), `spread` (GR-008), `bean_lookup` (GR-010),
+   * `dynamic_sql` (GR-011), `dynamic_impex` (GR-012). Derived in
+   * `transform.ts` from boolean-truthy values in the relationship's
+   * `metadata` map. UI-004. */
+  tags?: string[];
+  /** Local variable receiving this call/instantiation's result, when
+   *  the call is the RHS of a Java declaration `Type x = call()`. */
+  binds_to?: string;
+  /** Declared type of `binds_to`, when known (declarations only —
+   *  reassignments omit it because the type isn't restated). */
+  binds_type?: string;
+  /** Variable being reassigned (`x = call()`, plain `=` only). Kept
+   *  separate from `binds_to` so the renderer can distinguish a fresh
+   *  binding from an update. */
+  rebinds_to?: string;
+}
+
+export interface GraphData {
+  nodes: D3Node[];
+  links: D3Link[];
+  /** Per-file rollup metrics. Populated by the analyzer; scope-filtered
+   * alongside nodes so only in-scope files show up in the Quality report. */
+  files?: ScopeMetrics[];
+  /** Per-directory (module) rollup metrics. Same scoping rules as `files`. */
+  modules?: ScopeMetrics[];
+  /** Quality thresholds from the backend. Single source of truth for
+   *  tier classification and scoring. */
+  thresholds?: BackendThresholds;
+}
+
+/** Warn/bad threshold pair from the backend. */
+export interface WarnBad {
+  warn: number;
+  bad: number;
+}
+
+/** All quality thresholds, serialized by the backend alongside the graph. */
+export interface BackendThresholds {
+  cc: WarnBad;
+  cognitive: WarnBad;
+  nest: WarnBad;
+  loc_callable: WarnBad;
+  loc_container: WarnBad;
+  params: WarnBad;
+  fan_out: WarnBad;
+  fields: WarnBad;
+  variants: WarnBad;
+  method_count: WarnBad;
+  public_field_ratio: WarnBad;
+  file_entity_count: WarnBad;
+  file_loc: WarnBad;
+  file_fan_out: WarnBad;
+  module_entity_count: WarnBad;
+  module_loc: WarnBad;
+  module_fan_out: WarnBad;
+  cohesion: WarnBad;
+  [key: string]: unknown;
+}
+
+/** File- or module-level quality rollup (shape shared with Rust side). */
+export interface ScopeMetrics {
+  path: string;
+  entity_count: number;
+  callable_count: number;
+  container_count: number;
+  loc: number;
+  internal_edges: number;
+  external_edges: number;
+  cohesion?: number;
+  fan_in: number;
+  fan_out: number;
+  in_cycle: boolean;
+  /** Instability index at scope level. */
+  instability?: number;
+  /** Mean composite score of entities in this scope. */
+  avg_quality?: number;
+  /** Worst composite score in this scope. */
+  max_quality?: number;
+  /** Entities with composite score ≤ 0.5 (healthy). */
+  quality_ok?: number;
+  /** Entities with composite score in (0.5, 1.0] (amber). */
+  quality_warn?: number;
+  /** Entities with composite score > 1.0 (red). */
+  quality_bad?: number;
+  /** Composite scope score computed by the backend. */
+  composite_score?: number;
+}
+
+export type ViewMode = 'graph' | 'tree';
+
+/** Aggregation level for the graph view: show every entity, collapse to
+ * one node per file, or collapse to one node per directory. */
+export type GraphLevel = 'entity' | 'file' | 'module';
+
+export type TriState = 'general' | 'on' | 'off';
+
+export interface LevelOverrides {
+  enabled: boolean;
+  entityTypes: Record<string, TriState>;
+  relTypes: Record<string, TriState>;
+  outgoing: TriState;
+  incoming: TriState;
+  /**
+   * Show edges between two nodes at this same level. When `false`, only
+   * cross-level expansion edges and (for level 1) direct edges to the
+   * selected node are drawn; same-level peer edges are hidden.
+   * Default: true — preserves the behavior of pre-peer-filter builds.
+   */
+  peerEdges: boolean;
+}
+
+export const NODE_COLORS: Record<string, string> = {
+  Class: '#2196F3',
+  Dataclass: '#7E57C2',
+  AbstractClass: '#1565C0',
+  Struct: '#4CAF50',
+  Interface: '#FF9800',
+  Trait: '#FF5722',
+  Function: '#9C27B0',
+  Method: '#9C27B0',
+  Module: '#607D8B',
+  Enum: '#E91E63',
+  File: '#795548',
+  Constant: '#00BCD4',
+  Variable: '#8BC34A',
+  Property: '#BA68C8',
+  Service: '#26A69A',
+  TypeAlias: '#3F51B5',
+  Macro: '#FFEB3B',
+  Parameter: '#66BB6A',
+  Branch: '#B0BEC5',
+  Loop: '#90A4AE',
+  Import: '#A1887F',
+  /** Synthetic File container emitted by the Groovy parser for script
+   * files (top-level statements, no enclosing class). UI-001. */
+  GroovyScript: '#A1B56C',
+  /** Synthetic Spring-bean entity emitted by GR-010. Lavender accent
+   * pairs with the bean-lookup edge styling in UI-004. UI-002. */
+  Bean: '#9575CD',
+  /** Database table. Amber accent to read as data infrastructure rather
+   * than code. Declared for GR-011 under UI-002; first emitted by the
+   * `.sql` parser (SQL-001). */
+  Table: '#FFB74D',
+  /** Database view. A desaturated sibling of Table's amber — same family,
+   * because a view is a table-shaped thing, but dimmer because its rows are
+   * derived rather than stored. */
+  View: '#C99A5B',
+  /** Elevator: widest grouping above Category (optional). Deep
+   * indigo — sits one tier above Category visually, signals
+   * "structural / top of hierarchy". */
+  Extension: '#1A237E',
+  /** Elevator: top-level grouping (the onboarding "ground floor").
+   * Deep purple — sits above Features in the visual hierarchy and
+   * doesn't collide with the amber/cyan/pink Feature family below. */
+  Category: '#5E35B1',
+  /** Elevator: top-level capability. Amber 600 — the "elevator
+   * button" yellow communicates "this is an entry point". */
+  Feature: '#FFC107',
+  /** Elevator: verb on a Feature. Lighter amber so it reads as a
+   * derivative of its Feature in the hierarchy. */
+  Functionality: '#FFE082',
+  /** Elevator: cross-cutting domain concept. Cyan to break out of
+   * the amber family — visually flags "this isn't in the tree". */
+  Concept: '#26C6DA',
+  /** Elevator: UI page. Pink to signal "user-facing surface",
+   * distinct from the structural amber family. */
+  UiPage: '#EC407A',
+  /** ansible-deploy: orchestration + topology kinds. Playbook/Role in
+   * the Ansible red family (top of the chain); the k8s resource in the
+   * Kubernetes brand blue so the actual primitive stands out. */
+  Playbook: '#D32F2F',
+  Role: '#FF7043',
+  HostGroup: '#455A64',
+  DeploymentSet: '#78909C',
+  DeploymentEntry: '#FFB300',
+  TemplateFile: '#8D6E63',
+  K8sResource: '#326CE5',
+  HelmChart: '#3949AB',
+  Unknown: '#9E9E9E',
+};
+
+export const LINK_COLORS: Record<string, string> = {
+  Contains: '#607D8B',
+  Imports: '#9E9E9E',
+  Calls: '#FF9800',
+  Inherits: '#2196F3',
+  Implements: '#4CAF50',
+  DependsOn: '#B39DDB',
+  UsesType: '#00BCD4',
+  Returns: '#CE93D8',
+  TakesParam: '#66BB6A',
+  /** ansible-deploy edges. RendersFrom is the load-bearing
+   * entry→template link — Kubernetes blue to match the resources it
+   * reaches. Provides/Requires bind the orchestration side to the
+   * host-group side through the shared variable hub. */
+  RendersFrom: '#326CE5',
+  Includes: '#EF6C00',
+  Provides: '#66BB6A',
+  Requires: '#AB47BC',
+  /** Inter-resource wiring (Ingress→Service, Deployment→Secret/ConfigMap/
+   * PVC). Teal to read as "runtime wiring", distinct from the structural
+   * deploy edges above. */
+  References: '#009688',
+  /** Templating dimension: template → {{ variable }}. Muted light indigo
+   * so this high-volume layer recedes behind the structural topology. */
+  Interpolates: '#9FA8DA',
+};
+
+export const LANGUAGE_COLORS: Record<string, string> = {
+  Rust: '#DEA584',
+  Python: '#3572A5',
+  JavaScript: '#F7DF1E',
+  TypeScript: '#3178C6',
+  Java: '#B07219',
+  Go: '#00ADD8',
+  'C#': '#178600',
+  'C++': '#F34B7D',
+  C: '#555555',
+  Ruby: '#CC342D',
+  Swift: '#F05138',
+  Kotlin: '#A97BFF',
+  Scala: '#DC322F',
+  PHP: '#4F5D95',
+  /** Apache Groovy — official brand colour. Distinct from Java's
+   * brown so a mixed Java + Groovy codebase reads correctly in the
+   * language filter / scope tree. */
+  Groovy: '#4298B4',
+  /** Elevator (`.elv`) — domain-level spec language. Same amber as
+   * the Feature kind (its dominant node) so the language identity
+   * stays consistent across language-filter and node-color views. */
+  Elevator: '#FFC107',
+  /** ansible-deploy — Ansible brand red, so a deploy repo reads as its
+   * own language in the filter / scope tree. */
+  'Ansible Deploy': '#D32F2F',
+  Unknown: '#9E9E9E',
+};
+
+export const KIND_CODES: Record<string, string> = {
+  Class: 'Cl',
+  Dataclass: 'Dc',
+  AbstractClass: 'AbCl',
+  Struct: 'St',
+  Interface: 'In',
+  Trait: 'Tr',
+  Function: 'Fn',
+  Method: 'Me',
+  Module: 'Md',
+  Enum: 'En',
+  File: 'Fi',
+  Constant: 'Const',
+  TypeAlias: 'Ty',
+  Macro: 'Ma',
+  Variable: 'Va',
+  Property: 'Pr',
+  Service: 'Sv',
+  Parameter: 'Pa',
+  Branch: 'Br',
+  Loop: 'Lp',
+  Import: 'Im',
+  /** UI-001 — distinguishes a Groovy script container from a generic
+   * `File`. Two letters keep the visual budget the same as `Fi`. */
+  GroovyScript: 'Gv',
+  /** UI-002 — synthetic Spring-bean entity. Inert until GR-010
+   * lands; the entry is forward-looking so the UI doesn't need a
+   * second PR when the parser starts emitting the kind. */
+  Bean: 'Bn',
+  /** Database objects (SQL-001). `Vw` avoids colliding with `Va`/Variable. */
+  Table: 'Tb',
+  View: 'Vw',
+  /** Elevator (`.elv`) entity-kind codes. */
+  Extension: 'Ex',
+  Category: 'Ca',
+  Feature: 'Ft',
+  Functionality: 'Fu',
+  Concept: 'Cn',
+  UiPage: 'Up',
+  /** ansible-deploy entity-kind codes. */
+  Playbook: 'Pb',
+  Role: 'Ro',
+  HostGroup: 'Hg',
+  DeploymentSet: 'DS',
+  DeploymentEntry: 'De',
+  TemplateFile: 'Tpl',
+  K8sResource: 'K8s',
+  HelmChart: 'Hlm',
+  Unknown: '??',
+};

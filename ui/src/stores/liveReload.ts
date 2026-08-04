@@ -1,0 +1,205 @@
+/**
+ * Live-reload listener: connects to the `nao watch` SSE endpoint and
+ * triggers a data refresh whenever the backend signals that files changed.
+ *
+ * Once the endpoint can point at another origin (UI-032), this is the one
+ * code path that is not a `fetch`, and `EventSource` differs from `fetch` in
+ * ways that matter here: it cannot carry an `Authorization` header, so the
+ * pairing token has to travel in the query string; and its failures arrive
+ * as a bare `onerror` with no status, so "the origin was refused" and "the
+ * server is not up yet" are indistinguishable at the point of failure.
+ *
+ * That second difference is why this store diagnoses instead of just
+ * retrying (UI-033). A UI pointed at a refused origin used to re-request a
+ * rejection every five seconds forever while showing "Static", which reads
+ * as "nothing has changed" rather than "this is not connected".
+ */
+
+import { get, writable } from 'svelte/store';
+import { refreshData } from './scope';
+import { apiUrl, isVscode } from '../vscodeAdapter';
+import { endpoint } from '../endpoint';
+import { probe } from './connection';
+import { isServeMode } from './serveMode';
+
+/** True while a live-reload refresh is in progress. */
+export const liveReloading = writable(false);
+
+/** True when the SSE connection is active. */
+export const liveConnected = writable(false);
+
+/**
+ * Why the stream is not running, when it isn't.
+ *
+ * - `off` — serve mode, which has no `/events` and never will.
+ * - `refused` — the engine would not answer this origin. Needs
+ *   `--allow-origin` on the command the user already ran.
+ * - `token` — the engine wants the pairing token from its startup banner.
+ * - `unreachable` — nothing answered, after the retries were spent.
+ * - `no-stream` — the API answers but the stream does not. A proxy that
+ *   buffers SSE looks like this.
+ */
+export type LiveStopReason = 'off' | 'refused' | 'token' | 'unreachable' | 'no-stream';
+
+export type LiveStatus =
+  | { kind: 'connecting' }
+  | { kind: 'live' }
+  | { kind: 'retrying'; attempt: number }
+  | { kind: 'stopped'; reason: LiveStopReason };
+
+export const liveStatus = writable<LiveStatus>({ kind: 'connecting' });
+
+/**
+ * Backoff schedule, in milliseconds. Escalating rather than the flat five
+ * seconds it replaces: a server that is coming back comes back quickly, and
+ * one that isn't should not be asked twelve times a minute indefinitely.
+ * Running off the end of this list is what "gave up" means.
+ */
+const RETRY_DELAYS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
+let eventSource: EventSource | null = null;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let attempt = 0;
+
+/** Try to connect to the watch server's SSE endpoint.
+ *  Falls back silently if the endpoint isn't available. */
+export function connectLiveReload(url?: string): void {
+  // `nao serve` has no `/events` and never will — its repos are analyzed
+  // once, not watched. Without this guard the retry loop below would
+  // re-request a 404 every few seconds for the life of the page.
+  if (isServeMode()) {
+    liveStatus.set({ kind: 'stopped', reason: 'off' });
+    return;
+  }
+  // `apiUrl` supplies both the configured origin and the pairing token, so
+  // a cross-origin stream needs nothing extra here.
+  url = url ?? apiUrl('/events');
+  if (eventSource) return; // already connected
+
+  if (attempt === 0) liveStatus.set({ kind: 'connecting' });
+
+  try {
+    eventSource = new EventSource(url);
+
+    eventSource.addEventListener('connected', () => {
+      console.log('[liveReload] connected to watch server');
+      attempt = 0;
+      liveConnected.set(true);
+      liveStatus.set({ kind: 'live' });
+    });
+
+    eventSource.addEventListener('reload', async () => {
+      console.log('[liveReload] reload signal received — refreshing data');
+      liveReloading.set(true);
+      try {
+        await refreshData();
+      } finally {
+        liveReloading.set(false);
+      }
+    });
+
+    eventSource.onerror = () => {
+      // Connection lost or never established. `EventSource` gives no status
+      // here, so ask the JSON API what is actually wrong.
+      disconnectLiveReload();
+      void handleFailure(url as string);
+    };
+  } catch {
+    void handleFailure(url);
+  }
+}
+
+export function disconnectLiveReload(): void {
+  liveConnected.set(false);
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+}
+
+/** Stop trying, and stay stopped. Used by the manual disconnect toggle. */
+export function stopLiveReload(reason: LiveStopReason = 'off'): void {
+  disconnectLiveReload();
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  attempt = 0;
+  liveStatus.set({ kind: 'stopped', reason });
+}
+
+/** Start over after a give-up, from a user action. */
+export function reconnectLiveReload(): void {
+  attempt = 0;
+  connectLiveReload();
+}
+
+/** True when the stream is neither live nor deliberately off. */
+export function liveIsBroken(status: LiveStatus): boolean {
+  return status.kind === 'stopped' && status.reason !== 'off';
+}
+
+/**
+ * Decide whether to retry, and say why not when the answer is no.
+ *
+ * A refusal and a missing token are settled facts — the engine has to be
+ * restarted, or the user has to paste something — so retrying them is pure
+ * noise. Everything else gets the backoff.
+ */
+async function handleFailure(url: string): Promise<void> {
+  const terminal = await diagnose();
+  if (terminal) {
+    stopLiveReload(terminal);
+    return;
+  }
+  if (attempt >= RETRY_DELAYS.length) {
+    stopLiveReload('unreachable');
+    return;
+  }
+  const delay = RETRY_DELAYS[attempt];
+  attempt += 1;
+  liveStatus.set({ kind: 'retrying', attempt });
+  scheduleRetry(url, delay);
+}
+
+/**
+ * Ask the JSON API what the stream could not say.
+ *
+ * Returns a terminal reason, or `null` to mean "try again".
+ *
+ * Runs the same handshake the connect screen does, rather than a bare
+ * `fetch` of `/api/root`: a rejected cross-origin request is a CORS refusal
+ * *or* a dead port, the browser will not say which, and reporting the wrong
+ * one sends the user to fix a flag when the engine simply is not running.
+ * `/api/hello` answers every origin, so "it is there and it blocked you" is
+ * a fact rather than a guess.
+ */
+async function diagnose(): Promise<LiveStopReason | null> {
+  const crossOrigin = !isVscode() && endpoint().base !== '';
+  const { base, token } = endpoint();
+  const verdict = await probe(base, token);
+  switch (verdict.kind) {
+    case 'refused':
+      return 'refused';
+    case 'token-required':
+      return 'token';
+    case 'ok':
+      // The API answers but the stream did not. Give the retries a chance
+      // first — a restarting engine can be up on one and not the other for
+      // a moment — and only call it terminal once they are spent.
+      return attempt >= RETRY_DELAYS.length ? 'no-stream' : null;
+    default:
+      // Same-origin, an unreachable server is very often one that has not
+      // started yet: opening the UI before running `nao watch` is a real
+      // workflow, and it is what the retry loop is for.
+      return crossOrigin ? 'unreachable' : null;
+  }
+}
+
+function scheduleRetry(url: string, delay: number): void {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connectLiveReload(url);
+  }, delay);
+}

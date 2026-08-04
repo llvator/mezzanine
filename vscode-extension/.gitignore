@@ -1,0 +1,6 @@
+node_modules/
+dist/
+webview-dist/
+*.vsix
+# Educator corpus is copied from ../content/ at package time.
+content/

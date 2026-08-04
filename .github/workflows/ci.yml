@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  # Build and run all tests. Runs on push to main + every PR.
+  build-and-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (all targets)
+        run: cargo build --all-targets
+
+      - name: Test (all targets)
+        run: cargo test --all-targets
+
+  # Diff-style complexity gate. PR-only — needs both base and head.
+  # Fails if a new function exceeds the ceiling, or any existing
+  # function's metrics regressed compared to the PR's base branch.
+  # See .github/scripts/check_complexity.py for the rules.
+  complexity-gate:
+    name: complexity gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build nao
+        run: cargo build --release --bin nao
+
+      - name: Analyze base branch
+        run: |
+          set -euo pipefail
+          # Worktree the base ref into a sibling dir so we don't disturb
+          # target/ or stomp on the PR's working tree.
+          git fetch origin '${{ github.event.pull_request.base.sha }}'
+          git worktree add /tmp/base '${{ github.event.pull_request.base.sha }}'
+          ./target/release/nao analyze -f json -l rust /tmp/base/src > /tmp/baseline.json
+
+      - name: Analyze PR branch
+        run: ./target/release/nao analyze -f json -l rust src > /tmp/current.json
+
+      - name: Compare
+        run: python3 .github/scripts/check_complexity.py /tmp/baseline.json /tmp/current.json
+
+  # Verify the PR title follows the contract's commit-style rules (a subset
+  # we can mechanically check). The PR title becomes the merge / squash
+  # commit message, so its hygiene shows up in `git log` regardless of
+  # merge strategy. See CONTRIBUTING.md ("PR title rules").
+  pr-title:
+    name: pr title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          title="$PR_TITLE"
+
+          if [ -z "$title" ]; then
+            echo "::error::PR title is empty."
+            exit 1
+          fi
+
+          # Rule 1: length <= 70 characters.
+          if [ ${#title} -gt 70 ]; then
+            echo "::error::PR title is ${#title} chars (max 70)."
+            echo "::error::See CONTRIBUTING.md (\"PR title rules\")."
+            exit 1
+          fi
+
+          # Rule 2: no conventional-commit / area prefix.
+          # Matches: 'feat:', 'fix(api):', 'refactor!:', 'AREA:', etc.
+          if printf '%s\n' "$title" | grep -qE '^[A-Za-z]+(\([^)]*\))?!?:'; then
+            echo "::error::PR title starts with a forbidden prefix."
+            echo "::error::Forbidden patterns: 'feat:', 'fix(api):', 'refactor!:', 'AREA:', etc."
+            echo "::error::See CONTRIBUTING.md (\"PR title rules\", no-prefix rule)."
+            exit 1
+          fi
+
+          # Rule 3: starts with a capital letter (imperative mood is harder
+          # to mechanically check; we settle for the structural form).
+          if ! printf '%s\n' "$title" | grep -qE '^[A-Z]'; then
+            echo "::error::PR title must start with a capital letter."
+            exit 1
+          fi
+
+          # Rule 4: no trailing period.
+          if printf '%s\n' "$title" | grep -qE '\.$'; then
+            echo "::error::PR title must not end with a period."
+            exit 1
+          fi
+
+          echo "✓ PR title: $title"
+

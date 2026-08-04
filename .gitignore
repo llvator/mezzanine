@@ -1,0 +1,41 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Node
+node_modules/
+npm-debug.log*
+
+# VS Code extension build artefacts
+vscode-extension/dist/
+vscode-extension/*.vsix
+
+# nao's own generated output. `.nao/settings.json` is deliberately NOT
+# ignored — it describes the repo and is meant to be committed (see
+# .nao.example/README.md); only what nao writes is.
+.nao/data/
+
+# Runtime data from `nao` itself
+data.json
+data.details.json
+data.base-details.json
+data.index.json
+diff.json
+visualization.html
+deps.dot
+
+# Local test fixtures / language samples (not published)
+/data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Examples
+/data

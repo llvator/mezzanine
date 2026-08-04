@@ -1,0 +1,368 @@
+{
+  "name": "nao-code-visualizer",
+  "displayName": "Nao — Code Visualizer",
+  "description": "Visualize code relationships and dependencies for the file open in your editor",
+  "version": "1.0.0",
+  "publisher": "nao-team",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/llvator/nao.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "nao.openVisualizer",
+        "title": "Nao: Open Code Visualizer"
+      },
+      {
+        "command": "nao.visualizeCurrentFile",
+        "title": "Nao: Visualize Current File"
+      },
+      {
+        "command": "nao.stopServer",
+        "title": "Nao: Stop Server"
+      },
+      {
+        "command": "nao.restartServer",
+        "title": "Nao: Restart Server"
+      },
+      {
+        "command": "nao.selectGitRepo",
+        "title": "Nao: Select Git Repository…"
+      },
+      {
+        "command": "nao.scopes.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "nao.scopes.selectAll",
+        "title": "Select Root (All)",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "nao.scopes.clear",
+        "title": "Clear Selection",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "nao.analysisScopes.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "nao.analysisScopes.selectAll",
+        "title": "Select Root (All)",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "nao.analysisScopes.clear",
+        "title": "Clear Selection",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "nao.scopes.extendToParent",
+        "title": "Extend Selection to Parent Folder",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "nao.scopes.filter",
+        "title": "Filter Tree…",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "nao.scopes.clearFilter",
+        "title": "Clear Tree Filter",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "nao.scopes.pick",
+        "title": "Pick Visual Scopes…",
+        "category": "Nao",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "nao.analysisScopes.extendToParent",
+        "title": "Extend Selection to Parent Folder",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "nao.analysisScopes.filter",
+        "title": "Filter Tree…",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "nao.analysisScopes.clearFilter",
+        "title": "Clear Tree Filter",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "nao.analysisScopes.pick",
+        "title": "Pick Analysis Scopes…",
+        "category": "Nao",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "nao.analysisScopes.followActive",
+        "title": "Follow Active Editor",
+        "icon": "$(link)"
+      },
+      {
+        "command": "nao.analysisScopes.unfollowActive",
+        "title": "Stop Following Active Editor",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "nao.analysisScopes.followFile",
+        "title": "Follow File",
+        "icon": "$(file)"
+      },
+      {
+        "command": "nao.analysisScopes.followFolder",
+        "title": "Follow Folder",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "nao.educator.refreshProblems",
+        "title": "Nao: Refresh Educator Problems"
+      },
+      {
+        "command": "nao.educator.openHit",
+        "title": "Nao: Open Educator Hit"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nao",
+          "title": "Nao",
+          "icon": "resources/nao.svg"
+        }
+      ]
+    },
+    "views": {
+      "nao": [
+        {
+          "id": "nao.scopes",
+          "name": "Visual Scopes",
+          "size": 2
+        },
+        {
+          "id": "nao.analysisScopes",
+          "name": "Analysis Scope",
+          "visibility": "collapsed"
+        },
+        {
+          "type": "webview",
+          "id": "nao.controls",
+          "name": "Controls",
+          "visibility": "collapsed",
+          "size": 6
+        },
+        {
+          "type": "webview",
+          "id": "nao.diff",
+          "name": "Diff",
+          "visibility": "collapsed"
+        },
+        {
+          "type": "webview",
+          "id": "nao.selection",
+          "name": "Inspector",
+          "size": 3
+        },
+        {
+          "type": "webview",
+          "id": "nao.description",
+          "name": "Description",
+          "size": 3
+        },
+        {
+          "type": "webview",
+          "id": "nao.quality",
+          "name": "Quality",
+          "size": 3
+        },
+        {
+          "type": "webview",
+          "id": "nao.educator",
+          "name": "Educator",
+          "visibility": "collapsed"
+        },
+        {
+          "id": "nao.educatorProblems",
+          "name": "Educator Problems",
+          "visibility": "collapsed"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "nao.scopes.extendToParent",
+          "when": "view == nao.scopes",
+          "group": "navigation@0"
+        },
+        {
+          "command": "nao.scopes.pick",
+          "when": "view == nao.scopes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nao.scopes.filter",
+          "when": "view == nao.scopes && !nao.scopesFiltered",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nao.scopes.clearFilter",
+          "when": "view == nao.scopes && nao.scopesFiltered",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nao.scopes.selectAll",
+          "when": "view == nao.scopes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "nao.scopes.clear",
+          "when": "view == nao.scopes",
+          "group": "navigation@4"
+        },
+        {
+          "command": "nao.scopes.refresh",
+          "when": "view == nao.scopes",
+          "group": "navigation@5"
+        },
+        {
+          "command": "nao.analysisScopes.extendToParent",
+          "when": "view == nao.analysisScopes",
+          "group": "navigation@0"
+        },
+        {
+          "command": "nao.analysisScopes.pick",
+          "when": "view == nao.analysisScopes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "nao.analysisScopes.filter",
+          "when": "view == nao.analysisScopes && !nao.analysisScopesFiltered",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nao.analysisScopes.clearFilter",
+          "when": "view == nao.analysisScopes && nao.analysisScopesFiltered",
+          "group": "navigation@2"
+        },
+        {
+          "command": "nao.analysisScopes.selectAll",
+          "when": "view == nao.analysisScopes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "nao.analysisScopes.clear",
+          "when": "view == nao.analysisScopes",
+          "group": "navigation@4"
+        },
+        {
+          "command": "nao.analysisScopes.refresh",
+          "when": "view == nao.analysisScopes",
+          "group": "navigation@5"
+        },
+        {
+          "command": "nao.analysisScopes.followFolder",
+          "when": "view == nao.analysisScopes && nao.followActiveAnalysisScope && nao.analysisScopeFollowModeIsFile",
+          "group": "navigation@6"
+        },
+        {
+          "command": "nao.analysisScopes.followFile",
+          "when": "view == nao.analysisScopes && nao.followActiveAnalysisScope && !nao.analysisScopeFollowModeIsFile",
+          "group": "navigation@6"
+        },
+        {
+          "command": "nao.analysisScopes.followActive",
+          "when": "view == nao.analysisScopes && !nao.followActiveAnalysisScope",
+          "group": "navigation@7"
+        },
+        {
+          "command": "nao.analysisScopes.unfollowActive",
+          "when": "view == nao.analysisScopes && nao.followActiveAnalysisScope",
+          "group": "navigation@7"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Nao Code Visualizer",
+      "properties": {
+        "nao.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the nao binary. If empty, looks for 'nao' on PATH."
+        },
+        "nao.claudeBinary": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Claude Code executable used by the Quality view's Refactor action. If empty, looks for 'claude' on PATH."
+        },
+        "nao.serverPort": {
+          "type": "number",
+          "default": 3200,
+          "description": "Port for the nao watch server (used internally by the extension)."
+        },
+        "nao.includeTests": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include test files in the analysis."
+        },
+        "nao.language": {
+          "type": "string",
+          "default": "",
+          "description": "Restrict analysis to a single language (passed to 'nao watch --language'). Leave empty to analyze all detected languages. Useful for repos where you only care about one layer — e.g. set to 'ansible' to see just the Kubernetes deploy topology of an Ansible/Helm repo and skip its Python/vendored files. Accepts the same names as the CLI (rust, python, typescript, java, go, groovy, elevator, ansible, …)."
+        },
+        "nao.autoVisualize": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically update the visualization when switching files."
+        },
+        "nao.analysisScopeFollowMode": {
+          "type": "string",
+          "enum": ["file", "folder"],
+          "default": "folder",
+          "description": "Granularity for the Analysis Scope's 'Follow Active Editor' toggle: 'file' narrows scope to the active file, 'folder' narrows to its parent folder. Toggled from the Analysis Scope view's title bar."
+        },
+        "nao.educator.hoverEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Nao Educator content in the editor hover for Java source. Educator rules teach good-practice patterns at the cursor; disable to suppress them entirely. The educator contributes only when at least one rule matches at the cursor — hover popups on uninteresting tokens are unaffected."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build:all",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "build:webview": "cd ../ui && npm run build:vscode",
+    "sync:content": "rm -rf content && cp -R ../content content",
+    "build:all": "npm run sync:content && npm run build:webview && npm run build",
+    "package": "npm run build:all && npx --yes @vscode/vsce package --no-dependencies",
+    "install:local": "npm run package && code --install-extension $(ls -t *.vsix | head -n1)"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,83 @@
+# Reference workflow for `nao pr-report` (MCP-008).
+#
+# Posts nao's structural change report as a single PR comment, edited in
+# place on every push (found by the `<!-- nao-pr-report -->` marker the
+# command emits). Non-blocking by design: every step swallows failure so
+# this never gates a merge — nao is a signal, not a gate.
+#
+# Copy this into a consuming repo's `.github/workflows/`. It assumes the
+# `nao` binary is installed via `cargo install`; swap in a released
+# binary or a container image if you have one.
+name: nao pr-report
+
+on:
+  pull_request:
+
+# Least privilege: only needs to read the code and write PR comments.
+permissions:
+  contents: read
+  pull-requests: write
+
+# One in-flight run per PR; a newer push cancels the older report job.
+concurrency:
+  group: nao-pr-report-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-report:
+    name: structural change report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the merge-base with the target branch resolves.
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nao
+        run: cargo install --path . --bin nao
+        continue-on-error: true
+
+      - name: Compute merge-base and render report
+        id: report
+        continue-on-error: true
+        run: |
+          BASE="$(git merge-base origin/${{ github.base_ref }} HEAD)"
+          echo "Comparing working tree against merge-base $BASE" >&2
+          # `pr-report` always exits 0; base_ref is the merge-base so the
+          # diff is exactly the PR's own changes, not the branch's drift.
+          nao pr-report --base-ref "$BASE" > report.md
+          {
+            echo 'body<<NAO_EOF'
+            cat report.md
+            echo 'NAO_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upsert the PR comment
+        if: steps.report.outputs.body != ''
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- nao-pr-report -->';
+            const body = process.env.NAO_BODY;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number },
+            );
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+        env:
+          NAO_BODY: ${{ steps.report.outputs.body }}
+
+    # Job-level guard: even if a step's continue-on-error is removed later,
+    # the workflow itself is advisory. Keep the final status green.
+    continue-on-error: true

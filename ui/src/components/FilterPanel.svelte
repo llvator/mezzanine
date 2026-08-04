@@ -1,0 +1,1454 @@
+<script lang="ts">
+  import ColorChip from './ColorChip.svelte';
+  import { NODE_COLORS, LINK_COLORS, LANGUAGE_COLORS } from '../types/graph';
+  import { showGhostNodes, showBuiltinGhosts } from '../stores/graph';
+  import {
+    generalEntityTypes, generalRelTypes, generalOutgoing, generalIncoming,
+    generalLanguages, allLanguages,
+    levelOverrides, allEntityTypes, allRelTypes,
+    toggleEntityType, toggleRelType, toggleLanguage, setAllLanguages,
+    toggleLevelEnabled,
+    cycleEntityTypeTriState, cycleRelTypeTriState, cycleDirectionTriState,
+    searchTerm, searchMatches,
+    committedSearchIds, commitAllMatches, toggleCommittedMatch, clearCommittedMatches,
+    setCommittedMatches,
+    searchInEntityNames, searchInFileNames, searchInFolderNames,
+    searchEntityKinds, toggleSearchEntityKind, clearSearchEntityKinds,
+    toggleLevelPeerEdges, showDirectEdges, showCrossLevelEdges,
+    searchHidesNonMatches,
+  } from '../viewmodels/filterViewModel';
+  // Display-search machinery now lives in displayPlan.ts (see comment in
+  // filterViewModel.ts) — import directly to avoid a startup-time module cycle.
+  import { displaySearchTerm, displaySearchMatches } from '../viewmodels/displayPlan';
+  import { selectedNode, graphData } from '../stores/graph';
+  import { get } from 'svelte/store';
+  import type { D3Node, TriState } from '../types/graph';
+  import FileTree from './FileTree.svelte';
+  import { searchOutOfScopeMatches } from '../viewmodels/entitySearch';
+  import { focusScope } from '../stores/scope';
+  import ScopeTree from './ScopeTree.svelte';
+  import RootPathPicker from './RootPathPicker.svelte';
+  import AnalysisScopePanel from './AnalysisScopePanel.svelte';
+  import { serveMode, activeRepo, backToPicker } from '../stores/serveMode';
+  import { nodeEncoding, availableSizeChannels } from '../stores/encoding';
+  import { sizeChannel, colorChannel } from '../stores/settings';
+  import { NO_DATA_FILL, NO_DATA_FILL_OPACITY, COLOR_CHANNELS, R_MAX } from '../viewmodels/nodeEncoding';
+
+  /** Legend dots are drawn to scale with the canvas, shrunk to fit the
+   *  sidebar: the largest stop gets a 22px radius, and every other stop the
+   *  same factor. Three true-size dots would need ~180px of the ~220px of
+   *  content width the panel has, and would make the legend the tallest
+   *  block in it. */
+  const LEGEND_DOT_SCALE = 22 / R_MAX;
+
+  /** Keep the size channel valid when the aggregation level changes under it:
+   *  switching to File while size is WMC would otherwise leave a selected-but-
+   *  unavailable channel, which silently falls back to kind sizing with no
+   *  visible reason why. */
+  $: if (!$availableSizeChannels.some((c) => c.id === $sizeChannel)) sizeChannel.set('loc');
+
+  /** Master language toggle. Counted against `allLanguages` (the dataset)
+   *  rather than the filter set, so a stale entry in `generalLanguages`
+   *  can't make the box claim "all" while a row sits unchecked. */
+  $: shownLangCount = $allLanguages.filter((l) => $generalLanguages.has(l)).length;
+  $: langsAllShown = $allLanguages.length > 0 && shownLangCount === $allLanguages.length;
+  $: langsSomeShown = shownLangCount > 0 && !langsAllShown;
+
+  /** `owner__repo` → `owner/repo`; anything else passes through. */
+  function displayName(slug: string): string {
+    const parts = slug.split('__');
+    return parts.length === 2 ? `${parts[0]}/${parts[1]}` : slug;
+  }
+
+  // Collapsed by default — a session-level setting, not a per-look control.
+  let analysisScopeOpen = false;
+  let filesOpen = false;
+  let entitiesOpen = true;
+  let relationshipsOpen = true;
+  let searchScopeOpen = false;
+
+  // Cap the results list so large pattern matches don't drop hundreds of
+  // DOM nodes into the sidebar. The graph still highlights all of them.
+  const MAX_RESULTS_SHOWN = 50;
+
+  let searchInputEl: HTMLInputElement | undefined;
+  let activeResult = -1;
+
+  function selectMatch(node: D3Node) {
+    selectedNode.set(node);
+  }
+
+  /** An out-of-scope hit exists in the repo but not in the loaded graph, so
+   *  selecting it directly would select a node the canvas cannot draw. Scope
+   *  to its file first, then select. */
+  async function selectOutOfScope(node: D3Node) {
+    const ok = await focusScope(node.file_path);
+    if (!ok) return;
+    const match = get(graphData).nodes.find((n) => n.id === node.id)
+      ?? get(graphData).nodes.find((n) => n.original_id === node.original_id);
+    if (match) selectedNode.set(match);
+  }
+
+  $: visibleResults = $searchMatches.slice(0, MAX_RESULTS_SHOWN);
+  // Reset the keyboard cursor whenever the result set changes underneath it.
+  $: if ($searchTerm !== undefined) activeResult = -1;
+
+  /** Anchor for shift-click range commits: the last row whose checkbox was
+   *  clicked. Reset with the query, because an index into the previous
+   *  result set addresses a different entity in the new one. */
+  let commitAnchor = -1;
+  $: if ($searchTerm !== undefined) commitAnchor = -1;
+
+  /**
+   * Commit a row, or a run of rows when shift is held.
+   *
+   * On `click` rather than `change`: `shiftKey` is not on the change event,
+   * and by click time `currentTarget.checked` already holds the new state —
+   * which is the state the whole range takes, matching how every file
+   * manager behaves.
+   */
+  function onCommitClick(e: MouseEvent & { currentTarget: HTMLInputElement }, i: number) {
+    const checked = e.currentTarget.checked;
+    if (e.shiftKey && commitAnchor >= 0 && commitAnchor < visibleResults.length) {
+      const [lo, hi] = commitAnchor < i ? [commitAnchor, i] : [i, commitAnchor];
+      setCommittedMatches(visibleResults.slice(lo, hi + 1).map((m) => m.id), checked);
+    } else {
+      // Plain click: the box has already flipped itself, so mirror it rather
+      // than toggling the store again.
+      setCommittedMatches([visibleResults[i].id], checked);
+    }
+    commitAnchor = i;
+  }
+
+  function onSearchKeydownNav(e: KeyboardEvent) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (visibleResults.length === 0) return;
+      e.preventDefault();
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      activeResult = (activeResult + delta + visibleResults.length) % visibleResults.length;
+      selectMatch(visibleResults[activeResult]);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      clearSearch();
+      return;
+    }
+    onSearchKeydown(e);
+  }
+
+  function clearSearch() {
+    searchTerm.set('');
+    activeResult = -1;
+    searchInputEl?.blur();
+    // Hand focus back to the canvas so panning and zoom keys work again.
+    (document.querySelector('.graph-container svg') as SVGElement | null)?.focus?.();
+  }
+
+  /** Cmd/Ctrl-K from anywhere. Ignored while another text field has focus so
+   *  it can't hijack typing in the scope filter or the in-view search. */
+  function onGlobalKeydown(e: KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      const el = e.target as HTMLElement | null;
+      const typing = el instanceof HTMLElement
+        && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+      if (typing && el !== searchInputEl) return;
+      e.preventDefault();
+      entitiesOpen = true;
+      searchInputEl?.focus();
+      searchInputEl?.select();
+    }
+  }
+
+  // Enter while focused on the search input commits every current match.
+  // Shift+Enter is reserved for nothing yet but kept off the handler so a
+  // future "add to selection" behavior can be layered without breaking.
+  function onSearchKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      commitAllMatches();
+    }
+  }
+
+  function cycleTriState(level: number, category: 'entityTypes' | 'relTypes', key: string) {
+    if (category === 'entityTypes') cycleEntityTypeTriState(level, key);
+    else cycleRelTypeTriState(level, key);
+  }
+
+  function triStateLabel(state: TriState): string {
+    if (state === 'on') return '\u2713';
+    if (state === 'off') return '\u2717';
+    return 'G';
+  }
+
+  function toggleSection(id: string) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('open');
+  }
+</script>
+
+<svelte:window on:keydown={onGlobalKeydown} />
+
+{#if $serveMode && $activeRepo}
+  <!-- Serve mode: the repo is a choice the user made, so name it and let
+       them go back and change it. -->
+  <div class="repo-bar">
+    <button class="back" on:click={backToPicker} title="Back to the repo list">
+      ← Repos
+    </button>
+    <span class="repo-name" title={$activeRepo.url ?? $activeRepo.slug}>
+      {displayName($activeRepo.slug)}
+    </span>
+  </div>
+{:else}
+  <h1>Nao</h1>
+{/if}
+
+<!--
+  Three blocks, grouped by what a change costs — which is the thing the old
+  flat list left to a comment nobody reading the app could see:
+
+    Analysis            re-parses or refetches the dataset
+      Root Path         which codebase
+      Parsed Languages  which languages the analyzer reads at all
+      Analysis Scope    which code loads into the canvas
+
+    Graph Visualization redraws from the dataset already loaded
+      Files             hide files from the picture only
+      Languages         hide by language
+
+    Post-Filtering      narrows or emphasises what is drawn
+      Entities          search + entity kinds
+      Relationships     direction + rel kinds
+      Level Filters     traversal depth
+      Legend            reference
+
+  Names changed in UI-051: the old "Analysis Scope" filtered *languages* and
+  is now "Parsed Languages"; the old bare "Scope" is now "Analysis Scope";
+  "Files & Folders" is now the Graph Visualization block with "Files" inside.
+-->
+
+<!-- 0. Root Path: which codebase to analyze.
+     0b. Analysis Scope: control what the analyzer even parses. Sits
+     above every other filter because it shrinks the dataset; the
+     visual filters below only hide nodes that the analyzer produced.
+
+     Both re-run analysis on the server, which serve mode's repos don't
+     support — they're analyzed once from a fixed checkout. Hidden there
+     rather than left to fail against endpoints that don't exist. -->
+<!-- Search is navigation, not a filter, and it must not drift below the
+     fold as the scope tree grows — which is exactly what happened once the
+     repo gained files (UI-016). Pinned above every section that can grow. -->
+<div class="filter-section search-first">
+  <div class="sub-title">
+    <span class="search-label">Search in dataset</span>
+    <span class="search-hint">— type to preview, Enter to filter</span>
+  </div>
+  <div class="filter-group">
+    <input type="text"
+      data-probe="search-input"
+      bind:this={searchInputEl}
+      bind:value={$searchTerm}
+      on:keydown={onSearchKeydownNav}
+      placeholder="Search entities  (⌘K)" />
+  </div>
+</div>
+
+<!-- Block 1 of 3. The blocks are grouped by what a change *costs*, which is
+     the distinction the flat list hid: everything here re-parses or refetches
+     the dataset, everything in Graph Visualization redraws from the dataset
+     already loaded, and everything in Post-Filtering narrows what is drawn. -->
+<div class="filter-block">
+  <h2 class="block-title"><span class="block-step">1</span>Analysis</h2>
+  <p class="block-note">What nao parses and loads. Changing these re-runs analysis or refetches.</p>
+</div>
+
+{#if !$serveMode}
+  <div class="filter-section">
+    <h2>Root Path</h2>
+    <RootPathPicker />
+  </div>
+
+  <div class="filter-section">
+    <!-- A real <button> styled as the section header, rather than the
+         click-handler-on-<h2> the sibling sections use. Same appearance,
+         keyboard-reachable, and adds no a11y warnings. -->
+    <h2 class="section-heading-wrap">
+      <button
+        type="button"
+        class="section-header section-header-btn"
+        aria-expanded={analysisScopeOpen}
+        on:click={() => (analysisScopeOpen = !analysisScopeOpen)}
+      >
+        Parsed Languages <span class="toggle-arrow">{analysisScopeOpen ? '\u25BC' : '\u25B6'}</span>
+      </button>
+    </h2>
+    <p class="layer-note">Which languages the analyzer reads at all. Apply re-parses the repo.</p>
+    <AnalysisScopePanel open={analysisScopeOpen} />
+  </div>
+{/if}
+
+<!-- Still the most consequential control in the panel, and it used to be
+     called just "Scope" next to a "Analysis Scope" that meant languages.
+     The subtitle deliberately does NOT claim to move Quality: Quality reads
+     `analysisScopes`, which defaults to the whole repo and is decoupled from
+     this tree on purpose (scope.ts). An earlier version of this line said
+     otherwise and was wrong (UI-051). -->
+<div class="filter-section">
+  <h2>Analysis Scope</h2>
+  <p class="layer-note">Which code loads into the canvas. Quality measures its own population — see the Quality tab.</p>
+  <ScopeTree />
+</div>
+
+<!-- Block 2 of 3. -->
+<div class="filter-block">
+  <h2 class="block-title"><span class="block-step">2</span>Graph Visualization</h2>
+  <p class="block-note">What the canvas draws from the code above. The side panels keep the whole scope.</p>
+</div>
+
+<div class="filter-section">
+  <h2 class="section-header" on:click={() => (filesOpen = !filesOpen)}>
+    Files <span class="toggle-arrow">{filesOpen ? '\u25BC' : '\u25B6'}</span>
+  </h2>
+  <p class="layer-note">Hide files from the picture without changing what is analysed.</p>
+  {#if filesOpen}
+    <FileTree />
+  {/if}
+</div>
+
+<!-- 3. Languages: narrow by source language -->
+<div class="filter-section">
+  <h2>Languages</h2>
+  <label class="checkbox-item select-all">
+    <input type="checkbox"
+      checked={langsAllShown}
+      indeterminate={langsSomeShown}
+      on:change={(e) => setAllLanguages(e.currentTarget.checked)} />
+    <span>{langsAllShown ? 'All' : langsSomeShown ? `${shownLangCount} of ${$allLanguages.length}` : 'None'}</span>
+  </label>
+  <div class="checkbox-group">
+    {#each $allLanguages as lang}
+      <label class="checkbox-item">
+        <input type="checkbox" checked={$generalLanguages.has(lang)}
+          on:change={(e) => toggleLanguage(lang, e.currentTarget.checked)} />
+        <ColorChip color={LANGUAGE_COLORS[lang] || 'var(--text-muted)'} label={lang} />
+      </label>
+    {/each}
+  </div>
+</div>
+
+<!-- Block 3 of 3. -->
+<div class="filter-block">
+  <h2 class="block-title"><span class="block-step">3</span>Post-Filtering</h2>
+  <p class="block-note">Narrow or emphasise what is already drawn. Nothing here reloads data.</p>
+</div>
+
+<!-- Entities: search + entity-type filter. Search narrows entity
+     visibility, so it belongs next to the entity-type toggles. -->
+<div class="filter-section">
+  <h2 class="section-header" on:click={() => (entitiesOpen = !entitiesOpen)}>
+    Entities <span class="toggle-arrow">{entitiesOpen ? '\u25BC' : '\u25B6'}</span>
+  </h2>
+  {#if entitiesOpen}
+    <!-- Primary search: two-phase workflow.
+         · Type → live results list (preview). No graph filtering yet.
+         · Enter or "Commit all" → all current matches filter the graph.
+         · Per-row checkbox → individually commit/uncommit a match.
+         · Clear the input → filter is removed. -->
+    <!-- The field itself lives at the top of the panel; this section keeps
+         the scope controls and the results list that go with it. -->
+
+    <!-- Search scope: what the term is matched against. Collapsed by default
+         since the all-on defaults match the old behavior. -->
+    <div class="search-scope">
+      <button type="button" class="search-scope-toggle"
+        on:click={() => (searchScopeOpen = !searchScopeOpen)}>
+        <span class="toggle-arrow">{searchScopeOpen ? '\u25BC' : '\u25B6'}</span>
+        Search scope
+        {#if $searchEntityKinds.size > 0}
+          <span class="scope-badge">{$searchEntityKinds.size} kind{$searchEntityKinds.size === 1 ? '' : 's'}</span>
+        {/if}
+      </button>
+      {#if searchScopeOpen}
+        <div class="search-scope-body">
+          <div class="sub-title">Match on</div>
+          <div class="checkbox-group">
+            <label class="checkbox-item">
+              <input type="checkbox" bind:checked={$searchInEntityNames} />
+              <span>Entity names</span>
+            </label>
+            <label class="checkbox-item">
+              <input type="checkbox" bind:checked={$searchInFileNames} />
+              <span>File names</span>
+            </label>
+            <label class="checkbox-item">
+              <input type="checkbox" bind:checked={$searchInFolderNames} />
+              <span>Folder names</span>
+            </label>
+          </div>
+
+          <div class="sub-title">
+            Restrict to entity kinds
+            {#if $searchEntityKinds.size > 0}
+              <button type="button" class="scope-clear-btn" on:click={clearSearchEntityKinds}>
+                All kinds
+              </button>
+            {:else}
+              <span class="search-hint">— empty = all kinds</span>
+            {/if}
+          </div>
+          <div class="checkbox-group">
+            {#each $allEntityTypes as type}
+              <label class="checkbox-item">
+                <input type="checkbox"
+                  checked={$searchEntityKinds.has(type)}
+                  on:change={() => toggleSearchEntityKind(type)} />
+                <ColorChip color={NODE_COLORS[type] || 'var(--text-muted)'} label={type} />
+              </label>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+
+    {#if $committedSearchIds.size > 0}
+      <div class="commit-status">
+        <span class="commit-count">
+          Filtering on {$committedSearchIds.size} committed entit{$committedSearchIds.size === 1 ? 'y' : 'ies'}
+        </span>
+        <button type="button" class="commit-clear-btn" on:click={clearCommittedMatches}>
+          Clear filter
+        </button>
+      </div>
+      <!-- Dimming is the default: a search answers "where is X", and
+           deleting the graph around the answer removes what makes it one.
+           Hiding is the cheaper option on a scope too busy to read through,
+           so it stays one click away (UI-050). -->
+      <label class="checkbox-item commit-mode">
+        <input type="checkbox" bind:checked={$searchHidesNonMatches} />
+        <span>Hide non-matches instead of dimming them</span>
+      </label>
+    {/if}
+
+    {#if $searchTerm.trim()}
+      <div class="search-results">
+        <div class="search-results-header">
+          {#if $searchMatches.length === 0}
+            <span class="no-match">No matches</span>
+          {:else}
+            <span class="match-count" style="color: #FFD54F">
+              {$searchMatches.length} match{$searchMatches.length === 1 ? '' : 'es'}
+            </span>
+            {#if $searchMatches.length > MAX_RESULTS_SHOWN}
+              <span class="truncated">(showing first {MAX_RESULTS_SHOWN})</span>
+            {/if}
+            <button type="button" class="commit-all-btn" on:click={commitAllMatches}
+              title="Commit every current match to the filter (same as Enter)">
+              Commit all
+            </button>
+          {/if}
+        </div>
+        {#if $searchMatches.length > 0}
+          <ul class="search-results-list" data-probe="search-results">
+            {#each visibleResults as match, i (match.id)}
+              <li
+                class="search-result-item"
+                class:active={$selectedNode?.id === match.id || i === activeResult}
+                class:committed={$committedSearchIds.has(match.id)}
+                title="{match.qualified_name} — {match.file_path}:{match.line}"
+              >
+                <input type="checkbox"
+                  class="result-commit-cb"
+                  checked={$committedSearchIds.has(match.id)}
+                  on:click|stopPropagation={(e) => onCommitClick(e, i)}
+                  title="Commit this match to the filter (shift-click for a range)" />
+                <span class="result-kind" on:click={() => selectMatch(match)}>
+                  <i class="kind-dot" style="background: {NODE_COLORS[match.kind_raw] || 'var(--text-muted)'}"></i>
+                  {match.kind}
+                </span>
+                <span class="result-name" on:click={() => selectMatch(match)}>{match.name}</span>
+                <span class="result-path" on:click={() => selectMatch(match)}>{match.file_path}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+
+        {#if $searchOutOfScopeMatches.length > 0}
+          <!-- Hits that exist in the repo but not in the loaded scope. Before
+               this they simply did not appear, so searching inside a narrow
+               scope looked like "no such entity" (UI-016). -->
+          <div class="oos-header">
+            {$searchOutOfScopeMatches.length} more outside the current scope
+          </div>
+          <ul class="search-results-list" data-probe="search-results-oos">
+            {#each $searchOutOfScopeMatches.slice(0, MAX_RESULTS_SHOWN) as match (match.id)}
+              <!-- One button for the whole row rather than three clickable
+                   spans: same look, keyboard-reachable, no a11y warnings. -->
+              <li class="search-result-item oos">
+                <button
+                  type="button"
+                  class="oos-row-btn"
+                  title="{match.qualified_name} — {match.file_path}:{match.line} (outside the current scope; selecting scopes to this file)"
+                  on:click={() => selectOutOfScope(match)}
+                >
+                  <span class="result-kind"><i class="kind-dot" style="background: {NODE_COLORS[match.kind_raw] || 'var(--text-muted)'}"></i>{match.kind}</span>
+                  <span class="result-name">{match.name}</span>
+                  <span class="result-path">{match.file_path}</span>
+                  <span class="oos-scope-btn">Scope to it</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Display search: "Ctrl+F within the current view". Only highlights,
+         never filters. Useful for locating a specific entity inside an
+         already-scoped view without reshaping the graph. -->
+    <div class="sub-title">
+      <span class="search-label search-label-view">Search in view</span>
+      <span class="search-hint">— highlight only, no filtering</span>
+    </div>
+    <div class="filter-group">
+      <input type="text" bind:value={$displaySearchTerm} placeholder="Search visible entities..." />
+    </div>
+
+    {#if $displaySearchTerm.trim()}
+      <div class="search-results search-results-display">
+        <div class="search-results-header">
+          {#if $displaySearchMatches.length === 0}
+            <span class="no-match">No matches in current view</span>
+          {:else}
+            <span class="match-count" style="color: #4DD0E1">
+              {$displaySearchMatches.length} match{$displaySearchMatches.length === 1 ? '' : 'es'} in view
+            </span>
+            {#if $displaySearchMatches.length > MAX_RESULTS_SHOWN}
+              <span class="truncated">(showing first {MAX_RESULTS_SHOWN})</span>
+            {/if}
+          {/if}
+        </div>
+        {#if $displaySearchMatches.length > 0}
+          <ul class="search-results-list">
+            {#each $displaySearchMatches.slice(0, MAX_RESULTS_SHOWN) as match (match.id)}
+              <li
+                class="search-result-item"
+                class:active={$selectedNode?.id === match.id}
+                on:click={() => selectMatch(match)}
+                title="{match.qualified_name} — {match.file_path}:{match.line}"
+              >
+                <span class="result-kind"><i class="kind-dot" style="background: {NODE_COLORS[match.kind_raw] || 'var(--text-muted)'}"></i>
+                  {match.kind}
+                </span>
+                <span class="result-name">{match.name}</span>
+                <span class="result-path">{match.file_path}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Headings render nothing until a graph is loaded — an empty section
+         title is pure vertical cost in a pane that has none to spare. -->
+    {#if $allEntityTypes.length > 0}
+      <div class="sub-title">Entity Types</div>
+      <div class="checkbox-group">
+        {#each $allEntityTypes as type}
+          <label class="checkbox-item">
+            <input type="checkbox" checked={$generalEntityTypes.has(type)}
+              on:change={(e) => toggleEntityType(type, e.currentTarget.checked)} />
+            <ColorChip color={NODE_COLORS[type] || 'var(--text-muted)'} label={type} />
+          </label>
+        {/each}
+      </div>
+    {/if}
+
+    <div class="checkbox-group" style="margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-subtle);">
+      <label class="checkbox-item">
+        <input type="checkbox" checked={$showGhostNodes}
+          on:change={(e) => showGhostNodes.set(e.currentTarget.checked)} />
+        <ColorChip color="#9E9E9E" label="Ghost nodes (external refs)" />
+      </label>
+      <label class="checkbox-item">
+        <input type="checkbox" checked={$showBuiltinGhosts}
+          on:change={(e) => showBuiltinGhosts.set(e.currentTarget.checked)} />
+        <ColorChip color="#9E9E9E" label="Builtins (print, len, Vec, …)" />
+      </label>
+    </div>
+  {/if}
+</div>
+
+<!-- 5. Relationships: how edges are drawn (direction + rel types) -->
+<div class="filter-section">
+  <h2 class="section-header" on:click={() => (relationshipsOpen = !relationshipsOpen)}>
+    Relationships <span class="toggle-arrow">{relationshipsOpen ? '\u25BC' : '\u25B6'}</span>
+  </h2>
+  {#if relationshipsOpen}
+    <div class="sub-title">Direction</div>
+    <div class="checkbox-group">
+      <label class="checkbox-item">
+        <input type="checkbox" bind:checked={$generalOutgoing} />
+        <ColorChip color="#2196F3" label="Outgoing" />
+      </label>
+      <label class="checkbox-item">
+        <input type="checkbox" bind:checked={$generalIncoming} />
+        <ColorChip color="#E91E63" label="Incoming" />
+      </label>
+    </div>
+
+    {#if $allRelTypes.length > 0}
+      <div class="sub-title">Relationship Types</div>
+      <div class="checkbox-group">
+        {#each $allRelTypes as type}
+          <label class="checkbox-item">
+            <input type="checkbox" checked={$generalRelTypes.has(type)}
+              on:change={(e) => toggleRelType(type, e.currentTarget.checked)} />
+            <ColorChip color={LINK_COLORS[type] || 'var(--text-muted)'} label={type} />
+          </label>
+        {/each}
+      </div>
+    {/if}
+  {/if}
+</div>
+
+<!-- Level Filters -->
+<div class="filter-section">
+  <h2>Level Filters</h2>
+  <div class="level-hint">
+    Tri-state: <span class="ts-g">G</span>=General, <span class="ts-on">{'\u2713'}</span>=On, <span class="ts-off">{'\u2717'}</span>=Off
+  </div>
+
+  <!-- Edge-kind toggles (only meaningful while a node is selected). Direct
+       = edges incident to the selected node. Peer = edges between two
+       nodes at the same level (e.g. two 1st-level neighbors calling each
+       other). Decoupled so the user can see peer topology without the
+       selected node's own edges, or vice versa. -->
+  <div class="edge-kind-group">
+    <label class="edge-kind-item">
+      <input type="checkbox" bind:checked={$showDirectEdges} />
+      <span>Direct edges to selected</span>
+    </label>
+    <label class="edge-kind-item">
+      <input type="checkbox" bind:checked={$showCrossLevelEdges} />
+      <span>Cross-level edges (L1↔L2↔L3)</span>
+    </label>
+  </div>
+
+  {#each [1, 2, 3] as level}
+    {@const lo = $levelOverrides[level]}
+    {@const levelColors = ['', '#4CAF50', '#FF9800', '#E91E63']}
+    {@const levelNames = ['', '1st Level (Direct)', '2nd Level (Indirect)', '3rd Level (3 hops)']}
+    <div class="level-panel">
+      <div class="level-header" on:click={() => toggleSection(`level-${level}-body`)}>
+        <div class="level-header-left">
+          <input type="checkbox" checked={lo.enabled} on:click|stopPropagation={() => toggleLevelEnabled(level)} />
+          <ColorChip color={levelColors[level]} label={levelNames[level]} />
+        </div>
+        <span class="toggle-arrow">{'\u25B6'}</span>
+      </div>
+      <div id="level-{level}-body" class="level-body" class:disabled={!lo.enabled}>
+        <div class="edge-kind-group inline">
+          <label class="edge-kind-item">
+            <input type="checkbox" checked={lo.peerEdges}
+              on:change={() => toggleLevelPeerEdges(level)} />
+            <span>Peer edges (between same-level nodes)</span>
+          </label>
+        </div>
+        {#if $allEntityTypes.length > 0}
+          <div class="sub-title">Entity Types</div>
+          <div class="tri-state-group">
+            {#each $allEntityTypes as type}
+              <div class="tri-state-item" on:click={() => cycleTriState(level, 'entityTypes', type)}>
+                <button class="tri-state-btn" data-state={lo.entityTypes[type] || 'general'}>
+                  {triStateLabel(lo.entityTypes[type] || 'general')}
+                </button>
+                <ColorChip color={NODE_COLORS[type] || 'var(--text-muted)'} label={type} />
+              </div>
+            {/each}
+          </div>
+        {/if}
+        <div class="sub-title">Direction</div>
+        <div class="tri-state-group">
+          <div class="tri-state-item" on:click={() => cycleDirectionTriState(level, 'outgoing')}>
+            <button class="tri-state-btn" data-state={lo.outgoing}>{triStateLabel(lo.outgoing)}</button>
+            <ColorChip color="#2196F3" label="Outgoing" />
+          </div>
+          <div class="tri-state-item" on:click={() => cycleDirectionTriState(level, 'incoming')}>
+            <button class="tri-state-btn" data-state={lo.incoming}>{triStateLabel(lo.incoming)}</button>
+            <ColorChip color="#E91E63" label="Incoming" />
+          </div>
+        </div>
+        {#if $allRelTypes.length > 0}
+          <div class="sub-title">Relationship Types</div>
+          <div class="tri-state-group">
+            {#each $allRelTypes as type}
+              <div class="tri-state-item" on:click={() => cycleTriState(level, 'relTypes', type)}>
+                <button class="tri-state-btn" data-state={lo.relTypes[type] || 'general'}>
+                  {triStateLabel(lo.relTypes[type] || 'general')}
+                </button>
+                <ColorChip color={LINK_COLORS[type] || 'var(--text-muted)'} label={type} />
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/each}
+</div>
+
+<!-- Legend — UI-014: describes the ACTIVE encoding, not a fixed palette.
+     Before, this explained the kind colours and nothing else, which was
+     accurate only because kind was the only thing encoded. -->
+{#if $allEntityTypes.length > 0}
+<div class="filter-section" data-probe="legend">
+  <h2>Legend</h2>
+
+  <!-- The channel selector lives with the legend rather than beside the
+       aggregation control in the toolbar. UI-013 fits nine clusters into two
+       rows at 1280px with ~125px of slack, and two dropdowns need ~340px —
+       measured at three rows, failing that ticket's probe. Here the control
+       and the legend that explains it are one block, which is where a reader
+       looks to answer "what does this circle mean?" anyway. -->
+  {#if !$nodeEncoding.kindOnly}
+    <div class="encode-controls">
+      <label class="encode-field">
+        <span class="encode-prefix">Size</span>
+        <select class="encode-select" bind:value={$sizeChannel} aria-label="Metric driving node size">
+          {#each $availableSizeChannels as c}
+            <option value={c.id}>{c.label}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="encode-field">
+        <span class="encode-prefix">Colour</span>
+        <select class="encode-select" bind:value={$colorChannel} aria-label="What node colour encodes">
+          {#each COLOR_CHANNELS as c}
+            <option value={c.id}>{c.label}</option>
+          {/each}
+        </select>
+      </label>
+    </div>
+  {/if}
+
+  {#if $nodeEncoding.sizeLegend}
+    <div class="sub-title">Size — {$nodeEncoding.sizeLegend.label}</div>
+    <div class="size-ramp">
+      {#each $nodeEncoding.sizeLegend.stops as stop}
+        <div class="size-stop">
+          <!-- Canvas radii shrunk by ONE shared factor, not clamped per dot.
+               `Math.min(r, 17)` capped every stop that mattered — the ramp's
+               radii run past 17 well before the midpoint — so all three dots
+               rendered at an identical 34px and the legend contradicted the
+               very channel it was explaining. Scaling keeps the ratio (and
+               so the area comparison) exactly the canvas's. -->
+          <span
+            class="size-dot"
+            style="width: {stop.radius * LEGEND_DOT_SCALE * 2}px; height: {stop.radius * LEGEND_DOT_SCALE * 2}px"
+          ></span>
+          <span class="size-value">{stop.value.toLocaleString()}</span>
+        </div>
+      {/each}
+    </div>
+    <div class="legend-note">
+      {$nodeEncoding.sizeLegend.unit} · area scales with the value
+    </div>
+  {/if}
+
+  {#if $nodeEncoding.colorLegend.kind === 'severity'}
+    <div class="sub-title">Colour — refactor pressure</div>
+    <div class="severity-ramp">
+      {#each $nodeEncoding.colorLegend.steps ?? [] as step}
+        <div class="severity-step">
+          <span class="severity-swatch" style="background: {step.color}"></span>
+          <span class="severity-band">
+            {step.to === null ? `> ${step.from}` : `${step.from}–${step.to}`}
+          </span>
+          <span class="severity-tier tier-{step.tier}">{step.tier}</span>
+        </div>
+      {/each}
+    </div>
+    <div class="legend-item legend-nodata">
+      <div
+        class="legend-color"
+        style="background: {NO_DATA_FILL}; opacity: {NO_DATA_FILL_OPACITY}"
+      ></div>
+      No metrics — not "zero"
+    </div>
+    <div class="legend-note">
+      Same composite score the Quality tab ranks by. Lower is better.
+    </div>
+  {:else}
+    <div class="sub-title">Colour — entity kind</div>
+    <div class="legend">
+      {#each $allEntityTypes as type}
+        <div class="legend-item">
+          <div class="legend-color" style="background: {NODE_COLORS[type] || '#9E9E9E'}"></div>
+          {type}
+        </div>
+      {/each}
+    </div>
+  {/if}
+</div>
+{/if}
+
+<style>
+  .search-first { margin-bottom: 4px; }
+
+  /* The glyph already distinguishes the three states; the hue was doing
+     redundant work at 2.01:1 and 2.15:1 on the light panel (UI-023). */
+  .ts-g { color: var(--text-disabled); }
+  .ts-on, .ts-off { color: var(--text-secondary); font-weight: 700; }
+
+  /* Palette swatch beside themed text — see ColorChip for the reasoning. */
+  .kind-dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 4px;
+    box-shadow: 0 0 0 1px var(--border-subtle);
+  }
+  .result-kind { color: var(--text-muted); }
+
+  /* Were #FFD54F and #4DD0E1 — 1.41:1 and 1.84:1 on the light theme's white
+     panel. The two searches still read as different things via weight and
+     the accent, not via low-contrast hues. */
+  .search-label { color: var(--accent); font-weight: 600; }
+  .search-label-view { color: var(--text-secondary); }
+
+  .oos-header {
+    margin-top: 10px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border-subtle);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+  }
+
+  .search-result-item.oos { opacity: 0.85; }
+
+  .oos-row-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 0;
+    background: none;
+    border: none;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .oos-scope-btn {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    white-space: nowrap;
+  }
+  .oos-row-btn:hover .oos-scope-btn { border-color: var(--accent); color: var(--accent); }
+
+  /* Section header rendered as a button so it is keyboard-operable; the
+     wrapper keeps the <h2> for document outline without owning the click. */
+  .section-heading-wrap { margin: 0; }
+  .section-header-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+    margin-bottom: 20px;
+    color: var(--accent);
+  }
+
+  .repo-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+
+  .repo-bar .back {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .repo-bar .back:hover { color: var(--text); border-color: var(--accent); }
+
+  .repo-bar .repo-name {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--accent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Section headings are subordinate to the block they sit in: the blocks
+     are the workflow (analyse → visualise → post-filter) and the sections
+     are steps inside one. They used to be the larger of the two, which read
+     as nine peers under three labels. */
+  h2 {
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin: 12px 0 6px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+    color: var(--text-secondary);
+  }
+
+  /* Block headers: a rule above and a brighter, smaller-caps title, so the
+     three groups read as groups without adding a nesting level to every
+     section heading below them. */
+  .filter-block {
+    margin: 18px 0 2px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+
+  .filter-block:first-child {
+    margin-top: 4px;
+    padding-top: 0;
+    border-top: none;
+  }
+
+  .block-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0;
+    /* 1.2rem bold = 19.2px, over the 18.66px bold threshold for WCAG "large
+       text", where the floor is 3:1 rather than 4.5:1. That matters: --accent
+       on --bg-surface measures 3.46 in obsidian and 4.15 in midnight, so an
+       accent heading only clears the bar at this size. The pre-existing
+       palette gap is UI-024's; this just avoids adding to it. */
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--accent);
+    /* Overrides the shared h2 rule above — a block heading carries its own
+       rule via .filter-block's border-top and must not draw a second one. */
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+
+  /* The step number: these are a sequence, not three unrelated groups.
+     Outlined rather than filled. A filled badge needs a foreground that
+     clears 4.5:1 against `--accent` in every theme, and `--accent-fg` does
+     not: midnight's accent is #e94560 and its accent-fg is white, which
+     measures 3.83:1 (caught by `ux-probe.mjs ui-023`). An outline reuses the
+     accent-on-surface pair the block title already uses, so it introduces no
+     new colour pair to audit. */
+  .block-step {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    border: 1px solid var(--accent);
+    /* The digit is small text, so it gets no large-text allowance and must
+       clear 4.5:1 on its own. --text-secondary does that in every theme
+       (7.45 worst case); --accent would not. The ring stays accent — a
+       border carries no contrast requirement. */
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .block-note {
+    margin: 3px 0 0;
+    font-size: 0.66rem;
+    line-height: 1.35;
+    color: var(--text-dim);
+  }
+
+  .layer-note {
+    margin: 0 0 6px;
+    font-size: 0.68rem;
+    line-height: 1.35;
+    color: var(--text-dim);
+  }
+
+  .filter-section { margin-bottom: 20px; }
+
+  .filter-group { margin-bottom: 10px; }
+
+  .filter-group input[type="text"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-body);
+    color: var(--text);
+  }
+
+  .checkbox-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .checkbox-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.85rem;
+    padding: 4px 8px;
+    background: var(--bg-body);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .checkbox-item:hover { background: var(--bg-hover); }
+
+  /* Master toggle above a checkbox-group: transparent so it reads as a
+     control over the tiles below rather than as one more tile. */
+  .select-all {
+    align-self: flex-start;
+    display: inline-flex;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-weight: 500;
+    margin-bottom: 4px;
+    padding-left: 0;
+  }
+
+  .edge-kind-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 6px 0;
+  }
+
+  .edge-kind-group.inline { padding: 2px 0 6px; }
+
+  .edge-kind-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+
+  .edge-kind-item input[type="checkbox"] { cursor: pointer; margin: 0; }
+
+  .search-label { font-weight: 600; }
+  .search-hint { color: var(--text-disabled); font-weight: 400; font-size: 0.7rem; margin-left: 4px; }
+
+  .search-results {
+    margin: 8px 0 12px;
+    border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--bg-body) 50%, transparent);
+  }
+
+  .search-results-display {
+    border-color: rgba(77, 208, 225, 0.3);
+    background: rgba(77, 208, 225, 0.04);
+  }
+
+  .search-results-header {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 0.75rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+
+  .match-count { color: #FFD54F; font-weight: 600; }
+  .no-match { color: var(--text-dim); font-style: italic; }
+  .truncated { color: var(--text-disabled); font-size: 0.7rem; }
+
+  .search-results-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .search-result-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 20%, transparent);
+  }
+
+  .search-result-item:last-child { border-bottom: none; }
+  .search-result-item:hover { background: color-mix(in srgb, var(--bg-hover) 40%, transparent); }
+  .search-result-item.active { background: color-mix(in srgb, var(--accent) 25%, transparent); }
+  .search-result-item.committed {
+    box-shadow: inset 3px 0 0 #FFD54F;
+    background: rgba(255, 213, 79, 0.08);
+  }
+  .search-result-item.committed.active { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .result-commit-cb { cursor: pointer; margin: 0; flex-shrink: 0; }
+
+  .commit-mode {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    padding: 2px 4px 6px;
+  }
+
+  .commit-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 8px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    background: rgba(255, 213, 79, 0.08);
+    border: 1px solid rgba(255, 213, 79, 0.35);
+    font-size: 0.75rem;
+  }
+  .commit-count { color: #FFD54F; flex: 1; }
+  .commit-clear-btn {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid rgba(255, 213, 79, 0.5);
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .commit-clear-btn:hover { background: rgba(255, 213, 79, 0.15); }
+
+  .commit-all-btn {
+    margin-left: auto;
+    background: transparent;
+    color: #FFD54F;
+    border: 1px solid rgba(255, 213, 79, 0.4);
+    border-radius: 3px;
+    padding: 1px 8px;
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .commit-all-btn:hover { background: rgba(255, 213, 79, 0.15); }
+
+  .search-scope { margin: 4px 0 10px; }
+  .search-scope-toggle {
+    background: transparent;
+    color: var(--text-muted);
+    border: none;
+    font-size: 0.75rem;
+    padding: 4px 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .search-scope-toggle:hover { color: var(--text-secondary); }
+  .search-scope-body {
+    margin-top: 4px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--bg-body) 50%, transparent);
+  }
+  .scope-badge {
+    background: rgba(255, 213, 79, 0.15);
+    color: #FFD54F;
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 0.65rem;
+  }
+  .scope-clear-btn {
+    margin-left: 8px;
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid rgba(255, 213, 79, 0.4);
+    border-radius: 3px;
+    padding: 0 6px;
+    font-size: 0.65rem;
+    cursor: pointer;
+  }
+  .scope-clear-btn:hover { background: rgba(255, 213, 79, 0.12); }
+
+  .result-kind {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    flex-shrink: 0;
+    min-width: 56px;
+  }
+
+  .result-name {
+    color: var(--text);
+    flex-shrink: 0;
+    font-family: 'Monaco', 'Menlo', monospace;
+  }
+
+  .result-path {
+    color: var(--text-disabled);
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    text-align: right;
+  }
+
+  .sub-title {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin: 10px 0 6px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+
+  .section-header {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    user-select: none;
+  }
+
+  .toggle-arrow {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+
+  .level-hint {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .level-panel {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+
+  .level-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: color-mix(in srgb, var(--bg-hover) 50%, transparent);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .level-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .level-body {
+    padding: 10px 12px;
+    display: none;
+    background: color-mix(in srgb, var(--bg-body) 50%, transparent);
+  }
+
+  .level-body:global(.open) { display: block; }
+
+  .level-body.disabled {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+
+  .tri-state-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .tri-state-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.8rem;
+    padding: 3px 6px;
+    background: var(--bg-body);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .tri-state-item:hover { background: var(--bg-hover); }
+
+  .tri-state-btn {
+    width: 22px;
+    height: 18px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg-body);
+    color: var(--text-disabled);
+    cursor: pointer;
+    font-size: 0.65rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-weight: bold;
+  }
+
+  .tri-state-btn[data-state="on"] { background: #1B5E20; color: #E8F5E9; border-color: #4CAF50; }
+  .tri-state-btn[data-state="off"] { background: #B71C1C; color: #FFEBEE; border-color: #F44336; }
+  .tri-state-btn[data-state="general"] { background: var(--bg-body); color: var(--text-disabled); border-color: var(--border); }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.75rem;
+  }
+
+  .legend-color {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+  }
+
+  /* ── UI-014 encoding legend ─────────────────────────────────────────── */
+
+  .encode-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin: 8px 0 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .encode-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .encode-prefix {
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    min-width: 42px;
+  }
+
+  /* A DEFINITE width, not `flex: 1` — the sidebar sizes to its content, and a
+     <select> takes its intrinsic width from its longest <option>. Left to
+     shrink-to-fit these measured 271px each and pushed the panel to 319px,
+     which cost the canvas enough width to wrap the toolbar to four rows and
+     fail UI-020's layout check. `flex: 1; min-width: 0` does not help when
+     the container itself has no definite width to divide up. */
+  .encode-select {
+    flex: 0 0 auto;
+    width: 132px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .encode-select:hover { background: var(--bg-hover); }
+
+  .legend-note {
+    margin-top: 5px;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+
+  .size-ramp {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    margin-top: 8px;
+  }
+
+  .size-stop {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+
+  /* Same ring the canvas draws, so a legend dot reads as the same object as
+     a node — and so the smallest stop is still visible when its fill is
+     close to the panel background. */
+  .size-dot {
+    display: block;
+    border-radius: 50%;
+    background: var(--text-dim);
+    box-shadow: 0 0 0 1px var(--border-subtle);
+  }
+
+  .size-value {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .severity-ramp {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 8px;
+  }
+
+  .severity-step {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+  }
+
+  /* A bar rather than a dot: the ramp's job is to show ORDER, and stacked
+     bars of equal width put the lightness progression on one edge where it
+     can actually be compared. That progression is the channel that survives
+     colour-blindness, so it is the one the legend has to make visible. */
+  .severity-swatch {
+    display: block;
+    width: 34px;
+    height: 12px;
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px var(--border-subtle);
+  }
+
+  .severity-band {
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    min-width: 56px;
+  }
+
+  .severity-tier { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .severity-tier.tier-ok { color: var(--tier-ok-fg); }
+  .severity-tier.tier-warn { color: var(--tier-warn-fg); }
+  .severity-tier.tier-bad { color: var(--tier-bad-fg); }
+
+  .legend-nodata { margin-top: 8px; }
+</style>
