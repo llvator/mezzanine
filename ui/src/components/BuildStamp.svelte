@@ -9,10 +9,17 @@
    * named any of them, so "did my rebuild land?" was answered by guessing at
    * whether a changed string had appeared.
    *
-   * Sits below `.mode-bar-bottom`, which already owns bottom-right at 20px.
+   * Two placements. Standalone it is the right-hand end of the shortcut bar,
+   * which is where a status line carries its build info and where it no longer
+   * has to overlap anything. In the VS Code webview there is no such bar, so
+   * it stays what it was: fixed to the bottom-right corner, below
+   * `.mode-bar-bottom`, which already owns that corner at 20px.
    */
   import { connection } from '../stores/connection';
   import { uiBuild, formatBuiltAt } from '../buildInfo';
+
+  /** Laid out in flow rather than pinned to the corner. */
+  export let inline = false;
 
   $: engine = $connection?.kind === 'ok' ? $connection : null;
   // An engine built before /api/hello carried a version answers the probe
@@ -32,7 +39,7 @@
   ].join('\n');
 </script>
 
-<div class="build-stamp" {title} data-probe="build-stamp">
+<div class="build-stamp" class:inline {title} data-probe="build-stamp">
   <span class="part">ui&nbsp;{uiBuild.commit}</span>
   <span class="sep">·</span>
   <span class="part" class:stale={engine && engine.commit && engine.commit !== uiBuild.commit}>
@@ -41,6 +48,12 @@
 </div>
 
 <style>
+  .build-stamp.inline {
+    position: static;
+    flex: none;
+    padding-left: 4px;
+  }
+
   .build-stamp {
     position: fixed;
     right: 8px;

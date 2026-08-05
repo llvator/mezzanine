@@ -1,22 +1,26 @@
 <script lang="ts">
-  import { selectedNode, graphData } from '../stores/graph';
+  import { selectedNode, graphData, rawEntityGraph, hiddenFiles } from '../stores/graph';
   import {
     qualityRows,
     qualitySummary,
     fileRows,
     moduleRows,
     repoQuality,
-    scopeToAggregated,
+    scopeHolds,
     METRIC_EXPLANATIONS,
     SMELL_META,
     SCORE_SCALE_LABEL,
     SUMMARY_METRIC_THRESHOLDS,
     thresholdStore,
     qualityAnalysisScope,
+    currentEditorFile,
+    type QualityAnalysisScope,
     type QualityRow,
     type ScopeRow,
     type Tier,
   } from '../stores/quality';
+  import { clearHiddenFiles } from '../viewmodels/filterViewModel';
+  import { diffData } from '../stores/diff';
   import { setScopes, selectedScopes } from '../stores/scope';
   import { fetchRefactorPrompt, spawnAgentTerminal } from '../viewmodels/contextScope';
   import { connection } from '../stores/connection';
@@ -376,18 +380,105 @@
     scopeCopiedTimer = setTimeout(() => { scopeCopiedId = null; }, 1200);
   }
 
-  /** Convert a scope row's backend-provided quality fields into the
-   *  AggregatedScore shape used by the UI. */
-  function scopeAggregated(r: ScopeRow) {
-    return scopeToAggregated(r.scope);
-  }
-
+  /**
+   * Select what a file or module row names.
+   *
+   * The canvas draws a File or Module node for the path whenever the level is
+   * collapsed that far, and that node is the row's own subject — so it is what
+   * a click should land on. Falling straight to "first entity in the file" was
+   * the only rule before, and it is level-dependent in a way the reader is not:
+   * at Module level no node carries a plain file path, and at Entity level no
+   * node carries a directory path, so a module row's click resolved to nothing
+   * and did nothing at all.
+   */
   function selectScope(r: ScopeRow) {
-    // Clicking a file row selects the first entity living in that file
-    // (if any) so the per-entity panel + graph jump to the relevant area.
-    const target = $graphData.nodes.find((n) => n.file_path === r.scope.path);
+    activeScopePath = r.scope.path;
+    const isModule = (mode as Mode) === 'modules';
+    const nodes = $graphData.nodes;
+    const target =
+      nodes.find((n) => n.original_id === r.scope.path && (n.kind_raw === 'File' || n.kind_raw === 'Module'))
+      ?? nodes.find((n) => scopeHolds(r.scope.path, isModule, n.file_path));
     if (target) selectedNode.set(target);
   }
+
+  /**
+   * The scope row the reader last clicked.
+   *
+   * Tracked rather than read back off `selectedNode`, because the two only
+   * coincide when the canvas happens to be collapsed to this row's level: at
+   * Entity level no node carries a directory path, so a module row's click
+   * lands on an entity *inside* the module and a "is the selection this path"
+   * test says no. The row would then highlight or not depending on the
+   * aggregation level, which is not something the reader changed.
+   */
+  let activeScopePath: string | null = null;
+  // A path means one thing in the Files table and another in Modules, so it
+  // does not survive the switch.
+  $: if (mode) activeScopePath = null;
+
+  /**
+   * Narrow the canvas to one row's files — the post-filter, reached from the
+   * number that made you want it.
+   *
+   * Writes `hiddenFiles` (via its complement) rather than the scope rules, on
+   * ADR 0010's split: this is "get everything else off my screen", which is a
+   * membership test in `displayPlan` and costs nothing, not "re-analyse this",
+   * which refetches and moves every side panel. It leaves the population alone
+   * on purpose — see the note on the Population selector — so the reader can
+   * narrow the picture without the numbers they were reading shifting under
+   * them, and pick 'what the canvas is drawing' when they want both to move.
+   *
+   * Paths come from `rawEntityGraph`, never from `graphData`: a collapsed
+   * Module node carries a *directory* as its `file_path`, so filtering off the
+   * drawn graph would write directories into a store that holds files, and the
+   * filter would mean something different at each aggregation level. Written
+   * as real file paths it means one thing everywhere — including being the
+   * documented no-op at Module level, where there is no per-file node to hide.
+   */
+  /**
+   * Why the last "Only" click could not narrow anything, or null.
+   *
+   * The population can be wider than the visual scope — that is the whole
+   * point of having two — so a rollup row can legitimately name files the
+   * canvas has never loaded. The visual filter only hides what is loaded, so
+   * on such a row it has nothing to act on. Silence there reads as a broken
+   * button; the reader needs to know it is the scope, not the click.
+   */
+  let filterNotice: string | null = null;
+
+  /** Keep exactly `paths`, hide every other file the visual scope holds.
+   *  Returns false when the scope holds none of them. */
+  function filterToFiles(paths: Set<string>): boolean {
+    const all = $rawEntityGraph.nodes.map((n) => n.file_path).filter((p) => !!p);
+    const keep = all.filter((f) => paths.has(f));
+    if (keep.length === 0) return false;
+    hiddenFiles.set(new Set(all.filter((f) => !paths.has(f))));
+    return true;
+  }
+
+  function outsideScope(what: string): string {
+    return `${what} is outside the visual scope, so there is nothing on the canvas to narrow. `
+      + `Widen the scope tree, or set the population to the scope tree selection.`;
+  }
+
+  function filterToScope(e: Event, r: ScopeRow) {
+    e.stopPropagation();
+    const isModule = (mode as Mode) === 'modules';
+    const files = $rawEntityGraph.nodes
+      .map((n) => n.file_path)
+      .filter((p) => !!p && scopeHolds(r.scope.path, isModule, p));
+    filterNotice = filterToFiles(new Set(files)) ? null : outsideScope(r.scope.path || '(root)');
+  }
+
+  function filterToRow(e: Event, r: QualityRow) {
+    e.stopPropagation();
+    if (!r.node.file_path) return;
+    filterNotice = filterToFiles(new Set([r.node.file_path])) ? null : outsideScope(r.node.file_path);
+  }
+
+  /** How many files the visual filter is currently holding back. The one
+   *  signal that an "Only" click actually did something, and the way back. */
+  $: hiddenCount = $hiddenFiles.size;
 
   /**
    * Render a metric's ok/warn/bad boundaries in its own units.
@@ -429,19 +520,44 @@
    * Which population the metrics describe.
    *
    * The count alone ("Analysed: 5,244 entities") never said *what* was
-   * counted, and the answer moves with a five-way selector whose default is
-   * the whole repo — so narrowing the scope tree leaves this number
-   * unchanged and nothing explained why (UI-051).
+   * counted, and the answer moves with a selector whose default is the whole
+   * repo — so narrowing the scope tree leaves this number unchanged and
+   * nothing explained why (UI-051).
+   *
+   * The selector itself had no control here at all: the store was reachable
+   * only from the VS Code host's `setQualityAnalysisScope` message and from
+   * the one-way "Match it" link below, so a browser reader could be told the
+   * population was wrong and had exactly one thing to do about it. Naming a
+   * population you cannot change is a label, not a control.
    */
-  const POPULATION_LABELS: Record<string, string> = {
-    scope: 'whole analysis scope',
-    visualScope: 'the scope tree selection',
-    visualSelection: 'what the canvas is drawing',
-    currentFile: 'the file open in the editor',
-    changedFiles: 'files changed in the diff',
-  };
-  $: populationLabel = POPULATION_LABELS[$qualityAnalysisScope] ?? $qualityAnalysisScope;
+  const POPULATIONS: { value: QualityAnalysisScope; label: string }[] = [
+    { value: 'scope', label: 'whole analysis scope' },
+    { value: 'visualScope', label: 'the scope tree selection' },
+    { value: 'visualSelection', label: 'what the canvas is drawing' },
+    { value: 'selection', label: 'the current selection' },
+    { value: 'currentFile', label: 'the file open in the editor' },
+    { value: 'changedFiles', label: 'files changed in the diff' },
+  ];
 
+  /**
+   * Populations whose signal is missing right now.
+   *
+   * `analysisGraph` falls back to the whole scope when the signal it needs is
+   * absent, which is the right runtime behaviour and the wrong thing to leave
+   * unsaid in a picker: choosing "the current selection" with nothing selected
+   * would name a population and then quietly show a different one.
+   */
+  $: unavailable = new Set<QualityAnalysisScope>([
+    ...($selectedNode ? [] : ['selection' as const]),
+    ...($currentEditorFile ? [] : ['currentFile' as const]),
+    ...($diffData ? [] : ['changedFiles' as const]),
+  ]);
+
+  $: populationLabel =
+    POPULATIONS.find((p) => p.value === $qualityAnalysisScope)?.label ?? $qualityAnalysisScope;
+
+  /** True when the panel is measuring a population the canvas is not drawing.
+   *  Suppressed before a scope exists, when everything is empty anyway. */
   $: scopeMismatch =
     $qualityAnalysisScope !== 'visualSelection' && $selectedScopes.size > 0;
 
@@ -458,6 +574,12 @@
     <div class="spawn-error" role="alert">
       <span>Could not launch an agent — {spawnError}</span>
       <button type="button" on:click={() => (spawnError = null)} aria-label="Dismiss">×</button>
+    </div>
+  {/if}
+  {#if filterNotice}
+    <div class="filter-notice" role="status" data-probe="filter-notice">
+      <span>{filterNotice}</span>
+      <button type="button" on:click={() => (filterNotice = null)} aria-label="Dismiss">×</button>
     </div>
   {/if}
   <!-- Repo-level health banner: always visible, aggregates all entity scores. -->
@@ -487,6 +609,25 @@
       </div>
     </section>
   {/if}
+
+  <!-- Above the mode bar, not inside a tab: it decides what every tab below
+       is measuring, so a reader on Files or Modules needs it as much as one
+       on Entities — and while it lived in the Entities branch they could not
+       reach it at all without switching tabs first. -->
+  <label class="population-picker">
+    <span>Population</span>
+    <select
+      data-probe="quality-population-picker"
+      value={$qualityAnalysisScope}
+      on:change={(e) => qualityAnalysisScope.set(e.currentTarget.value as QualityAnalysisScope)}
+    >
+      {#each POPULATIONS as p}
+        <option value={p.value} disabled={unavailable.has(p.value)}>
+          {p.label}{unavailable.has(p.value) ? ' (unavailable)' : ''}
+        </option>
+      {/each}
+    </select>
+  </label>
 
   <!-- Mode selector: Entities / Files / Modules.
        Each mode reuses the same severity filter + sort + copy pipeline. -->
@@ -616,6 +757,15 @@
           <option value={1000}>1000</option>
         </select>
       </label>
+      {#if hiddenCount > 0}
+        <!-- A row's "Only" click leaves nothing on screen saying it happened
+             beyond a smaller canvas, which is indistinguishable from a scope
+             change. State it, and put the way back next to it. -->
+        <span class="filter-state" data-probe="visual-filter-state">
+          Canvas filtered · {hiddenCount} {hiddenCount === 1 ? 'file' : 'files'} hidden
+          <button type="button" class="align-btn" on:click={clearHiddenFiles}>Show all</button>
+        </span>
+      {/if}
     </section>
 
     </div>
@@ -680,6 +830,13 @@
                 {/if}
               </td>
               <td class="copy-cell">
+                <button
+                  type="button"
+                  class="copy-btn"
+                  title="Draw only this entity's file on the canvas — a visual filter, so the metrics above stay on the population you picked"
+                  aria-label="Filter the canvas to this entity's file"
+                  on:click={(e) => filterToRow(e, r)}
+                >Only</button>
                 {#if canSpawn}
                   <button
                     type="button"
@@ -759,6 +916,12 @@
             <option value={1000}>1000</option>
           </select>
         </label>
+        {#if hiddenCount > 0}
+          <span class="filter-state" data-probe="visual-filter-state">
+            Canvas filtered · {hiddenCount} {hiddenCount === 1 ? 'file' : 'files'} hidden
+            <button type="button" class="align-btn" on:click={clearHiddenFiles}>Show all</button>
+          </span>
+        {/if}
       </section>
 
       </div>
@@ -786,14 +949,14 @@
           </thead>
           <tbody>
             {#each scopeVisible as r (r.scope.path)}
-              {@const agg = scopeAggregated(r)}
-              <tr on:click={() => selectScope(r)}>
+              {@const agg = r.aggregate}
+              <tr class:selected={activeScopePath === r.scope.path} on:click={() => selectScope(r)}>
                 <td class="score-cell">
                   <div class="score-bar" style="width: {scorePct(r.score)}%"></div>
                   <span class="score-val">{r.score.toFixed(2)}</span>
                 </td>
-                <td class="num agg-cell" title={agg ? `avg ${agg.avgScore.toFixed(2)} · ${agg.okCount} ok / ${agg.warnCount} warn / ${agg.badCount} bad` : ''}>
-                  {#if agg}
+                <td class="num agg-cell" title={agg.entityCount > 0 ? `avg ${agg.avgScore.toFixed(2)} across ${agg.entityCount} entities in this population · ${agg.okCount} ok / ${agg.warnCount} warn / ${agg.badCount} bad` : 'No scored entities in this population'}>
+                  {#if agg.entityCount > 0}
                     <span class="tier-{agg.tier}">{agg.avgScore.toFixed(2)}</span>
                     <span class="agg-dist">
                       <span class="t-ok">{agg.okCount}</span>/<span class="t-warn">{agg.warnCount}</span>/<span class="t-bad">{agg.badCount}</span>
@@ -811,6 +974,13 @@
                 <td class="num {tierClass(r.tiers.fanOut)}">{r.scope.fan_out}</td>
                 <td class="num">{r.scope.in_cycle ? '●' : ''}</td>
                 <td class="copy-cell">
+                  <button
+                    type="button"
+                    class="copy-btn"
+                    title="Draw only this {mode === 'files' ? 'file' : 'folder'} on the canvas — a visual filter, so the metrics stay on the population you picked"
+                    aria-label="Filter the canvas to this scope"
+                    on:click={(e) => filterToScope(e, r)}
+                  >Only</button>
                   <button
                     type="button"
                     class="copy-btn"
@@ -877,6 +1047,44 @@
   .scope-mismatch {
     font-size: 0.72rem;
     font-weight: 400;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+
+  /* Above the tabs, not in the filter row: the filters narrow what one table
+     lists, this decides what every number in the panel is measured over, and
+     stacking the two reads as one group of equals. */
+  .population-picker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 10px;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+  }
+  .population-picker select {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: var(--bg-deep);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-size: 0.78rem;
+    font-family: inherit;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+
+  .filter-state {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-end;
+    padding-bottom: 2px;
+    font-size: 0.7rem;
     color: var(--text-dim);
     white-space: nowrap;
   }
@@ -1221,6 +1429,27 @@
     font-size: 0.75rem;
     line-height: 1.4;
   }
+  /* Not an error — the click was reasonable and the scope was too narrow for
+     it, which is information rather than a fault. Amber, not red. */
+  .filter-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 6px 10px;
+    padding: 6px 10px;
+    border: 1px solid rgba(255, 152, 0, 0.45);
+    border-radius: 4px;
+    background: rgba(255, 152, 0, 0.1);
+    color: var(--tier-warn-fg);
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+  .filter-notice span { flex: 1; word-break: break-word; }
+  .filter-notice button {
+    background: transparent; border: none; color: inherit;
+    cursor: pointer; font-size: 1rem; line-height: 1; padding: 0 2px;
+  }
+
   .spawn-error span { flex: 1; word-break: break-word; }
   .spawn-error button {
     background: transparent; border: none; color: inherit;

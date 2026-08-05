@@ -739,16 +739,26 @@ impl JsonRenderer {
             let abs = config.root_path.join(&file.path);
             let candidates = [abs, std::path::PathBuf::from(&file.path)];
             let content = candidates.iter().find_map(|p| std::fs::read_to_string(p).ok());
-            let Some(mut source) = content else { continue };
-            if source.len() > MAX_FILE_BYTES {
-                source.truncate(MAX_FILE_BYTES);
-                source.push_str("\n\n/* … truncated by nao (file exceeds 256 KB) */\n");
+            let documentation = graph
+                .file_documentation(std::path::Path::new(&file.path))
+                .map(str::to_string);
+            let source = content.map(|mut source| {
+                if source.len() > MAX_FILE_BYTES {
+                    source.truncate(MAX_FILE_BYTES);
+                    source.push_str("\n\n/* … truncated by nao (file exceeds 256 KB) */\n");
+                }
+                source
+            });
+            // An unreadable file (deleted since the analysis) still has a
+            // description worth showing, so the entry turns on either half.
+            if source.is_none() && documentation.is_none() {
+                continue;
             }
             details.insert(
                 strip_root(&file.path),
                 EntityDetail {
-                    documentation: None,
-                    source_code: Some(source),
+                    documentation,
+                    source_code: source,
                     fields: Vec::new(),
                     impl_blocks: Vec::new(),
                 },

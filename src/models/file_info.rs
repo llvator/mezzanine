@@ -20,6 +20,16 @@ pub struct FileInfo {
     
     /// SHA256 hash of contents (for caching)
     pub content_hash: Option<String>,
+
+    /// What this file is for, in its own words: the `//!` header of a Rust
+    /// file and the equivalent elsewhere. `None` when the file has none, or
+    /// when its language's parser doesn't recover one yet.
+    ///
+    /// It lives here rather than on an entity because it describes the file,
+    /// and the module a file defines is declared somewhere else. Renderers
+    /// read it through `DependencyGraph::file_documentation`.
+    #[serde(default)]
+    pub documentation: Option<String>,
 }
 
 /// Supported programming languages
@@ -64,6 +74,19 @@ pub enum Language {
     /// (see the parser's `classify`) and, for now, explicit via
     /// `from_name`.
     AnsibleDeploy,
+    /// Markdown (`.md`, `.markdown`). A documentation *link* language, not
+    /// a code one: the parser recovers one Note per file and the links
+    /// between notes, plus the source paths a note points at. Complexity
+    /// metrics stay empty for the same reason they do for SQL and
+    /// ansible-deploy — see ADR 0003.
+    ///
+    /// **Opt-in.** Unlike every other extension here, `.md` is ubiquitous
+    /// in code repos: READMEs, ADRs, changelogs and issue trackers would
+    /// otherwise land in every graph unasked. `from_extension` still claims
+    /// the extension so single-file analysis works, but the walker skips
+    /// Markdown unless it is named explicitly (`-l markdown`) — see
+    /// `Language::is_opt_in`.
+    Markdown,
     /// SQL schema files (`.sql`). Parsed for *topology* — tables, columns and
     /// the foreign keys between them — not for control flow, so complexity
     /// metrics stay empty. In migration-based repos a `.sql` file is a
@@ -118,6 +141,7 @@ impl Language {
             "svelte" => Language::Svelte,
             "elv" => Language::Elevator,
             "sql" => Language::Sql,
+            "md" | "markdown" => Language::Markdown,
             _ => Language::Unknown,
         }
     }
@@ -154,6 +178,7 @@ impl Language {
             Language::Svelte => &["svelte"],
             Language::Elevator => &["elv"],
             Language::Sql => &["sql"],
+            Language::Markdown => &["md", "markdown"],
             // Intentionally empty: ansible-deploy is path-classified,
             // not extension-owned (`.yml`/`.j2` belong to no one).
             Language::AnsibleDeploy => &[],
@@ -174,14 +199,76 @@ impl Language {
             "csharp" | "cs" | "c#" => Some(Language::CSharp),
             "cpp" | "c++" => Some(Language::Cpp),
             "c" => Some(Language::C),
+            // These five had no arm until the UI-list drift test went looking.
+            // The "Parsed Languages" panel has always offered them, and the
+            // server dropped each one as an unknown language — five checkboxes
+            // that did nothing, Kotlin among them, which has a real parser.
+            "ruby" | "rb" => Some(Language::Ruby),
+            "swift" => Some(Language::Swift),
+            "kotlin" | "kt" => Some(Language::Kotlin),
+            "scala" => Some(Language::Scala),
+            "php" => Some(Language::PHP),
             "groovy" => Some(Language::Groovy),
             "impex" => Some(Language::Impex),
             "svelte" => Some(Language::Svelte),
             "elevator" | "elv" => Some(Language::Elevator),
             "ansible" | "ansible-deploy" | "ansibledeploy" => Some(Language::AnsibleDeploy),
             "sql" | "postgres" | "postgresql" => Some(Language::Sql),
+            "markdown" | "md" => Some(Language::Markdown),
             _ => None,
         }
+    }
+
+    /// The canonical token for this language in a filter list — the one
+    /// `from_name` round-trips and the one the UI's checkboxes are keyed by.
+    ///
+    /// `from_name` accepts aliases (`rs`, `golang`, `ansible-deploy`); this
+    /// picks the single spelling to *emit*. Needed because
+    /// `GET /api/analysis/scope` reports the server's current filter and the
+    /// UI has to match those strings against its own list. Deriving it from
+    /// serde's lowercase rename would give `ansibledeploy`, which the UI
+    /// spells `ansible` — close enough to look right and wrong enough to
+    /// leave that checkbox unticked.
+    pub fn filter_name(&self) -> &'static str {
+        match self {
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::JavaScript => "javascript",
+            Language::TypeScript => "typescript",
+            Language::Java => "java",
+            Language::Go => "go",
+            Language::CSharp => "csharp",
+            Language::Cpp => "cpp",
+            Language::C => "c",
+            Language::Ruby => "ruby",
+            Language::Swift => "swift",
+            Language::Kotlin => "kotlin",
+            Language::Scala => "scala",
+            Language::PHP => "php",
+            Language::Groovy => "groovy",
+            Language::Impex => "impex",
+            Language::Svelte => "svelte",
+            Language::Elevator => "elevator",
+            Language::AnsibleDeploy => "ansible",
+            Language::Sql => "sql",
+            Language::Markdown => "markdown",
+            Language::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the walker should skip this language unless the user names
+    /// it explicitly (`-l <lang>`).
+    ///
+    /// Only Markdown qualifies today. Every other extension nao claims
+    /// belongs to source code, so finding one is evidence the user wants it
+    /// analyzed. `.md` is different: a code repo is full of READMEs, ADRs,
+    /// changelogs and issue trackers that are *about* the code rather than
+    /// part of it. Claiming them by default would add hundreds of nodes to
+    /// every existing graph — nao's own checkout has 368 `.md` files
+    /// against 175 `.rs` — and change what every current user sees without
+    /// them asking. Opt-in keeps the doc layer a deliberate view.
+    pub fn is_opt_in(&self) -> bool {
+        matches!(self, Language::Markdown)
     }
 
     /// Whether a bare name defined in `other` may bind to a reference
@@ -244,6 +331,7 @@ impl Language {
             Language::Elevator => "Elevator",
             Language::AnsibleDeploy => "Ansible Deploy",
             Language::Sql => "SQL",
+            Language::Markdown => "Markdown",
             Language::Unknown => "Unknown",
         }
     }
@@ -310,5 +398,86 @@ impl Span {
     /// Get the number of lines this span covers
     pub fn line_count(&self) -> usize {
         self.end.line - self.start.line + 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `Language` the backend can parse, sans `Unknown`. Adding a
+    /// variant means adding it here — which is the point: the assertion
+    /// below then tells you the UI needs it too.
+    const ALL: &[Language] = &[
+        Language::Rust,
+        Language::Python,
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Java,
+        Language::Go,
+        Language::CSharp,
+        Language::Cpp,
+        Language::C,
+        Language::Ruby,
+        Language::Swift,
+        Language::Kotlin,
+        Language::Scala,
+        Language::PHP,
+        Language::Groovy,
+        Language::Impex,
+        Language::Svelte,
+        Language::Elevator,
+        Language::AnsibleDeploy,
+        Language::Sql,
+        Language::Markdown,
+    ];
+
+    /// The UI's "Parsed Languages" panel offers a hardcoded list, and it had
+    /// silently drifted from this enum four times over — `svelte`, `sql`,
+    /// `ansible` and `markdown` were all parseable while the panel that
+    /// claims to control "which languages the analyzer reads at all" could
+    /// not offer them. Nothing failed; the checkbox just wasn't there.
+    ///
+    /// Reading the TypeScript from a Rust test is crude, and it is still the
+    /// cheapest thing that makes the drift *loud*. The alternative — serving
+    /// the list from the backend — is the real fix and is not this test's
+    /// job to force.
+    #[test]
+    fn the_ui_language_list_matches_the_enum() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/utils/languageScope.ts"),
+        )
+        .expect("the UI language list must exist; move this test if the path changes");
+
+        let body = source
+            .split_once("ALL_ANALYSIS_LANGUAGES: readonly string[] = [")
+            .expect("the exported list must still be named this")
+            .1
+            .split_once(']')
+            .expect("unterminated list literal")
+            .0;
+
+        let listed: Vec<String> = body
+            .split(',')
+            .filter_map(|s| s.trim().strip_prefix('\'')?.strip_suffix('\'').map(str::to_string))
+            .collect();
+
+        let listed: std::collections::BTreeSet<&str> =
+            listed.iter().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ALL.iter().map(|l| l.filter_name()).collect();
+
+        assert_eq!(
+            expected, listed,
+            "the UI's ALL_ANALYSIS_LANGUAGES must be exactly the canonical \
+             filter names — left is the enum, right is the TypeScript"
+        );
+
+        for name in &listed {
+            assert!(
+                Language::from_name(name).is_some(),
+                "the UI offers `{name}`, which `Language::from_name` rejects"
+            );
+        }
     }
 }

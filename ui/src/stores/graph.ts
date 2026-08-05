@@ -1,6 +1,7 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import type { D3Node, GraphData, GraphLevel, ViewMode, LevelOverrides, TriState } from '../types/graph';
 import { collapseGraph } from '../viewmodels/collapseGraph';
+import type { HoverMode } from '../viewmodels/hoverHighlight';
 
 // Entity-level source of truth, written by `publishGraph`. Every other
 // view derives from this + `graphLevel` — this is the single place scope
@@ -13,6 +14,33 @@ export const rawEntityGraph = writable<GraphData>({ nodes: [], links: [] });
 // collapses to one-per-directory.
 export const graphLevel = writable<GraphLevel>('entity');
 
+/**
+ * Scopes opened one level finer than `graphLevel` (UI-057).
+ *
+ * Holds **paths**, never ids: `collapseGraph` builds fresh node objects on
+ * every level change and `sanitizeId` rewrites paths into ids, so an
+ * id-keyed set would stop matching the moment the view moved.
+ *
+ * This is what makes the level a property of a *region* rather than of the
+ * whole canvas. Before it, a repo above `RENDER_BUDGET` could never show a
+ * single entity as an entity without narrowing the scope and throwing away
+ * the context that made it interesting.
+ */
+export const expandedScopes = writable<Set<string>>(new Set());
+
+/** Open or close one scope, leaving the rest of the view alone. */
+export function toggleExpanded(path: string): void {
+  expandedScopes.update((s) => {
+    const next = new Set(s);
+    if (!next.delete(path)) next.add(path);
+    return next;
+  });
+}
+
+export function collapseAllScopes(): void {
+  expandedScopes.set(new Set());
+}
+
 // --- Graph data ---
 //
 // The graph that components render. Purely derived from `rawEntityGraph +
@@ -24,10 +52,10 @@ export const graphLevel = writable<GraphLevel>('entity');
 // the recomputation is atomic: every subscriber sees the same consistent
 // (raw, level) pair.
 export const graphData = derived(
-  [rawEntityGraph, graphLevel],
-  ([$raw, $level]) => {
-    const result = collapseGraph($raw, $level);
-    console.log(`[graphData derived] level=${$level} rawNodes=${$raw.nodes.length} → collapsedNodes=${result.nodes.length} collapsedLinks=${result.links.length}`);
+  [rawEntityGraph, graphLevel, expandedScopes],
+  ([$raw, $level, $expanded]) => {
+    const result = collapseGraph($raw, $level, $expanded);
+    console.log(`[graphData derived] level=${$level} expanded=${$expanded.size} rawNodes=${$raw.nodes.length} → collapsedNodes=${result.nodes.length} collapsedLinks=${result.links.length}`);
     return result;
   },
 );
@@ -51,9 +79,48 @@ export const treeMaxDepth = writable<number>(2);
 export const hoveredNode = writable<D3Node | null>(null);
 export const hoverLocked = writable(false);
 
+/**
+ * A hover lasts exactly as long as the canvas draws the node.
+ *
+ * `mouseout` is the only thing that clears it, and it never fires when the
+ * re-render destroys the element the pointer was over — so navigating from
+ * a side panel (a Description rung, a relationship row, a search hit) left
+ * the hover pinned to an entity that was no longer on screen, and the
+ * Description pane, which prefers hover over selection, went on narrating
+ * it. The lock is the one case where a hover is meant to outlive the
+ * pointer, so it is honoured here too.
+ */
+graphData.subscribe(($data) => {
+  const hovered = get(hoveredNode);
+  if (!hovered || get(hoverLocked)) return;
+  if (!$data.nodes.some((n) => n.id === hovered.id)) hoveredNode.set(null);
+});
+
+/**
+ * Make `node` the subject, from a side panel.
+ *
+ * Selecting is all the canvas needs, but the pointer is over a panel when
+ * this runs, so whatever the graph still thinks is hovered is a leftover —
+ * and the Description pane reads hover *before* selection. Without the
+ * clear, following a relationship or a child moved the Details column and
+ * the canvas while the prose column went on describing the node you left.
+ *
+ * A frozen preview (`L`) is the one hover the reader asked to keep, so it
+ * survives; the Details column shows the new selection either way.
+ */
+export function focusNode(node: D3Node) {
+  if (!get(hoverLocked)) hoveredNode.set(null);
+  selectedNode.set(node);
+}
+
 /** Number of relationship hops to highlight when hovering a node.
  *  1 = direct connections only (default), 2 = friends-of-friends, 3 = three hops. */
 export const hoverDepth = writable<number>(1);
+
+/** What a hover lights up: what this node connects to, or what it lives with
+ *  (UI-054). Ephemeral like `hoverDepth` — it is a way of reading the current
+ *  picture, not a preference about how the tool should open. */
+export const hoverMode = writable<HoverMode>('connections');
 
 // --- View mode ---
 export const viewMode = writable<ViewMode>('graph');
@@ -101,7 +168,19 @@ export const generalOutgoing = writable(true);
 export const generalIncoming = writable(true);
 
 // --- Language filter ---
-export const generalLanguages = writable<Set<string>>(new Set());
+//
+// Stored as what the user *excluded*, for the same reason as the file filter
+// below: `generalLanguages` used to be the writable, re-seeded to "every
+// language in the new dataset" on every publish — so unticking Markdown
+// survived until the next level toggle, scope change, or auto-level
+// escalation, all of which republish. Switching Module → File is exactly that
+// republish, and it silently restored every language the user had turned off.
+//
+// Language names, not ids, so nothing needs translating between levels — a
+// collapsed File or Module node carries the language of the entities it rolls
+// up. `generalLanguages` is derived from this, next to `visibleFiles`, since
+// it needs `allLanguages`.
+export const hiddenLanguages = writable<Set<string>>(new Set());
 
 // --- File filter ---
 //
@@ -188,6 +267,16 @@ export const allLanguages = derived(graphData, ($data) =>
 // --- Derived: all file paths ---
 export const allFiles = derived(graphData, ($data) =>
   [...new Set($data.nodes.map((n) => n.file_path))].sort()
+);
+
+/** What the language filter lets through: every language in the current
+ *  dataset the user hasn't hidden. Read by `displayPlan` as an allow-list,
+ *  exactly as when it was a writable — only the thing that writes it changed.
+ *  Declared here rather than beside `hiddenLanguages` because it reads
+ *  `allLanguages`, which is defined above. */
+export const generalLanguages = derived(
+  [allLanguages, hiddenLanguages],
+  ([$all, $hidden]) => new Set($all.filter((l) => !$hidden.has(l))),
 );
 
 /** What the file filter lets through: everything in the current dataset the

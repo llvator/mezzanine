@@ -336,6 +336,17 @@ pub enum EntityKind {
     /// SQL: a view. Kept distinct from Table so the UI can show that its rows
     /// are derived rather than stored.
     View,
+    /// Markdown: one document. The whole file is a single node — the unit a
+    /// reader links to and the unit a link resolves to — so a Note is
+    /// deliberately **not** a container: headings are not entities and
+    /// nothing has a Note as its `parent_id`.
+    ///
+    /// Carries `References` edges to the notes it links to, and the source
+    /// paths it points at as `cr:` code refs (the same attribute Elevator
+    /// uses, so notes ride the existing spec↔code pairing per ADR 0005).
+    /// A link to a note that does not exist resolves to an `unresolved`
+    /// Note stub — the equivalent of Obsidian's ghost node.
+    Note,
     /// Unknown or unrecognized
     Unknown,
 }
@@ -415,6 +426,7 @@ impl EntityKind {
             EntityKind::HelmChart => "helm chart",
             EntityKind::Table => "table",
             EntityKind::View => "view",
+            EntityKind::Note => "note",
             EntityKind::Unknown => "unknown",
         }
     }

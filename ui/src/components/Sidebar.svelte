@@ -11,9 +11,12 @@
   import FilterPanel from './FilterPanel.svelte';
   import QualityReport from './QualityReport.svelte';
   import Settings from './Settings.svelte';
+  import { sidebarTab } from '../stores/panes';
 
-  type Tab = 'filters' | 'quality' | 'settings';
-  let activeTab: Tab = 'filters';
+  /** Which tab is showing is a store rather than component state since
+   *  UI-075: `f`, `q` and `s` switch tabs from the keyboard, and the handler
+   *  that owns those keys is not inside this component. */
+  $: activeTab = $sidebarTab;
 </script>
 
 <div class="sidebar">
@@ -22,19 +25,19 @@
       type="button"
       class="tab"
       class:active={activeTab === 'filters'}
-      on:click={() => (activeTab = 'filters')}
+      on:click={() => sidebarTab.set('filters')}
     >Filters</button>
     <button
       type="button"
       class="tab"
       class:active={activeTab === 'quality'}
-      on:click={() => (activeTab = 'quality')}
+      on:click={() => sidebarTab.set('quality')}
     >Quality</button>
     <button
       type="button"
       class="tab tab-icon"
       class:active={activeTab === 'settings'}
-      on:click={() => (activeTab = 'settings')}
+      on:click={() => sidebarTab.set('settings')}
       title="Settings"
     >
       <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">

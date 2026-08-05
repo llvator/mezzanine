@@ -483,3 +483,193 @@ fn handle(entity: &CodeEntity, other: &Relationship) {
         ]
     );
 }
+
+/// A struct-shaped variant's associated data is a signature, not a source
+/// excerpt. The clap subcommands in `main.rs` carry a doc comment and an
+/// `#[arg(…)]` attribute per field; capturing the body verbatim turned the
+/// variant's field entry — and so its node label in the graph — into a
+/// paragraph of source.
+#[test]
+fn struct_variant_data_drops_docs_and_attributes() {
+    let src = r#"
+enum Commands {
+    /// Detect circular dependencies
+    Cycles {
+        /// Path to analyze
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output format
+        #[arg(short, long, default_value = "ascii")]
+        format: OutputFormatArg,
+    },
+}
+"#;
+    let result = parse(src);
+    let variants = &result
+        .entities
+        .iter()
+        .find(|e| e.name == "Commands")
+        .expect("enum entity")
+        .fields;
+
+    assert_eq!(variants.len(), 1);
+    assert_eq!(variants[0].name, "Cycles");
+    assert_eq!(
+        variants[0].type_name.as_deref(),
+        Some("{ path: PathBuf, format: OutputFormatArg }")
+    );
+}
+
+/// Tuple and unit variants keep their existing shape.
+#[test]
+fn tuple_and_unit_variant_data_are_unchanged() {
+    let src = r#"
+enum Shape {
+    Point,
+    Pair(String, u32),
+}
+"#;
+    let result = parse(src);
+    let variants = &result
+        .entities
+        .iter()
+        .find(|e| e.name == "Shape")
+        .expect("enum entity")
+        .fields;
+
+    let by_name = |n: &str| {
+        variants
+            .iter()
+            .find(|v| v.name == n)
+            .unwrap_or_else(|| panic!("variant {n}"))
+    };
+    assert_eq!(by_name("Point").type_name, None);
+    assert_eq!(by_name("Pair").type_name.as_deref(), Some("(String, u32)"));
+}
+
+// ---------------------------------------------------------------------
+//  Documentation — which item a doc comment ends up describing.
+// ---------------------------------------------------------------------
+
+/// The `documentation` of the named entity, or `None` if it has none.
+fn doc_of(result: &ParseResult, name: &str) -> Option<String> {
+    result
+        .entities
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("no entity named {name}"))
+        .documentation
+        .clone()
+}
+
+#[test]
+fn module_declaration_takes_its_outer_doc() {
+    // `mod foo;` is the only place a file-backed module can be described
+    // from, so a `///` above it has to land somewhere.
+    let src = r#"
+/// Everything about parsing.
+pub mod parser;
+"#;
+    assert_eq!(
+        doc_of(&parse(src), "parser").as_deref(),
+        Some("Everything about parsing.")
+    );
+}
+
+#[test]
+fn inline_module_takes_the_header_of_its_body() {
+    let src = r#"
+pub mod parser {
+    //! Everything about parsing.
+
+    pub fn go() {}
+}
+"#;
+    let result = parse(src);
+    assert_eq!(
+        doc_of(&result, "parser").as_deref(),
+        Some("Everything about parsing.")
+    );
+    // …and the header does not also become the first item's description.
+    assert_eq!(doc_of(&result, "go"), None);
+}
+
+#[test]
+fn an_outer_doc_wins_over_the_body_header() {
+    // Both spellings present: the one at the declaration is the one the
+    // reader wrote about the module *as seen from outside*.
+    let src = r#"
+/// Seen from outside.
+mod parser {
+    //! Seen from inside.
+}
+"#;
+    assert_eq!(
+        doc_of(&parse(src), "parser").as_deref(),
+        Some("Seen from outside.")
+    );
+}
+
+#[test]
+fn file_header_describes_the_file_not_the_first_item() {
+    // The header is separated from `go` by nothing at all — the shape that
+    // silently made it `go`'s description before.
+    let src = r#"//! What this file is for.
+//! Second line.
+/// The function's own doc.
+pub fn go() {}
+"#;
+    let result = parse(src);
+    assert_eq!(
+        result.file_documentation.as_deref(),
+        Some("What this file is for.\nSecond line.")
+    );
+    assert_eq!(doc_of(&result, "go").as_deref(), Some("The function's own doc."));
+}
+
+#[test]
+fn file_header_survives_a_licence_banner_and_inner_attributes() {
+    let src = r#"// Copyright someone, some year.
+#![allow(dead_code)]
+//! What this file is for.
+
+use std::fmt;
+"#;
+    assert_eq!(
+        parse(src).file_documentation.as_deref(),
+        Some("What this file is for.")
+    );
+}
+
+#[test]
+fn a_file_with_no_header_reports_none() {
+    let src = r#"
+/// Only the function is documented.
+pub fn go() {}
+"#;
+    assert_eq!(parse(src).file_documentation, None);
+}
+
+#[test]
+fn constants_type_aliases_and_macros_take_their_docs() {
+    let src = r#"
+/// How many at most.
+pub const LIMIT: u32 = 10;
+
+/// What we call a row.
+pub type Row = Vec<String>;
+
+/// Shorthand for the noisy call.
+macro_rules! shout {
+    () => {};
+}
+"#;
+    let result = parse(src);
+    assert_eq!(doc_of(&result, "LIMIT").as_deref(), Some("How many at most."));
+    assert_eq!(doc_of(&result, "Row").as_deref(), Some("What we call a row."));
+    assert_eq!(
+        doc_of(&result, "shout").as_deref(),
+        Some("Shorthand for the noisy call.")
+    );
+}

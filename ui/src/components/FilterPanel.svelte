@@ -9,30 +9,38 @@
     toggleEntityType, toggleRelType, toggleLanguage, setAllLanguages,
     toggleLevelEnabled,
     cycleEntityTypeTriState, cycleRelTypeTriState, cycleDirectionTriState,
-    searchTerm, searchMatches,
-    committedSearchIds, commitAllMatches, toggleCommittedMatch, clearCommittedMatches,
-    setCommittedMatches,
+    searchTerm, commitAllMatches,
     searchInEntityNames, searchInFileNames, searchInFolderNames,
     searchEntityKinds, toggleSearchEntityKind, clearSearchEntityKinds,
     toggleLevelPeerEdges, showDirectEdges, showCrossLevelEdges,
-    searchHidesNonMatches,
   } from '../viewmodels/filterViewModel';
   // Display-search machinery now lives in displayPlan.ts (see comment in
   // filterViewModel.ts) — import directly to avoid a startup-time module cycle.
-  import { displaySearchTerm, displaySearchMatches } from '../viewmodels/displayPlan';
-  import { selectedNode, graphData } from '../stores/graph';
+  import { displaySearchTerm, displaySearchMatches, displayPlan } from '../viewmodels/displayPlan';
+  import { selectedNode, graphData, graphLevel, expandedScopes, collapseAllScopes } from '../stores/graph';
+  import { searchFocusRequest } from '../stores/keymap';
   import { get } from 'svelte/store';
+  import { tick } from 'svelte';
   import type { D3Node, TriState } from '../types/graph';
   import FileTree from './FileTree.svelte';
-  import { searchOutOfScopeMatches } from '../viewmodels/entitySearch';
-  import { focusScope } from '../stores/scope';
+  import EntitySearchResults from './EntitySearchResults.svelte';
+  import { visibleSearchResults } from '../viewmodels/searchResults';
   import ScopeTree from './ScopeTree.svelte';
   import RootPathPicker from './RootPathPicker.svelte';
   import AnalysisScopePanel from './AnalysisScopePanel.svelte';
+  import SpecFilterSection from './SpecFilterSection.svelte';
+  import SavedViewsSection from './SavedViewsSection.svelte';
   import { serveMode, activeRepo, backToPicker } from '../stores/serveMode';
   import { nodeEncoding, availableSizeChannels } from '../stores/encoding';
-  import { sizeChannel, colorChannel } from '../stores/settings';
+  import { sizeChannel, colorChannel, folderCohesion, showFolderHulls, hullDepth, HULL_DEPTHS, HULL_DEPTH_LABELS, demoteHubs, hubCount } from '../stores/settings';
+  import { HUB_COUNTS, hubNames } from '../viewmodels/hubs';
+  import { COHESION_LEVELS, COHESION_LABELS } from '../utils/forceCohesion';
   import { NO_DATA_FILL, NO_DATA_FILL_OPACITY, COLOR_CHANNELS, R_MAX } from '../viewmodels/nodeEncoding';
+
+  /** Names of the currently demoted hubs (UI-056), read off the plan rather
+   *  than recomputed here — the panel must say exactly what the canvas did,
+   *  and a second ranking could disagree with the first. */
+  $: demotedNames = hubNames($graphData.nodes, [...$displayPlan.demotedHubIds]);
 
   /** Legend dots are drawn to scale with the canvas, shrunk to fit the
    *  sidebar: the largest stop gets a 22px radius, and every other stop the
@@ -78,55 +86,25 @@
     selectedNode.set(node);
   }
 
-  /** An out-of-scope hit exists in the repo but not in the loaded graph, so
-   *  selecting it directly would select a node the canvas cannot draw. Scope
-   *  to its file first, then select. */
-  async function selectOutOfScope(node: D3Node) {
-    const ok = await focusScope(node.file_path);
-    if (!ok) return;
-    const match = get(graphData).nodes.find((n) => n.id === node.id)
-      ?? get(graphData).nodes.find((n) => n.original_id === node.original_id);
-    if (match) selectedNode.set(match);
-  }
-
-  $: visibleResults = $searchMatches.slice(0, MAX_RESULTS_SHOWN);
   // Reset the keyboard cursor whenever the result set changes underneath it.
   $: if ($searchTerm !== undefined) activeResult = -1;
 
-  /** Anchor for shift-click range commits: the last row whose checkbox was
-   *  clicked. Reset with the query, because an index into the previous
-   *  result set addresses a different entity in the new one. */
-  let commitAnchor = -1;
-  $: if ($searchTerm !== undefined) commitAnchor = -1;
-
   /**
-   * Commit a row, or a run of rows when shift is held.
+   * Arrow-key cursor over the ranked result list.
    *
-   * On `click` rather than `change`: `shiftKey` is not on the change event,
-   * and by click time `currentTarget.checked` already holds the new state —
-   * which is the state the whole range takes, matching how every file
-   * manager behaves.
+   * Reads the same `visibleSearchResults` the list renders, so the cursor
+   * walks the rows in the order they are shown. Out-of-scope hits are
+   * skipped: `selectedNode` can only hold a node the loaded graph has, and
+   * arrowing onto one would silently do nothing.
    */
-  function onCommitClick(e: MouseEvent & { currentTarget: HTMLInputElement }, i: number) {
-    const checked = e.currentTarget.checked;
-    if (e.shiftKey && commitAnchor >= 0 && commitAnchor < visibleResults.length) {
-      const [lo, hi] = commitAnchor < i ? [commitAnchor, i] : [i, commitAnchor];
-      setCommittedMatches(visibleResults.slice(lo, hi + 1).map((m) => m.id), checked);
-    } else {
-      // Plain click: the box has already flipped itself, so mirror it rather
-      // than toggling the store again.
-      setCommittedMatches([visibleResults[i].id], checked);
-    }
-    commitAnchor = i;
-  }
-
   function onSearchKeydownNav(e: KeyboardEvent) {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      if (visibleResults.length === 0) return;
+      const rows = $visibleSearchResults.filter((r) => r.inScope);
+      if (rows.length === 0) return;
       e.preventDefault();
       const delta = e.key === 'ArrowDown' ? 1 : -1;
-      activeResult = (activeResult + delta + visibleResults.length) % visibleResults.length;
-      selectMatch(visibleResults[activeResult]);
+      activeResult = (activeResult + delta + rows.length) % rows.length;
+      selectMatch(rows[activeResult].node);
       return;
     }
     if (e.key === 'Escape') {
@@ -145,19 +123,23 @@
     (document.querySelector('.graph-container svg') as SVGElement | null)?.focus?.();
   }
 
-  /** Cmd/Ctrl-K from anywhere. Ignored while another text field has focus so
-   *  it can't hijack typing in the scope filter or the in-view search. */
-  function onGlobalKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
-      const el = e.target as HTMLElement | null;
-      const typing = el instanceof HTMLElement
-        && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
-      if (typing && el !== searchInputEl) return;
-      e.preventDefault();
-      entitiesOpen = true;
-      searchInputEl?.focus();
-      searchInputEl?.select();
-    }
+  /**
+   * Take the caret when the shortcut layer asks (`Cmd-K` anywhere, `/` in this
+   * pane). The panel used to own that keystroke through its own window
+   * listener; since UI-075 the keymap owns every key and this is the half of
+   * the job no store can do — opening the disclosure and selecting the text.
+   *
+   * A counter rather than a flag, so two asks in a row are two events. `tick`
+   * because the first ask may arrive with the section still closed, and the
+   * input does not exist until it renders.
+   */
+  $: if ($searchFocusRequest > 0) grabSearchFocus();
+
+  async function grabSearchFocus() {
+    entitiesOpen = true;
+    await tick();
+    searchInputEl?.focus();
+    searchInputEl?.select();
   }
 
   // Enter while focused on the search input commits every current match.
@@ -186,8 +168,6 @@
     if (el) el.classList.toggle('open');
   }
 </script>
-
-<svelte:window on:keydown={onGlobalKeydown} />
 
 {#if $serveMode && $activeRepo}
   <!-- Serve mode: the repo is a choice the user made, so name it and let
@@ -258,6 +238,13 @@
      the distinction the flat list hid: everything here re-parses or refetches
      the dataset, everything in Graph Visualization redraws from the dataset
      already loaded, and everything in Post-Filtering narrows what is drawn. -->
+<!-- Saved views (UI-082). Above block 1 because a view spans all three
+     blocks — a scope from Analysis, a level and file exclusions from
+     Visualization, the spec filter and a committed search from
+     Post-Filtering. Inside any one of them it would read as a control over
+     that block's settings, which is the one thing it is not. -->
+<SavedViewsSection />
+
 <div class="filter-block">
   <h2 class="block-title"><span class="block-step">1</span>Analysis</h2>
   <p class="block-note">What nao parses and loads. Changing these re-runs analysis or refetches.</p>
@@ -316,6 +303,106 @@
   {/if}
 </div>
 
+<!-- UI-057. The gesture has to be stated somewhere: nothing about a circle
+     suggests it opens, and a reader who never finds out is stuck with one
+     granularity for the whole canvas. It lives here rather than in the
+     toolbar because the toolbar is capped at two rows (UI-013) and a ninth
+     cluster pushed it to three — and because this is a Graph Visualization
+     decision, which is the block it now sits in. -->
+<div class="filter-section" data-probe="expansion">
+  <h2>Expanded scopes</h2>
+  <p class="layer-note">
+    Shift + double-click a file or module on the canvas to open it in place.
+    The rest of the view stays as it is.
+  </p>
+  {#if $expandedScopes.size > 0}
+    <button
+      type="button"
+      class="seg-btn expand-collapse"
+      data-probe="collapse-all"
+      on:click={() => collapseAllScopes()}
+    >Collapse {$expandedScopes.size} open {$expandedScopes.size === 1 ? 'scope' : 'scopes'}</button>
+  {:else}
+    <p class="layer-note" data-probe="expand-hint">Nothing is open.</p>
+  {/if}
+</div>
+
+<!-- UI-052. Layout, not filtering — which is why it sits in Graph
+     Visualization and not in Post-Filtering: it moves what is drawn, it
+     never removes any of it. Nothing here refetches (ADR 0010). -->
+<div class="filter-section" data-probe="cohesion">
+  <h2 id="cohesion-label">Folder cohesion</h2>
+  <p class="layer-note">How hard the folder tree pulls against the call graph. Off is the plain force layout.</p>
+  <div class="seg-group" role="group" aria-labelledby="cohesion-label">
+    {#each COHESION_LEVELS as lvl}
+      <button
+        type="button"
+        class="seg-btn"
+        class:active={$folderCohesion === lvl}
+        aria-pressed={$folderCohesion === lvl}
+        data-probe="cohesion-{lvl}"
+        on:click={() => folderCohesion.set(lvl)}
+      >{COHESION_LABELS[lvl]}</button>
+    {/each}
+  </div>
+  <label class="checkbox-item">
+    <input type="checkbox" bind:checked={$showFolderHulls} data-probe="hulls-toggle" />
+    <span>Outline and name each folder</span>
+  </label>
+  <!-- UI-070. How much of the folder tree gets an outline. A separate control
+       from the toggle rather than four states of one, because "should there be
+       regions" and "how many tiers of them" are different questions and the
+       first one has an established answer. Layout overlay only: it changes
+       which outlines exist, never which nodes are drawn. -->
+  {#if $showFolderHulls}
+    <div class="seg-group" role="group" aria-label="How many tiers of the folder tree get an outline">
+      {#each HULL_DEPTHS as d}
+        <button
+          type="button"
+          class="seg-btn"
+          class:active={$hullDepth === d}
+          aria-pressed={$hullDepth === d}
+          data-probe="hull-depth-{d}"
+          on:click={() => hullDepth.set(d)}
+        >{HULL_DEPTH_LABELS[d]}</button>
+      {/each}
+    </div>
+  {/if}
+
+  <!-- UI-056. Hides edges, never entities — hence the wording, and hence the
+       list below: a control that silently removed a node's edges would leave
+       the reader believing nothing depends on it. -->
+  <label class="checkbox-item">
+    <input type="checkbox" bind:checked={$demoteHubs} data-probe="demote-toggle" />
+    <span>Hide edges into the most-depended-on nodes</span>
+  </label>
+  {#if $demoteHubs}
+    <div class="seg-group" role="group" aria-label="How many nodes to demote">
+      {#each HUB_COUNTS as n}
+        <button
+          type="button"
+          class="seg-btn"
+          class:active={$hubCount === n}
+          aria-pressed={$hubCount === n}
+          data-probe="hub-count-{n}"
+          on:click={() => hubCount.set(n)}
+        >{n}</button>
+      {/each}
+    </div>
+    <p class="layer-note" data-probe="demoted-list">
+      {#if demotedNames.length}
+        Demoted: {demotedNames.join(', ')}. They are still drawn and still
+        selectable; only the arrows pointing at them are hidden.
+      {:else}
+        Nothing to demote in this view.
+      {/if}
+    </p>
+  {/if}
+  {#if $graphLevel === 'module'}
+    <p class="layer-note">No effect at Module level — each node is already a folder.</p>
+  {/if}
+</div>
+
 <!-- 3. Languages: narrow by source language -->
 <div class="filter-section">
   <h2>Languages</h2>
@@ -342,6 +429,14 @@
   <h2 class="block-title"><span class="block-step">3</span>Post-Filtering</h2>
   <p class="block-note">Narrow or emphasise what is already drawn. Nothing here reloads data.</p>
 </div>
+
+<!-- Spec: narrow by what an Elevator entity declares. First in the block, and
+     above Entities, because it filters by *meaning* rather than by shape — it
+     is the one control here a reader reaches for knowing what they want rather
+     than what it looks like. Renders nothing when the project has no `.elv`
+     files. Its twin is the spec pane; either can drive the filter, and the
+     filter outlives both (ADR 0011). -->
+<SpecFilterSection />
 
 <!-- Entities: search + entity-type filter. Search narrows entity
      visibility, so it belongs next to the entity-type toggles. -->
@@ -411,97 +506,11 @@
       {/if}
     </div>
 
-    {#if $committedSearchIds.size > 0}
-      <div class="commit-status">
-        <span class="commit-count">
-          Filtering on {$committedSearchIds.size} committed entit{$committedSearchIds.size === 1 ? 'y' : 'ies'}
-        </span>
-        <button type="button" class="commit-clear-btn" on:click={clearCommittedMatches}>
-          Clear filter
-        </button>
-      </div>
-      <!-- Dimming is the default: a search answers "where is X", and
-           deleting the graph around the answer removes what makes it one.
-           Hiding is the cheaper option on a scope too busy to read through,
-           so it stays one click away (UI-050). -->
-      <label class="checkbox-item commit-mode">
-        <input type="checkbox" bind:checked={$searchHidesNonMatches} />
-        <span>Hide non-matches instead of dimming them</span>
-      </label>
-    {/if}
-
-    {#if $searchTerm.trim()}
-      <div class="search-results">
-        <div class="search-results-header">
-          {#if $searchMatches.length === 0}
-            <span class="no-match">No matches</span>
-          {:else}
-            <span class="match-count" style="color: #FFD54F">
-              {$searchMatches.length} match{$searchMatches.length === 1 ? '' : 'es'}
-            </span>
-            {#if $searchMatches.length > MAX_RESULTS_SHOWN}
-              <span class="truncated">(showing first {MAX_RESULTS_SHOWN})</span>
-            {/if}
-            <button type="button" class="commit-all-btn" on:click={commitAllMatches}
-              title="Commit every current match to the filter (same as Enter)">
-              Commit all
-            </button>
-          {/if}
-        </div>
-        {#if $searchMatches.length > 0}
-          <ul class="search-results-list" data-probe="search-results">
-            {#each visibleResults as match, i (match.id)}
-              <li
-                class="search-result-item"
-                class:active={$selectedNode?.id === match.id || i === activeResult}
-                class:committed={$committedSearchIds.has(match.id)}
-                title="{match.qualified_name} — {match.file_path}:{match.line}"
-              >
-                <input type="checkbox"
-                  class="result-commit-cb"
-                  checked={$committedSearchIds.has(match.id)}
-                  on:click|stopPropagation={(e) => onCommitClick(e, i)}
-                  title="Commit this match to the filter (shift-click for a range)" />
-                <span class="result-kind" on:click={() => selectMatch(match)}>
-                  <i class="kind-dot" style="background: {NODE_COLORS[match.kind_raw] || 'var(--text-muted)'}"></i>
-                  {match.kind}
-                </span>
-                <span class="result-name" on:click={() => selectMatch(match)}>{match.name}</span>
-                <span class="result-path" on:click={() => selectMatch(match)}>{match.file_path}</span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-
-        {#if $searchOutOfScopeMatches.length > 0}
-          <!-- Hits that exist in the repo but not in the loaded scope. Before
-               this they simply did not appear, so searching inside a narrow
-               scope looked like "no such entity" (UI-016). -->
-          <div class="oos-header">
-            {$searchOutOfScopeMatches.length} more outside the current scope
-          </div>
-          <ul class="search-results-list" data-probe="search-results-oos">
-            {#each $searchOutOfScopeMatches.slice(0, MAX_RESULTS_SHOWN) as match (match.id)}
-              <!-- One button for the whole row rather than three clickable
-                   spans: same look, keyboard-reachable, no a11y warnings. -->
-              <li class="search-result-item oos">
-                <button
-                  type="button"
-                  class="oos-row-btn"
-                  title="{match.qualified_name} — {match.file_path}:{match.line} (outside the current scope; selecting scopes to this file)"
-                  on:click={() => selectOutOfScope(match)}
-                >
-                  <span class="result-kind"><i class="kind-dot" style="background: {NODE_COLORS[match.kind_raw] || 'var(--text-muted)'}"></i>{match.kind}</span>
-                  <span class="result-name">{match.name}</span>
-                  <span class="result-path">{match.file_path}</span>
-                  <span class="oos-scope-btn">Scope to it</span>
-                </button>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </div>
-    {/if}
+    <!-- Mode toggle, status row and the ranked result list. Extracted to
+         its own component: this file was already five times the ~300-line
+         guideline, and the ranked list is where all the new query UI
+         landed. -->
+    <EntitySearchResults />
 
     <!-- Display search: "Ctrl+F within the current view". Only highlights,
          never filters. Useful for locating a specific entity inside an
@@ -816,41 +825,6 @@
   .search-label { color: var(--accent); font-weight: 600; }
   .search-label-view { color: var(--text-secondary); }
 
-  .oos-header {
-    margin-top: 10px;
-    padding-top: 6px;
-    border-top: 1px dashed var(--border-subtle);
-    font-size: 0.72rem;
-    color: var(--text-dim);
-  }
-
-  .search-result-item.oos { opacity: 0.85; }
-
-  .oos-row-btn {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    padding: 0;
-    background: none;
-    border: none;
-    font: inherit;
-    color: inherit;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .oos-scope-btn {
-    margin-left: auto;
-    padding: 1px 8px;
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-    font-size: 0.68rem;
-    white-space: nowrap;
-  }
-  .oos-row-btn:hover .oos-scope-btn { border-color: var(--accent); color: var(--accent); }
-
   /* Section header rendered as a button so it is keyboard-operable; the
      wrapper keeps the <h2> for document outline without owning the click. */
   .section-heading-wrap { margin: 0; }
@@ -987,6 +961,41 @@
     color: var(--text-dim);
   }
 
+  /* Segmented control (UI-052). Mirrors the toolbar's `level-toggle` look —
+     one bordered strip, the active segment carrying the accent — but the
+     toolbar's rules are scoped to its own component, so the panel needs its
+     own. `--text-secondary` for the inactive ink rather than `--accent`,
+     which measured 3.46:1 on obsidian at this size (UI-051's table). */
+  .seg-group {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    width: fit-content;
+  }
+
+  .seg-btn {
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    border-right: 1px solid var(--border);
+    padding: 3px 12px;
+    font-size: 0.72rem;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .seg-btn:last-child { border-right: none; }
+  .expand-collapse {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .seg-btn:hover { background: var(--bg-hover); }
+  .seg-btn.active {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    color: var(--text);
+    font-weight: 600;
+  }
+
   .filter-section { margin-bottom: 20px; }
 
   .filter-group { margin-bottom: 10px; }
@@ -1101,54 +1110,6 @@
   .search-result-item:last-child { border-bottom: none; }
   .search-result-item:hover { background: color-mix(in srgb, var(--bg-hover) 40%, transparent); }
   .search-result-item.active { background: color-mix(in srgb, var(--accent) 25%, transparent); }
-  .search-result-item.committed {
-    box-shadow: inset 3px 0 0 #FFD54F;
-    background: rgba(255, 213, 79, 0.08);
-  }
-  .search-result-item.committed.active { background: color-mix(in srgb, var(--accent) 22%, transparent); }
-  .result-commit-cb { cursor: pointer; margin: 0; flex-shrink: 0; }
-
-  .commit-mode {
-    font-size: 0.7rem;
-    color: var(--text-dim);
-    padding: 2px 4px 6px;
-  }
-
-  .commit-status {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 4px 0 8px;
-    padding: 6px 10px;
-    border-radius: 4px;
-    background: rgba(255, 213, 79, 0.08);
-    border: 1px solid rgba(255, 213, 79, 0.35);
-    font-size: 0.75rem;
-  }
-  .commit-count { color: #FFD54F; flex: 1; }
-  .commit-clear-btn {
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid rgba(255, 213, 79, 0.5);
-    border-radius: 3px;
-    padding: 2px 8px;
-    font-size: 0.7rem;
-    cursor: pointer;
-  }
-  .commit-clear-btn:hover { background: rgba(255, 213, 79, 0.15); }
-
-  .commit-all-btn {
-    margin-left: auto;
-    background: transparent;
-    color: #FFD54F;
-    border: 1px solid rgba(255, 213, 79, 0.4);
-    border-radius: 3px;
-    padding: 1px 8px;
-    font-size: 0.7rem;
-    cursor: pointer;
-  }
-  .commit-all-btn:hover { background: rgba(255, 213, 79, 0.15); }
-
   .search-scope { margin: 4px 0 10px; }
   .search-scope-toggle {
     background: transparent;

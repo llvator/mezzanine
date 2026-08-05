@@ -16,30 +16,17 @@
 
 import { writable, derived, get } from 'svelte/store';
 import { apiUrl } from '../vscodeAdapter';
+import { nextStagedLanguages, allOrNoneStaged } from '../utils/languageScope';
 
-/** All languages the backend understands. Mirrors the `Language`
- *  enum in `src/models/file_info.rs` (sans `Unknown`). Hardcoded
- *  because the list is small and stable; if it grows often, expose
- *  it from the server. */
-export const ALL_ANALYSIS_LANGUAGES: readonly string[] = [
-  'rust',
-  'python',
-  'javascript',
-  'typescript',
-  'java',
-  'go',
-  'csharp',
-  'cpp',
-  'c',
-  'ruby',
-  'swift',
-  'kotlin',
-  'scala',
-  'php',
-  'groovy',
-  'impex',
-  'elevator',
-] as const;
+/** The language lists and the staging rules live in
+ *  `utils/languageScope.ts` so they can be tested without importing this
+ *  store — which pulls in `vscodeAdapter` and, with it, the browser.
+ *  Re-exported here because this store is the public face of the panel. */
+export {
+  ALL_ANALYSIS_LANGUAGES,
+  OPT_IN_ANALYSIS_LANGUAGES,
+  DEFAULT_ANALYSIS_LANGUAGES,
+} from '../utils/languageScope';
 
 /** What's *currently* analyzed. `null` means "no filter — everything". */
 export const appliedAnalysisLanguages = writable<Set<string> | null>(null);
@@ -48,6 +35,40 @@ export const appliedAnalysisLanguages = writable<Set<string> | null>(null);
  *  load and after a successful apply. Apply button checks `staged !==
  *  applied`. */
 export const stagedAnalysisLanguages = writable<Set<string> | null>(null);
+
+/** Whether Markdown is currently analyzed — the widening switch, the same
+ *  one `--include-docs` and `nao.includeDocs` set. Distinct from ticking
+ *  `markdown` in the language list, which *restricts* to a set that happens
+ *  to contain it; this one survives whatever the list says. */
+export const appliedIncludeDocs = writable<boolean>(false);
+export const stagedIncludeDocs = writable<boolean>(false);
+
+/** Seed both from the server. Without this the panel assumes "no filter,
+ *  no docs" — and against a server started with `--include-docs` the first
+ *  Apply would send `include_docs: false` and turn docs off for real. */
+export async function loadAnalysisScope(): Promise<void> {
+  try {
+    const resp = await fetch(apiUrl('/api/analysis/scope'));
+    if (!resp.ok) return;
+    const data = (await resp.json()) as {
+      languages: string[] | null;
+      include_docs: boolean;
+    };
+    const langs = data.languages === null ? null : new Set(data.languages);
+    appliedAnalysisLanguages.set(langs);
+    stagedAnalysisLanguages.set(langs);
+    appliedIncludeDocs.set(!!data.include_docs);
+    stagedIncludeDocs.set(!!data.include_docs);
+  } catch {
+    // A server too old to answer leaves the defaults in place. Nothing to
+    // report — the panel is still usable, it just starts from an assumption.
+  }
+}
+
+/** Toggle the docs switch. */
+export function setStagedIncludeDocs(checked: boolean): void {
+  stagedIncludeDocs.set(checked);
+}
 
 /** True while an apply is in flight. The button shows a spinner and is
  *  disabled until this clears. */
@@ -60,8 +81,9 @@ export const analysisScopeError = writable<string | null>(null);
 /** True when the staged set differs from the applied set. The Apply
  *  button is enabled iff this is true. */
 export const analysisScopeDirty = derived(
-  [stagedAnalysisLanguages, appliedAnalysisLanguages],
-  ([$staged, $applied]) => !setsEqual($staged, $applied),
+  [stagedAnalysisLanguages, appliedAnalysisLanguages, stagedIncludeDocs, appliedIncludeDocs],
+  ([$staged, $applied, $stagedDocs, $appliedDocs]) =>
+    !setsEqual($staged, $applied) || $stagedDocs !== $appliedDocs,
 );
 
 function setsEqual(a: Set<string> | null, b: Set<string> | null): boolean {
@@ -76,25 +98,21 @@ function setsEqual(a: Set<string> | null, b: Set<string> | null): boolean {
  *  to a fresh Set on first interaction so the user can opt into a
  *  narrower scope without separately "starting" the filter. */
 export function toggleStagedLanguage(lang: string, checked: boolean): void {
-  stagedAnalysisLanguages.update((s) => {
-    const ns = s === null ? new Set(ALL_ANALYSIS_LANGUAGES) : new Set(s);
-    if (checked) ns.add(lang);
-    else ns.delete(lang);
-    // If the user re-checks every language, treat it as "no filter"
-    // so the wire shape matches the startup default.
-    if (ns.size === ALL_ANALYSIS_LANGUAGES.length) return null;
-    return ns;
-  });
+  stagedAnalysisLanguages.update((s) => nextStagedLanguages(s, lang, checked));
 }
 
-/** Stage every language, or none of them. "Every" is `null` rather than a
- *  full Set so the wire shape matches the startup default (see
- *  `toggleStagedLanguage`). "None" is an empty Set, which is *not* a valid
- *  thing to apply — the backend reads `[]` as "no filter" — so the panel
- *  disables Apply while the staged set is empty; it exists as the fast way
- *  to get to "just this one language" without unticking sixteen boxes. */
+/** Stage every language, or none of them.
+ *
+ *  "Every" is an explicit full Set, *not* `null`. `null` means the server
+ *  default, which excludes the opt-in languages — so sending it for a
+ *  master-toggle labelled "all" would quietly analyze less than it claims.
+ *
+ *  "None" is an empty Set, which is not a valid thing to apply — the backend
+ *  reads `[]` as "no filter" — so the panel disables Apply while the staged
+ *  set is empty; it exists as the fast way to get to "just this one language"
+ *  without unticking twenty boxes. */
 export function setAllStagedLanguages(checked: boolean): void {
-  stagedAnalysisLanguages.set(checked ? null : new Set());
+  stagedAnalysisLanguages.set(allOrNoneStaged(checked));
 }
 
 /** True when the user has staged an empty language set. Nothing can be
@@ -107,17 +125,20 @@ export const stagedScopeEmpty = derived(
 /** Discard staged changes. Used by the Cancel button. */
 export function resetStaged(): void {
   stagedAnalysisLanguages.set(get(appliedAnalysisLanguages));
+  stagedIncludeDocs.set(get(appliedIncludeDocs));
   analysisScopeError.set(null);
 }
 
 /** Apply staged changes: POST to the backend. Returns true on success. */
 export async function applyAnalysisScope(): Promise<boolean> {
   const staged = get(stagedAnalysisLanguages);
+  const stagedDocs = get(stagedIncludeDocs);
   analysisScopeApplying.set(true);
   analysisScopeError.set(null);
   try {
     const body = JSON.stringify({
       languages: staged === null ? null : [...staged],
+      include_docs: stagedDocs,
     });
     const resp = await fetch(apiUrl('/api/analysis/scope'), {
       method: 'POST',
@@ -139,6 +160,7 @@ export async function applyAnalysisScope(): Promise<boolean> {
     // The SSE 'reload' event will refresh the graph; we just commit
     // the applied state here so the UI can stop showing "dirty".
     appliedAnalysisLanguages.set(staged);
+    appliedIncludeDocs.set(stagedDocs);
     return true;
   } catch (e) {
     analysisScopeError.set(`Failed to apply: ${e}`);

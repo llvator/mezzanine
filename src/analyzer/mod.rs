@@ -4,6 +4,7 @@ mod file_walker;
 mod dependency_resolver;
 mod parse_store;
 mod lsp_tracer;
+mod markdown_links;
 mod receiver_index;
 pub mod sql_fold;
 
@@ -41,6 +42,31 @@ fn check_cancel(cancel: &Arc<AtomicBool>) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Longest type fragment a synthesized `name: type` node label carries.
+/// Past this the label has stopped being a name and started being source.
+const MAX_LABEL_TYPE_CHARS: usize = 60;
+
+/// Build the display name of a synthesized parameter or field node.
+///
+/// These names are read at a glance on the graph canvas, so the type has
+/// to survive as one short line. A language parser can hand back a type
+/// spanning many lines — a Rust enum variant body, a TypeScript inline
+/// object type — and without this the whole block became the label.
+fn member_label(name: &str, type_name: Option<&str>) -> String {
+    let Some(type_name) = type_name else {
+        return name.to_string();
+    };
+    let flat = type_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return name.to_string();
+    }
+    if flat.chars().count() <= MAX_LABEL_TYPE_CHARS {
+        return format!("{name}: {flat}");
+    }
+    let kept: String = flat.chars().take(MAX_LABEL_TYPE_CHARS).collect();
+    format!("{name}: {}…", kept.trim_end())
 }
 
 /// Main analyzer that coordinates parsing and dependency analysis.
@@ -137,7 +163,7 @@ impl Analyzer {
             .progress_chars("━╸─"),
         );
 
-        let languages = &self.config.analysis.languages;
+        let analysis = &self.config.analysis;
         let results: Vec<_> = files
             .par_iter()
             .filter_map(|file_path| {
@@ -145,7 +171,11 @@ impl Analyzer {
                     return None;
                 }
                 let language = parser::detect_language(file_path);
-                if !languages.is_empty() && !languages.contains(&language) {
+                // Same predicate the walker used to discover this file. It
+                // was a second, independently-written copy of the rule, and
+                // the two disagreed the moment `include_docs` existed:
+                // the walker admitted a `.md` and this dropped it.
+                if !analysis.accepts_language(language) {
                     progress.inc(1);
                     return None;
                 }
@@ -365,6 +395,7 @@ impl Analyzer {
         self.relationships.extend(dep_relationships);
 
         self.validate_elevator_imports();
+        self.resolve_markdown_links();
         self.synthesise_unresolved_stubs();
         self.derive_parent_from_contains();
 
@@ -515,6 +546,22 @@ impl Analyzer {
     /// only appears if no real definition was emitted by any file. No
     /// race with parser-side stubs (we removed those for non-UI
     /// kinds).
+    /// Resolve the markdown link forms that need the whole corpus:
+    /// wikilinks (which name a note without locating it) and code refs
+    /// (which the parser could only record as absolute paths). See
+    /// [`markdown_links`].
+    fn resolve_markdown_links(&mut self) {
+        let unresolved = markdown_links::resolve_wikilinks(&self.entities, &mut self.relationships);
+        if !unresolved.is_empty() {
+            self.warnings.push(format!(
+                "markdown: {} wikilink target(s) match no note: {}",
+                unresolved.len(),
+                unresolved.join(", ")
+            ));
+        }
+        markdown_links::relativize_code_refs(&mut self.entities, &self.config.root_path);
+    }
+
     fn synthesise_unresolved_stubs(&mut self) {
         // Capture (kind, file_path_to_inherit) per missing target.
         // The stub inherits the file_path of whichever entity first
@@ -527,7 +574,7 @@ impl Analyzer {
             if self.entities.contains_key(&rel.target_id) {
                 continue;
             }
-            let Some(kind) = elevator_kind_from_id(&rel.target_id) else {
+            let Some(kind) = stub_kind_from_id(&rel.target_id) else {
                 continue;
             };
             let inherited_path = self
@@ -540,13 +587,13 @@ impl Analyzer {
                 .or_insert((kind, inherited_path));
         }
         for (id, (kind, file_path)) in to_create {
-            let qualname = elevator_qualname_from_id(&id).unwrap_or_else(|| id.clone());
-            let leaf = qualname.rsplit('.').next().unwrap_or(&qualname).to_string();
+            let qualname = stub_qualname_from_id(&id).unwrap_or_else(|| id.clone());
+            let leaf = stub_leaf(&id, &qualname);
             let span = Span::new(Position::new(0, 0, 0), Position::new(0, 0, 0));
             let mut entity = CodeEntity::new(leaf, kind, file_path, span);
             entity.id = id.clone();
             entity.qualified_name = qualname;
-            entity.tags.insert("elevator".to_string());
+            entity.tags.insert(stub_layer_tag(&id).to_string());
             entity.tags.insert("unresolved".to_string());
             self.entities.insert(id, entity);
         }
@@ -639,6 +686,7 @@ impl Analyzer {
             size: content.len() as u64,
             line_count: content.lines().count(),
             content_hash: Some(content_hash.clone()),
+            documentation: result.file_documentation,
         };
 
         let parsed = ParsedFile {
@@ -675,10 +723,7 @@ impl Analyzer {
                     continue;
                 }
 
-                let display_name = match &param.type_name {
-                    Some(t) => format!("{}: {}", param.name, t),
-                    None => param.name.clone(),
-                };
+                let display_name = member_label(&param.name, param.type_name.as_deref());
 
                 let param_id = format!("{}::param::{}", func_id, param.name);
                 let mut entity = CodeEntity::new(
@@ -740,10 +785,7 @@ impl Analyzer {
                     continue;
                 }
 
-                let display_name = match &field.type_name {
-                    Some(t) => format!("{}: {}", field.name, t),
-                    None => field.name.clone(),
-                };
+                let display_name = member_label(&field.name, field.type_name.as_deref());
 
                 let field_id = format!("{}::field::{}", owner_id, field.name);
                 // De-dupe across multiple synthesis paths (e.g. same file
@@ -1044,6 +1086,61 @@ fn elevator_qualname_from_id(id: &str) -> Option<String> {
     parts.next().map(|s| s.to_string())
 }
 
+/// The kind a dangling relationship target should be given as a stub, or
+/// `None` for an ID from a layer that does not want ghosts.
+///
+/// Two layers do. Elevator, where a reference to an undefined Feature is
+/// drift worth seeing. And Markdown, where a link to a note that does not
+/// exist is the single most useful thing a document graph can show you —
+/// Obsidian draws it as a hollow node and so does nao, through this path.
+fn stub_kind_from_id(id: &str) -> Option<EntityKind> {
+    if id.starts_with("md::") {
+        return Some(EntityKind::Note);
+    }
+    elevator_kind_from_id(id)
+}
+
+/// The qualified name a stub should carry, per layer.
+fn stub_qualname_from_id(id: &str) -> Option<String> {
+    if let Some(name) = id.strip_prefix("md::wiki.") {
+        return Some(name.to_string());
+    }
+    if let Some(path) = id.strip_prefix("md::note.") {
+        return Some(path.to_string());
+    }
+    elevator_qualname_from_id(id)
+}
+
+/// The display name a stub carries.
+///
+/// An Elevator qualname is dot-separated and its last segment is the name.
+/// The two markdown forms are neither: a wikilink is already a name and may
+/// itself contain dots ("v1.2 notes"), and a note path wants its filename
+/// rather than the whole path.
+fn stub_leaf(id: &str, qualname: &str) -> String {
+    if id.starts_with("md::wiki.") {
+        return qualname.to_string();
+    }
+    if id.starts_with("md::note.") {
+        return PathBuf::from(qualname)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(qualname)
+            .to_string();
+    }
+    qualname.rsplit('.').next().unwrap_or(qualname).to_string()
+}
+
+/// The layer tag a stub inherits, so filters and `isSpecEntity`-style
+/// predicates treat it like the real entities beside it.
+fn stub_layer_tag(id: &str) -> &'static str {
+    if id.starts_with("md::") {
+        "markdown"
+    } else {
+        "elevator"
+    }
+}
+
 /// Result of code analysis.
 ///
 /// `Serialize`/`Deserialize` exist so `nao serve` can snapshot a finished
@@ -1097,6 +1194,23 @@ impl AnalysisResult {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// A node label is a name, not a source excerpt. Whatever a language
+    /// parser hands back as a type, the synthesized parameter/field label
+    /// stays one short line.
+    #[test]
+    fn a_long_or_wrapped_type_cannot_run_away_with_the_label() {
+        assert_eq!(member_label("path", Some("PathBuf")), "path: PathBuf");
+        assert_eq!(member_label("path", None), "path");
+        assert_eq!(
+            member_label("cfg", Some("{\n  a: u32,\n  b: u32,\n}")),
+            "cfg: { a: u32, b: u32, }"
+        );
+
+        let long = member_label("x", Some(&"Deep<".repeat(40)));
+        assert!(long.chars().count() <= MAX_LABEL_TYPE_CHARS + 5, "{long}");
+        assert!(long.ends_with('…'), "truncation should be visible: {long}");
+    }
 
     /// Two analyses of the same tree must be identical — same entity
     /// order, same relationship targets, same fan-in/out, same smells

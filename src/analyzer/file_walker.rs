@@ -144,20 +144,23 @@ impl<'a> FileWalker<'a> {
         if matches!(language, Language::Unknown) {
             return false;
         }
-        
-        // Check language filter
-        if !self.config.analysis.languages.is_empty() 
-            && !self.config.analysis.languages.contains(&language) 
-        {
+
+        // Language filter, including the opt-in rule for Markdown. Asked of
+        // the config rather than restated here, so the parse loop cannot
+        // answer it differently — see `AnalysisConfig::accepts_language`.
+        if !self.config.analysis.accepts_language(language) {
             return false;
         }
         
-        // Check test files — except Elevator specs: `.elv` files are
-        // domain specs, not code, and legitimately live at paths like
-        // `my-spec/` or `spec.elv` that the substring heuristic would
-        // silently swallow.
+        // Check test files — except Elevator specs and Markdown docs.
+        // `.elv` files are domain specs, not code, and legitimately live at
+        // paths like `my-spec/` or `spec.elv` that the substring heuristic
+        // would silently swallow. The same is true of a doc: `docs/testing.md`
+        // is a document *about* tests, and dropping it would tear a hole in
+        // the link graph that the notes still pointing at it cannot explain.
         if !self.config.analysis.include_tests
             && language != Language::Elevator
+            && language != Language::Markdown
             && is_test_path(path)
         {
             return false;

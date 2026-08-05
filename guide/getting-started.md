@@ -273,6 +273,7 @@ each profile's window after install (`Cmd+Shift+P → Developer: Reload Window`)
 
 | You want to… | Read |
 |---|---|
+| Put it to work — the patterns each surface is good at | [workflows/](workflows/) — [terminal](workflows/cli/) and [visualizer](workflows/web-ui/) |
 | Learn the Elevator (.elv) spec language | [elevator-language.md](elevator-language.md) — or just run `elevator --docs` |
 | Understand the VS Code panels in detail | [vscode-extension/README.md](../vscode-extension/README.md) |
 | See the project's high-level features (quality metrics, code smells) | [README.md](../README.md) |

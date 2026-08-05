@@ -11,6 +11,7 @@ mod groovy;
 mod impex;
 mod elevator;
 mod ansible;
+pub(crate) mod markdown;
 pub(crate) mod sql;
 mod generic_parser;
 
@@ -29,6 +30,7 @@ pub use groovy::GroovyParser;
 pub use impex::ImpexParser;
 pub use elevator::ElevatorParser;
 pub use ansible::AnsibleParser;
+pub use markdown::MarkdownParser;
 pub use sql::SqlParser;
 pub use generic_parser::GenericParser;
 
@@ -66,6 +68,7 @@ pub fn get_parser(language: Language) -> Box<dyn LanguageParser> {
         Language::Elevator => Box::new(ElevatorParser::new()),
         Language::AnsibleDeploy => Box::new(AnsibleParser::new()),
         Language::Sql => Box::new(SqlParser::new()),
+        Language::Markdown => Box::new(MarkdownParser::new()),
         // For other languages, use the generic parser for now
         _ => Box::new(GenericParser::new(language)),
     }

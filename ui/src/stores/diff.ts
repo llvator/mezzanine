@@ -7,6 +7,7 @@ import { writable, derived, get } from 'svelte/store';
 import type { Readable } from 'svelte/store';
 import { apiUrl } from '../vscodeAdapter';
 import { isServeMode } from './serveMode';
+import { rollUpByScope, type ScopeChange } from '../viewmodels/diffRollup';
 
 export type ChangeStatus = 'added' | 'removed' | 'modified' | 'unchanged';
 
@@ -125,6 +126,23 @@ export const diffSourceChangedMap: Readable<Map<string, boolean>> = derived(
   },
 );
 
+/**
+ * Scope path → rolled-up change, covering every file and directory the diff
+ * reported on (UI-064).
+ *
+ * The two maps above answer "did this entity change". Above entity
+ * aggregation the canvas draws scopes, not entities, so this answers "did
+ * anything in this scope change" — and, because the diff reports on
+ * unchanged entities too, `has(path)` separately answers "was this scope in
+ * the diff at all". A file created after the diff ran is absent from both
+ * maps and from this one, and that absence is a fact worth keeping: it is
+ * not the same as unchanged.
+ */
+export const diffScopeChanges: Readable<Map<string, ScopeChange>> = derived(
+  diffData,
+  ($d) => rollUpByScope($d?.entities ?? []),
+);
+
 /** Map from normalized entity ID → metric deltas (only for modified entities). */
 export const diffDeltaMap: Readable<Map<string, MetricDelta[]>> = derived(
   diffData,
@@ -153,8 +171,16 @@ export const diffBaseIdMap: Readable<Map<string, string>> = derived(
   },
 );
 
-/** Load diff from the API. Silently no-ops if no diff is available (404). */
-export async function loadDiff(): Promise<void> {
+/**
+ * Load diff from the API. Silently no-ops if no diff is available (404).
+ *
+ * `baseDetails` is skippable because a live refresh does not need them
+ * (UI-067): the base of a `→ working` diff is a fixed commit, so its
+ * before-source never changes while the watcher recomputes the head. Fetching
+ * them anyway would re-download the whole base payload on every file save.
+ */
+export async function loadDiff(opts: { baseDetails?: boolean } = {}): Promise<void> {
+  const { baseDetails = true } = opts;
   // Serve mode has no diff endpoint (SRV-003 left it out of the per-repo
   // namespace), so skip the request rather than probing for a 404.
   if (isServeMode()) return;
@@ -166,7 +192,7 @@ export async function loadDiff(): Promise<void> {
       diffData.set(data);
       diffActive.set(true);
       // Also load base details for side-by-side comparison
-      await loadBaseDetails();
+      if (baseDetails) await loadBaseDetails();
     } else {
       diffData.set(null);
       diffActive.set(false);

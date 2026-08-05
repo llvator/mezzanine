@@ -1,4 +1,6 @@
 import { writable } from 'svelte/store';
+import { COHESION_LEVELS, type CohesionLevel } from '../utils/forceCohesion';
+import { HUB_COUNTS, DEFAULT_HUB_COUNT } from '../viewmodels/hubs';
 
 export type ThemeId = 'llvator' | 'obsidian' | 'nord' | 'light' | 'midnight';
 
@@ -231,7 +233,7 @@ function loadChannel<T extends string>(key: string, valid: readonly T[], fallbac
   return fallback;
 }
 
-const SIZE_CHANNEL_IDS = ['loc', 'coupling', 'methodCount', 'wmc', 'cyclomatic', 'pagerank', 'kind'] as const;
+const SIZE_CHANNEL_IDS = ['loc', 'degree', 'coupling', 'methodCount', 'wmc', 'cyclomatic', 'pagerank', 'kind'] as const;
 const COLOR_CHANNEL_IDS = ['severity', 'kind'] as const;
 
 export type SizeChannelId = typeof SIZE_CHANNEL_IDS[number];
@@ -249,6 +251,116 @@ sizeChannel.subscribe((v) => {
 });
 colorChannel.subscribe((v) => {
   try { localStorage.setItem(COLOR_CHANNEL_KEY, v); } catch { /* ignore */ }
+});
+
+// ── Folder cohesion (UI-052) ────────────────────────────────────────────
+//
+// How hard the folder tree pulls against the call graph in the force layout.
+// A view setting like the two above, and persisted for the same reason: a
+// reader who has tuned the picture should not have to re-tune it on reload.
+//
+// Default is `low`, not `off`. Off-by-default would mean the first graph
+// anyone ever sees is the hairball this force exists to break up, with the
+// remedy behind a control they have no reason to look for — the same mistake
+// UI-022 fixed for auto-fit. Low is enough to make groups visible without
+// overriding what the relationships say.
+const COHESION_KEY = 'nao-folder-cohesion';
+
+export const folderCohesion = writable<CohesionLevel>(
+  loadChannel(COHESION_KEY, COHESION_LEVELS, 'low'),
+);
+
+folderCohesion.subscribe((v) => {
+  try { localStorage.setItem(COHESION_KEY, v); } catch { /* ignore */ }
+});
+
+// ── Folder hulls (UI-055) ───────────────────────────────────────────────
+//
+// Outline and name each folder region on the canvas. On by default: naming
+// the regions is the whole reason the grouping work is visible at all, and a
+// reader who has to discover a toggle to find out what they are looking at
+// has not been told.
+const HULLS_KEY = 'nao-folder-hulls';
+
+function loadHulls(): boolean {
+  try {
+    const v = localStorage.getItem(HULLS_KEY);
+    if (v !== null) return v === 'true';
+  } catch { /* SSR / blocked storage */ }
+  return true;
+}
+
+export const showFolderHulls = writable<boolean>(loadHulls());
+
+showFolderHulls.subscribe((v) => {
+  try { localStorage.setItem(HULLS_KEY, String(v)); } catch { /* ignore */ }
+});
+
+// ── Region tiers (UI-070) ───────────────────────────────────────────────
+//
+// How many levels of the folder tree get an outline. 1 is the UI-055
+// picture — a region per leaf folder and nothing above it — and each step
+// adds the tier above.
+//
+// Default 2, because one tier cannot say the thing the reader is missing:
+// three sibling regions with no shape around them are three neighbourhoods
+// with no district, and the canvas ends up a weaker account of the repo than
+// the file tree in the sidebar. It is capped at 3 rather than left open:
+// past that the outlines are nested closer than the eye separates them, and
+// every tier costs a polygon per group per redraw.
+const HULL_DEPTH_KEY = 'nao-hull-depth';
+
+export const HULL_DEPTHS: readonly number[] = [1, 2, 3];
+
+export const HULL_DEPTH_LABELS: Record<number, string> = {
+  1: 'Folders',
+  2: '+ Parent',
+  3: '+ Grandparent',
+};
+
+function loadHullDepth(): number {
+  try {
+    const v = Number(localStorage.getItem(HULL_DEPTH_KEY));
+    if (HULL_DEPTHS.includes(v)) return v;
+  } catch { /* SSR / blocked storage */ }
+  return 2;
+}
+
+export const hullDepth = writable<number>(loadHullDepth());
+
+hullDepth.subscribe((v) => {
+  try { localStorage.setItem(HULL_DEPTH_KEY, String(v)); } catch { /* ignore */ }
+});
+
+// ── Hub demotion (UI-056) ───────────────────────────────────────────────
+//
+// Off by default. Unlike cohesion and hulls, which change how the same graph
+// is arranged and annotated, this one *removes edges from the picture* —
+// and a tool that quietly hides relationships on first run has misled the
+// reader before they have had a chance to ask for it.
+const DEMOTE_KEY = 'nao-demote-hubs';
+const HUB_COUNT_KEY = 'nao-hub-count';
+
+function loadDemote(): boolean {
+  try { return localStorage.getItem(DEMOTE_KEY) === 'true'; } catch { return false; }
+}
+
+function loadHubCount(): number {
+  try {
+    const v = Number(localStorage.getItem(HUB_COUNT_KEY));
+    if (HUB_COUNTS.includes(v)) return v;
+  } catch { /* SSR / blocked storage */ }
+  return DEFAULT_HUB_COUNT;
+}
+
+export const demoteHubs = writable<boolean>(loadDemote());
+export const hubCount = writable<number>(loadHubCount());
+
+demoteHubs.subscribe((v) => {
+  try { localStorage.setItem(DEMOTE_KEY, String(v)); } catch { /* ignore */ }
+});
+hubCount.subscribe((v) => {
+  try { localStorage.setItem(HUB_COUNT_KEY, String(v)); } catch { /* ignore */ }
 });
 
 // ── Theme ───────────────────────────────────────────────────────────────

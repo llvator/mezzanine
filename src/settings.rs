@@ -102,6 +102,10 @@ pub struct Settings {
     pub language: Option<Vec<String>>,
     pub kind: Option<Vec<EntityKind>>,
     pub include_tests: Option<bool>,
+    /// Analyze Markdown alongside the code. The durable way to turn the doc
+    /// layer on, which matters more here than for most flags: the VS Code
+    /// extension and `nao watch` are launched without anyone typing a flag.
+    pub include_docs: Option<bool>,
     pub include_external: Option<bool>,
     pub max_depth: Option<usize>,
     pub min_weight: Option<u32>,
@@ -167,7 +171,16 @@ pub fn user_path() -> Option<PathBuf> {
 
 /// The repo-scope settings file path for an analyzed root.
 pub fn repo_path(root: &Path) -> PathBuf {
-    root.join(REPO_DIR).join(FILE_NAME)
+    repo_dir(root).join(FILE_NAME)
+}
+
+/// The repo-scope directory for an analyzed root, whether or not it exists.
+///
+/// Exported because settings are no longer the only thing that lives there —
+/// saved views (`views.json`) are repo-scope for the same reason, and the
+/// spelling of the directory belongs in one place.
+pub fn repo_dir(root: &Path) -> PathBuf {
+    root.join(REPO_DIR)
 }
 
 /// Read and validate one settings file. Absent is the normal case and says
@@ -269,6 +282,7 @@ impl Settings {
             language: self.language.or(lower.language),
             kind: self.kind.or(lower.kind),
             include_tests: self.include_tests.or(lower.include_tests),
+            include_docs: self.include_docs.or(lower.include_docs),
             include_external: self.include_external.or(lower.include_external),
             max_depth: self.max_depth.or(lower.max_depth),
             min_weight: self.min_weight.or(lower.min_weight),
@@ -289,6 +303,9 @@ impl Settings {
     pub fn apply_to_config(&self, config: &mut Config) {
         if let Some(v) = self.include_tests {
             config.analysis.include_tests |= v;
+        }
+        if let Some(v) = self.include_docs {
+            config.analysis.include_docs |= v;
         }
         if let Some(v) = self.include_external {
             config.analysis.include_external |= v;

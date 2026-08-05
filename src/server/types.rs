@@ -52,6 +52,26 @@ pub(crate) struct RootPathRequest {
 pub(crate) struct AnalysisScopeRequest {
     #[serde(default)]
     pub languages: Option<Vec<String>>,
+    /// Analyze Markdown alongside the code. Widens, so it survives the
+    /// `languages` filter — the CLI's `--include-docs` and the extension's
+    /// `nao.includeDocs` set the same thing.
+    ///
+    /// `None` means "leave it as the server was started"; a client that
+    /// never sends the field cannot turn off a `--include-docs` the operator
+    /// passed on the command line.
+    #[serde(default)]
+    pub include_docs: Option<bool>,
+}
+
+/// `GET /api/analysis/scope` — what the analyzer is *currently* configured
+/// to read. The panel seeds itself from this instead of assuming: without it
+/// a UI that loads against a server started with `--include-docs` shows the
+/// toggle off, and the first Apply turns docs off for real.
+#[derive(Serialize)]
+pub(crate) struct AnalysisScopeState {
+    /// Canonical filter names, or `null` for "no filter".
+    pub languages: Option<Vec<String>>,
+    pub include_docs: bool,
 }
 
 #[derive(Serialize)]

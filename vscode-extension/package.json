@@ -2,13 +2,17 @@
   "name": "nao-code-visualizer",
   "displayName": "Nao — Code Visualizer",
   "description": "Visualize code relationships and dependencies for the file open in your editor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "nao-team",
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "https://github.com/llvator/nao.git",
     "directory": "vscode-extension"
+  },
+  "homepage": "https://llvator.com",
+  "bugs": {
+    "url": "https://github.com/llvator/nao/issues"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -323,6 +327,11 @@
           "type": "boolean",
           "default": false,
           "description": "Include test files in the analysis."
+        },
+        "nao.includeDocs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Analyze Markdown documents alongside the code: one node per .md file, the links between them, and the source files they point at. Off by default because a repo's READMEs, ADRs and changelogs would otherwise add hundreds of nodes to every graph."
         },
         "nao.language": {
           "type": "string",

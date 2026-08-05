@@ -34,6 +34,19 @@ export interface CanvasChrome {
   orderBadgeStroke: string;
   /** Digit inside the amber call-order badge. */
   orderBadgeText: string;
+  /** Wash behind a folder group's nodes (UI-055). */
+  hullFill: string;
+  hullFillOpacity: number;
+  /** Outline of a folder group. */
+  hullStroke: string;
+  hullStrokeOpacity: number;
+  /** The folder's name, drawn on the outline. */
+  hullLabelFill: string;
+  /** The theme's accent, for a canvas that still has an emphasis channel
+   *  free. The code canvas does not — hover, selection and UI-014's metric
+   *  encoding have all three — but the spec pane (ADR 0011) draws no metrics,
+   *  so it can spend one on "this entity claims the selected code". */
+  accent: string;
 }
 
 /** Near-black on the fixed `#FF9800` badge, for the same reason. */
@@ -68,5 +81,21 @@ export function canvasChrome(): CanvasChrome {
     arrowFill: prop('--text-dim', '#888888'),
     orderBadgeStroke: prop('--bg-body', '#1a1a2e'),
     orderBadgeText: ON_BADGE_FILL,
+    // Folder hulls (UI-055). Deliberately achromatic: node fill already means
+    // a metric (UI-014), and a tinted region behind a severity ramp would
+    // shift what every circle inside it appears to say. `--text` at 6% is a
+    // wash that reads as "these belong together" in both light and dark
+    // themes without competing for the colour channel.
+    //
+    // No per-group hue. Adjacent regions are told apart by their outline and
+    // their name, which is information a hue could not carry anyway.
+    hullFill: prop('--text', '#eeeeee'),
+    hullFillOpacity: 0.06,
+    hullStroke: prop('--text-dim', '#888888'),
+    hullStrokeOpacity: 0.35,
+    // Dimmer than `nameLabelFill` and set in small caps by the caller, so a
+    // region name cannot be mistaken for an entity name.
+    hullLabelFill: prop('--text-dim', '#888888'),
+    accent: prop('--accent', '#4a9eff'),
   };
 }

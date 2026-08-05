@@ -170,6 +170,11 @@ impl LanguageParser for RustParser {
             }
         }
 
+        // The file's own `//!` header. It documents no entity — a `.rs` file
+        // is a module whose declaration lives in another file — so it travels
+        // beside the entities and the analyzer lifts it onto `FileInfo`.
+        result.file_documentation = doc_comments::extract_inner_doc(&tree.root_node(), content);
+
         // Emit UsesType edges from signature/field types (RS-001).
         types::emit_uses_type_edges(&mut result);
 

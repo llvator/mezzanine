@@ -24,8 +24,10 @@ pub(crate) async fn sse_handler(
         yield Ok(Event::default().event("connected").data("ok"));
         loop {
             match rx.recv().await {
-                Ok(()) => {
-                    yield Ok(Event::default().event("reload").data("changed"));
+                Ok(kind) => {
+                    // Two event names, so a client can re-fetch only the
+                    // overlay when only the overlay moved (UI-067).
+                    yield Ok(Event::default().event(kind.event_name()).data("changed"));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,

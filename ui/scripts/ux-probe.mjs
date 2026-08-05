@@ -31,7 +31,9 @@
  *   pin-toggle · search-input · search-results · legend
  *   scope-query · file-filter · file-tree
  *   quality-summary · metric-threshold · quality-population
+ *   quality-population-picker · visual-filter-state · filter-notice
  *   quality-chart · tick · chart-legend · chart-empty
+ *   overview-panel
  *
  * Checks that need human eyes are NOT modelled here. Each ticket lists them
  * separately under "Manual".
@@ -277,6 +279,82 @@ function installProbeLib() {
       };
     },
 
+    /**
+     * The overview panel, its dots, and the viewport box inside it (UI-083).
+     *
+     * Everything is reported in panel-relative coordinates, because every
+     * claim worth making here is "the box is inside the panel" or "the box
+     * shrank" — both of which are about the box's place in the panel and
+     * neither of which cares where on screen the panel happens to be.
+     */
+    overview() {
+      const panel = document.querySelector('[data-probe="overview-panel"]');
+      if (!panel) return null;
+      const map = panel.querySelector('svg.overview-map');
+      const canvas = box('canvas');
+      const p = panel.getBoundingClientRect();
+      if (!map) return { open: false, insideCanvas: null, dots: 0, box: null };
+      const m = map.getBoundingClientRect();
+      const rect = map.querySelector('rect.viewport-box');
+      const r = rect?.getBoundingClientRect();
+      return {
+        open: true,
+        // The panel is an overlay on the canvas, not a column beside it.
+        insideCanvas: canvas
+          ? p.x >= canvas.x - 0.5 && p.y >= canvas.y - 0.5 &&
+            p.right <= canvas.right + 0.5 && p.bottom <= canvas.bottom + 0.5
+          : null,
+        dots: map.querySelectorAll('circle').length,
+        map: { w: +m.width.toFixed(1), h: +m.height.toFixed(1) },
+        box: r ? {
+          x: +(r.x - m.x).toFixed(1), y: +(r.y - m.y).toFixed(1),
+          w: +r.width.toFixed(1), h: +r.height.toFixed(1),
+          // The fraction of the panel the viewport covers — the number that
+          // has to fall as the canvas zooms in.
+          share: +((r.width * r.height) / (m.width * m.height)).toFixed(4),
+        } : null,
+      };
+    },
+
+    /** Press at a fraction of the overview panel, so the probe can assert
+     *  that a click there steers the canvas. Pointer events rather than a
+     *  CDP mouse click: the panel listens on `pointerdown` and captures. */
+    clickOverview(fx, fy) {
+      const map = document.querySelector('[data-probe="overview-panel"] svg.overview-map');
+      if (!map) return null;
+      const m = map.getBoundingClientRect();
+      const clientX = m.x + m.width * fx;
+      const clientY = m.y + m.height * fy;
+      const opts = { clientX, clientY, bubbles: true, cancelable: true, pointerId: 1, button: 0, isPrimary: true };
+      map.dispatchEvent(new PointerEvent('pointerdown', opts));
+      map.dispatchEvent(new PointerEvent('pointerup', opts));
+      return { clientX: +clientX.toFixed(1), clientY: +clientY.toFixed(1) };
+    },
+
+    /** The canvas's zoom transform, as the `k`/`x`/`y` d3 wrote onto the
+     *  root group — the thing the overview's box is a reading of. */
+    canvasTransform() {
+      const g = document.querySelector('.graph-container svg > g');
+      const t = g?.getAttribute('transform') ?? '';
+      const tr = /translate\(([-\d.e]+)[, ]([-\d.e]+)\)/.exec(t);
+      const sc = /scale\(([-\d.e]+)\)/.exec(t);
+      return {
+        raw: t,
+        x: tr ? +(+tr[1]).toFixed(2) : 0,
+        y: tr ? +(+tr[2]).toFixed(2) : 0,
+        k: sc ? +(+sc[1]).toFixed(4) : 1,
+      };
+    },
+
+    /** Toolbar zoom, by aria-label — `clickText('+')` would match half the
+     *  buttons on the page. */
+    zoomCanvas(dir = 'in') {
+      const b = document.querySelector(`button[aria-label="Zoom ${dir}"]`);
+      if (!b) return false;
+      b.click();
+      return true;
+    },
+
     /** Node name-label fill vs the canvas background it sits on. */
     labelContrast() {
       const t = document.querySelector('g.node text.name-label');
@@ -513,6 +591,24 @@ function installProbeLib() {
       return true;
     },
 
+    /**
+     * Every scope row with its *exact* entity count.
+     *
+     * `scopeRowState` reads the count's rendered text, which `formatCount`
+     * abbreviates — "9.4k" parses to 9.4 and loses to a plain "691". The
+     * title attribute carries the real number, which is what any comparison
+     * between rows has to use.
+     */
+    scopeRowCounts() {
+      return [...document.querySelectorAll('.scope-tree .tree-item')].map((r) => {
+        const title = r.querySelector('.count')?.getAttribute('title') ?? '';
+        return {
+          path: r.querySelector('.label')?.getAttribute('title') ?? '',
+          entities: Number((title.match(/^(\d+)\s+entities/) ?? [0, 0])[1]),
+        };
+      });
+    },
+
     /** Whether a scope row reads as selected, and the index count beside it. */
     scopeRowState(path) {
       const row = [...document.querySelectorAll('.scope-tree .tree-item')]
@@ -587,6 +683,485 @@ function installProbeLib() {
       if (!b) return false;
       b.click();
       return true;
+    },
+
+    // ── grouping (UI-052 / UI-053) ───────────────────────────────────────
+
+    /** Live node positions read off the d3 data join. `__data__` is where d3
+     *  parks the datum, so this reports where the simulation actually put
+     *  each node rather than re-deriving it from the transform attribute. */
+    /**
+     * The group a node belongs to — `folderKeyOf` in
+     * utils/forceCohesion.ts, mirrored.
+     *
+     * One definition here for the same reason there is one there. Three
+     * probes ask this question, and one analyze run emits both
+     * `./ui/src/stores` and `ui/src/stores` (AN-015), so a probe that
+     * normalises differently from the app reports a folder as scattered at
+     * exactly the moment the app has united it — a bug that exists only in
+     * the measurement.
+     */
+    folderOfPath(p) {
+      if (!p) return null;
+      const i = p.lastIndexOf('/');
+      const dir = i < 0 ? '' : p.slice(0, i);
+      if (dir === '.') return '';
+      return dir.startsWith('./') ? dir.slice(2) : dir;
+    },
+
+    nodePositions() {
+      return [...document.querySelectorAll('g.node')]
+        .filter((g) => g.style.display !== 'none')
+        .map((g) => {
+          const d = g.__data__ ?? {};
+          return { id: d.id, folder: this.folderOfPath(d.file_path ?? ''), x: d.x, y: d.y };
+        })
+        .filter((n) => Number.isFinite(n.x) && Number.isFinite(n.y));
+    },
+
+    /** Mean distance between same-folder nodes, over mean distance between
+     *  all pairs. 1.0 means folders are no more clustered than chance; lower
+     *  is tighter. This is the one number that says whether grouping is
+     *  visible, and it is invariant to zoom and to canvas size — which a raw
+     *  distance is not. Ghosts are excluded: they have no folder. */
+    cohesionRatio() {
+      const ns = this.nodePositions().filter((n) => n.folder !== null);
+      let intraSum = 0, intraN = 0, allSum = 0, allN = 0;
+      for (let i = 0; i < ns.length; i++) {
+        for (let j = i + 1; j < ns.length; j++) {
+          const d = Math.hypot(ns[i].x - ns[j].x, ns[i].y - ns[j].y);
+          allSum += d; allN++;
+          if (ns[i].folder === ns[j].folder) { intraSum += d; intraN++; }
+        }
+      }
+      // Report the counts even when the ratio is undefined. A bare null here
+      // says "no pairs" but not whether that is because nothing rendered,
+      // because every node is in its own folder, or because the datum is
+      // missing — three very different bugs.
+      const rendered = document.querySelectorAll('g.node').length;
+      if (!intraN || !allN) return { ratio: null, nodes: ns.length, rendered, intraPairs: intraN };
+      const intra = intraSum / intraN;
+      const all = allSum / allN;
+      return { intra, all, ratio: intra / all, nodes: ns.length, rendered, intraPairs: intraN };
+    },
+
+    /**
+     * Mean distance between nodes whose folders share a real subtree, over
+     * the same for nodes whose folders share nothing but the whole graph
+     * (UI-069).
+     *
+     * `cohesionRatio` cannot see this: it asks whether a folder is tight, and
+     * both populations here are *cross-folder* pairs, so a layout that
+     * clusters leaves perfectly can still score 1.0 on kinship. 1.0 means the
+     * tree above the leaf folder is invisible in the layout — which is what
+     * the flat force produced. Lower means subtrees cohere.
+     *
+     * "A real subtree" is deeper than the drawn set's common ancestor, which
+     * is the same thing the force means: a directory holding every drawn node
+     * has the graph's centroid and can only act as a centering force, so a
+     * pair that shares nothing deeper than that is unrelated as far as this
+     * feature is concerned. Ghosts have no folder and are excluded, as
+     * everywhere else.
+     */
+    kinshipRatio() {
+      const ns = this.nodePositions().filter((n) => n.folder !== null);
+      const segsOf = (f) => (f === '' ? [] : f.split('/'));
+      const sharedDepth = (a, b) => {
+        let i = 0;
+        while (i < a.length && i < b.length && a[i] === b[i]) i++;
+        return i;
+      };
+      const segs = ns.map((n) => segsOf(n.folder));
+      // The common ancestor's depth. Everything at or above it holds the
+      // whole canvas.
+      let rootDepth = segs.length ? segs[0].length : 0;
+      for (const s of segs) rootDepth = Math.min(rootDepth, sharedDepth(segs[0], s));
+
+      let kinSum = 0, kinN = 0, farSum = 0, farN = 0;
+      for (let i = 0; i < ns.length; i++) {
+        for (let j = i + 1; j < ns.length; j++) {
+          // Same folder is UI-052's business, and including it would let a
+          // tight leaf folder carry the kinship number on its own.
+          if (ns[i].folder === ns[j].folder) continue;
+          const d = Math.hypot(ns[i].x - ns[j].x, ns[i].y - ns[j].y);
+          if (sharedDepth(segs[i], segs[j]) > rootDepth) { kinSum += d; kinN++; }
+          else { farSum += d; farN++; }
+        }
+      }
+      const rendered = document.querySelectorAll('g.node').length;
+      const folders = new Set(ns.map((n) => n.folder));
+      // Report the populations even when the ratio is undefined: "no kin
+      // pairs" means the scope has no two folders inside one subtree, which
+      // is a fact about the scope and not a failure of the layout.
+      if (!kinN || !farN) {
+        return { ratio: null, kinPairs: kinN, farPairs: farN, folders: folders.size, nodes: ns.length, rendered };
+      }
+      const kin = kinSum / kinN;
+      const far = farSum / farN;
+      return {
+        kin, far, ratio: kin / far,
+        kinPairs: kinN, farPairs: farN, folders: folders.size, nodes: ns.length, rendered,
+      };
+    },
+
+    // ── hub demotion (UI-056) ────────────────────────────────────────────
+
+    setDemote(on) {
+      const cb = document.querySelector('[data-probe="demote-toggle"]');
+      if (!cb) return false;
+      if (cb.checked !== on) cb.click();
+      return cb.checked === on;
+    },
+
+    setHubCount(n) {
+      const b = document.querySelector(`[data-probe="hub-count-${n}"]`);
+      if (!b) return false;
+      b.click();
+      return b.getAttribute('aria-pressed') === 'true';
+    },
+
+    /** Edges and nodes actually drawn, so a "fewer edges" claim is measured
+     *  on the picture rather than on the plan. */
+    drawnCounts() {
+      const vis = (sel) => [...document.querySelectorAll(sel)].filter((e) => e.style.display !== 'none').length;
+      return { links: vis('line.link'), nodes: vis('g.node') };
+    },
+
+    demotedList() {
+      const p = document.querySelector('[data-probe="demoted-list"]');
+      return p ? p.textContent.replace(/\s+/g, ' ').trim() : null;
+    },
+
+    nodeIsSelected(name) {
+      const g = [...document.querySelectorAll('g.node')].find((n) => n.textContent.includes(name));
+      return !!g?.classList.contains('selected');
+    },
+
+    clearSelection() {
+      const b = [...document.querySelectorAll('button')]
+        .find((x) => x.textContent.trim() === 'Clear Selection');
+      if (b) b.click();
+      return !!b;
+    },
+
+    /** Is a node still there and still clickable after being demoted? */
+    nodeIsSelectable(name) {
+      const g = [...document.querySelectorAll('g.node')]
+        .filter((n) => n.style.display !== 'none')
+        .find((n) => n.textContent.includes(name));
+      if (!g) return { present: false };
+      g.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return { present: true, selected: g.classList.contains('selected') };
+    },
+
+    // ── mixed-level expansion (UI-057 / UI-058) ──────────────────────────
+
+    /** Shift + double-click a node by visible name — the expand gesture. */
+    expandNode(name) {
+      const g = [...document.querySelectorAll('g.node')]
+        .filter((n) => n.style.display !== 'none')
+        .find((n) => n.textContent.includes(name));
+      if (!g) return false;
+      g.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, shiftKey: true }));
+      return true;
+    },
+
+    expansionState() {
+      const section = document.querySelector('[data-probe="expansion"]');
+      const btn = document.querySelector('[data-probe="collapse-all"]');
+      const hint = document.querySelector('[data-probe="expand-hint"]');
+      return {
+        count: btn ? Number((btn.textContent.match(/(\d+)/) ?? [])[1] ?? 0) : 0,
+        hint: hint ? hint.textContent.trim() : null,
+        // The gesture is spelled out in the section's own copy, not in a
+        // tooltip — a hint nobody can see is not discoverability.
+        gesture: section ? section.textContent.replace(/\s+/g, ' ').trim() : null,
+      };
+    },
+
+    collapseAll() {
+      const b = document.querySelector('[data-probe="collapse-all"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    },
+
+    /** Kinds of the nodes actually drawn — the proof that a view is mixed. */
+    drawnNodeKinds() {
+      const out = {};
+      for (const g of document.querySelectorAll('g.node')) {
+        if (g.style.display === 'none') continue;
+        const k = g.__data__?.kind_raw ?? '?';
+        out[k] = (out[k] ?? 0) + 1;
+      }
+      return out;
+    },
+
+    /** Kinds of the edges actually drawn (UI-058). */
+    drawnLinkKinds() {
+      const out = {};
+      for (const l of document.querySelectorAll('line.link')) {
+        if (l.style.display === 'none') continue;
+        const k = l.__data__?.kind_raw ?? '?';
+        out[k] = (out[k] ?? 0) + 1;
+      }
+      return out;
+    },
+
+    firstNodeOfKind(kind) {
+      const g = [...document.querySelectorAll('g.node')]
+        .filter((n) => n.style.display !== 'none')
+        .find((n) => n.__data__?.kind_raw === kind);
+      return g ? (g.__data__?.name ?? null) : null;
+    },
+
+    // ── the marked set ───────────────────────────────────────────────────
+
+    /** ⌘-click the first `n` drawn nodes — the mark gesture. Returns the
+     *  paths marked, which is what the drill will be scoped to. */
+    markNodes(n) {
+      const gs = [...document.querySelectorAll('g.node')]
+        .filter((g) => g.style.display !== 'none')
+        .slice(0, n);
+      for (const g of gs) g.dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }));
+      return gs.map((g) => g.__data__?.file_path ?? null);
+    },
+
+    /** What the canvas and the toolbar each say about the set. They are two
+     *  surfaces for one store and disagreeing is the failure to catch. */
+    markState() {
+      const btn = document.querySelector('[data-probe="drill-marks"]');
+      return {
+        rings: document.querySelectorAll('circle.mark-ring').length,
+        marked: document.querySelectorAll('g.node.marked').length,
+        selected: document.querySelectorAll('g.node.selected').length,
+        button: btn ? btn.textContent.replace(/\s+/g, ' ').trim() : null,
+        level: [...document.querySelectorAll('.level-btn')]
+          .find((b) => b.classList.contains('active'))?.textContent.trim() ?? null,
+      };
+    },
+
+    drillMarks() {
+      const b = document.querySelector('[data-probe="drill-marks"]');
+      if (!b) return false;
+      b.click();
+      return true;
+    },
+
+    // ── hover highlight (UI-054) ─────────────────────────────────────────
+
+    setHoverMode(mode) {
+      const b = document.querySelector(`[data-probe="hover-mode-${mode}"]`);
+      if (!b || b.disabled) return false;
+      b.click();
+      return b.getAttribute('aria-pressed') === 'true';
+    },
+
+    hoverModeState() {
+      return ['connections', 'group'].map((m) => {
+        const b = document.querySelector(`[data-probe="hover-mode-${m}"]`);
+        return { mode: m, present: !!b, active: b?.getAttribute('aria-pressed') === 'true', disabled: !!b?.disabled };
+      });
+    },
+
+    /** Are the depth buttons available? They only mean something in Links
+     *  mode, and a control that silently does nothing is worse than one that
+     *  says it is unavailable. */
+    depthEnabled() {
+      const group = [...document.querySelectorAll('.toolbar-group')]
+        .find((g) => /Highlight depth/i.test(g.textContent ?? ''));
+      const btns = [...(group?.querySelectorAll('button') ?? [])];
+      return { count: btns.length, enabled: btns.filter((b) => !b.disabled).length };
+    },
+
+    /** Hover a node by visible name and report what stayed lit.
+     *  Returns null when no such node is drawn. */
+    hoverNode(name) {
+      const g = [...document.querySelectorAll('g.node')]
+        .filter((n) => n.style.display !== 'none')
+        .find((n) => n.textContent.includes(name));
+      if (!g) return null;
+      g.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      const folderOf = (el) => this.folderOfPath(el.__data__?.file_path ?? '');
+      const all = [...document.querySelectorAll('g.node')].filter((n) => n.style.display !== 'none');
+      const lit = all.filter((n) => !n.classList.contains('dimmed'));
+      return {
+        hovered: name,
+        hoveredFolder: folderOf(g),
+        drawn: all.length,
+        lit: lit.length,
+        litFolders: [...new Set(lit.map(folderOf))],
+      };
+    },
+
+    unhoverAll() {
+      for (const g of document.querySelectorAll('g.node')) {
+        g.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+      }
+      return document.querySelectorAll('g.node.dimmed').length;
+    },
+
+    /** Folder hulls (UI-055): what is outlined, what it is called, and
+     *  where it sits in paint order. */
+    hulls() {
+      const gs = [...document.querySelectorAll('g.folder-hull')];
+      return gs.map((g) => {
+        const path = g.querySelector('path.hull-shape');
+        const text = g.querySelector('text.hull-label');
+        const cs = path ? getComputedStyle(path) : null;
+        return {
+          label: text?.textContent?.trim() ?? null,
+          // The full directory, which the label does not carry — it shows the
+          // last segment only. Ancestry questions need this (UI-070).
+          path: g.getAttribute('data-path'),
+          parent: g.classList.contains('parent'),
+          d: path?.getAttribute('d')?.slice(0, 12) ?? null,
+          fillOpacity: path ? Number(path.getAttribute('fill-opacity')) : null,
+          fill: cs?.fill ?? null,
+          pointerEvents: cs?.pointerEvents ?? null,
+          fontSize: text ? getComputedStyle(text).fontSize : null,
+        };
+      });
+    },
+
+    /** For each drawn outline, how many visible nodes inside it belong to
+     *  that folder versus another one.
+     *
+     *  Uses `isPointInFill` against the rendered curve rather than
+     *  re-deriving the polygon, so it measures the shape the user sees.
+     *  This is the check whose absence let the first build pass: outlines
+     *  were counted, named and painted in the right order while being five
+     *  overlapping sheets that enclosed each other's nodes. */
+    hullPurity() {
+      const nodes = this.nodePositions().filter((n) => n.folder !== null);
+
+      return [...document.querySelectorAll('g.folder-hull')].map((g) => {
+        const path = g.querySelector('path.hull-shape');
+        const label = g.querySelector('text')?.textContent?.trim() ?? null;
+        // The region's directory, read off the element rather than guessed
+        // from the label. The label carries the last segment only, so
+        // matching on it could not tell `ui/src/stores` from any other
+        // `stores`, and — since UI-070 — could not tell a region's own
+        // descendants from strangers either.
+        const dir = g.getAttribute('data-path');
+        if (!path || !path.isPointInFill) return { label, path: dir, own: 0, foreign: 0, share: null };
+        let own = 0, foreign = 0;
+        for (const n of nodes) {
+          let inside = false;
+          try { inside = path.isPointInFill(new DOMPoint(n.x, n.y)); } catch { inside = false; }
+          if (!inside) continue;
+          // A node under this region is its own: a parent outline is supposed
+          // to contain its children's nodes.
+          const mine = dir === null
+            ? false
+            : n.folder === dir || (dir === '' ? true : n.folder.startsWith(`${dir}/`));
+          if (mine) own++; else foreign++;
+        }
+        return { label, path: dir, own, foreign, share: own + foreign ? foreign / (own + foreign) : null };
+      });
+    },
+
+    /** Index of the hull layer among the canvas's top-level groups. Lower
+     *  means painted earlier, i.e. further back. */
+    hullPaintOrder() {
+      const root = document.querySelector('.graph-container svg > g');
+      if (!root) return null;
+      const kids = [...root.children].map((c) => c.getAttribute('class'));
+      return { order: kids, hulls: kids.indexOf('file-hulls'), nodes: kids.indexOf('nodes-group'), links: kids.indexOf('links-group') };
+    },
+
+    /** Font size of an entity name label, to compare against a hull label. */
+    nameLabelFontSize() {
+      const t = document.querySelector('g.node text.name-label');
+      return t ? getComputedStyle(t).fontSize : null;
+    },
+
+    setHulls(on) {
+      const cb = document.querySelector('[data-probe="hulls-toggle"]');
+      if (!cb) return false;
+      if (cb.checked !== on) cb.click();
+      return cb.checked === on;
+    },
+
+    /** How many tiers of the folder tree get an outline (UI-070). */
+    setHullDepth(n) {
+      const b = document.querySelector(`[data-probe="hull-depth-${n}"]`);
+      if (!b) return false;
+      b.click();
+      return b.getAttribute('aria-pressed') === 'true';
+    },
+
+    hullDepthState() {
+      return [...document.querySelectorAll('[data-probe^="hull-depth-"]')].map((b) => ({
+        depth: Number(b.getAttribute('data-probe').replace('hull-depth-', '')),
+        label: b.textContent.trim(),
+        active: b.getAttribute('aria-pressed') === 'true',
+      }));
+    },
+
+    setCohesion(level) {
+      const b = document.querySelector(`[data-probe="cohesion-${level}"]`);
+      if (!b) return false;
+      b.click();
+      return true;
+    },
+
+    cohesionState() {
+      return [...document.querySelectorAll('[data-probe="cohesion"] .seg-btn')]
+        .map((b) => ({ label: b.textContent.trim(), active: b.getAttribute('aria-pressed') === 'true' }));
+    },
+
+    /** Turn the diff filters off, and report whether a diff was active.
+     *
+     *  Originally a workaround: with a diff loaded, File and Module
+     *  aggregation drew nothing at all, so a layout suite measured an empty
+     *  canvas. UI-064 fixed that — collapsed nodes now resolve through a
+     *  scope rollup instead of missing an entity-keyed lookup.
+     *
+     *  It stays because the layout suites want *every* node in the scope,
+     *  not the changed ones. With `diffCoreOnly` defaulting to true, a
+     *  suite that did not clear it would now measure a real but partial
+     *  canvas — which is worse than an obviously empty one. */
+    clearDiffFilters() {
+      const boxes = [...document.querySelectorAll('.diff-filter-group input[type=checkbox]')];
+      let cleared = 0;
+      for (const cb of boxes) {
+        if (!cb.checked) continue;
+        cb.click();
+        cleared++;
+      }
+      return { diffActive: boxes.length > 0, cleared };
+    },
+
+    /** Set the two diff filter checkboxes and report where they landed.
+     *  Order matches the bar: [Changes, Core]. */
+    setDiffFilters(want) {
+      const boxes = [...document.querySelectorAll('.diff-filter-group input[type=checkbox]')];
+      want.forEach((on, i) => { if (boxes[i] && boxes[i].checked !== on) boxes[i].click(); });
+      return boxes.map((b) => b.checked);
+    },
+
+    /** Enough of the diff bar to tell "no diff loaded" from "diff loaded and
+     *  drawing nothing" — the two look identical on the canvas and only one
+     *  of them is a bug. */
+    diffState() {
+      const boxes = [...document.querySelectorAll('.diff-filter-group input[type=checkbox]')];
+      const nodes = [...document.querySelectorAll('g.node')];
+      return {
+        active: boxes.length > 0,
+        filters: boxes.map((b) => b.checked),
+        dom: nodes.length,
+        shown: nodes.filter((n) => getComputedStyle(n).display !== 'none').length,
+        level: [...document.querySelectorAll('button.level-btn')]
+          .find((b) => b.classList.contains('active'))?.textContent.trim() ?? null,
+      };
+    },
+
+    /** Persisted like the theme — raw, not JSON (settings.ts). Set this
+     *  before a reload to control the strength the next load starts at. */
+    storeCohesion(level) {
+      try { localStorage.setItem('nao-folder-cohesion', level); } catch { /* ignore */ }
+      return localStorage.getItem('nao-folder-cohesion') === level;
     },
 
     // ── actions ──────────────────────────────────────────────────────────
@@ -668,6 +1243,124 @@ async function expandFileTree(page, path) {
     await sleep(300);
   }
 }
+
+/**
+ * Clear the diff filters once they actually exist.
+ *
+ * The diff loads asynchronously after a scope pick, so a single immediate
+ * call can run before the bar is in the DOM, silently do nothing, and show
+ * up thousands of milliseconds later as an empty canvas that looks like a
+ * layout failure. Polls until it clears something or until nodes are
+ * visible (a clean tree loads no diff and needs no clearing). See UI-061.
+ */
+async function clearDiff(page) {
+  for (let i = 0; i < 12; i++) {
+    const r = await page.eval(() => window.__probe.clearDiffFilters());
+    if (r.cleared > 0) return r;
+    const n = await page.eval(() => window.__probe.nodePositions().length);
+    if (n > 0) return { diffActive: r.diffActive, cleared: 0, nodes: n };
+    await sleep(1000);
+  }
+  return { diffActive: false, cleared: 0 };
+}
+
+/**
+ * Wait until the force simulation stops moving, and report how long it took.
+ *
+ * A fixed sleep cannot stand in for this. The settle takes as long as the
+ * node count and the forces make it take, so "sleep 9s then compare two
+ * runs" is a race: sample one run mid-settle and the other after it, and the
+ * positions differ for reasons that have nothing to do with the thing under
+ * test. Polls for two consecutive identical samples instead.
+ */
+async function waitSettled(page, maxMs = 30000) {
+  let prev = null;
+  const started = Date.now();
+  while (Date.now() - started < maxMs) {
+    const now = await page.eval(() => window.__probe.nodePositions());
+    if (prev && now.length && now.length === prev.length) {
+      const by = new Map(prev.map((n) => [n.id, n]));
+      let worst = 0;
+      for (const n of now) {
+        const p = by.get(n.id);
+        if (!p) { worst = Infinity; break; }
+        worst = Math.max(worst, Math.hypot(n.x - p.x, n.y - p.y));
+      }
+      if (worst < 0.5) return { settledMs: Date.now() - started, nodes: now.length };
+    }
+    prev = now;
+    await sleep(500);
+  }
+  return { settledMs: -1, nodes: prev?.length ?? 0 };
+}
+
+/**
+ * The top-level scope row holding the most entities.
+ *
+ * Resolved once and reused, so every level in a run measures the same scope —
+ * comparing two cohesion settings across two different scopes would be
+ * measuring nothing.
+ */
+async function widestScope(page) {
+  if (widestScope.chosen) return widestScope.chosen;
+  const rows = await page.eval(() => window.__probe.scopeRowCounts());
+  let best = null;
+  for (const r of rows) {
+    if (!best || r.entities > best.entities) best = r;
+  }
+  widestScope.chosen = best?.path ?? '.';
+  return widestScope.chosen;
+}
+widestScope.chosen = null;
+
+/**
+ * Settle one cohesion level from a fresh page load, and report both grouping
+ * numbers for it (UI-069).
+ *
+ * A fresh load per level, rather than clicking the control on a live graph.
+ * Toggling restarts alpha at 0.3 from wherever the previous setting left the
+ * nodes, so the measurement inherits that local minimum: measured that way,
+ * one configuration scored anywhere in a ±0.08 band across runs and the
+ * suite flapped between pass and fail on unchanged code. Reloading gives
+ * every level the identical UI-053 seed to start from.
+ *
+ * The scope is the biggest top-level row rather than a name written here.
+ * Kinship needs folders nested two deep *inside* the scope, and which row
+ * offers that is a property of the payload, not of this repo: today the
+ * largest is `.`, because one analyze run spells 9,445 of its entities
+ * `./src/…` and the rest plainly (AN-015). Naming a folder here would tie
+ * the suite to that bug and break the day it is fixed. Picking the largest
+ * subtree keeps working either way, and a scope that genuinely has no depth
+ * — `ui`, whose folders all sit directly under `ui/src` — is reported as
+ * such by the first check rather than measured as a failure.
+ *
+ * Cached per level for the process, because each call costs a page load and
+ * a full settle, and three checks want the same two numbers.
+ */
+async function settledGrouping(page, level) {
+  const hit = settledGrouping.cache.get(level);
+  if (hit) return hit;
+  await page.eval((l) => window.__probe.storeCohesion(l), level);
+  await page.goto(APP); await ready(page);
+  const scope = await widestScope(page);
+  // Idempotent, because the scope selection persists across reloads and the
+  // checkbox *toggles*: clicking a row a previous measurement already
+  // selected deselects it, and the canvas comes back holding one file. That
+  // failure looks exactly like a layout bug and is not one.
+  const scoped = await page.eval((p) => window.__probe.scopeRowState(p), scope);
+  if (!scoped?.checked) await page.eval((p) => window.__probe.toggleScopePath(p), scope);
+  // See `clearDiff` / UI-061 — a dirty working tree otherwise hides every
+  // node at File aggregation and this suite measures an empty canvas.
+  await clearDiff(page);
+  await waitSettled(page);
+  const out = {
+    kinship: await page.eval(() => window.__probe.kinshipRatio()),
+    cohesion: await page.eval(() => window.__probe.cohesionRatio()),
+  };
+  settledGrouping.cache.set(level, out);
+  return out;
+}
+settledGrouping.cache = new Map();
 
 async function ready(page, ms = 6000) {
   await page.eval(installProbeLib);
@@ -2158,12 +2851,1166 @@ const SUITES = {
       },
     ],
   },
+
+  'ui-052': {
+    ticket: 'UI-052', title: 'Folder cohesion force',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      // See `clearDiff` / UI-061 — a dirty working tree otherwise hides every
+      // node at File aggregation and this suite measures an empty canvas.
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'canvas-has-nodes',
+        criterion: 'The scope actually drew something to measure',
+        async run(page) {
+          const r = await page.eval(() => window.__probe.cohesionRatio());
+          return ok(!!r?.ratio, r, r?.ratio ? '' : 'empty canvas — every later number here is meaningless');
+        },
+      },
+      {
+        id: 'control-present',
+        criterion: 'A four-step cohesion control is in the sidebar, one step active',
+        async run(page) {
+          const segs = await page.eval(() => window.__probe.cohesionState());
+          const active = segs.filter((s) => s.active);
+          return ok(segs.length === 4 && active.length === 1, segs,
+            segs.length ? '' : 'no cohesion control — is it inside the Graph Visualization block?');
+        },
+      },
+      {
+        id: 'strength-tightens-folders',
+        criterion: 'Same-folder nodes sit closer at High than at Off',
+        async run(page) {
+          // Measured, not inferred from the control's state: the whole claim
+          // of UI-052 is that the layout changes, and a pressed button proves
+          // nothing about where the nodes went.
+          await page.eval(() => window.__probe.setCohesion('off'));
+          await waitSettled(page);
+          const off = await page.eval(() => window.__probe.cohesionRatio());
+          await page.eval(() => window.__probe.setCohesion('high'));
+          await waitSettled(page);
+          const high = await page.eval(() => window.__probe.cohesionRatio());
+          if (!off?.ratio || !high?.ratio) return ok(false, { off, high }, 'no same-folder pairs to measure');
+          const pass = high.ratio < off.ratio * 0.9;
+          return ok(pass, { offRatio: +off.ratio.toFixed(3), highRatio: +high.ratio.toFixed(3), nodes: high.nodes },
+            pass ? '' : 'cohesion did not visibly tighten folders');
+        },
+      },
+      {
+        id: 'grouping-hides-nothing',
+        criterion: 'Changing strength moves nodes without removing any',
+        async run(page) {
+          await page.eval(() => window.__probe.setCohesion('off'));
+          await sleep(3000);
+          const before = await page.eval(() => window.__probe.renderedNodes());
+          await page.eval(() => window.__probe.setCohesion('high'));
+          await sleep(3000);
+          const after = await page.eval(() => window.__probe.renderedNodes());
+          return ok(before === after, { before, after },
+            before === after ? '' : 'the node count moved — this is a layout control, not a filter');
+        },
+      },
+      {
+        id: 'restores-default',
+        criterion: 'The suite leaves the persisted strength back at its default',
+        async run(page) {
+          // Clicking a segment persists it (settings.ts), so a suite that
+          // ends on High hands High to whatever runs next. Suites already
+          // leak enough state into each other without adding to it.
+          await page.eval(() => window.__probe.setCohesion('low'));
+          await sleep(500);
+          const segs = await page.eval(() => window.__probe.cohesionState());
+          const active = segs.find((s) => s.active);
+          return ok(active?.label === 'Low', segs);
+        },
+      },
+    ],
+  },
+
+  'ui-069': {
+    ticket: 'UI-069', title: 'Cohesion follows the folder tree, not one folder',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      settledGrouping.cache.clear();
+      widestScope.chosen = null;
+      // A first load purely so `__probe` exists to write the persisted level
+      // with. Every measurement below then starts from its own reload.
+      await page.goto(APP); await ready(page);
+    },
+    checks: [
+      {
+        id: 'both-populations-drawn',
+        criterion: 'The scope drew related and unrelated folder pairs to compare',
+        async run(page) {
+          const { kinship } = await settledGrouping(page, 'low');
+          return ok(!!kinship?.ratio, kinship,
+            kinship?.ratio ? '' : `kinPairs=${kinship?.kinPairs} farPairs=${kinship?.farPairs} — this scope has no tree depth, so every number below is meaningless`);
+        },
+      },
+      {
+        id: 'subtrees-stay-together',
+        criterion: 'Folders inside one subtree stay closer than folders sharing none',
+        async run(page) {
+          // Deliberately *not* an off-versus-high comparison, though that is
+          // the obvious shape and was the first build. Raising the strength
+          // also contracts every leaf folder into a ball, and a ball's members
+          // cannot approach each other past the collision radius while
+          // unrelated pairs go on contracting — so that comparison conflates
+          // UI-052's effect with UI-069's and cannot attribute what it sees.
+          //
+          // The attributable measurement is nested against flat at a fixed
+          // strength, made by building with `MAX_TIERS` at 4 and at 1. On this
+          // repo's widest scope (219 files, 12,564 kin pairs, 10,198 far
+          // pairs):
+          //
+          //            flat    nested
+          //   low      0.502   0.484
+          //   high     0.464   0.376
+          //
+          // The ancestor tiers are worth 19% of the ratio at High, and the
+          // effect grows with strength, which is what a real force does. That
+          // comparison needs a build flag, so it cannot live in a suite; the
+          // control version of it is in `graph-grouping.test.ts` ("kinship
+          // comes from the tree, not from the arithmetic").
+          //
+          // What is left for the browser is the standing property: a subtree
+          // is not scattered. The threshold sits well above the measured 0.484
+          // so a payload with weaker folder-call correlation still passes, and
+          // well below 1.0 so a change that starts flinging subtrees apart
+          // fails loudly.
+          const k = (await settledGrouping(page, 'low')).kinship;
+          if (!k?.ratio) return ok(false, k, 'no pairs to measure');
+          return ok(k.ratio < 0.75, { ratio: +k.ratio.toFixed(3), kinPairs: k.kinPairs, farPairs: k.farPairs },
+            k.ratio < 0.75 ? '' : 'subtrees are no more clustered than unrelated folders');
+        },
+      },
+      {
+        id: 'leaves-still-tighten',
+        criterion: 'Nesting did not cost UI-052 its own property',
+        async run(page) {
+          // The ancestor pull takes a share of a strength that used to go
+          // entirely to the leaf. If that share loosens the leaf folders,
+          // UI-069 bought kinship by spending the thing UI-052 built and the
+          // hulls depend on.
+          const off = (await settledGrouping(page, 'off')).cohesion;
+          const high = (await settledGrouping(page, 'high')).cohesion;
+          if (!off?.ratio || !high?.ratio) return ok(false, { off, high }, 'no same-folder pairs to measure');
+          const pass = high.ratio < off.ratio * 0.9;
+          return ok(pass, { offRatio: +off.ratio.toFixed(3), highRatio: +high.ratio.toFixed(3) },
+            pass ? '' : 'folders stopped tightening — the ancestor tiers took the leaf pull');
+        },
+      },
+      {
+        id: 'grouping-hides-nothing',
+        criterion: 'Strength moves nodes without removing any',
+        async run(page) {
+          const off = (await settledGrouping(page, 'off')).kinship;
+          const high = (await settledGrouping(page, 'high')).kinship;
+          return ok(off.rendered === high.rendered, { off: off.rendered, high: high.rendered },
+            off.rendered === high.rendered ? '' : 'the node count moved — this is a layout control, not a filter');
+        },
+      },
+      {
+        id: 'restores-default',
+        criterion: 'The suite leaves the persisted strength back at its default',
+        async run(page) {
+          // The measurements above write the level to localStorage, so a
+          // suite that ends on High hands High to whatever runs next. These
+          // suites already leak enough state into each other.
+          await page.eval(() => window.__probe.storeCohesion('low'));
+          await page.goto(APP); await ready(page);
+          const segs = await page.eval(() => window.__probe.cohesionState());
+          const active = segs.find((s) => s.active);
+          return ok(active?.label === 'Low', segs);
+        },
+      },
+    ],
+  },
+
+  'ui-053': {
+    ticket: 'UI-053', title: 'Folder-seeded initial positions',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      // Cohesion off for the whole suite. With the force running, any
+      // clustering could come from the seed or from the force, and this
+      // suite is only about the seed.
+      await page.goto(APP); await ready(page);
+      await page.eval(() => window.__probe.storeCohesion('off'));
+      await page.goto(APP); await ready(page);
+      // Before the scope pick, deliberately. The simulation runs whether or
+      // not the nodes are displayed, so clearing the diff *after* the graph
+      // is built would hand us an already-settled layout and there would be
+      // no first frames left to measure. See UI-061.
+      await clearDiff(page);
+    },
+    checks: [
+      {
+        id: 'structure-before-settling',
+        criterion: 'Folders are already grouped in the first frames, with the force off',
+        async run(page) {
+          await page.eval((n) => window.__probe.pickScope(n), 'ui');
+          // Measure the moment nodes exist rather than at a fixed delay: the
+          // publish takes as long as it takes, and a fixed sleep either
+          // measures an empty canvas or a settled one depending on the day.
+          let seen = 0;
+          for (let i = 0; i < 60; i++) {
+            seen = await page.eval(() => window.__probe.nodePositions().length);
+            if (seen > 0) break;
+            await sleep(200);
+          }
+          const early = await page.eval(() => window.__probe.cohesionRatio());
+          if (!early?.ratio) return ok(false, early, 'no same-folder pairs to measure');
+          const pass = early.ratio < 0.85;
+          return ok(pass, { ratio: +early.ratio.toFixed(3), nodes: early.nodes },
+            pass ? '' : 'the seed carried no folder structure — did nodes start on the index spiral?');
+        },
+      },
+      {
+        id: 'stable-across-reloads',
+        criterion: 'The same scope settles to the same picture twice',
+        async run(page) {
+          // Note: this passes on pre-UI-053 builds too — identical data gives
+          // an identical phyllotaxis spiral. It guards against the seed
+          // introducing instability; the improvement it was written for
+          // (invariance to node array order) is asserted in the unit suite.
+          // Both samples are taken from a stopped simulation, not from a
+          // fixed delay — see `waitSettled`.
+          const settleA = await waitSettled(page);
+          const first = await page.eval(() => window.__probe.nodePositions());
+          await page.goto(APP); await ready(page);
+          await clearDiff(page);
+          await page.eval((n) => window.__probe.pickScope(n), 'ui');
+          const settleB = await waitSettled(page);
+          const second = await page.eval(() => window.__probe.nodePositions());
+          if (settleA.settledMs < 0 || settleB.settledMs < 0) {
+            return ok(false, { settleA, settleB }, 'the simulation never came to rest — cannot compare');
+          }
+          if (!first.length || !second.length) {
+            return ok(false, { first: first.length, second: second.length }, 'a canvas was empty — nothing to compare');
+          }
+
+          const byId = new Map(second.map((n) => [n.id, n]));
+          let compared = 0, moved = 0, worst = 0;
+          for (const a of first) {
+            const b = byId.get(a.id);
+            if (!b) continue;
+            compared++;
+            const d = Math.hypot(a.x - b.x, a.y - b.y);
+            if (d > worst) worst = d;
+            if (d > 40) moved++;
+          }
+          const pass = compared > 0 && moved / compared < 0.1;
+          return ok(pass, { compared, moved, worst: Math.round(worst), settleA, settleB },
+            pass ? '' : 'the same scope drew a different picture on reload');
+        },
+      },
+      {
+        id: 'restores-default',
+        criterion: 'The suite leaves the persisted strength back at its default',
+        async run(page) {
+          const restored = await page.eval(() => window.__probe.storeCohesion('low'));
+          return ok(restored === true, restored);
+        },
+      },
+    ],
+  },
+
+  'ui-070': {
+    ticket: 'UI-070', title: 'Regions at more than one tier',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      // The widest scope, for the reason ui-069 gives: tiers need folders
+      // nested inside the scope, and which top-level row offers that is a
+      // property of the payload rather than a name worth hard-coding.
+      const scope = await widestScope(page);
+      const scoped = await page.eval((p) => window.__probe.scopeRowState(p), scope);
+      if (!scoped?.checked) await page.eval((p) => window.__probe.toggleScopePath(p), scope);
+      await clearDiff(page);
+      // High cohesion for the same reason ui-055 uses it: zero outlines is a
+      // legitimate outcome of a layout whose groups are not separable, so
+      // asserting on the default setting would test the dataset.
+      await page.eval(() => window.__probe.setCohesion('high'));
+      await page.eval(() => window.__probe.setHulls(true));
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'depth-control-present',
+        criterion: 'A tier control sits with the outline toggle, one step active',
+        async run(page) {
+          const segs = await page.eval(() => window.__probe.hullDepthState());
+          const active = segs.filter((s) => s.active);
+          return ok(segs.length >= 2 && active.length === 1, segs,
+            segs.length ? '' : 'no tier control — is it inside the Graph Visualization block?');
+        },
+      },
+      {
+        id: 'one-tier-draws-only-real-folders',
+        criterion: 'At one tier every region is a folder that holds a drawn node',
+        async run(page) {
+          // What "one tier" claims, stated exactly. Not "no region contains
+          // another": a folder holding both files and a drawn subfolder is a
+          // parent at any setting, because it genuinely is one — `ui/src` has
+          // loose files *and* `ui/src/stores` under it. The tier count is how
+          // far *above* a node's own folder an outline may sit, so at one
+          // tier no region may be a pure ancestor.
+          await page.eval(() => window.__probe.setHullDepth(1));
+          await sleep(1500);
+          const [hulls, nodes] = await Promise.all([
+            page.eval(() => window.__probe.hulls()),
+            page.eval(() => window.__probe.nodePositions()),
+          ]);
+          const held = new Set(nodes.map((n) => n.folder));
+          const drawn = hulls.filter((h) => h.d && h.path !== null);
+          const invented = drawn.filter((h) => !held.has(h.path)).map((h) => h.path);
+          return ok(invented.length === 0, { drawn: drawn.length, invented },
+            invented.length === 0 ? '' : `${invented.join(', ')} hold no drawn file of their own`);
+        },
+      },
+      {
+        id: 'a-tier-adds-regions',
+        criterion: 'Raising the tier count outlines the subtrees around the folders',
+        async run(page) {
+          await page.eval(() => window.__probe.setHullDepth(1));
+          await sleep(1500);
+          const one = await page.eval(() => window.__probe.hulls());
+          await page.eval(() => window.__probe.setHullDepth(2));
+          await sleep(1500);
+          const two = await page.eval(() => window.__probe.hulls());
+          const parents = two.filter((h) => h.d && h.parent);
+          // Every region drawn at one tier must still be drawn at two: a tier
+          // is an addition, never a replacement.
+          const kept = one.filter((h) => h.d).every((h) => two.some((t) => t.path === h.path && t.d));
+          const pass = parents.length > 0 && kept;
+          return ok(pass, { atOne: one.filter((h) => h.d).length, atTwo: two.filter((h) => h.d).length, parents: parents.map((p) => p.path) },
+            parents.length === 0 ? 'no subtree got an outline — is the foreign-share test still rejecting ancestors?' : (kept ? '' : 'a leaf region disappeared when the tier was added'));
+        },
+      },
+      {
+        id: 'a-parent-contains-its-children',
+        criterion: 'A parent region is mostly its own subtree, not a lasso',
+        async run(page) {
+          // The UI-055 guard, retested one tier up. A descendant is not
+          // foreign — that is the whole change — so a parent that fails this
+          // is enclosing other subtrees rather than its own.
+          const purity = await page.eval(() => window.__probe.hullPurity());
+          const parents = purity.filter((p) => p.share !== null && p.path && p.path.indexOf('/') === -1);
+          const worst = parents.reduce((w, p) => (w === null || p.share > w.share ? p : w), null);
+          const pass = parents.length === 0 || worst.share <= 0.35;
+          return ok(pass, { parents: parents.map((p) => ({ path: p.path, own: p.own, foreign: p.foreign, share: +p.share.toFixed(2) })) },
+            pass ? '' : `${worst.path} is ${Math.round(worst.share * 100)}% other subtrees`);
+        },
+      },
+      {
+        id: 'parents-read-as-headings',
+        criterion: 'A parent is outline-only, and its name is the larger one',
+        async run(page) {
+          const hulls = await page.eval(() => window.__probe.hulls());
+          const parents = hulls.filter((h) => h.d && h.parent);
+          const leaves = hulls.filter((h) => h.d && !h.parent);
+          if (!parents.length || !leaves.length) return ok(false, { parents: parents.length, leaves: leaves.length }, 'no nesting drawn to compare');
+          // No wash on a parent: three nested fills stack into a tint over
+          // the innermost nodes and start shifting what their metric colours
+          // appear to say.
+          const unfilled = parents.every((p) => p.fillOpacity === 0);
+          const bigger = parseFloat(parents[0].fontSize) > parseFloat(leaves[0].fontSize);
+          return ok(unfilled && bigger,
+            { parentFill: parents[0].fillOpacity, leafFill: leaves[0].fillOpacity, parentFont: parents[0].fontSize, leafFont: leaves[0].fontSize },
+            unfilled ? (bigger ? '' : 'a parent name is not set apart from its children') : 'a parent region is filled, and the washes stack');
+        },
+      },
+      {
+        id: 'painted-outside-in',
+        criterion: 'A parent is painted before the regions inside it',
+        async run(page) {
+          const hulls = await page.eval(() => window.__probe.hulls());
+          const drawn = hulls.filter((h) => h.d);
+          let violation = null;
+          drawn.forEach((h, i) => {
+            if (!h.parent || !h.path) return;
+            const child = drawn.findIndex((c, j) => j < i && c.path && c.path.startsWith(`${h.path}/`));
+            if (child !== -1) violation = { parent: h.path, buriedBy: drawn[child].path };
+          });
+          return ok(violation === null, { drawn: drawn.length, violation },
+            violation ? `${violation.parent} was painted over ${violation.buriedBy}` : '');
+        },
+      },
+      {
+        id: 'tiers-hide-nothing',
+        criterion: 'Adding a tier draws no fewer nodes',
+        async run(page) {
+          await page.eval(() => window.__probe.setHullDepth(1));
+          await sleep(1200);
+          const before = await page.eval(() => window.__probe.renderedNodes());
+          await page.eval(() => window.__probe.setHullDepth(3));
+          await sleep(1200);
+          const after = await page.eval(() => window.__probe.renderedNodes());
+          return ok(before === after, { before, after },
+            before === after ? '' : 'the node count moved — regions are an overlay, not a filter');
+        },
+      },
+      {
+        id: 'restores-default',
+        criterion: 'The suite leaves the persisted tier count back at its default',
+        async run(page) {
+          await page.eval(() => window.__probe.setHullDepth(2));
+          await sleep(500);
+          const segs = await page.eval(() => window.__probe.hullDepthState());
+          return ok(segs.find((s) => s.active)?.depth === 2, segs);
+        },
+      },
+    ],
+  },
+
+  'ui-055': {
+    ticket: 'UI-055', title: 'Named hulls behind folder groups',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      // High cohesion for the checks that need a region to exist. Zero
+      // outlines is a *legitimate* outcome of this design — a group that
+      // isn't spatially separable earns none — so asserting "at least one"
+      // at whatever the default happens to yield tests the dataset, not the
+      // feature. High is where separability is the expected outcome.
+      await page.eval(() => window.__probe.setCohesion('high'));
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'regions-are-outlined',
+        criterion: 'Separable folder groups get an outline',
+        async run(page) {
+          await page.eval(() => window.__probe.setHulls(true));
+          await sleep(1200);
+          const hulls = await page.eval(() => window.__probe.hulls());
+          const drawn = hulls.filter((h) => h.d);
+          // Not a fixed count. How many regions exist is a property of the
+          // layout, and the whole design is that a group which is not
+          // spatially separable gets no outline rather than a bad one.
+          return ok(drawn.length >= 1, { hulls: hulls.length, drawn: drawn.length },
+            drawn.length >= 1 ? '' : 'no outlines at all — is the hull layer being cleared?');
+        },
+      },
+      {
+        id: 'no-outline-is-a-lasso',
+        criterion: 'Every outline is mostly its own folder, not a lasso round the middle',
+        async run(page) {
+          const purity = await page.eval(() => window.__probe.hullPurity());
+          const bad = purity.filter((p) => p.share !== null && p.share > 0.5);
+          return ok(purity.length > 0 && bad.length === 0, purity,
+            bad.length === 0 ? '' : `${bad.map((b) => b.label).join(', ')} enclose mostly other folders`);
+        },
+      },
+      {
+        id: 'regions-earn-their-outline',
+        criterion: 'Raising cohesion does not reduce how many regions are drawn',
+        async run(page) {
+          // The self-regulating claim: separability is what earns an
+          // outline, so tightening the layout may add regions and must
+          // never remove them.
+          await page.eval(() => window.__probe.setCohesion('off'));
+          await waitSettled(page);
+          const off = (await page.eval(() => window.__probe.hulls())).length;
+          await page.eval(() => window.__probe.setCohesion('high'));
+          await waitSettled(page);
+          const high = (await page.eval(() => window.__probe.hulls())).length;
+          await page.eval(() => window.__probe.setCohesion('high'));
+          await waitSettled(page);
+          return ok(high >= off, { off, high },
+            high >= off ? '' : 'tightening the layout removed regions');
+        },
+      },
+      {
+        id: 'regions-are-named',
+        criterion: 'Every outline carries the folder name',
+        async run(page) {
+          const hulls = await page.eval(() => window.__probe.hulls());
+          const named = hulls.filter((h) => h.label && h.label.length > 0);
+          return ok(hulls.length > 0 && named.length === hulls.length,
+            hulls.map((h) => h.label),
+            named.length === hulls.length ? '' : 'an outline has no label — the name is the point of the ticket');
+        },
+      },
+      {
+        id: 'label-is-not-an-entity-name',
+        criterion: 'A region name cannot be mistaken for an entity name',
+        async run(page) {
+          const [hulls, nameSize] = await Promise.all([
+            page.eval(() => window.__probe.hulls()),
+            page.eval(() => window.__probe.nameLabelFontSize()),
+          ]);
+          const hullSize = hulls[0]?.fontSize;
+          const upper = hulls.every((h) => h.label === h.label.toUpperCase());
+          const pass = !!hullSize && hullSize !== nameSize && upper;
+          return ok(pass, { hullSize, nameSize, upper },
+            pass ? '' : 'hull labels read like node labels');
+        },
+      },
+      {
+        id: 'painted-behind-everything',
+        criterion: 'Outlines sit behind links and nodes',
+        async run(page) {
+          const o = await page.eval(() => window.__probe.hullPaintOrder());
+          const pass = o && o.hulls >= 0 && o.hulls < o.links && o.hulls < o.nodes;
+          return ok(pass, o, pass ? '' : 'the hull layer is not the backmost group');
+        },
+      },
+      {
+        id: 'does-not-steal-clicks',
+        criterion: 'Outlines are not hit-testable, so click-to-deselect survives',
+        async run(page) {
+          // A hittable hull covers most of the canvas and would silently
+          // break the background-click deselect, which only fires when the
+          // event target is the <svg> itself.
+          const hulls = await page.eval(() => window.__probe.hulls());
+          const pass = hulls.length > 0 && hulls.every((h) => h.pointerEvents === 'none');
+          return ok(pass, hulls.map((h) => h.pointerEvents), pass ? '' : 'a hull is hit-testable');
+        },
+      },
+      {
+        id: 'fill-does-not-claim-the-colour-channel',
+        criterion: 'The wash is faint enough not to read as node colour',
+        async run(page) {
+          const hulls = await page.eval(() => window.__probe.hulls());
+          const worst = Math.max(...hulls.map((h) => h.fillOpacity ?? 0));
+          return ok(worst > 0 && worst <= 0.12, { worst },
+            worst <= 0.12 ? '' : 'hull fill is strong enough to shift how a node reads');
+        },
+      },
+      {
+        id: 'restores-default-cohesion',
+        criterion: 'The suite leaves the persisted strength back at its default',
+        async run(page) {
+          await page.eval(() => window.__probe.setCohesion('low'));
+          await sleep(500);
+          const segs = await page.eval(() => window.__probe.cohesionState());
+          return ok(segs.find((x) => x.active)?.label === 'Low', segs);
+        },
+      },
+      {
+        id: 'toggle-removes-them',
+        criterion: 'Turning the control off leaves no outline behind',
+        async run(page) {
+          await page.eval(() => window.__probe.setHulls(false));
+          await sleep(1000);
+          const off = await page.eval(() => window.__probe.hulls());
+          await page.eval(() => window.__probe.setHulls(true));
+          await sleep(1200);
+          const on = await page.eval(() => window.__probe.hulls());
+          const pass = off.length === 0 && on.length > 0;
+          return ok(pass, { off: off.length, on: on.length },
+            pass ? '' : 'the toggle did not fully clear or restore the layer');
+        },
+      },
+    ],
+  },
+
+  'ui-064': {
+    ticket: 'UI-064', title: 'A loaded diff must not blank the collapsed canvas',
+    // Needs a diff. `nao watch` picks up an existing diff.json at boot; if
+    // there isn't one, compute HEAD → working first:
+    //   curl -XPOST localhost:3000/api/diff -H 'content-type: application/json' \
+    //        -d '{"from_ref":"HEAD","to_ref":"WORKING"}'
+    // Deliberately does NOT call `clearDiff` — the filters being on is the
+    // whole subject.
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await sleep(14000);
+    },
+    checks: [
+      {
+        id: 'diff-is-loaded',
+        criterion: 'A diff is active, so the rest of this suite means something',
+        async run(page) {
+          const s = await page.eval(() => window.__probe.diffState());
+          return ok(s.active, s, s.active ? '' : 'no diff bar — compute one (see the suite header) or these checks prove nothing');
+        },
+      },
+      {
+        id: 'collapsed-canvas-draws',
+        criterion: 'A scope that auto-collapses to File level draws nodes under the default filters',
+        async run(page) {
+          // The bug, exactly: `Shown: 0` on a scope that was just reported as
+          // in-scope and collapsed, with every sidebar filter permissive.
+          await page.eval((w) => window.__probe.setDiffFilters(w), [false, true]);
+          await sleep(3000);
+          const s = await page.eval(() => window.__probe.diffState());
+          return ok(s.shown > 0, s,
+            s.shown > 0 ? '' : 'diff filters emptied the collapsed canvas — the entity-keyed lookup is back');
+        },
+      },
+      {
+        id: 'filters-narrow-rather-than-erase',
+        criterion: 'core ⊆ changes ⊆ everything, with each step a real count',
+        async run(page) {
+          // A filter that hides everything and a filter that hides nothing
+          // are both easy to ship by accident. What says the rollup is being
+          // read is the ladder between them.
+          const at = async (want) => {
+            await page.eval((w) => window.__probe.setDiffFilters(w), want);
+            await sleep(2500);
+            return (await page.eval(() => window.__probe.diffState())).shown;
+          };
+          const core = await at([false, true]);
+          const changes = await at([true, false]);
+          const all = await at([false, false]);
+          const pass = core > 0 && core <= changes && changes <= all && changes < all;
+          return ok(pass, { core, changes, all },
+            pass ? '' : 'expected 0 < core ≤ changes < all — a flat ladder means the filter is not consulting the rollup');
+        },
+      },
+      {
+        id: 'clearing-restores-everything',
+        criterion: 'With both filters off, every node in the scope is back',
+        async run(page) {
+          await page.eval((w) => window.__probe.setDiffFilters(w), [false, false]);
+          await sleep(2500);
+          const s = await page.eval(() => window.__probe.diffState());
+          return ok(s.dom > 0 && s.shown === s.dom, s,
+            s.shown === s.dom ? '' : 'nodes stayed hidden with no diff filter asking for it');
+        },
+      },
+    ],
+  },
+
+  'ui-054': {
+    ticket: 'UI-054', title: 'Hover highlights the folder group',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'both-questions-offered',
+        criterion: 'Hover can answer either question, with one selected',
+        async run(page) {
+          const st = await page.eval(() => window.__probe.hoverModeState());
+          const present = st.filter((m) => m.present);
+          const active = st.filter((m) => m.active);
+          return ok(present.length === 2 && active.length === 1, st,
+            present.length === 2 ? '' : 'the hover-mode control is missing');
+        },
+      },
+      {
+        id: 'links-is-the-default',
+        criterion: 'Connections stays the default — this is an addition, not a replacement',
+        async run(page) {
+          const st = await page.eval(() => window.__probe.hoverModeState());
+          const active = st.find((m) => m.active);
+          return ok(active?.mode === 'connections', st);
+        },
+      },
+      {
+        id: 'group-mode-lights-one-folder',
+        criterion: 'In Folder mode, everything lit shares the hovered node\'s folder',
+        async run(page) {
+          await page.eval(() => window.__probe.setHoverMode('group'));
+          await sleep(400);
+          const r = await page.eval(() => window.__probe.hoverNode('displayPlan.ts'));
+          if (!r) return ok(false, r, 'displayPlan.ts not drawn — cannot hover it');
+          // The lit set must be exactly one folder, and it must be the
+          // hovered node's own.
+          const pass = r.litFolders.length === 1 && r.litFolders[0] === r.hoveredFolder && r.lit < r.drawn;
+          return ok(pass, r, pass ? '' : 'the lit set is not one folder');
+        },
+      },
+      {
+        id: 'links-mode-answers-differently',
+        criterion: 'Connections mode lights a different set from Folder mode',
+        async run(page) {
+          await page.eval(() => window.__probe.unhoverAll());
+          await page.eval(() => window.__probe.setHoverMode('connections'));
+          await sleep(400);
+          const r = await page.eval(() => window.__probe.hoverNode('displayPlan.ts'));
+          if (!r) return ok(false, r, 'displayPlan.ts not drawn');
+          // Reachability crosses folders; membership does not. If this lit
+          // exactly one folder, the two modes are not actually distinct.
+          return ok(r.litFolders.length > 1, r,
+            r.litFolders.length > 1 ? '' : 'connections mode lit a single folder — are the modes wired to the same path?');
+        },
+      },
+      {
+        id: 'hover-does-not-outlive-the-cursor',
+        criterion: 'Leaving the node restores every dimmed element',
+        async run(page) {
+          await page.eval(() => window.__probe.setHoverMode('group'));
+          await page.eval(() => window.__probe.hoverNode('displayPlan.ts'));
+          await sleep(200);
+          const stillDimmed = await page.eval(() => window.__probe.unhoverAll());
+          return ok(stillDimmed === 0, { stillDimmed },
+            stillDimmed === 0 ? '' : 'a hover-scoped dim survived mouseout');
+        },
+      },
+      {
+        id: 'depth-says-it-is-unavailable',
+        criterion: 'Highlight depth greys out in Folder mode instead of silently doing nothing',
+        async run(page) {
+          await page.eval(() => window.__probe.setHoverMode('group'));
+          await sleep(300);
+          const inGroup = await page.eval(() => window.__probe.depthEnabled());
+          await page.eval(() => window.__probe.setHoverMode('connections'));
+          await sleep(300);
+          const inLinks = await page.eval(() => window.__probe.depthEnabled());
+          const pass = inGroup.enabled === 0 && inLinks.enabled === inLinks.count && inLinks.count > 0;
+          return ok(pass, { inGroup, inLinks },
+            pass ? '' : 'depth availability does not track the hover mode');
+        },
+      },
+    ],
+  },
+
+  'ui-056': {
+    ticket: 'UI-056', title: 'Demote hub nodes',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'off-by-default',
+        criterion: 'Nothing is hidden until the reader asks for it',
+        async run(page) {
+          const list = await page.eval(() => window.__probe.demotedList());
+          return ok(list === null, { list },
+            list === null ? '' : 'edges were being hidden on first load');
+        },
+      },
+      {
+        id: 'demoting-removes-edges-not-nodes',
+        criterion: 'Turning it on draws fewer edges and the same nodes',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.drawnCounts());
+          await page.eval(() => window.__probe.setDemote(true));
+          await sleep(2500);
+          const after = await page.eval(() => window.__probe.drawnCounts());
+          const pass = after.links < before.links && after.nodes === before.nodes;
+          return ok(pass, { before, after },
+            pass ? '' : 'either no edges went away, or nodes did');
+        },
+      },
+      {
+        id: 'says-what-it-took',
+        criterion: 'The demoted nodes are named while the control is active',
+        async run(page) {
+          const list = await page.eval(() => window.__probe.demotedList());
+          const pass = !!list && /Demoted:/.test(list);
+          return ok(pass, { list },
+            pass ? '' : 'edges vanished with nothing on screen saying which');
+        },
+      },
+      {
+        id: 'a-demoted-node-is-still-a-node',
+        criterion: 'A demoted node stays drawn and stays selectable',
+        async run(page) {
+          const list = await page.eval(() => window.__probe.demotedList());
+          const listed = (list ?? '').replace(/^Demoted:\s*/, '').split(',')[0]?.trim();
+          if (!listed) return ok(false, { list }, 'no demoted name to test');
+          // The panel qualifies colliding names (`types/graph.ts`); the canvas
+          // label is the bare file name, so search on the last segment.
+          const first = listed.slice(listed.lastIndexOf('/') + 1);
+          const r = await page.eval((n) => window.__probe.nodeIsSelectable(n), first);
+          // The selection re-runs the display plan, so the class lands a tick
+          // later; read it back rather than trusting the click's own return.
+          await sleep(1500);
+          const cls = await page.eval((n) => window.__probe.nodeIsSelected(n), first);
+          // Clear it again. A selection narrows the view to a BFS around the
+          // node, and leaving one set would hand the next check a seven-node
+          // graph — which is exactly what it did on the first run.
+          await page.eval(() => window.__probe.clearSelection());
+          await waitSettled(page);
+          return ok(r.present && cls, { first, present: r.present, selected: cls },
+            r.present ? '' : 'the demoted node left the canvas');
+        },
+      },
+      {
+        id: 'count-changes-what-is-demoted',
+        criterion: 'Raising N demotes more and removes more edges',
+        async run(page) {
+          await page.eval(() => window.__probe.setHubCount(3));
+          await sleep(2000);
+          const few = await page.eval(() => window.__probe.drawnCounts());
+          await page.eval(() => window.__probe.setHubCount(10));
+          await sleep(2000);
+          const many = await page.eval(() => window.__probe.drawnCounts());
+          return ok(many.links < few.links, { few, many },
+            many.links < few.links ? '' : 'N had no effect on the picture');
+        },
+      },
+      {
+        id: 'turning-it-off-restores-everything',
+        criterion: 'The control is fully reversible',
+        async run(page) {
+          const on = await page.eval(() => window.__probe.drawnCounts());
+          await page.eval(() => window.__probe.setDemote(false));
+          await sleep(2500);
+          const off = await page.eval(() => window.__probe.drawnCounts());
+          const pass = off.links > on.links && off.nodes === on.nodes;
+          return ok(pass, { on, off }, pass ? '' : 'the graph did not come back');
+        },
+      },
+    ],
+  },
+
+  'ui-057': {
+    ticket: 'UI-057', title: 'Expand one scope without expanding all of them',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      // `src` is big enough that auto-level lands on Module, which is where
+      // opening one scope in place has something to prove.
+      await page.eval((n) => window.__probe.pickScope(n), 'src');
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'gesture-is-discoverable',
+        criterion: 'The toolbar says how to open a scope',
+        async run(page) {
+          const st = await page.eval(() => window.__probe.expansionState());
+          return ok(!!st.gesture && /double-click/i.test(st.gesture), st,
+            st.gesture ? '' : 'nothing on screen tells the reader the gesture exists');
+        },
+      },
+      {
+        id: 'one-scope-opens-the-rest-stay-shut',
+        criterion: 'Opening one scope draws its contents beside collapsed ones',
+        async run(page) {
+          // Whichever level auto-level picked, the claim is the same: after
+          // opening one scope the canvas carries *two* granularities at once.
+          // Targeting the level that is actually on screen keeps this honest
+          // on any repo — `src` here collapses to File, not Module.
+          const before = await page.eval(() => window.__probe.drawnNodeKinds());
+          const rollup = (before.Module ?? 0) > 0 ? 'Module' : 'File';
+          const target = await page.eval((k) => window.__probe.firstNodeOfKind(k), rollup);
+          if (!target) return ok(false, { before, rollup }, `no ${rollup} node to open`);
+          await page.eval((n) => window.__probe.expandNode(n), target);
+          await waitSettled(page);
+          const after = await page.eval(() => window.__probe.drawnNodeKinds());
+          const finer = Object.keys(after).filter((k) => k !== rollup);
+          const pass = (after[rollup] ?? 0) > 0 && finer.length > 0;
+          return ok(pass, { rollup, target, before, after },
+            pass ? '' : 'the view is still uniform — expansion did not take');
+        },
+      },
+      {
+        id: 'expansion-is-counted-and-reversible',
+        criterion: 'The toolbar counts open scopes and closes them again',
+        async run(page) {
+          const open = await page.eval(() => window.__probe.expansionState());
+          const opened = await page.eval(() => window.__probe.drawnNodeKinds());
+          await page.eval(() => window.__probe.collapseAll());
+          await waitSettled(page);
+          const shut = await page.eval(() => window.__probe.drawnNodeKinds());
+          // Back to one granularity, and the toolbar had counted the one
+          // scope that was open.
+          const pass = open.count === 1 && Object.keys(shut).length === 1;
+          return ok(pass, { open, opened, shut },
+            pass ? '' : 'collapsing did not restore the uniform view');
+        },
+      },
+      {
+        id: 'opening-does-not-refetch',
+        criterion: 'Opening a scope redraws; it does not reload the dataset',
+        async run(page) {
+          // The scope line reports what is *loaded*. Expansion is a drawing
+          // decision (ADR 0010) and must not move it.
+          const before = await page.eval(() => window.__probe.scopeEntities());
+          const target = await page.eval(() => window.__probe.firstNodeOfKind('Module'));
+          await page.eval((n) => window.__probe.expandNode(n), target);
+          await waitSettled(page);
+          const after = await page.eval(() => window.__probe.scopeEntities());
+          await page.eval(() => window.__probe.collapseAll());
+          await waitSettled(page);
+          return ok(before === after, { before, after },
+            before === after ? '' : 'expanding changed what is loaded');
+        },
+      },
+    ],
+  },
+
+  'ui-058': {
+    ticket: 'UI-058', title: 'Edges into a collapsed group merge into one',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'collapsed-neighbours-speak-dependency',
+        criterion: 'With everything collapsed, every edge is a dependency',
+        async run(page) {
+          const kinds = await page.eval(() => window.__probe.drawnLinkKinds());
+          const total = Object.values(kinds).reduce((a, b) => a + b, 0);
+          const pass = total > 0 && (kinds.DependsOn ?? 0) === total;
+          return ok(pass, kinds,
+            pass ? '' : '"file A calls file B" is nonsense — these should read as dependencies');
+        },
+      },
+      {
+        id: 'opened-regions-keep-their-real-kinds',
+        criterion: 'Inside an opened file, edges keep the kind they really are',
+        async run(page) {
+          const kinds0 = await page.eval(() => window.__probe.drawnNodeKinds());
+          const rollup = (kinds0.Module ?? 0) > 0 ? 'Module' : 'File';
+          const target = await page.eval((k) => window.__probe.firstNodeOfKind(k), rollup);
+          if (!target) return ok(false, { kinds0 }, `no ${rollup} node to open`);
+          await page.eval((n) => window.__probe.expandNode(n), target);
+          await waitSettled(page);
+          const kinds = await page.eval(() => window.__probe.drawnLinkKinds());
+          const specific = Object.entries(kinds).filter(([k]) => k !== 'DependsOn');
+          await page.eval(() => window.__probe.collapseAll());
+          await waitSettled(page);
+          return ok(specific.length > 0, { target, kinds },
+            specific.length > 0 ? '' : 'every edge is still DependsOn — real kinds were flattened');
+        },
+      },
+      {
+        id: 'a-merged-edge-carries-its-count',
+        criterion: 'A merged edge says how many relationships it stands for',
+        async run(page) {
+          const titles = await page.eval(() => [...document.querySelectorAll('line.link title')]
+            .map((t) => t.textContent).filter((t) => /underlying relationship/.test(t)).slice(0, 3));
+          return ok(titles.length > 0, titles,
+            titles.length > 0 ? '' : 'no merged edge reports its breakdown on hover');
+        },
+      },
+    ],
+  },
+
+  'ui-083': {
+    ticket: 'UI-083', title: 'An overview panel that says where the viewport is',
+    /**
+     * Every claim here is about the *box*, because a minimap that draws a
+     * pretty cloud and puts the box in the wrong place is worse than no
+     * minimap — it is a confident wrong answer to the one question the panel
+     * exists to answer, and nothing on screen contradicts it.
+     *
+     * The geometry itself is unit-tested (`npm run test:overview`). What
+     * needs a browser is the wiring: that the box responds to a real zoom,
+     * that a real click steers the real canvas, and that the panel is over
+     * the canvas rather than beside it.
+     */
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'panel-overlays-the-canvas',
+        criterion: 'The overview sits inside the canvas, taking no column from it',
+        async run(page) {
+          const o = await page.eval(() => window.__probe.overview());
+          return ok(!!o && o.open && o.insideCanvas === true, o,
+            o ? '' : 'no [data-probe="overview-panel"] on the page');
+        },
+      },
+      {
+        id: 'clears-the-bottom-bar',
+        criterion: 'The panel does not cover the live-status and endpoint chips',
+        async run(page) {
+          // Both want the bottom-right corner. A status indicator hidden
+          // under an opaque panel is worse than one that is absent — the page
+          // still looks like it is reporting.
+          const over = await page.eval(() => window.__probe.overlap('overview-panel', 'mode-bar'));
+          return ok(over === null, { overlap: over },
+            over === null ? '' : 'the overview is sitting on the mode bar');
+        },
+      },
+      {
+        id: 'draws-the-graph-it-summarises',
+        criterion: 'One dot per drawn node, and the same count as the canvas',
+        async run(page) {
+          const o = await page.eval(() => window.__probe.overview());
+          const drawn = await page.eval(() => window.__probe.renderedNodes());
+          // The box is a `rect`, not a `circle`, so the dot count is exact
+          // rather than off by one.
+          return ok(o?.dots === drawn && drawn > 0, { dots: o?.dots, drawn },
+            o?.dots === drawn ? '' : 'the panel and the canvas disagree about what is drawn');
+        },
+      },
+      {
+        id: 'box-starts-inside-the-panel',
+        criterion: 'The viewport box is drawn within the panel at rest',
+        async run(page) {
+          const o = await page.eval(() => window.__probe.overview());
+          const b = o?.box;
+          const pass = !!b && b.x >= -0.5 && b.y >= -0.5 &&
+            b.x + b.w <= o.map.w + 0.5 && b.y + b.h <= o.map.h + 0.5;
+          return ok(pass, { box: b, map: o?.map },
+            pass ? '' : 'the box is outside the panel — the reader is told nothing');
+        },
+      },
+      {
+        id: 'zooming-in-shrinks-the-box',
+        criterion: 'Zooming the canvas shrinks the box, and it stays inside',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.overview());
+          for (let i = 0; i < 3; i++) {
+            await page.eval(() => window.__probe.zoomCanvas('in'));
+            await sleep(500);
+          }
+          const after = await page.eval(() => window.__probe.overview());
+          const k = await page.eval(() => window.__probe.canvasTransform());
+          const inside = !!after?.box && after.box.x >= -0.5 && after.box.y >= -0.5 &&
+            after.box.x + after.box.w <= after.map.w + 0.5 &&
+            after.box.y + after.box.h <= after.map.h + 0.5;
+          // Shrunk, not merely changed: the direction is the whole claim.
+          const shrank = !!before?.box && !!after?.box && after.box.share < before.box.share;
+          return ok(shrank && inside, { before: before?.box, after: after?.box, k },
+            shrank ? (inside ? '' : 'the box left the panel once zoomed')
+              : 'the box did not shrink — it is not tracking the zoom');
+        },
+      },
+      {
+        id: 'a-click-steers-the-canvas',
+        criterion: 'Clicking a corner of the panel pans the canvas that way',
+        async run(page) {
+          // Still zoomed in from the previous check, which is the state this
+          // matters in — at 1x the whole graph is on screen and a pan has
+          // nothing to reveal.
+          const before = await page.eval(() => window.__probe.canvasTransform());
+          await page.eval(() => window.__probe.clickOverview(0.15, 0.15));
+          await sleep(400);
+          const after = await page.eval(() => window.__probe.canvasTransform());
+          // Centring on a point up and to the LEFT moves the world right and
+          // down on screen, so both translations must increase. Asserting the
+          // sign is what separates a working inverse from a sign-flipped one,
+          // which moves just as convincingly in the wrong direction.
+          const pass = after.x > before.x + 1 && after.y > before.y + 1 && after.k === before.k;
+          return ok(pass, { before, after },
+            pass ? '' : 'the click did not pan the canvas toward the point pressed');
+        },
+      },
+      {
+        id: 'the-corner-folds-away',
+        criterion: 'The panel can be collapsed and the choice sticks',
+        async run(page) {
+          await page.eval(() => window.__probe.clickText('Overview'));
+          await sleep(300);
+          const closed = await page.eval(() => window.__probe.overview());
+          await page.goto(APP); await ready(page);
+          await page.eval((n) => window.__probe.pickScope(n), 'ui');
+          await waitSettled(page);
+          const reloaded = await page.eval(() => window.__probe.overview());
+          // Put it back, so a later suite in the same run does not inherit a
+          // hidden panel.
+          await page.eval(() => window.__probe.clickText('Overview'));
+          await sleep(300);
+          const reopened = await page.eval(() => window.__probe.overview());
+          const pass = closed?.open === false && reloaded?.open === false && reopened?.open === true;
+          return ok(pass, { closed: closed?.open, reloaded: reloaded?.open, reopened: reopened?.open },
+            pass ? '' : 'the collapse state did not survive a reload');
+        },
+      },
+    ],
+  },
+
+  'ui-084': {
+    ticket: 'UI-084', title: 'Mark several files, then drill into all of them',
+    /**
+     * The claim is a *transition*: a file-level view goes to an entity-level
+     * one covering exactly the files that were picked. Every check below
+     * either drives that transition or asserts something it must not have
+     * disturbed — the pure part (which path a node stands for, what survives
+     * a level change) is unit-tested in `npm run test:marks`, and what needs
+     * a browser is the wiring between the gesture, the ring and the scope.
+     */
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      await waitSettled(page);
+      // File level is where the feature is for: the reader can see which
+      // files depend on which, and cannot see inside any of them.
+      await page.eval(() => window.__probe.setLevel('File'));
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'mark-rings-without-selecting',
+        criterion: '⌘-click rings a node and leaves the subject alone',
+        async run(page) {
+          const paths = await page.eval((n) => window.__probe.markNodes(n), 2);
+          await sleep(400);
+          const st = await page.eval(() => window.__probe.markState());
+          // `selected` is the load-bearing half. Marking that re-pointed the
+          // Details and Description panes would make building a set destroy
+          // the reading you built it from.
+          const pass = st.rings === 2 && st.marked === 2 && st.selected === 0;
+          return ok(pass, { paths, ...st },
+            pass ? '' : 'the ring and the subject did not come out independent');
+        },
+      },
+      {
+        id: 'toolbar-counts-the-set',
+        criterion: 'The toolbar offers the drill and says how big the set is',
+        async run(page) {
+          const st = await page.eval(() => window.__probe.markState());
+          const pass = /Drill into 2 marked/.test(st.button ?? '');
+          return ok(pass, st,
+            pass ? '' : 'the set has no control — a mark you cannot spend is invisible state');
+        },
+      },
+      {
+        id: 'drill-lands-at-entity-level',
+        criterion: 'Spending the set re-opens the same files as entities',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.drawnNodeKinds());
+          await page.eval(() => window.__probe.drillMarks());
+          await waitSettled(page);
+          const st = await page.eval(() => window.__probe.markState());
+          const after = await page.eval(() => window.__probe.drawnNodeKinds());
+          // Nothing in the feature names a level: two files fall under the
+          // render budget, so auto-level picks Entity on its own. A view
+          // still made of File circles means the drill did not narrow.
+          const pass = st.level === 'Entity' && !after.File;
+          return ok(pass, { before, after, level: st.level },
+            pass ? '' : 'the drill did not reach the entities');
+        },
+      },
+      {
+        id: 'the-set-is-spent',
+        criterion: 'The marks and their control are gone once drilled',
+        async run(page) {
+          // Every node now drawn sits under a marked path, so a set that
+          // survived the drill would ring the whole canvas.
+          const st = await page.eval(() => window.__probe.markState());
+          const pass = st.rings === 0 && st.marked === 0 && st.button === null;
+          return ok(pass, st, pass ? '' : 'the spent set is still ringing nodes');
+        },
+      },
+    ],
+  },
 };
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
 const argv = process.argv.slice(2);
 const keepOpen = argv.includes('--keep-open');
+const verbose = argv.includes('--verbose');
 const wanted = argv.includes('--all')
   ? Object.keys(SUITES)
   : argv.filter((a) => !a.startsWith('--')).map((a) => a.toLowerCase());
@@ -2171,7 +4018,7 @@ const wanted = argv.includes('--all')
 if (!wanted.length) {
   console.log(`ux-probe — layout assertions for the nao web UI
 
-usage: node ui/scripts/ux-probe.mjs <suite...> | --all [--keep-open]
+usage: node ui/scripts/ux-probe.mjs <suite...> | --all [--keep-open] [--verbose]
 
 suites:
 ${Object.entries(SUITES).map(([k, s]) => `  ${k.padEnd(8)} ${s.ticket} — ${s.title}`).join('\n')}
@@ -2217,7 +4064,10 @@ for (const key of wanted) {
       res.pass ? passed++ : failed++;
       const mark = res.pass ? `${G}PASS${Z}` : `${R}FAIL${Z}`;
       console.log(`  ${mark}  ${check.criterion}`);
-      if (!res.pass) {
+      // A passing check's measurement is worth reading too — it is what you
+      // quote when writing the ticket up, and re-deriving it later means
+      // re-running the whole suite with the assertion inverted.
+      if (!res.pass || verbose) {
         if (res.actual !== null && res.actual !== undefined) {
           console.log(`        ${D}actual: ${JSON.stringify(res.actual)}${Z}`);
         }

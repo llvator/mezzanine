@@ -313,6 +313,7 @@ mod tests {
                 size: 10,
                 line_count: 2,
                 content_hash: Some("deadbeef".to_string()),
+                documentation: Some("What this file is for.".to_string()),
             },
             entities: vec![entity],
             relationships: Vec::new(),

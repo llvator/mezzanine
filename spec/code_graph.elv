@@ -50,6 +50,7 @@ f parsers {
     fu dispatch
     fu parse
     fu infer_types
+    fu describe
 }
 
 fu f.parsers.dispatch {
@@ -61,6 +62,12 @@ fu f.parsers.parse {
     d: "Returns a ParseResult of entities, relationships, imports and warnings. Three obligations a parser ships without easily, all silent when missed: warnings propagate into AnalysisResult rather than being dropped, so a partial parse reads as partial and not as clean; every entity carries its real span and source_code, because f.diff pairs entities by EntityKey and then compares source_hash — an entity whose source_code is None can never be reported as modified; and every callable carries the complexity triple, which is the parser's to compute in its own complexity.rs because f.metrics only ever consumes it. Miss the third and quality/hotspots return an empty ranking for that language, which reads as clean rather than unmeasured — the failure four parsers shipped with. The scoring convention has to be identical across languages or the numbers are not comparable: nesting structures add 1 + depth to cognitive, flat increments add 1, every branch adds 1 to cyclomatic, and a bodyless signature gets Some(1) rather than None because it has one straight-through path."
     cr: "src/parser/language_parser.rs", "src/parser/java/complexity.rs", "src/parser/groovy/complexity.rs"
     references: f.diff, f.metrics
+}
+
+fu f.parsers.describe {
+    d: "Recovers what the code says about itself, and the host language decides which way a comment points. Rust has two directions that are not interchangeable: an outer doc (/// and /** */) describes the item below it, collected backwards through prev_sibling; an inner doc (//! and /*! */) describes the scope around it, collected forwards from the first child of a source_file or a mod body. Conflating them fails silently in both directions — a header with no use block under it is read as the description of whichever item happens to follow, and the file's own header lands nowhere. A file header belongs to no entity, because the module a .rs file defines is declared in a different file, so it travels beside them as file_documentation and the pipeline lifts it onto FileInfo for renderers to key by path. Two traps worth the words: extract_doc_comment must stop at an inner doc rather than absorb it, and the grammar's line_comment node includes its trailing newline, so a body that is not trimmed makes every multi-line description double-spaced."
+    cr: "src/parser/rust/doc_comments.rs", "src/parser/rust/leaves.rs", "src/parser/rust/mod.rs"
+    references: f.model, f.renderers
 }
 
 fu f.parsers.infer_types {

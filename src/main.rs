@@ -56,6 +56,11 @@ enum Commands {
         #[arg(long)]
         include_tests: bool,
 
+        /// Analyze Markdown documents alongside the code. Widens the
+        /// analysis; `-l markdown` narrows it to docs only.
+        #[arg(long)]
+        include_docs: bool,
+
         /// Include external dependencies
         #[arg(long)]
         include_external: bool,
@@ -242,6 +247,11 @@ enum Commands {
         #[arg(long)]
         include_tests: bool,
 
+        /// Analyze Markdown documents alongside the code. Widens the
+        /// analysis; `-l markdown` narrows it to docs only.
+        #[arg(long)]
+        include_docs: bool,
+
         /// Filter by language
         #[arg(short, long)]
         language: Option<Vec<String>>,
@@ -290,6 +300,15 @@ enum Commands {
         /// choose the terminal and `NAO_CLAUDE_BIN` for a non-PATH install.
         #[arg(long)]
         allow_agent_spawn: bool,
+
+        /// Keep a loaded diff exactly where it was computed. By default a
+        /// `working tree` diff follows the watcher: every re-analysis
+        /// recomputes it against the same base ref, so the overlay describes
+        /// the tree you are editing rather than the one you had when you
+        /// pressed the button. Pass this to pin it to that moment instead.
+        /// Diffs between two commits are fixed comparisons and never follow.
+        #[arg(long)]
+        pin_diff: bool,
     },
 
     /// Host several analyzed repos at once and serve the browser UI against
@@ -547,6 +566,7 @@ fn dispatch_analysis(command: Commands) -> Result<()> {
             language,
             kind,
             include_tests,
+            include_docs,
             include_external,
             layout,
             group_by_file,
@@ -562,6 +582,7 @@ fn dispatch_analysis(command: Commands) -> Result<()> {
             language,
             kind,
             include_tests,
+            include_docs,
             include_external,
             layout.into(),
             group_by_file,
@@ -606,12 +627,14 @@ fn dispatch_server(command: Commands) -> Result<()> {
             output_dir,
             port,
             include_tests,
+            include_docs,
             language,
             debounce_ms,
             content_fallback,
             allow_origin,
             no_token,
             allow_agent_spawn,
+            pin_diff,
             ui_dir,
         } => {
             // Watch analyzes a path the operator chose, so both scopes apply.
@@ -622,6 +645,7 @@ fn dispatch_server(command: Commands) -> Result<()> {
                     .unwrap_or_else(|| PathBuf::from("ui/public")),
                 port: port.or(settings.port).unwrap_or(3000),
                 include_tests: include_tests || settings.include_tests.unwrap_or(false),
+                include_docs: include_docs || settings.include_docs.unwrap_or(false),
                 languages: language.or_else(|| settings.language.clone()),
                 debounce_ms: debounce_ms.or(settings.debounce_ms).unwrap_or(300),
                 content_fallback: content_fallback.or_else(|| settings.content_fallback.clone()),
@@ -632,6 +656,7 @@ fn dispatch_server(command: Commands) -> Result<()> {
                 ui_dir,
                 settings_ui_dir: settings.ui_dir.clone(),
                 allow_agent_spawn,
+                pin_diff,
                 settings,
                 path,
             })
@@ -1000,6 +1025,7 @@ fn run_analyze(
     languages: Option<Vec<String>>,
     kinds: Option<Vec<EntityKindArg>>,
     include_tests: bool,
+    include_docs: bool,
     include_external: bool,
     layout: LayoutDirection,
     group_by_file: bool,
@@ -1016,6 +1042,7 @@ fn run_analyze(
     }
 
     config.analysis.include_tests = include_tests;
+    config.analysis.include_docs = include_docs;
     config.analysis.include_external = include_external;
     config.display.group_by_file = group_by_file;
     config.display.show_line_numbers = line_numbers;

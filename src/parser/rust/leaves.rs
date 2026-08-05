@@ -4,6 +4,7 @@
 //! body), but the entity itself is built the same way as the others.
 
 use super::super::language_parser::{node_text, node_to_span};
+use super::doc_comments::{extract_doc_comment, extract_inner_doc};
 use super::helpers::parse_visibility;
 use crate::models::{CodeEntity, EntityKind};
 use std::path::Path;
@@ -23,6 +24,14 @@ pub(super) fn parse_module(
     entity.visibility = parse_visibility(node, source);
     entity.parent_id = parent_id.map(String::from);
     entity.source_code = Some(node_text(node, source).to_string());
+    // Both spellings document a module: `/// …` above the declaration, and
+    // `//!` at the top of its body. A `mod foo;` can only have the first,
+    // and the file it names carries its own header — see
+    // `RustParser::parse`, which lifts that onto the file.
+    entity.documentation = extract_doc_comment(node, source).or_else(|| {
+        node.child_by_field_name("body")
+            .and_then(|body| extract_inner_doc(&body, source))
+    });
 
     Some(entity)
 }
@@ -41,6 +50,7 @@ pub(super) fn parse_constant(
     entity.visibility = parse_visibility(node, source);
     entity.parent_id = parent_id.map(String::from);
     entity.source_code = Some(node_text(node, source).to_string());
+    entity.documentation = extract_doc_comment(node, source);
 
     Some(entity)
 }
@@ -59,6 +69,7 @@ pub(super) fn parse_type_alias(
     entity.visibility = parse_visibility(node, source);
     entity.parent_id = parent_id.map(String::from);
     entity.source_code = Some(node_text(node, source).to_string());
+    entity.documentation = extract_doc_comment(node, source);
 
     Some(entity)
 }
@@ -76,6 +87,7 @@ pub(super) fn parse_macro(
     let mut entity = CodeEntity::new(&name, EntityKind::Macro, path, span);
     entity.parent_id = parent_id.map(String::from);
     entity.source_code = Some(node_text(node, source).to_string());
+    entity.documentation = extract_doc_comment(node, source);
 
     Some(entity)
 }

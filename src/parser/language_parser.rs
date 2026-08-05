@@ -24,6 +24,16 @@ pub struct ParseResult {
     /// Any warnings during parsing
     pub warnings: Vec<String>,
 
+    /// Documentation for the file as a whole — Rust's `//!` header, and the
+    /// equivalent in any other language that has one.
+    ///
+    /// Separate from entity documentation because it belongs to no entity:
+    /// the module a `.rs` file defines is declared in a *different* file, so
+    /// there is nothing in this parse to hang it on. `parse_file_standalone`
+    /// lifts it onto `FileInfo::documentation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_documentation: Option<String>,
+
     /// Ordered SQL schema operations (SQL-002). Empty for every other
     /// language — language-specific in the same way `CodeEntity::impl_blocks`
     /// is Rust-specific.

@@ -19,6 +19,8 @@
 import { derived, type Readable } from 'svelte/store';
 import * as d3 from 'd3';
 import type { D3Node, D3Link, GraphData, ViewMode, LevelOverrides, TriState } from '../types/graph';
+import { isSpecNode } from '../types/graph';
+import { pathsClaim } from '../utils/refPaths';
 import {
   graphData,
   selectedNode,
@@ -44,8 +46,13 @@ import {
   type TreeDensity,
 } from '../stores/graph';
 import { searchMatchIds, searchNeighborIds } from './filterViewModel';
-import { diffActive, diffChangesOnly, diffCoreOnly, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffDimOpacity, normalizeEntityId, type ChangeStatus } from '../stores/diff';
-import { scopeOversized } from '../stores/scope';
+import { diffActive, diffChangesOnly, diffCoreOnly, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges, diffDimOpacity, normalizeEntityId, type ChangeStatus } from '../stores/diff';
+import type { ScopeChange } from './diffRollup';
+import { gateByDrawCeiling, type DrawOverflow } from './drawCeiling';
+import { rankHubs } from './hubs';
+import { demoteHubs, hubCount } from '../stores/settings';
+import { crossFilterPaths } from '../stores/crossFilter';
+import { splitViewOpen } from '../stores/panes';
 
 export interface DisplayPlan {
   /** 'tree' when viewMode === 'tree' AND a selection exists in the
@@ -73,6 +80,11 @@ export interface DisplayPlan {
    *  feedback loop. */
   searchMatched: Set<string>;
   searchNeighbors: Set<string>;
+  /** Ids of nodes whose *incoming* edges are suppressed because they are
+   *  among the most-depended-on in the current view (UI-056). The nodes
+   *  themselves are still drawn and still selectable — this hides edges,
+   *  never entities. */
+  demotedHubIds: Set<string>;
   /** Node ids that passed every filter except one that dims rather than
    *  hides — the diff filters, or a committed search when it is set to dim.
    *  Drawn at `dimOpacity` instead of being removed. */
@@ -83,6 +95,16 @@ export interface DisplayPlan {
    *  hiding with extra steps. When both dim, the more visible value wins —
    *  the failure worth avoiding is "the node vanished". */
   dimOpacity: number;
+  /** Non-null when the plan wanted more nodes on screen than the canvas
+   *  draws, in which case every visibility set above is empty and the View
+   *  shows the overflow card instead.
+   *
+   *  Carried on the plan rather than kept in a store because it is a
+   *  property *of this plan* — the count it reports is the one `compute()`
+   *  just produced under the current filters. The store it replaced was
+   *  written from `applySelection` and read here before `compute()` ran,
+   *  which is precisely why no filter could move it (UI-061). */
+  overflow: DrawOverflow | null;
 }
 
 /** Link key that distinguishes duplicate edges between the same pair.
@@ -122,6 +144,8 @@ interface ComputeArgs {
   rels: Set<string>;
   langs: Set<string>;
   files: Set<string>;
+  demoteHubs: boolean;
+  hubCount: number;
   generalOut: boolean;
   generalIn: boolean;
   lo: Record<number, LevelOverrides>;
@@ -142,6 +166,9 @@ interface ComputeArgs {
   diffCoreOnly: boolean;
   diffStatuses: Map<string, ChangeStatus>;
   diffSourceChanged: Map<string, boolean>;
+  /** Scope path → rolled-up change, for the collapsed levels where a node's
+   *  `original_id` is a path rather than an entity id (UI-064). */
+  diffScopes: Map<string, ScopeChange>;
   showGhosts: boolean;
   /** Independent toggle for `ghost_stdlib`-tagged ghosts. When false,
    *  those ghosts are hidden even if `showGhosts` is true. */
@@ -149,6 +176,13 @@ interface ComputeArgs {
   /** Toggle for the `template_var`-tagged ansible templating layer.
    *  When false (default), those nodes and their edges are hidden. */
   showTemplateVars: boolean;
+  /** Split view: the Elevator layer draws in its own pane, so it comes out
+   *  of this one (ADR 0011). */
+  splitView: boolean;
+  /** Code paths the focused spec entity claims, or null when no cross-filter
+   *  is active. `[]` is a real value meaning "claims nothing" — see
+   *  `stores/crossFilter.ts`. */
+  crossFilterPaths: string[] | null;
 }
 
 function emptyPlan(): DisplayPlan {
@@ -161,8 +195,10 @@ function emptyPlan(): DisplayPlan {
     nodeDistances: null,
     searchMatched: new Set(),
     searchNeighbors: new Set(),
+    demotedHubIds: new Set(),
     dimmedNodeIds: new Set(),
     dimOpacity: 0,
+    overflow: null,
   };
 }
 
@@ -184,6 +220,18 @@ function nodePassesFilters(n: D3Node, args: ComputeArgs): FilterResult {
   // Ansible templating layer — hidden by default so the high-volume
   // config-variable nodes don't bury the deploy topology.
   if (!args.showTemplateVars && n.tags?.includes('template_var')) return 'hidden';
+  // Split view: the spec layer is drawn by its own pane, so this one stops
+  // drawing it. Without this the `.elv` entities appear twice on screen and
+  // the code pane's force layout spends its space on nodes that already have
+  // a better home (ADR 0011).
+  if (args.splitView && isSpecNode(n)) return 'hidden';
+  // Cross-filter from the spec pane. Hard, not dimmed: the interaction asks
+  // for "only what belongs to this", and an empty path list is a real answer
+  // ("this entity declares no code") rather than a cleared filter — the
+  // blank-canvas card names it.
+  if (args.crossFilterPaths && !pathsClaim(args.crossFilterPaths, n.file_path)) {
+    return 'hidden';
+  }
   // Hard filters — these truly hide the node
   if (!args.kinds.has(n.kind_raw)) return 'hidden';
   if (!args.langs.has(n.language)) return 'hidden';
@@ -197,20 +245,57 @@ function nodePassesFilters(n: D3Node, args: ComputeArgs): FilterResult {
   }
   // Diff filter: when diff mode is active, dim (not hide) filtered nodes.
   if (args.diffIsActive && (args.diffChangesOnly || args.diffCoreOnly)) {
-    const normalizedId = normalizeEntityId(n.original_id);
-    const status = args.diffStatuses.get(normalizedId);
-
-    if (args.diffChangesOnly) {
-      if (!status || status === 'unchanged') return 'dimmed';
-    }
-
-    if (args.diffCoreOnly) {
-      const isCore = args.diffSourceChanged.get(normalizedId);
-      if (isCore === false) return 'dimmed';
-      if (!status || status === 'unchanged') return 'dimmed';
+    const change = changeOf(n, args);
+    if (!change) return diffUnknown(n, args);
+    if (args.diffChangesOnly && change.status === 'unchanged') return 'dimmed';
+    if (args.diffCoreOnly && (change.status === 'unchanged' || !change.sourceChanged)) {
+      return 'dimmed';
     }
   }
   return 'visible';
+}
+
+/**
+ * What the diff says about a node, or null when it has nothing to say.
+ *
+ * Entity nodes are keyed by entity id. A collapsed File or Module node
+ * carries its scope path in `original_id` instead, so the entity lookup
+ * misses and the scope rollup answers (UI-064). Entity ids and scope paths
+ * do not collide — an id carries `:line:name` — so trying them in this order
+ * needs no discriminator on the node.
+ */
+function changeOf(n: D3Node, args: ComputeArgs): ScopeChange | null {
+  const id = normalizeEntityId(n.original_id);
+  const status = args.diffStatuses.get(id);
+  if (status) {
+    return { status, sourceChanged: args.diffSourceChanged.get(id) ?? true };
+  }
+  return args.diffScopes.get(n.original_id) ?? null;
+}
+
+/**
+ * Verdict for a node the diff never mentioned.
+ *
+ * Unknown is not unchanged, and conflating the two is how the interesting
+ * nodes disappear: a file created since the diff ran is absent from every
+ * map, and dimming it to `diffDimOpacity: 0` hides exactly the thing the
+ * user opened a diff to see.
+ *
+ * The distinction that survives maintenance is whether the diff *looked*.
+ * It reports on unchanged entities too, so its scope keys are the whole file
+ * tree as of the moment it ran:
+ *
+ * - the node's file is in that tree ⇒ the diff considered the file and said
+ *   nothing about this node, which means it is one of the kinds the diff
+ *   deliberately skips (`Parameter`) or a ghost. Dim it, as before.
+ * - the file is absent ⇒ the diff never saw it. Show it.
+ *
+ * Ghosts carry an empty `file_path` and so take the first branch, leaving
+ * their visibility to `showGhosts` where it belongs.
+ */
+function diffUnknown(n: D3Node, args: ComputeArgs): FilterResult {
+  if (n.file_path && !args.diffScopes.has(n.file_path)) return 'visible';
+  return 'dimmed';
 }
 
 /** BFS over dependency edges from `start`, limited by maxLevel and the
@@ -633,7 +718,17 @@ function compute(args: ComputeArgs): DisplayPlan {
     return emptyPlan();
   }
 
-  const selectionInGraph = selected ? graph.nodes.some((n) => n.id === selected.id) : false;
+  // A spec entity selected while the split view is open is *not* a selection
+  // as far as this pane is concerned. Clicking in the spec pane sets the
+  // global selection — the Details panel is shared — and both of the things
+  // `selectionInGraph` gates would then be wrong here: tree mode would re-root
+  // the code canvas on a Feature and redraw the spec hierarchy it was just
+  // told not to draw, and force mode would restrict the canvas to the BFS
+  // reach of a node that has no code edges, emptying it. The cross-filter the
+  // same click applied is the answer the user actually asked for.
+  const specIsSelected = args.splitView && !!selected && isSpecNode(selected);
+  const selectionInGraph =
+    selected && !specIsSelected ? graph.nodes.some((n) => n.id === selected.id) : false;
   const wantsTree = viewMode === 'tree' && selectionInGraph;
   console.log(`[displayPlan] compute: nodes=${graph.nodes.length} links=${graph.links.length} viewMode=${viewMode} selected=${selected?.id ?? 'null'} selectionInGraph=${selectionInGraph} wantsTree=${wantsTree} kinds=${[...new Set(graph.nodes.map(n=>n.kind_raw))]} filterKinds=${[...args.kinds]}`);
 
@@ -806,8 +901,10 @@ function compute(args: ComputeArgs): DisplayPlan {
       nodeDistances: levels,
       searchMatched: args.searchMatched,
       searchNeighbors: args.searchNeighbors,
-      dimmedNodeIds: new Set(),
+      demotedHubIds: new Set(),
+    dimmedNodeIds: new Set(),
       dimOpacity: 0,
+      overflow: null,
     };
   }
 
@@ -832,6 +929,13 @@ function compute(args: ComputeArgs): DisplayPlan {
     visibleNodeIds = restricted;
   }
 
+  // UI-056. Ranked over what is actually drawn, not over the repo: whether a
+  // node is a hub is a property of the view the reader chose, and a rank
+  // taken from the whole dataset would demote nothing on a narrow scope.
+  const demotedHubIds = args.demoteHubs
+    ? new Set(rankHubs(graph.nodes.filter((n) => visibleNodeIds.has(n.id)), args.hubCount))
+    : new Set<string>();
+
   const visibleLinkKeys = new Set<string>();
   const maxLevel = getMaxLevel(args.lo, args.maxDepth);
   const searchActive = args.searchMatched.size > 0;
@@ -840,6 +944,11 @@ function compute(args: ComputeArgs): DisplayPlan {
     const s = sourceIdOf(l), t = targetIdOf(l);
     if (!visibleNodeIds.has(s) || !visibleNodeIds.has(t)) continue;
     if (!args.rels.has(l.kind_raw)) continue;
+    // Suppress edges *into* a demoted hub. Inbound is what makes a utility
+    // module unreadable — everything points at it — while its own outgoing
+    // edges are few and carry real information. The node stays drawn, so the
+    // reader can still select it and read its true fan-in in the panel.
+    if (demotedHubIds.has(t) && !demotedHubIds.has(s)) continue;
     if (searchActive && !args.searchMatched.has(s) && !args.searchMatched.has(t)) continue;
 
     if (selectionInGraph && nodeDistances) {
@@ -881,6 +990,7 @@ function compute(args: ComputeArgs): DisplayPlan {
     mode: 'force',
     visibleNodeIds,
     visibleLinkKeys,
+    demotedHubIds,
     selectedId: selectionInGraph ? selected!.id : null,
     treePositions: new Map(),
     nodeDistances,
@@ -892,6 +1002,7 @@ function compute(args: ComputeArgs): DisplayPlan {
     dimOpacity: args.searchMatched.size > 0 && !args.searchHides
       ? Math.max(args.searchDim, args.diffDim)
       : args.diffDim,
+    overflow: null,
     };
 }
 
@@ -903,29 +1014,18 @@ export const displayPlan: Readable<DisplayPlan> = derived(
     showDirectEdges, showCrossLevelEdges,
     searchMatchIds, searchNeighborIds,
     viewportWidth, treeDensity, treeMaxDepth,
-    diffActive, diffChangesOnly, diffCoreOnly, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap,
-    showGhostNodes, showBuiltinGhosts, showTemplateVars, scopeOversized,
+    diffActive, diffChangesOnly, diffCoreOnly, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges,
+    showGhostNodes, showBuiltinGhosts, showTemplateVars,
     searchHidesNonMatches, searchDimOpacity, diffDimOpacity,
+    demoteHubs, hubCount,
+    splitViewOpen, crossFilterPaths,
   ],
-  ([$g, $sel, $vm, $kinds, $rels, $langs, $files, $genOut, $genIn, $lo, $sde, $scle, $sm, $sn, $vpW, $den, $dep, $diffAct, $diffCO, $diffCore, $diffFilt, $diffStat, $diffSrc, $ghosts, $builtinGhosts, $templateVars, $oversized, $searchHides, $searchDim, $diffDim]) => {
-    // Scope exceeds render threshold — publish an empty plan so the
-    // canvas stays quiet. graphData is still populated for side panels.
-    if ($oversized) {
-      const empty: DisplayPlan = {
-        mode: 'force',
-        visibleNodeIds: new Set(),
-        visibleLinkKeys: new Set(),
-        selectedId: null,
-        treePositions: new Map(),
-        nodeDistances: null,
-        searchMatched: new Set(),
-        searchNeighbors: new Set(),
-        dimmedNodeIds: new Set(),
-        dimOpacity: 0,
-      };
-      return empty;
-    }
-    return compute({
+  ([$g, $sel, $vm, $kinds, $rels, $langs, $files, $genOut, $genIn, $lo, $sde, $scle, $sm, $sn, $vpW, $den, $dep, $diffAct, $diffCO, $diffCore, $diffFilt, $diffStat, $diffSrc, $diffScopes, $ghosts, $builtinGhosts, $templateVars, $searchHides, $searchDim, $diffDim, $demoteHubs, $hubCount, $splitView, $crossPaths]) => {
+    // The plan is always computed. The render gate is applied to its result
+    // rather than in front of it (UI-061): every filter above narrows
+    // `visibleNodeIds`, so gating on that count is what makes filtering a
+    // way out of the overflow card instead of a no-op behind it.
+    return gateByDrawCeiling(compute({
       graph: $g,
       selected: $sel,
       viewMode: $vm,
@@ -933,6 +1033,8 @@ export const displayPlan: Readable<DisplayPlan> = derived(
       rels: $rels,
       langs: $langs,
       files: $files,
+      demoteHubs: $demoteHubs,
+      hubCount: $hubCount,
       generalOut: $genOut,
       generalIn: $genIn,
       lo: $lo,
@@ -949,13 +1051,16 @@ export const displayPlan: Readable<DisplayPlan> = derived(
       diffCoreOnly: $diffCore,
       diffStatuses: $diffStat,
       diffSourceChanged: $diffSrc,
+      diffScopes: $diffScopes,
       showGhosts: $ghosts,
       showBuiltinGhosts: $builtinGhosts,
       showTemplateVars: $templateVars,
       searchHides: $searchHides,
       searchDim: $searchDim,
       diffDim: $diffDim,
-    });
+      splitView: $splitView,
+      crossFilterPaths: $crossPaths,
+    }));
   },
 );
 

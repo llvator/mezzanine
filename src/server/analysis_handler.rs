@@ -23,8 +23,31 @@ use crate::config::Config;
 use crate::graph::DependencyGraph;
 use crate::models::file_info::Language;
 
-use super::state::{write_json_with_cancel, AppState};
-use super::types::{AnalysisScopeRequest, AnalysisScopeResponse};
+use super::state::{write_json_with_cancel, AppState, ReloadKind};
+use super::types::{AnalysisScopeRequest, AnalysisScopeResponse, AnalysisScopeState};
+
+/// GET /api/analysis/scope — report the current filter so a freshly loaded
+/// UI can show what is actually being analyzed rather than guessing.
+pub(crate) async fn analysis_scope_state_handler(
+    State(state): State<AppState>,
+) -> Result<Json<AnalysisScopeState>, (StatusCode, String)> {
+    let config = state
+        .config
+        .read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {e}")))?;
+    let mut languages: Vec<String> = config
+        .analysis
+        .languages
+        .iter()
+        .map(|l| l.filter_name().to_string())
+        .collect();
+    languages.sort();
+    Ok(Json(AnalysisScopeState {
+        // Empty means "no filter", which is what `null` means on the wire.
+        languages: (!languages.is_empty()).then_some(languages),
+        include_docs: config.analysis.include_docs,
+    }))
+}
 
 /// POST /api/analysis/scope — replace the analyzer's language filter
 /// and re-run. Treats `languages = []` the same as `null`.
@@ -36,6 +59,7 @@ pub(crate) async fn analysis_scope_handler(
     let requested: Option<Vec<String>> = req
         .languages
         .filter(|v| !v.is_empty());
+    let include_docs = req.include_docs;
 
     // Step 1 + 2: ask any in-flight analysis to abort, then acquire the
     // serialization mutex. The mutex guarantees we don't trample a run
@@ -63,7 +87,7 @@ pub(crate) async fn analysis_scope_handler(
     // set. We don't mutate the existing `state.config` until the run
     // succeeds — that keeps readers (the live SSE clients, scope_handler)
     // observing the previous, valid scope.
-    let new_config = match build_config_with_languages(&state, &requested) {
+    let new_config = match build_config_with_languages(&state, &requested, include_docs) {
         Ok(c) => c,
         Err(msg) => {
             let mut in_progress = state.analysis_in_progress.lock().await;
@@ -97,7 +121,7 @@ pub(crate) async fn analysis_scope_handler(
             if let Ok(mut c) = state.config.write() {
                 *c = new_config;
             }
-            let _ = state.tx.send(());
+            let _ = state.tx.send(ReloadKind::Graph);
             Ok(Json(AnalysisScopeResponse {
                 success: true,
                 languages: requested,
@@ -124,6 +148,7 @@ pub(crate) async fn analysis_scope_handler(
 fn build_config_with_languages(
     state: &AppState,
     requested: &Option<Vec<String>>,
+    include_docs: Option<bool>,
 ) -> Result<Config, String> {
     let mut config = state
         .config
@@ -131,6 +156,11 @@ fn build_config_with_languages(
         .map_err(|e| format!("Config lock poisoned: {}", e))?
         .clone();
     config.analysis.languages.clear();
+    // Absent means "unchanged", not "off": a client that doesn't know about
+    // the field must not silently undo the operator's `--include-docs`.
+    if let Some(v) = include_docs {
+        config.analysis.include_docs = v;
+    }
     if let Some(langs) = requested {
         for lang in langs {
             match Language::from_name(lang) {

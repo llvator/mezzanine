@@ -45,6 +45,16 @@ pub struct AnalysisConfig {
     /// Whether to analyze test files
     pub include_tests: bool,
 
+    /// Whether to analyze documentation (Markdown) alongside the code.
+    ///
+    /// The widening switch for opt-in languages ([`Language::is_opt_in`]).
+    /// `languages` cannot express this: it is a *restricting* filter, so
+    /// `-l markdown` yields a docs-only graph rather than adding docs to the
+    /// normal one, and asking for both would mean naming every other language
+    /// by hand. Same shape and same reason as `include_tests`, which widens
+    /// the file set rather than narrowing it.
+    pub include_docs: bool,
+
     /// Whether to include standard library references
     pub include_stdlib: bool,
 
@@ -206,6 +216,37 @@ impl Default for Config {
     }
 }
 
+impl AnalysisConfig {
+    /// Whether files of this language should be analyzed at all.
+    ///
+    /// **The single answer to that question.** The file walker and the
+    /// analyzer's parse loop both ask it, and they used to ask it separately:
+    /// the walker discovered a file, counted it, and the parse loop then
+    /// dropped it against a filter written one line differently. A file that
+    /// is found and then silently discarded is the worst of both — the work
+    /// is done and the result is missing — so the rule lives here and both
+    /// callers read it. Same reasoning as `parser::detect_language` being the
+    /// one place a path becomes a `Language`.
+    ///
+    /// Three cases:
+    ///
+    /// - **Opt-in languages** ([`Language::is_opt_in`] — Markdown today) are
+    ///   out unless asked for, by `include_docs` or by name in `languages`.
+    /// - **`include_docs` widens.** A language it enables is exempt from the
+    ///   `languages` filter, so a repo pinning
+    ///   `"language": ["rust", …]` in its settings cannot silently overrule an
+    ///   explicit `--include-docs`.
+    /// - **`languages` restricts**, as it always has. Empty means all.
+    pub fn accepts_language(&self, language: Language) -> bool {
+        let named = self.languages.contains(&language);
+
+        if language.is_opt_in() {
+            return self.include_docs || named;
+        }
+        self.languages.is_empty() || named
+    }
+}
+
 impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
@@ -213,6 +254,7 @@ impl Default for AnalysisConfig {
             languages: HashSet::new(), // All languages
             include_external: false,
             include_tests: false,
+            include_docs: false,
             include_stdlib: false,
             exclude_patterns: vec![
                 "**/node_modules/**".to_string(),
@@ -306,5 +348,79 @@ impl Config {
     pub fn with_layout_direction(mut self, direction: LayoutDirection) -> Self {
         self.display.layout_direction = direction;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three ways `.md` can be asked for, or not.
+    ///
+    /// These exist because the rule was written twice — once in the file
+    /// walker, once in the analyzer's parse loop — and the copies disagreed
+    /// as soon as `include_docs` was added: the walker admitted a Markdown
+    /// file and the parse loop dropped it, so `--include-docs` reported the
+    /// same entity count as a run without it. Both callers now ask
+    /// `accepts_language`, and these pin what it answers.
+    fn config_with(languages: &[Language], include_docs: bool) -> AnalysisConfig {
+        AnalysisConfig {
+            languages: languages.iter().copied().collect(),
+            include_docs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn markdown_stays_out_of_a_default_analysis() {
+        assert!(!config_with(&[], false).accepts_language(Language::Markdown));
+    }
+
+    #[test]
+    fn include_docs_lets_markdown_in() {
+        assert!(config_with(&[], true).accepts_language(Language::Markdown));
+    }
+
+    #[test]
+    fn naming_markdown_lets_it_in_without_the_flag() {
+        assert!(config_with(&[Language::Markdown], false).accepts_language(Language::Markdown));
+    }
+
+    #[test]
+    fn naming_markdown_alone_excludes_the_code() {
+        let config = config_with(&[Language::Markdown], false);
+        assert!(!config.accepts_language(Language::Rust));
+    }
+
+    /// The bug this whole flag exists to fix. A repo that pins its languages
+    /// in `.nao/settings.json` — as nao's own checkout does — must not
+    /// silently overrule someone typing `--include-docs`.
+    #[test]
+    fn a_pinned_language_list_does_not_overrule_include_docs() {
+        let config = config_with(&[Language::Rust, Language::TypeScript], true);
+        assert!(config.accepts_language(Language::Markdown));
+        assert!(config.accepts_language(Language::Rust));
+        assert!(!config.accepts_language(Language::Python));
+    }
+
+    #[test]
+    fn include_docs_does_not_widen_anything_but_the_opt_in_languages() {
+        // It is not a general "ignore the filter" switch.
+        let config = config_with(&[Language::Rust], true);
+        assert!(!config.accepts_language(Language::Python));
+    }
+
+    #[test]
+    fn an_empty_language_list_still_means_every_normal_language() {
+        let config = config_with(&[], false);
+        assert!(config.accepts_language(Language::Rust));
+        assert!(config.accepts_language(Language::Python));
+    }
+
+    #[test]
+    fn include_docs_leaves_the_default_all_languages_behaviour_alone() {
+        let config = config_with(&[], true);
+        assert!(config.accepts_language(Language::Rust));
+        assert!(config.accepts_language(Language::Markdown));
     }
 }

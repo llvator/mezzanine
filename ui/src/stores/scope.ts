@@ -2,26 +2,32 @@ import { writable, derived, get } from 'svelte/store';
 import type { GraphData, GraphLevel, D3Node, D3Link } from '../types/graph';
 import { transformAnalysisJson } from '../transform';
 import { publishGraph } from '../viewmodels/filterViewModel';
-import { graphLevel, pruneHiddenFiles } from './graph';
+import { graphLevel, pruneHiddenFiles, expandedScopes } from './graph';
 import {
   isInScope, compactRules, toggleRule, includeAll, hasExclusionInside,
 } from '../utils/scopeRules';
 import type { ScopeRule } from '../utils/scopeRules';
+import { livePaths } from '../viewmodels/markSet';
+import { clearMarks, markedPaths, pruneMarks } from './marks';
 
 export type { ScopeRule } from '../utils/scopeRules';
 export { isInScope, isDirectRule } from '../utils/scopeRules';
 import { resetDetailsCache } from './details';
 import { apiUrl } from '../vscodeAdapter';
 
-/** Soft threshold: selections above this are fully analyzed (Quality,
- *  Summary, Diff, Context, etc. all work) but the graph canvas refuses
- *  to draw them because D3 + DOM gets sluggish past a few thousand
- *  nodes. The UI surfaces a warning and suggests narrowing the scope
- *  or enabling a filter (e.g. "Changes only" during a diff). */
+/** Selection size at which the scope tree starts flagging rows as large.
+ *
+ *  No longer gates the canvas. Until UI-061 this was the render gate, and
+ *  it decided from the wrong quantity: the index's entity total for the
+ *  selected paths, evaluated before collapse and before any filter ran.
+ *  What the canvas costs is the number of nodes that reach the DOM, which
+ *  is what `DRAW_CEILING` in `viewmodels/drawCeiling.ts` now measures.
+ *
+ *  What survives here is advisory — a hint in the scope tree that a
+ *  selection is big. Whether a scope-level ceiling should exist at all,
+ *  and what it would guard now that it no longer guards drawing, is
+ *  UI-063. */
 export const ENTITY_THRESHOLD = 2000;
-/** Alias kept for clarity at call sites — same value, but the name
- *  emphasises that the limit is a render concern, not an analysis one. */
-export const RENDER_THRESHOLD = ENTITY_THRESHOLD;
 
 /** Target node count the d3 simulation + DOM can keep responsive. When a
  *  scope's entity count exceeds this, the graph auto-escalates to file
@@ -60,15 +66,26 @@ export const autoLevel = writable<boolean>(true);
  *  circle — which is exactly the deploy topology the language exists to
  *  reveal. A real deploy repo easily crosses 400 nodes. */
 const CHEAP_LANGUAGES = new Set(['Elevator', 'Ansible Deploy']);
-export function pickLevel(data: GraphData, budget: number = RENDER_BUDGET): GraphLevel {
+export function pickLevel(
+  data: GraphData,
+  budget: number = RENDER_BUDGET,
+  expanded: ReadonlySet<string> = new Set<string>(),
+): GraphLevel {
   const visible = data.nodes.filter((n) => !n.tags?.includes('ghost'));
   const heavyEntities = visible.filter((n) => !CHEAP_LANGUAGES.has(n.language));
   if (heavyEntities.length <= budget) return 'entity';
-  const files = new Set<string>();
-  for (const n of visible) {
-    files.add(n.file_path);
-  }
-  if (files.size <= budget) return 'file';
+
+  // UI-057: count what would actually be *drawn*, not what the level names.
+  // An expanded scope contributes its members instead of one circle, and a
+  // level chosen without knowing that would pick File, see the expansion push
+  // the count over budget, escalate to Module, and take the user's expansion
+  // with it — auto-level and the reader fighting each other one click apart.
+  const atFile = new Set<string>();
+  for (const n of visible) atFile.add(expanded.has(n.file_path) ? n.id : n.file_path);
+  if (atFile.size <= budget) return 'file';
+
+  // Module is the coarsest level there is, so it is returned whether or not
+  // it fits — the draw ceiling downstream is what refuses an impossible view.
   return 'module';
 }
 
@@ -160,8 +177,6 @@ export function setAnalysisScopes(paths: string[]): void {
 let fullDataPromise: Promise<GraphData> | null = null;
 export const graphLoading = writable(false);
 export const graphLoadError = writable<string | null>(null);
-/** True when current selection exceeds the threshold (graph is not rendered). */
-export const scopeOversized = writable(false);
 
 /** The full unfiltered graph, written once per fetch. Exposed as a store
  *  (not just a promise) so derived stores like `analysisGraphData` can
@@ -235,6 +250,21 @@ export function scopeCounts(
   }
   for (const child of root.children ?? []) visit(child);
   return { entities, relationships };
+}
+
+/** Drop expansions and marks for scopes that are no longer in the graph.
+ *
+ *  One walk for both, because both hold paths for the same reason and would
+ *  otherwise go stale in the same way: a scope the reader can no longer see
+ *  is invisible state, and an expansion would silently re-open — or a mark
+ *  silently widen a later drill — the moment they scoped back. */
+function pruneScopeState(scoped: GraphData): void {
+  const live = livePaths(scoped.nodes);
+  expandedScopes.update((s) => {
+    const next = new Set([...s].filter((p) => live.has(p)));
+    return next.size === s.size ? s : next;
+  });
+  pruneMarks(live);
 }
 
 /** Filter the full graph to entities/relationships within ANY selected scope.
@@ -348,31 +378,24 @@ function filterToSelection(full: GraphData, rules: ScopeRule[]): GraphData {
 
 /** Apply the current selection: aggregate counts and publish the scoped
  *  graph. The graph is always published so downstream analysis views
- *  (Quality, Summary, Diff, Context) see the user's full scope. If the
- *  scope exceeds the render threshold, `scopeOversized` is set so the
- *  graph canvas can decline to render while the side panels still work.
+ *  (Quality, Summary, Diff, Context) see the user's full scope.
  *
- *  `force` used to bypass the block entirely; kept for API compatibility
- *  but now only affects the warning flag (analysis runs either way). */
-export async function applySelection(opts: { force?: boolean } = {}): Promise<void> {
+ *  Nothing here decides whether the canvas draws. It used to: a scope over
+ *  `ENTITY_THRESHOLD` set a flag that `displayPlan` read before computing,
+ *  which meant the decision was made from the selection's index total,
+ *  upstream of collapse and of every filter. That gate now lives on the
+ *  computed plan, measured on nodes actually drawn — see
+ *  `viewmodels/drawCeiling.ts`. */
+export async function applySelection(): Promise<void> {
   const idx = get(indexData);
   if (!idx) return;
   const rules = get(scopeRules);
 
   if (rules.length === 0) {
-    scopeOversized.set(false);
     publishGraph({ nodes: [], links: [] });
     return;
   }
 
-  const { entities } = scopeCounts(rules, idx);
-
-  // Analysis-layer cap (2k entities): beyond this we still run every
-  // analysis pass but refuse to even collapse-and-render, because the full
-  // dataset is too large to hold efficiently in the browser. Below this
-  // we always render — `pickLevel` picks an aggregation level that keeps
-  // the d3 simulation responsive.
-  scopeOversized.set(!opts.force && entities > ENTITY_THRESHOLD);
   graphLoading.set(true);
   graphLoadError.set(null);
 
@@ -382,8 +405,12 @@ export async function applySelection(opts: { force?: boolean } = {}): Promise<vo
     // Auto-pick the aggregation level so the rendered node count stays
     // under RENDER_BUDGET. Users can pin the level via the level toggle,
     // which flips `autoLevel` off.
+    // Expansions that fell out of the new scope are dropped: an open scope
+    // the reader can no longer see is invisible state that would silently
+    // re-open if they scoped back.
+    pruneScopeState(scoped);
     const auto = get(autoLevel);
-    const picked = pickLevel(scoped);
+    const picked = pickLevel(scoped, RENDER_BUDGET, get(expandedScopes));
     const visibleCount = scoped.nodes.filter((n) => !n.tags?.includes('ghost')).length;
     console.log(
       `[auto-level] scoped.nodes=${scoped.nodes.length} (visible=${visibleCount} ghosts=${scoped.nodes.length - visibleCount}) autoLevel=${auto} picked=${picked} (budget=${RENDER_BUDGET}) — currentLevel=${get(graphLevel)}`
@@ -421,7 +448,6 @@ export function toggleScope(path: string): void {
 /** Clear all selections. */
 export function clearScope(): void {
   scopeRules.set([]);
-  scopeOversized.set(false);
   publishGraph({ nodes: [], links: [] });
 }
 
@@ -451,11 +477,13 @@ export function selectAllScope(): void {
  * Replace the current scope selection with an arbitrary set of paths and
  * re-render. Used by the VS Code native scope TreeView.
  *
- * `force` skips the entity-threshold safety check — the caller is promising
- * it handled the "too many entities" concern some other way (e.g. by
- * enabling a filter that hides most of them).
+ * Took a `force` flag until UI-061, to let a caller promise it had handled
+ * the "too many entities" concern by enabling a filter that hides most of
+ * them. That promise is now kept by the mechanism itself: filters run
+ * upstream of the render gate, so a caller that enables one gets the effect
+ * without an override, and there is no longer a check to skip.
  */
-export async function setScopes(paths: string[], opts: { force?: boolean } = {}): Promise<void> {
+export async function setScopes(paths: string[]): Promise<void> {
   const idx = get(indexData);
   if (!idx) {
     // Index not loaded yet — remember the request and apply once it arrives.
@@ -466,7 +494,7 @@ export async function setScopes(paths: string[], opts: { force?: boolean } = {})
     if (!get(indexData)) return;
   }
   scopeRules.set(compactRules(includeAll(paths)));
-  await applySelection({ force: opts.force });
+  await applySelection();
 }
 
 /**
@@ -491,6 +519,37 @@ export async function drillIn(path: string): Promise<void> {
   autoLevel.set(true);
   await setScopes([path]);
   console.log(`[drill] drillIn() completed path=${path}`);
+}
+
+/**
+ * Drill into everything marked at once — the way from a picture of files to a
+ * picture of the entities inside them.
+ *
+ * The same two moves as `drillIn`, and the plural is the entire point.
+ * Relationships run *between* files, so a reader who wants to see one in
+ * detail wants both of its ends and nothing else; drilling into one end throws
+ * away the other, and drilling into the folder that holds both usually brings
+ * back too much to render at entity level. `setScopes` compacts the paths, so
+ * marking a folder and a file inside it is one scope rather than two.
+ *
+ * Nothing here mentions the aggregation level. `autoLevel` re-picks it from
+ * `RENDER_BUDGET` against the new, smaller scope, so a handful of files opens
+ * at Entity level for exactly the reason any small scope does. Marking half
+ * the repo honestly gets File level back, which is what `markedStats` warns
+ * about before the click rather than after.
+ *
+ * The marks are cleared once the scope has applied: the set has been spent,
+ * and every node now drawn lives under a marked path, so keeping it would ring
+ * the entire canvas. The scope itself is the durable record of the decision —
+ * it is what the scope tree now shows.
+ */
+export async function drillIntoMarks(): Promise<void> {
+  const paths = [...get(markedPaths)];
+  if (paths.length === 0) return;
+  console.log(`[drill] drillIntoMarks() called with ${paths.length} marked path(s)`);
+  autoLevel.set(true);
+  await setScopes(paths);
+  clearMarks();
 }
 
 /**
@@ -560,6 +619,27 @@ export const selectionStats = derived(
   ([$idx, $rules]) => {
     if (!$idx || $rules.length === 0) return NO_STATS;
     return scopeCounts($rules, $idx);
+  },
+);
+
+/**
+ * What drilling into the marked set would load, and the level it would land
+ * at — read from the index, so the button can say it before the click.
+ *
+ * `pickLevel` is the authority on the level and takes a graph, which is not
+ * available for a scope that has not been loaded yet; `RENDER_BUDGET` against
+ * the index's entity total is the same comparison against the same constant,
+ * one step earlier. It can be wrong in the reader's favour — ghosts and
+ * Elevator entities are excluded from the real count and not from this one —
+ * so the warning is worded as the coarser outcome it predicts rather than as a
+ * promise about what will be drawn.
+ */
+export const markedStats = derived(
+  [indexData, markedPaths],
+  ([$idx, $marks]) => {
+    if (!$idx || $marks.size === 0) return { ...NO_STATS, fitsEntityLevel: true };
+    const counts = scopeCounts(compactRules(includeAll($marks)), $idx);
+    return { ...counts, fitsEntityLevel: counts.entities <= RENDER_BUDGET };
   },
 );
 

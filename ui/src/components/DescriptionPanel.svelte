@@ -8,18 +8,32 @@
    * followed by its ancestors', so skimming the canvas narrates the graph.
    */
   import { description, describeOnHover } from '../stores/description';
-  import { selectedNode, rawEntityGraph } from '../stores/graph';
+  import { focusNode, rawEntityGraph } from '../stores/graph';
   import { NODE_COLORS } from '../types/graph';
 
   $: chain = $description?.chain ?? [];
+  $: children = $description?.children ?? [];
   $: source = $description?.source ?? null;
 
-  /** Clicking a rung pins it. Climbing is the point: the pane is often the
-   *  first place a parent becomes visible, and pinning it re-roots the
-   *  chain there. Ancestors outside the loaded graph aren't selectable. */
+  /** How many children show before the list is capped. A Feature has a
+   *  handful; a File has every method in it, and the pane is a column. */
+  const CHILD_PREVIEW = 12;
+
+  /** Which subject the reader expanded, not a bare boolean: hovering the
+   *  next node has to collapse the list again, and comparing ids does that
+   *  without a second reactive statement to reset the flag. */
+  let expandedFor: string | null = null;
+  $: subjectId = chain[0]?.entityId ?? null;
+  $: showAllChildren = subjectId !== null && subjectId === expandedFor;
+  $: shownChildren = showAllChildren ? children : children.slice(0, CHILD_PREVIEW);
+
+  /** Clicking a rung or a child pins it. Moving is the point: the pane is
+   *  often the first place a parent — or the functionality under a feature —
+   *  becomes visible, and pinning it re-roots the chain there. Entities
+   *  outside the loaded graph aren't selectable. */
   function select(entityId: string) {
     const node = $rawEntityGraph.nodes.find((n) => n.original_id === entityId);
-    if (node) selectedNode.set(node);
+    if (node) focusNode(node);
   }
 
   function kindColor(kind: string): string {
@@ -68,6 +82,40 @@
           <div class="loc">{entry.filePath}:{entry.line}</div>
         {/if}
       </article>
+
+      <!-- Children hang off the subject only. Deeper in the chain they
+           would list the subject's own siblings, which is noise: the
+           reader is climbing to find context, not browsing the tree. -->
+      {#if i === 0 && children.length > 0}
+        <section class="children" data-probe="description-children">
+          <div class="children-head">
+            <span>contains ({children.length})</span>
+            {#if children.length > CHILD_PREVIEW}
+              <button
+                type="button"
+                class="more-btn"
+                on:click={() => (expandedFor = showAllChildren ? null : subjectId)}
+              >{showAllChildren ? 'Show fewer' : `Show all ${children.length}`}</button>
+            {/if}
+          </div>
+          {#each shownChildren as child (child.entityId)}
+            <div class="child">
+              <div class="head">
+                <span class="kind" style="background: {kindColor(child.kind)}">{child.kind}</span>
+                <button
+                  type="button"
+                  class="name"
+                  title={child.qualifiedName || child.name}
+                  on:click={() => select(child.entityId)}
+                >{child.name}</button>
+              </div>
+              {#if child.documentation}
+                <p class="doc child-doc">{child.documentation}</p>
+              {/if}
+            </div>
+          {/each}
+        </section>
+      {/if}
     {/each}
   {/if}
 </div>
@@ -131,6 +179,63 @@
   .rung + .rung {
     border-top: 1px solid var(--border-subtle);
     padding-top: 10px;
+  }
+
+  /* The children block sits between the subject rung and the first parent
+     rung, so it has to carry the separator that `.rung + .rung` would
+     otherwise have drawn there. */
+  .children + .rung {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 10px;
+  }
+
+  .children {
+    /* Indented and rule-marked so the list reads as "inside the entity
+       above" rather than as more rungs of the chain. */
+    margin: 0 0 10px 6px;
+    padding-left: 8px;
+    border-left: 2px solid var(--border-subtle);
+  }
+
+  .children-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.64rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  .more-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: nowrap;
+  }
+  .more-btn:hover { text-decoration: underline; }
+
+  .child + .child { margin-top: 6px; }
+
+  /* A child is a lead, not the subject: name at body size, description
+     clamped to two lines. Reading all of it is one click away. */
+  .child .name { font-size: 0.8rem; font-weight: 500; }
+  .child-doc {
+    font-size: 0.74rem;
+    line-height: 1.45;
+    color: var(--text-muted);
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
   }
 
   .parent-of {

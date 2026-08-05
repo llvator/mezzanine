@@ -234,6 +234,24 @@ export interface LevelOverrides {
   peerEdges: boolean;
 }
 
+/**
+ * Whether a node belongs to the Elevator spec layer rather than to the code.
+ *
+ * Lives with the node model because three layers ask it — the display plan,
+ * the search-result block classifier, and the spec pane's own view model —
+ * and the answer must be the same for all three or the split view draws a
+ * node in both panes, or in neither.
+ *
+ * Keyed on `language`, matching the Elevator closure pass in `stores/scope.ts`.
+ * The `elevator` *tag* is a near-synonym but not the same predicate:
+ * `stores/codeRefs.ts` deliberately widens its own test to markdown notes,
+ * which claim code the same way a `cr:` does but are not nodes in the spec
+ * hierarchy.
+ */
+export function isSpecNode(node: D3Node): boolean {
+  return node.language === 'Elevator' && !node.tags?.includes('ghost');
+}
+
 export const NODE_COLORS: Record<string, string> = {
   Class: '#2196F3',
   Dataclass: '#7E57C2',
@@ -270,6 +288,10 @@ export const NODE_COLORS: Record<string, string> = {
    * because a view is a table-shaped thing, but dimmer because its rows are
    * derived rather than stored. */
   View: '#C99A5B',
+  /** Markdown document. Slate blue-grey — prose is the layer code is
+   * discussed *about*, so it reads as background material next to the
+   * saturated code kinds rather than competing with them. */
+  Note: '#7986CB',
   /** Elevator: widest grouping above Category (optional). Deep
    * indigo — sits one tier above Category visually, signals
    * "structural / top of hierarchy". */
@@ -357,6 +379,10 @@ export const LANGUAGE_COLORS: Record<string, string> = {
   /** ansible-deploy — Ansible brand red, so a deploy repo reads as its
    * own language in the filter / scope tree. */
   'Ansible Deploy': '#D32F2F',
+  /** Markdown — the same slate as the Note kind (its only node), so the
+   * doc layer looks the same whether the reader is colouring by language
+   * or by kind. */
+  Markdown: '#7986CB',
   Unknown: '#9E9E9E',
 };
 
@@ -392,6 +418,8 @@ export const KIND_CODES: Record<string, string> = {
   /** Database objects (SQL-001). `Vw` avoids colliding with `Va`/Variable. */
   Table: 'Tb',
   View: 'Vw',
+  /** Markdown document. `Nt` — `No` would read as a negation. */
+  Note: 'Nt',
   /** Elevator (`.elv`) entity-kind codes. */
   Extension: 'Ex',
   Category: 'Ca',

@@ -26,6 +26,10 @@ export class NaoServer {
     private readonly workspaceRoot: string,
     preferredPort: number,
     private readonly includeTests: boolean,
+    /** Analyze Markdown too, passed as `nao watch --include-docs`. Widens the
+     *  analysis, so it survives a `language` filter — see the engine's
+     *  `AnalysisConfig::accepts_language`. */
+    private readonly includeDocs: boolean,
     private readonly output: vscode.OutputChannel,
     /** Path to the Educator content corpus shipped with the extension. Passed
      *  to `nao watch` as `--content-fallback` so rules/lessons work in
@@ -75,6 +79,7 @@ export class NaoServer {
 
     const args = ['watch', this.workspaceRoot, '--port', String(this.port)];
     if (this.includeTests) args.push('--include-tests');
+    if (this.includeDocs) args.push('--include-docs');
     if (this.language && this.language.trim()) {
       args.push('--language', this.language.trim());
     }

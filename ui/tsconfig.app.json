@@ -14,6 +14,13 @@
      */
     "allowJs": true,
     "checkJs": true,
+    /**
+     * The `scripts/*.test.ts` suites run under `node --test` with type
+     * stripping, which is plain ESM: it resolves no extensions. A view model
+     * that imports another view model therefore has to write the `.ts`, and
+     * without this flag `noEmit` rejects that. Vite resolves it either way.
+     */
+    "allowImportingTsExtensions": true,
     "moduleDetection": "force"
   },
   "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.svelte"]

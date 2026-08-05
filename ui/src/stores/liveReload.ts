@@ -17,6 +17,7 @@
 
 import { get, writable } from 'svelte/store';
 import { refreshData } from './scope';
+import { loadDiff } from './diff';
 import { apiUrl, isVscode } from '../vscodeAdapter';
 import { endpoint } from '../endpoint';
 import { probe } from './connection';
@@ -96,6 +97,15 @@ export function connectLiveReload(url?: string): void {
       } finally {
         liveReloading.set(false);
       }
+    });
+
+    // A `→ working` diff is recomputed by the engine after each
+    // re-analysis and announced separately, because only the overlay moved
+    // (UI-067). Re-fetching the graph here as well would restart a canvas
+    // that has no reason to move, and the `reload` above has already done it.
+    eventSource.addEventListener('diff', async () => {
+      console.log('[liveReload] diff signal received — reloading the overlay');
+      await loadDiff({ baseDetails: false });
     });
 
     eventSource.onerror = () => {

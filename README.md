@@ -3,9 +3,13 @@
 Interactive code visualizer and quality-metrics explorer for VS Code,
 backed by a Rust analysis engine.
 
+Project website: **[llvator.com](https://llvator.com)**
+
 > **New here? Start with [guide/getting-started.md](guide/getting-started.md)** — a 5-minute install-and-run guide covering the `nao` CLI, the `elevator` CLI, and the VS Code extension. The rest of this README is a feature reference.
 
 > **Big picture:** [guide/capabilities-and-roadmap.md](guide/capabilities-and-roadmap.md) — what Nao can do today (including the MCP tools for AI agents), how the pieces fit together, and where it's headed.
+
+> **Working patterns:** [guide/workflows/](guide/workflows/) — what each surface is actually good at, split into [terminal](guide/workflows/cli/) workflows (the two CLIs and the MCP tools) and [visualizer](guide/workflows/web-ui/) workflows (the canvas).
 
 ## VS Code extension
 
@@ -72,6 +76,8 @@ Per entity (functions, methods, classes/structs, files):
 - `nao.serverPort` — port for the internal nao watch server
   (default `3200`).
 - `nao.includeTests` — include test files in the analysis.
+- `nao.includeDocs` — analyze Markdown documents alongside the code
+  (see [Turning on the documentation layer](#turning-on-the-documentation-layer)).
 - `nao.autoVisualize` — automatically sync when switching files or
   moving the cursor.
 
@@ -101,6 +107,50 @@ usage via "used via members".
 | Impex (SAP Hybris) | Hand-rolled parser; no tree-sitter grammar exists for the format |
 | Ansible / Kubernetes | Topology-oriented: playbooks, roles, vars and templates, not individual tasks |
 | Elevator (`.elv`) | The domain-spec language, not source code |
+| Markdown (`.md`) | Documents and the links between them, plus the source files they point at. **Opt-in** — see below |
+
+### Turning on the documentation layer
+
+Markdown is the one language nao does not read by default. `.md` is everywhere
+in a code repo — READMEs, ADRs, changelogs, issue trackers — and claiming it
+unasked would add hundreds of nodes to every graph. Two ways to ask, answering
+two different questions:
+
+```sh
+nao analyze . --include-docs   # the normal analysis, plus its docs
+nao analyze . -l markdown      # the docs alone, as a pure note graph
+nao watch . --include-docs     # same, live
+```
+
+`--include-docs` **widens**; `-l` **restricts**, as it always does.
+
+Every surface has the same switch:
+
+| Surface | Control |
+|---|---|
+| CLI | `--include-docs` on `analyze` and `watch` |
+| Browser UI / webview | **Include documentation**, in the Parsed Languages panel |
+| VS Code | the `nao.includeDocs` setting — then reload the window |
+
+The extension spawns `nao watch` for you, which is why a flag typed in a
+terminal never reaches it. The in-panel switch takes effect on **Apply**
+without a restart, and reports the server's real state on load rather than
+assuming.
+
+Ticking `markdown` in the language list works too, but it is a different
+operation: the switch *adds* docs to whatever is selected, the checkbox
+*restricts* to a set that contains them. Selecting only `markdown` is how you
+get the pure note graph.
+
+To leave it on for every surface at once, put it in the settings file:
+
+```jsonc
+// .nao/settings.json  (repo)  or  ~/.config/nao/settings.json  (user)
+{ "include_docs": true }
+```
+
+A pinned `"language"` list does **not** override this. Asking for docs
+explicitly beats a config file that never mentioned them.
 
 Everything else — **including Go** — falls back to a generic parser with
 reduced fidelity: entities but no reliable relationships.
@@ -137,11 +187,11 @@ A snapshot of `src/` against the same complexity ceiling CI enforces (cyclomatic
 <!-- repo-health:start -->
 | Metric | Value |
 |---|---|
-| Source files (Rust) | 157 |
-| Functions analyzed | 1704 |
-| Functions above ceiling (grandfathered) | 109 |
-| Cyclomatic complexity (p50 / p90 / max) | 3 / 10 / 40 |
-| Cognitive complexity (p50 / p90 / max) | 2 / 14 / 129 |
+| Source files (Rust) | 160 |
+| Functions analyzed | 1817 |
+| Functions above ceiling (grandfathered) | 111 |
+| Cyclomatic complexity (p50 / p90 / max) | 3 / 9 / 41 |
+| Cognitive complexity (p50 / p90 / max) | 2 / 13 / 129 |
 | Max nesting depth (p50 / p90 / max) | 1 / 3 / 12 |
 <!-- repo-health:end -->
 

@@ -2,7 +2,7 @@
   import ColorChip from './ColorChip.svelte';
   import type { D3Node } from '../types/graph';
   import { LINK_COLORS } from '../types/graph';
-  import { graphData } from '../stores/graph';
+  import { graphData, focusNode } from '../stores/graph';
   import { drillIn } from '../stores/scope';
   import { currentDetail, loadDetail, type EntityDetails } from '../stores/details';
   import { codeRefIndex, anchorState, isSpecEntity, revealSpecEntity, showImplementingCode } from '../stores/codeRefs';
@@ -68,6 +68,22 @@
       if (b.order != null) return 1;
       return 0;
     });
+  }
+
+  /** Follow a relationship to the entity at its other end.
+   *
+   *  The rows have looked clickable since they were written — `.rel-item`
+   *  has carried `cursor: pointer` and a hover background — but nothing
+   *  was bound, so the one navigation the panel most obviously offered did
+   *  nothing. Selecting is the same verb the Description rungs, the search
+   *  results and the quality table already use, and it is what re-roots
+   *  the canvas.
+   *
+   *  Both endpoints come out of `graphData`, so the node is on the canvas
+   *  by construction — no scope widening needed, unlike `revealSpecEntity`. */
+  function focusRelated(nodeId: string) {
+    const node = $graphData.nodes.find((n) => n.id === nodeId);
+    if (node) focusNode(node);
   }
 
   function getLinkTarget(link: any, direction: 'out' | 'in'): string {
@@ -691,7 +707,13 @@
           <div class="rel-list">
             {#each sortByOrder(outgoing) as link}
               {@const targetId = getLinkTarget(link, 'out')}
-              <div class="rel-item">
+              <button
+                type="button"
+                class="rel-item"
+                data-probe="rel-item"
+                title="Show {getNodeName(targetId)}"
+                on:click={() => focusRelated(targetId)}
+              >
                 {#if link.order != null}
                   <span class="rel-order">{link.order}</span>
                 {/if}
@@ -708,7 +730,7 @@
                 {:else if link.rebinds_to}
                   <span class="rel-bind rel-rebind" title="Reassigned to existing variable">⟲ {link.rebinds_to}</span>
                 {/if}
-              </div>
+              </button>
             {/each}
           </div>
         {/if}
@@ -717,7 +739,13 @@
           <div class="rel-list">
             {#each sortByOrder(incoming) as link}
               {@const sourceId = getLinkTarget(link, 'in')}
-              <div class="rel-item">
+              <button
+                type="button"
+                class="rel-item"
+                data-probe="rel-item"
+                title="Show {getNodeName(sourceId)}"
+                on:click={() => focusRelated(sourceId)}
+              >
                 {#if link.order != null}
                   <span class="rel-order">{link.order}</span>
                 {/if}
@@ -734,7 +762,7 @@
                 {:else if link.rebinds_to}
                   <span class="rel-bind rel-rebind" title="Caller reassigns to an existing variable">⟲ {link.rebinds_to}</span>
                 {/if}
-              </div>
+              </button>
             {/each}
           </div>
         {/if}
@@ -1058,6 +1086,9 @@
     border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
   }
 
+  /* A button, not a div: the row navigates, so it has to be reachable by
+     keyboard and announced as an action. Everything below the first three
+     lines is undoing the native button chrome. */
   .rel-item {
     display: flex;
     align-items: center;
@@ -1067,9 +1098,19 @@
     font-size: 0.8rem;
     cursor: pointer;
     margin-bottom: 2px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    font-family: inherit;
+    color: inherit;
   }
 
   .rel-item:hover { background: var(--bg-hover); }
+  .rel-item:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
 
   .rel-order {
     font-size: 0.65rem;

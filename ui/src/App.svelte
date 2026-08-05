@@ -6,7 +6,7 @@
   import {
     graphData, selectedNode, viewMode, graphLevel,
     showLabels, showKindLabels, showLinkLabels,
-    treeDensity, hoverDepth, hoverLocked,
+    treeDensity, hoverDepth,
   } from './stores/graph';
   import type { GraphLevel } from './types/graph';
   import type { TreeDensity } from './stores/graph';
@@ -14,8 +14,12 @@
   import { setTreeDepth, levelOverrides, showGhostNodes, showBuiltinGhosts, showTemplateVars } from './stores/graph';
   import { activeTheme, applyTheme, autoFitView } from './stores/settings';
   import CanvasToolbar from './components/CanvasToolbar.svelte';
+  import OverviewPanel from './components/OverviewPanel.svelte';
   import { publishGraph } from './viewmodels/filterViewModel';
   import { displayPlan } from './viewmodels/displayPlan';
+  import { blankCanvasReason } from './viewmodels/emptyCanvas';
+  import { searchMatchIds } from './viewmodels/filterViewModel';
+  import { searchHidesNonMatches } from './stores/graph';
   import {
     connectLiveReload, liveConnected, liveReloading, liveStatus,
     liveIsBroken, reconnectLiveReload, stopLiveReload,
@@ -57,9 +61,10 @@
   }
   import {
     loadIndex, indexData, indexLoadError, selectedScopes, selectionStats,
-    graphLoading, graphLoadError, scopeOversized, ENTITY_THRESHOLD,
+    graphLoading, graphLoadError,
   } from './stores/scope';
   import { loadGraphData } from './transform';
+  import { loadViews } from './stores/savedViews';
   import RepoPicker from './components/RepoPicker.svelte';
   import {
     serveMode, activeRepo, enterServeMode, selectRepo, slugFromHash, backToPicker,
@@ -78,7 +83,9 @@
   // left, Details and Description on the right. Details moved out of the
   // sidebar's bottom half, where it was taking 35% of the height the scope
   // tree and the quality table needed (UI-011).
-  let leftCollapsed = false;
+  // Whether the left column is open lives in `panes.ts` since UI-075: `0`
+  // focuses it, and focusing a collapsed pane has to open it.
+  $: leftCollapsed = !$sidebarPaneOpen;
   let leftWidth = 360;
 
   /** Window width, so the layout can decide whether a column still fits. */
@@ -95,8 +102,23 @@
   // gives up, so the narrow case is a narrower pane rather than no pane.
   // All three want ~1620px; below that Description drops out, and below
   // ~1220px so does Details. Collapsing the sidebar buys back its width.
-  $: leftUsed = leftCollapsed ? 0 : leftWidth;
-  $: rightRoom = winWidth - leftUsed - 60 - MIN_CANVAS_WIDTH;
+  // The spec pane (ADR 0011) is a fourth column and claims its room *before*
+  // the right-hand side, because it is the control surface the canvas is
+  // being steered from: a cross-filter you cannot see the source of is worse
+  // than a missing Description. It sits on the left, next to the sidebar, so
+  // the reading order matches the direction of the interaction — pick a
+  // concept, watch the code narrow to its right.
+  $: sidebarUsed = leftCollapsed ? 0 : leftWidth;
+  /** 20px per collapse strip. The fourth appears with the spec pane. */
+  $: toggleStrips = 60 + (specToggleShown ? 20 : 0);
+  $: specToggleShown = !isVscode() && !$specGraph.empty;
+  $: specRoom = winWidth - sidebarUsed - toggleStrips - MIN_CANVAS_WIDTH;
+  $: specShownWidth = Math.min($specWidth, specRoom);
+  $: showSpec = $splitViewOpen && specToggleShown && specShownWidth >= SPEC_MIN_WIDTH;
+  $: specSquashed = $splitViewOpen && specToggleShown && !showSpec;
+
+  $: leftUsed = sidebarUsed + (showSpec ? specShownWidth : 0);
+  $: rightRoom = winWidth - leftUsed - toggleStrips - MIN_CANVAS_WIDTH;
 
   $: detailsShownWidth = Math.min($detailsWidth, rightRoom);
   $: showDetails = $detailsPaneOpen && detailsShownWidth >= DETAILS_MIN_WIDTH;
@@ -135,9 +157,18 @@
   import {
     detailsPaneOpen, describePaneOpen, detailsWidth,
     DETAILS_MIN_WIDTH, DETAILS_MAX_WIDTH, DESCRIPTION_WIDTH, MIN_CANVAS_WIDTH,
+    splitViewOpen, specWidth, SPEC_MIN_WIDTH, SPEC_MAX_WIDTH,
   } from './stores/panes';
+  import SpecGraphView from './components/SpecGraphView.svelte';
+  import { specGraph, specSelection, clearSpecFocus } from './stores/crossFilter';
   import DescriptionPanel from './components/DescriptionPanel.svelte';
   import DetailsPanel from './components/DetailsPanel.svelte';
+  import ShortcutBar from './components/ShortcutBar.svelte';
+  import ShortcutHelp from './components/ShortcutHelp.svelte';
+  import { sidebarPaneOpen } from './stores/panes';
+  import { focusedPane, shortcutHelpOpen } from './stores/keymap';
+  import { matchBinding, isTypingTarget, type PaneId } from './viewmodels/keymap';
+  import { runCommand } from './viewmodels/keymapActions';
   import { focusScope, setScopes, drillIn, analysisScopes, setAnalysisScopes, ensureFullData, autoLevel } from './stores/scope';
   import { qualityRows, repoQuality, qualityAnalysisScope, qualitySortBy, currentEditorFile, tierFromScore } from './stores/quality';
   import type { QualityAnalysisScope, QualitySortKey } from './stores/quality';
@@ -164,9 +195,13 @@
    * (UI-017). Naming a concrete folder, and offering to select it, gives the
    * user a first graph to learn from.
    *
-   * Deliberately skips anything at or above ENTITY_THRESHOLD: those render as
-   * the oversized-scope overlay, which would be a worse first experience than
-   * the card it replaced.
+   * Used to skip anything at or above ENTITY_THRESHOLD, on the grounds that
+   * those landed in the oversized-scope overlay. Since UI-061 they don't:
+   * `pickLevel` collapses a large folder to file or module level and it
+   * draws. The filter had two costs — it passed over the folder most worth
+   * looking at, and on a repo whose top-level folders are all large it
+   * returned null, leaving the card with no folder to name and the user with
+   * the generic instruction UI-017 exists to avoid.
    */
   $: suggestedScope = (() => {
     const idx = $indexData;
@@ -174,10 +209,42 @@
     const roots = Object.values(idx.nodes).filter(
       (n) => n.type === 'folder' && n.path !== '' && !n.path.includes('/'),
     );
-    const renderable = roots.filter((n) => n.entity_count < ENTITY_THRESHOLD);
-    if (renderable.length === 0) return null;
-    return renderable.reduce((a, b) => (b.entity_count > a.entity_count ? b : a));
+    if (roots.length === 0) return null;
+    return roots.reduce((a, b) => (b.entity_count > a.entity_count ? b : a));
   })();
+
+  /** Next coarser aggregation level, or null at the coarsest. Drives the
+   *  overflow card's first remedy — the one that helps most, because it
+   *  divides the drawn count rather than trimming it. */
+  $: coarserLevel = $graphLevel === 'entity' ? 'file' : $graphLevel === 'file' ? 'module' : null;
+
+  /** Collapse a level from the overflow card. Pins the level (autoLevel off)
+   *  because the user asked for this one specifically — the same contract the
+   *  toolbar's level buttons use. */
+  function collapseOneLevel() {
+    if (!coarserLevel) return;
+    autoLevel.set(false);
+    graphLevel.set(coarserLevel as GraphLevel);
+  }
+
+  /** Turn on the diff filter the old card recommended but could not deliver.
+   *  Both flags are needed: `diffChangesOnly` is only consulted when the
+   *  master toggle is on. */
+  function showChangesOnly() {
+    diffFiltersEnabled.set(true);
+    diffChangesOnly.set(true);
+  }
+
+  /** Both diff filters off — the one-click way out of a canvas they emptied. */
+  function clearDiffFilters() {
+    diffChangesOnly.set(false);
+    diffCoreOnly.set(false);
+  }
+
+  /** Non-null when the scope produced nodes and every one of them is
+   *  filtered out of sight (UI-064). The decision is in `emptyCanvas.ts`;
+   *  what is left here is which remedies to offer. */
+  $: blankCanvas = blankCanvasReason($displayPlan, $graphData.nodes.length);
 
   async function startHere() {
     if (!suggestedScope) return;
@@ -552,7 +619,10 @@
             }
             diffChangesOnly.set(true);
             diffFiltersEnabled.set(true);
-            void setScopes(leafFiles, { force: true });
+            // No `force` needed since UI-061: the diff filters set just
+            // above run upstream of the render gate, so they narrow the
+            // drawn count the gate reads instead of being invisible to it.
+            void setScopes(leafFiles);
             break;
           }
           case 'setDiffChangesOnly':
@@ -857,6 +927,10 @@
     // Try to load a diff overlay (from `nao diff`). Silent no-op if
     // diff.json doesn't exist, and skipped entirely in serve mode.
     loadDiff();
+    // Saved views (UI-082). After the repo is settled, since serve mode keys
+    // its browser-side fallback by the slug. Never awaited: the list is a way
+    // back to a picture, not a prerequisite for drawing one.
+    void loadViews();
   }
 
   /**
@@ -924,6 +998,33 @@
     document.addEventListener('mouseup', onUp);
   }
 
+  /** The spec column grows rightwards, so its handle is on its right edge.
+   *  Same ceiling rule as Details: the drag stops where the pane would stop
+   *  rendering, so the handle never goes somewhere the layout won't follow. */
+  function startSpecResize(e: MouseEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = $specWidth;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMove = (e: MouseEvent) => {
+      const next = startWidth + (e.clientX - startX);
+      const ceiling = Math.min(SPEC_MAX_WIDTH, specRoom);
+      specWidth.set(Math.min(ceiling, Math.max(SPEC_MIN_WIDTH, next)));
+    };
+
+    const onUp = () => {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
   /** The Details column grows leftwards, so its handle is on its left edge
    *  and a drag towards the canvas widens it. */
   function startDetailsResize(e: MouseEvent) {
@@ -952,14 +1053,34 @@
     document.addEventListener('mouseup', onUp);
   }
 
-  /** `L` freezes the hover preview so the cursor can leave the graph without
-   *  the Details and Description panes resetting. Bound at the window rather
-   *  than in the panel, so closing the panel doesn't take the key with it. */
+  /**
+   * The one keyboard entry point (UI-075).
+   *
+   * Bound at the window rather than per panel so a key survives its pane being
+   * collapsed, and dispatched through `matchBinding` so the bar at the bottom
+   * and the behaviour here can never drift: both read the same table. Nothing
+   * is prevented unless a binding claimed it — an unclaimed key stays the
+   * browser's.
+   */
   function onKeydown(e: KeyboardEvent) {
-    if (e.key !== 'l' && e.key !== 'L') return;
-    if (e.target instanceof HTMLElement
-        && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
-    hoverLocked.update((v) => !v);
+    if (isVscode()) return;
+    const typing = isTypingTarget(e.target as HTMLElement | null);
+    const binding = matchBinding(e, $focusedPane, typing);
+    if (!binding) return;
+    if (runCommand(binding.command, { graphView })) e.preventDefault();
+  }
+
+  /**
+   * Focus follows the pointer *press*, not hover: the panes are read while the
+   * cursor sweeps the canvas, and taking focus on hover would make the live
+   * key set flicker under a moving mouse. `data-pane` marks the regions —
+   * matched by `closest` so a click anywhere inside a pane counts, including
+   * on controls that stop propagation later.
+   */
+  function onPointerDownCapture(e: PointerEvent) {
+    const el = (e.target as HTMLElement | null)?.closest?.('[data-pane]');
+    const pane = el?.getAttribute('data-pane') as PaneId | null;
+    if (pane) focusedPane.set(pane);
   }
 </script>
 
@@ -967,6 +1088,7 @@
   bind:innerWidth={winWidth}
   on:hashchange={onHashChange}
   on:keydown={onKeydown}
+  on:pointerdown|capture={onPointerDownCapture}
 />
 
 {#if !booted}
@@ -984,21 +1106,53 @@
 {:else if $serveMode && !$activeRepo}
   <RepoPicker onSelect={onPickRepo} />
 {:else}
-<BuildStamp />
+<!-- Standalone, the build stamp rides at the right end of the shortcut bar.
+     The webview has no bar, so there it keeps the fixed corner it had. -->
+{#if isVscode()}
+  <BuildStamp />
+{/if}
 
+<div class="app-shell">
 <div class="app-root">
   <!-- Left sidebar (standalone mode only — in VS Code the "Scopes" and
        "View Options" native views replace it). -->
   {#if !isVscode()}
-    <div class="panel left-panel" class:collapsed={leftCollapsed} style="width: {leftCollapsed ? 0 : leftWidth}px">
+    <div class="panel left-panel" class:collapsed={leftCollapsed}
+      class:pane-focused={$focusedPane === 'sidebar'}
+      data-pane="sidebar"
+      style="width: {leftCollapsed ? 0 : leftWidth}px">
       {#if !leftCollapsed}
         <Sidebar />
         <div class="resize-handle right" on:mousedown={startResize}></div>
       {/if}
     </div>
     <button class="panel-toggle left" class:collapsed={leftCollapsed}
-      on:click={() => (leftCollapsed = !leftCollapsed)}>
+      on:click={() => sidebarPaneOpen.set(leftCollapsed)}>
       {leftCollapsed ? '\u25B6' : '\u25C0'}
+    </button>
+  {/if}
+
+  <!-- Spec: the Elevator layer on its own canvas (ADR 0011). Rendered only
+       when the project has one \u2014 the strip and the pane are both absent
+       otherwise, rather than present and empty. -->
+  {#if specToggleShown}
+    <div class="panel spec-panel" class:collapsed={!showSpec}
+      class:pane-focused={$focusedPane === 'spec'}
+      data-pane="spec"
+      data-probe="spec-panel"
+      style="width: {showSpec ? specShownWidth : 0}px">
+      {#if showSpec}
+        <SpecGraphView />
+        <div class="resize-handle right" on:mousedown={startSpecResize}></div>
+      {/if}
+    </div>
+    <button class="panel-toggle spec" class:collapsed={!showSpec}
+      class:squashed={specSquashed}
+      title={specSquashed
+        ? 'The spec pane is hidden \u2014 the window is too narrow for it and the canvas'
+        : showSpec ? 'Hide the spec pane' : 'Show the spec pane'}
+      on:click={() => splitViewOpen.set(!$splitViewOpen)}>
+      {showSpec ? '\u25C0' : '\u25B6'}
     </button>
   {/if}
 
@@ -1114,31 +1268,122 @@
              in the side panels, the canvas just declines to draw), or
            - no scope is selected yet, or
            - a load error occurred -->
-    {#if $indexData && !$graphLoading && ($scopeOversized || $graphData.nodes.length === 0)}
+    {#if $indexData && !$graphLoading && ($displayPlan.overflow || $graphData.nodes.length === 0 || blankCanvas)}
       <div class="overlay">
-        {#if $scopeOversized}
+        {#if $displayPlan.overflow}
           <div class="overlay-card warn">
-            <h3>Scope too large to render</h3>
+            <h3>Too much to draw at once</h3>
             <p>
-              In scope: <strong>{$selectionStats.entities.toLocaleString()}</strong> entities and
-              <strong>{$selectionStats.relationships.toLocaleString()}</strong> relationships,
-              above the render threshold of <strong>{ENTITY_THRESHOLD.toLocaleString()}</strong>.
-              The graph canvas is paused to protect UI performance.
+              This view wants <strong>{$displayPlan.overflow.drawn.toLocaleString()}</strong>
+              nodes on screen; the canvas draws up to
+              <strong>{$displayPlan.overflow.ceiling.toLocaleString()}</strong>.
+              Both numbers move as you filter.
             </p>
             <p>
               <strong>Analysis continues in the side panels</strong> —
               Quality, Summary, Diff, and Context all work on the full scope.
             </p>
-            <p>
-              To draw the graph: narrow the scope (fewer folders/files) or
-              enable a filter that restricts what's shown — for example
-              <em>Changes only</em> during a diff.
-            </p>
+            <p>Draw less:</p>
+            <!-- Only remedies the current state can actually apply. The old
+                 card recommended "Changes only" unconditionally, which did
+                 nothing twice over: the gate ran before the filters, and
+                 there is no diff to filter unless one is loaded. -->
+            <ul class="remedies">
+              {#if coarserLevel}
+                <li>
+                  <button type="button" class="link-btn" on:click={collapseOneLevel}>
+                    Collapse to {coarserLevel}
+                  </button>
+                  — one node per {coarserLevel === 'file' ? 'file' : 'folder'}
+                </li>
+              {/if}
+              {#if $showGhostNodes}
+                <li>
+                  <button type="button" class="link-btn" on:click={() => showGhostNodes.set(false)}>
+                    Hide external references
+                  </button>
+                  — library and stdlib nodes outside this repo
+                </li>
+              {/if}
+              {#if $diffActive && !$diffChangesOnly}
+                <li>
+                  <button type="button" class="link-btn" on:click={showChangesOnly}>
+                    Show changed entities only
+                  </button>
+                </li>
+              {/if}
+              <li>
+                Uncheck entity or relationship types in the sidebar, or narrow
+                the <button type="button" class="link-btn" on:click={revealScopeTree}>Analysis Scope</button>.
+              </li>
+            </ul>
           </div>
         {:else if $graphLoadError}
           <div class="overlay-card warn">
             <h3>Failed to load</h3>
             <p>{$graphLoadError}</p>
+          </div>
+        {:else if blankCanvas}
+          <!-- The scope drew nothing, and a filter is why. Without this the
+               canvas is simply white while the side panels stay full, which
+               reads as "this scope is empty" — the wrong conclusion, and the
+               one that hid UI-064 for as long as it did. -->
+          <div class="overlay-card">
+            <h3>Everything here is filtered out</h3>
+            <p>
+              This scope holds <strong>{blankCanvas.built.toLocaleString()}</strong>
+              {blankCanvas.built === 1 ? 'node' : 'nodes'}. The current filters
+              hide all of them.
+            </p>
+            <p>Show more:</p>
+            <ul class="remedies">
+              {#if $diffActive && ($diffChangesOnly || $diffCoreOnly)}
+                <li>
+                  <button type="button" class="link-btn" on:click={clearDiffFilters}>
+                    Clear the diff filters
+                  </button>
+                  — nothing in this scope changed{$diffCoreOnly && !$diffChangesOnly ? ' at the source level' : ''}
+                </li>
+                {#if $diffDimOpacity === 0}
+                  <li>
+                    <button type="button" class="link-btn" on:click={() => diffDimOpacity.set(0.15)}>
+                      Fade the unchanged instead of hiding them
+                    </button>
+                  </li>
+                {/if}
+              {/if}
+              {#if $specSelection.size > 0}
+                <!-- The honest case this exists for: a Feature with no `cr:`
+                     anywhere in its subtree claims no code, so the filter is
+                     working and the answer is "nobody wrote down where this
+                     lives". Saying that beats an unexplained white canvas. -->
+                <li>
+                  <button type="button" class="link-btn" on:click={clearSpecFocus}>
+                    Clear the spec filter
+                  </button>
+                  — this spec entity may declare no <code>cr:</code> code reference
+                </li>
+              {/if}
+              {#if $searchMatchIds.size > 0 && $searchHidesNonMatches}
+                <li>
+                  <button type="button" class="link-btn" on:click={() => searchHidesNonMatches.set(false)}>
+                    Dim non-matches instead of hiding them
+                  </button>
+                </li>
+              {/if}
+              {#if !$showGhostNodes}
+                <li>
+                  <button type="button" class="link-btn" on:click={() => showGhostNodes.set(true)}>
+                    Show external references
+                  </button>
+                  — this scope may be nothing but calls out of it
+                </li>
+              {/if}
+              <li>
+                Re-check entity or relationship types in the sidebar, or pick a
+                different <button type="button" class="link-btn" on:click={revealScopeTree}>scope</button>.
+              </li>
+            </ul>
           </div>
         {:else}
           <div class="overlay-card">
@@ -1163,7 +1408,8 @@
               </p>
             {/if}
             <p class="threshold-note">
-              Items above the threshold of {ENTITY_THRESHOLD.toLocaleString()} entities are marked with ⚠ and won't render.
+              Large folders are drawn collapsed — one node per file, or per
+              folder — so they render rather than being refused.
             </p>
           </div>
         {/if}
@@ -1188,6 +1434,11 @@
         </div>
       </div>
     {/if}
+
+    <!-- Last in the slot so it paints over the canvas but under the overlay
+         cards, which are full-cover and answer a more urgent question than
+         "where am I" when they are up. -->
+    <OverviewPanel {graphView} />
   </GraphView>
   </div>
 
@@ -1205,6 +1456,8 @@
       {showDetails ? '▶' : '◀'}
     </button>
     <div class="panel details-panel" class:collapsed={!showDetails}
+      class:pane-focused={$focusedPane === 'details'}
+      data-pane="details"
       data-probe="details-panel"
       style="width: {showDetails ? detailsShownWidth : 0}px">
       {#if showDetails}
@@ -1229,6 +1482,8 @@
       {showDescription ? '▶' : '◀'}
     </button>
     <div class="panel right-panel" class:collapsed={!showDescription}
+      class:pane-focused={$focusedPane === 'description'}
+      data-pane="description"
       style="width: {showDescription ? DESCRIPTION_WIDTH : 0}px">
       {#if showDescription}
         <DescriptionPanel />
@@ -1237,6 +1492,19 @@
   {/if}
 
 </div>
+
+<!-- Which pane the keyboard is in, and what it can do from there (UI-075).
+     Standalone only: in VS Code the panes are native views with their own
+     focus model and their own keybinding surface, and a second one drawn
+     inside the webview would describe keys the host never delivers. -->
+{#if !isVscode()}
+  <ShortcutBar ctx={{ graphView }} />
+{/if}
+</div>
+
+{#if $shortcutHelpOpen && !isVscode()}
+  <ShortcutHelp />
+{/if}
 {/if}
 
 <style>
@@ -1246,12 +1514,33 @@
     background: var(--bg-deep);
   }
 
-  .app-root {
+  /* The shell exists so the shortcut bar can be a real row rather than an
+     overlay: floating it would have covered the canvas's own bottom-left
+     controls, and the bar is read while the pointer is down there. */
+  .app-shell {
     display: flex;
+    flex-direction: column;
     height: 100vh;
     width: 100vw;
     overflow: hidden;
   }
+
+  .app-root {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    overflow: hidden;
+  }
+
+  /* Focus is drawn inset, not as an outline: the panes sit edge to edge, and
+     an outline would be clipped by the neighbour's overflow on one side. */
+  .panel.pane-focused {
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  /* A pane the window squashed keeps the focus but not the ring — a 1px
+     accent line on a zero-width column is just a stripe. */
+  .panel.collapsed.pane-focused { box-shadow: none; }
 
   .panel {
     background: var(--bg-surface);
@@ -1262,6 +1551,7 @@
   }
 
   .left-panel { border-right: 1px solid var(--border); }
+  .spec-panel { border-right: 1px solid var(--border); }
   .details-panel { border-left: 1px solid var(--border); }
   .right-panel { border-left: 1px solid var(--border); }
 
@@ -1300,6 +1590,7 @@
 
   .panel-toggle:hover { background: var(--bg-hover); color: var(--text); }
   .panel-toggle.left { border-left: none; border-right: none; }
+  .panel-toggle.spec { border-left: none; border-right: none; }
   .panel-toggle.details { border-left: none; border-right: none; }
   .panel-toggle.right { border-left: none; border-right: none; }
 
@@ -1492,6 +1783,10 @@
   }
 
   .threshold-note { color: var(--text-dim); font-size: 0.85em; }
+  /* Remedies read as a list of moves, not a paragraph to parse. Each row is
+     an action plus what it costs you. */
+  .remedies { margin: 0.4em 0 0; padding-left: 1.2em; text-align: left; }
+  .remedies li { margin-bottom: 0.35em; }
 
   .overlay-card {
     pointer-events: auto;

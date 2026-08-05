@@ -21,6 +21,10 @@ pub struct DependencyGraph {
     file_metrics: Vec<FileMetrics>,
     /// Per-module (directory) rollup metrics keyed by full directory path.
     module_metrics: Vec<ModuleMetrics>,
+    /// What each file says it is for, keyed the same way as `file_metrics`.
+    /// Prose rather than a rollup, so it sits beside the metrics instead of
+    /// inside them, and only files that carry a header appear.
+    file_docs: HashMap<String, String>,
 }
 
 /// Per-file entity counts and composite scores collected during a single
@@ -58,12 +62,22 @@ impl DependencyGraph {
             reverse_map: HashMap::new(),
             file_metrics: Vec::new(),
             module_metrics: Vec::new(),
+            file_docs: HashMap::new(),
         }
     }
 
     /// Per-file quality rollups (empty until `from_analysis` runs).
     pub fn file_metrics(&self) -> &[FileMetrics] {
         &self.file_metrics
+    }
+
+    /// What a file says it is for — its `//!` header — or `None` when it
+    /// says nothing. Accepts either spelling of the path (`./src/foo.rs`,
+    /// `src/foo.rs`); both normalise to the `file_metrics` key.
+    pub fn file_documentation(&self, path: &std::path::Path) -> Option<&str> {
+        self.file_docs
+            .get(&Self::normalize_path(path))
+            .map(String::as_str)
     }
 
     /// Per-directory quality rollups (empty until `from_analysis` runs).
@@ -325,6 +339,16 @@ impl DependencyGraph {
         // entity-level pass so entity metrics are finalized before we
         // aggregate.
         graph.populate_scope_metrics();
+
+        // File-level docs ride on `FileInfo` rather than on any entity, so
+        // they are joined here instead of falling out of the entity walk.
+        for file in &result.files {
+            if let Some(doc) = &file.documentation {
+                graph
+                    .file_docs
+                    .insert(Self::normalize_path(&file.path), doc.clone());
+            }
+        }
 
         graph
     }
@@ -1673,6 +1697,42 @@ mod tests {
             warnings: Vec::new(),
         };
         DependencyGraph::from_analysis(&result)
+    }
+
+    #[test]
+    fn a_files_own_description_survives_the_path_spelling() {
+        use crate::models::file_info::Language;
+        use crate::models::FileInfo;
+
+        // The walker hands out `./src/tmp.rs`; entities normalise to
+        // `src/tmp.rs`. The lookup has to bridge that, or a file node
+        // never finds the header its own file wrote.
+        let result = AnalysisResult {
+            entities: vec![entity("./src/tmp.rs", 1, "TmpDir", EntityKind::Struct)],
+            relationships: Vec::new(),
+            files: vec![FileInfo {
+                path: std::path::PathBuf::from("./src/tmp.rs"),
+                language: Language::Rust,
+                size: 0,
+                line_count: 1,
+                content_hash: None,
+                documentation: Some("Scratch directories.".to_string()),
+            }],
+            warnings: Vec::new(),
+        };
+        let g = DependencyGraph::from_analysis(&result);
+
+        let key = &g.file_metrics()[0].path;
+        assert_eq!(key, "src/tmp.rs");
+        assert_eq!(
+            g.file_documentation(std::path::Path::new(key)),
+            Some("Scratch directories.")
+        );
+        assert_eq!(
+            g.file_documentation(std::path::Path::new("./src/tmp.rs")),
+            Some("Scratch directories.")
+        );
+        assert_eq!(g.file_documentation(std::path::Path::new("src/other.rs")), None);
     }
 
     #[test]

@@ -1,24 +1,34 @@
 import { derived, writable } from 'svelte/store';
 import type { D3Node, GraphData, EntityMetrics, ScopeMetrics, BackendThresholds } from '../types/graph';
-import { graphData, rawEntityGraph } from './graph';
+import { graphData, rawEntityGraph, selectedNode } from './graph';
 import { diffData } from './diff';
 import { analysisGraphData } from './scope';
 import { displayPlan } from '../viewmodels/displayPlan';
+import {
+  ancestorDirs,
+  changedFilePaths,
+  narrowRollups,
+  selectionPopulation,
+} from '../viewmodels/qualityPopulation';
 
 /** Where the Quality view pulls entities from:
  *    'scope'            — entities in the Analysis Scope tree (default)
  *    'visualScope'      — entities in the Visual Scopes tree (pre-filter)
  *    'visualSelection'  — entities actually drawn on screen right now
  *                         (post-filter, post-search, post-level-aggregation)
+ *    'selection'        — what the selected node stands for: a File or Module
+ *                         node's whole path, any other entity plus what it
+ *                         contains
  *    'currentFile'      — only entities in the file focused in the editor
  *    'changedFiles'     — only entities in files that differ from HEAD (diff).
  *  When the required signal is missing (no file focus / no diff loaded /
- *  empty visual scope / empty visual selection), the filter falls back to
- *  'scope'. */
+ *  empty visual scope / empty visual selection / nothing selected), the
+ *  filter falls back to 'scope'. */
 export type QualityAnalysisScope =
   | 'scope'
   | 'visualScope'
   | 'visualSelection'
+  | 'selection'
   | 'currentFile'
   | 'changedFiles';
 
@@ -46,22 +56,32 @@ export const qualityAnalysisScope = writable<QualityAnalysisScope>('scope');
  *  standalone mode and before the first focus event. */
 export const currentEditorFile = writable<string | null>(null);
 
+// The membership rules themselves live in `viewmodels/qualityPopulation.ts`,
+// store-free so they can be unit-tested. Re-exported here because this module
+// is where the rest of the app already looks for anything quality-shaped.
+export {
+  scopeHolds,
+  ancestorDirs,
+  selectionPopulation,
+} from '../viewmodels/qualityPopulation';
+
 /** Graph data filtered to the currently chosen analysis scope. Starts
  *  from `analysisGraphData` (the full graph sliced by the *analysis*
  *  scope — which can be wider than the visual scope — NOT from
  *  `graphData`, which is the visually-scoped subset). The per-file /
  *  changed-files narrowing is then layered on top.
  *
- *  Quality metrics, the aggregate summary, and the row list all derive
- *  from here so the user can analyze a scope bigger than the one drawn. */
+ *  Every part of the Quality panel derives from here — the summary, the
+ *  entity rows, the scatters, and the file/module rollups — so the panel
+ *  describes one population and the selector moves all of it at once. */
 export const analysisGraph = derived(
-  [analysisGraphData, rawEntityGraph, graphData, displayPlan, qualityAnalysisScope, currentEditorFile, diffData],
-  ([$g, $visual, $shown, $plan, $scope, $file, $diff]): GraphData => {
+  [analysisGraphData, rawEntityGraph, graphData, displayPlan, qualityAnalysisScope, currentEditorFile, diffData, selectedNode],
+  ([$g, $visual, $shown, $plan, $scope, $file, $diff, $sel]): GraphData => {
     // Visual scope — reuse rawEntityGraph which applySelection already
     // populates with the visual-scope-filtered entities (no graphLevel
     // collapsing applied yet, so we have raw entities).
     if ($scope === 'visualScope') {
-      return $visual.nodes.length > 0 ? $visual : $g;
+      return narrowRollups($visual.nodes.length > 0 ? $visual : $g);
     }
     // Visual selection — only the nodes actually drawn on the canvas
     // right now. Respects every filter, search, level aggregation, and
@@ -69,28 +89,24 @@ export const analysisGraph = derived(
     if ($scope === 'visualSelection') {
       const ids = $plan?.visibleNodeIds;
       if (ids && ids.size > 0) {
-        return { ...$shown, nodes: $shown.nodes.filter((n) => ids.has(n.id)) };
+        return narrowRollups($shown, $shown.nodes.filter((n) => ids.has(n.id)));
       }
-      return $g;
+      return narrowRollups($g);
+    }
+    if ($scope === 'selection' && $sel) {
+      const picked = selectionPopulation($g.nodes, $sel);
+      if (picked.length > 0) return narrowRollups($g, picked);
+      return narrowRollups($g);
     }
     if ($scope === 'currentFile' && $file) {
       const f = $file;
-      return { ...$g, nodes: $g.nodes.filter((n) => n.file_path === f) };
+      return narrowRollups($g, $g.nodes.filter((n) => n.file_path === f));
     }
     if ($scope === 'changedFiles' && $diff) {
-      // "Core" changes only — mirrors what `scopeToChangedFiles` uses.
-      const changed = new Set(
-        $diff.entities
-          .filter((e) =>
-            e.status === 'added' || e.status === 'removed'
-            || (e.status === 'modified' && e.source_changed === true)
-          )
-          .map((e) => e.file_path)
-          .filter((p): p is string => typeof p === 'string' && p.length > 0),
-      );
-      return { ...$g, nodes: $g.nodes.filter((n) => changed.has(n.file_path)) };
+      const changed = changedFilePaths($diff);
+      return narrowRollups($g, $g.nodes.filter((n) => changed.has(n.file_path)));
     }
-    return $g;
+    return narrowRollups($g);
   },
 );
 
@@ -577,6 +593,12 @@ export interface ScopeRow {
     cohesion: Tier;
     fanOut: Tier;
   };
+  /** Entity-level quality of the rows *this population* holds under the
+   *  scope — not the engine's whole-file rollup. The two agree when the
+   *  population is the whole scope and diverge the moment it is not, which
+   *  is exactly when a whole-file average would be describing entities the
+   *  reader has filtered away. */
+  aggregate: AggregatedScore;
 }
 
 /** Minimum entity count for cohesion to be meaningful. Files with fewer
@@ -669,20 +691,56 @@ function scopeTiers(s: ScopeMetrics, isModule: boolean): ScopeRow['tiers'] {
   };
 }
 
-export const fileRows = derived(graphData, ($g): ScopeRow[] =>
-  ($g.files ?? []).map((f) => ({
-    scope: f,
-    score: f.composite_score ?? scopeCompositeScore(f, false),
-    tiers: scopeTiers(f, false),
-  })),
+/**
+ * The population's entity rows, keyed by every scope path that holds them:
+ * the file itself and each directory above it.
+ *
+ * One map serves files and modules because a path cannot be both, and
+ * building it by walking each row's ancestors once is what keeps the module
+ * aggregate a subtree rollup — the same shape the engine's `is_descendant`
+ * produces — without a rollup × row scan per recompute.
+ */
+const rowsByScope = derived(qualityRows, ($rows): Map<string, QualityRow[]> => {
+  const byScope = new Map<string, QualityRow[]>();
+  const push = (key: string, r: QualityRow) => {
+    const bucket = byScope.get(key);
+    if (bucket) bucket.push(r);
+    else byScope.set(key, [r]);
+  };
+  for (const r of $rows) {
+    const path = r.node.file_path;
+    if (!path) continue;
+    push(path, r);
+    for (const dir of ancestorDirs(path)) push(dir, r);
+  }
+  return byScope;
+});
+
+function scopeRowsFrom(
+  scopes: ScopeMetrics[],
+  isModule: boolean,
+  byScope: Map<string, QualityRow[]>,
+): ScopeRow[] {
+  return scopes.map((s) => ({
+    scope: s,
+    score: s.composite_score ?? scopeCompositeScore(s, isModule),
+    tiers: scopeTiers(s, isModule),
+    aggregate: aggregateRows(byScope.get(s.path) ?? []),
+  }));
+}
+
+/** File and module rollups for the current population. Derived from
+ *  `analysisGraph`, not `graphData`: the panel names one population and
+ *  every tab in it has to be that population, or the reader is comparing
+ *  a summary of one set of files against a table of another. */
+export const fileRows = derived(
+  [analysisGraph, rowsByScope],
+  ([$g, $byScope]): ScopeRow[] => scopeRowsFrom($g.files ?? [], false, $byScope),
 );
 
-export const moduleRows = derived(graphData, ($g): ScopeRow[] =>
-  ($g.modules ?? []).map((m) => ({
-    scope: m,
-    score: m.composite_score ?? scopeCompositeScore(m, true),
-    tiers: scopeTiers(m, true),
-  })),
+export const moduleRows = derived(
+  [analysisGraph, rowsByScope],
+  ([$g, $byScope]): ScopeRow[] => scopeRowsFrom($g.modules ?? [], true, $byScope),
 );
 
 // --- Aggregated quality scores (repo / folder / file level) ---
@@ -785,26 +843,13 @@ export const repoQuality = derived(qualityRows, ($rows): AggregatedScore =>
   aggregateRows($rows),
 );
 
-/** Convert a backend `ScopeMetrics` entry (which already carries aggregated
- * quality fields computed in Rust) into the frontend `AggregatedScore` shape. */
-export function scopeToAggregated(s: ScopeMetrics): AggregatedScore {
-  const qOk = s.quality_ok ?? 0;
-  const qWarn = s.quality_warn ?? 0;
-  const qBad = s.quality_bad ?? 0;
-  const avg = s.avg_quality ?? 0;
-  const count = qOk + qWarn + qBad;
-  return {
-    avgScore: avg,
-    maxScore: s.max_quality ?? 0,
-    entityCount: count,
-    okCount: qOk,
-    warnCount: qWarn,
-    badCount: qBad,
-    cycleCount: 0, // cycle count per entity not tracked at scope level
-    badRatio: count > 0 ? qBad / count : 0,
-    tier: count === 0 ? 'na' : tierFromAvg(avg),
-  };
-}
+// The engine's own `avg_quality` / `quality_ok|warn|bad` rollup used to feed
+// this column via a `scopeToAggregated` adapter. It was dropped when the
+// rollups started following the population: those fields are computed over the
+// whole file whatever the reader has narrowed to, so the column contradicted
+// the summary sitting above it. `ScopeRow.aggregate` is the replacement, and
+// it uses the identical LOC-weighted formula (`aggregateRows`), so the numbers
+// still agree with the engine whenever the population is the whole scope.
 
 export const qualitySummary = derived(qualityRows, ($rows): QualitySummary => {
   const s: QualitySummary = {

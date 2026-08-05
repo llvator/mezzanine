@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { NaoServer } from './server';
 import { VisualizerPanel } from './panel';
 import { SelectionViewProvider } from './sideViewProvider';
+import type { SelectionPayload } from './sideViewProvider';
 import { DescriptionViewProvider } from './descriptionViewProvider';
 import { ScopeTreeProvider } from './scopeTreeProvider';
 import { ControlsViewProvider } from './controlsViewProvider';
@@ -133,11 +134,7 @@ export function activate(context: vscode.ExtensionContext) {
     VisualizerPanel.currentPanel?.sendCommand('selectEntityById', entityId);
   });
   qualityProvider.onGoToSource(async (file, line) => {
-    const workspaceRoot = getProjectRoot();
-    const absPath = workspaceRoot
-      ? vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), file).fsPath
-      : file;
-    await openAtLine(absPath, line);
+    await openAtLine(resolveWorkspacePath(file), line);
   });
 
   // Forward every click in the Controls view to the main panel, except for
@@ -145,6 +142,7 @@ export function activate(context: vscode.ExtensionContext) {
   controlsProvider.onCommand((command, value) => {
     if (command === 'setFollowSelection') {
       followSelection = !!value;
+      controlsProvider.setFollowSelection(followSelection);
       return;
     }
     VisualizerPanel.currentPanel?.sendCommand(command, value);
@@ -321,16 +319,23 @@ export function activate(context: vscode.ExtensionContext) {
       controlsProvider.setSelection(payload);
 
       // Auto-open the file at its line when "follow selection" is on.
-      if (followSelection && payload?.filePath) {
-        const workspaceRoot = getProjectRoot();
-        const absPath = workspaceRoot
-          ? vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), payload.filePath).fsPath
-          : payload.filePath;
+      if (followSelection && payload?.filePath && isOpenableSelection(payload)) {
+        const absPath = resolveWorkspacePath(payload.filePath);
         // Suppress the resulting active-editor/cursor change events for a
         // short window so they don't bounce back into the graph as a
         // focusFile/focusCursor.
         suppressEditorEventsUntil = Date.now() + 800;
-        await openAtLine(absPath, payload.line, { preserveFocus: true });
+        try {
+          await openAtLine(absPath, payload.line, { preserveFocus: true });
+        } catch (err) {
+          // Nothing opened, so nothing will echo back — drop the window
+          // rather than swallowing 800ms of the user's real editor events
+          // for a click that did nothing.
+          suppressEditorEventsUntil = 0;
+          outputChannel.appendLine(
+            `[follow] could not open ${absPath}:${payload.line} — ${(err as Error).message}`
+          );
+        }
       }
     })
   );
@@ -358,12 +363,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       'nao.internalGoToDefinition',
       async (args: { filePath: string; line?: number }) => {
-        const workspaceRoot = getProjectRoot();
-        // filePath from the side view is workspace-relative; resolve it
-        const absPath = workspaceRoot
-          ? vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), args.filePath).fsPath
-          : args.filePath;
-        await openAtLine(absPath, args.line);
+        await openAtLine(resolveWorkspacePath(args.filePath), args.line);
       }
     )
   );
@@ -885,9 +885,10 @@ async function ensureServer(
   const binaryPath = config.get<string>('binaryPath', '') || 'nao';
   const port = config.get<number>('serverPort', 3200);
   const includeTests = config.get<boolean>('includeTests', false);
+  const includeDocs = config.get<boolean>('includeDocs', false);
   const language = config.get<string>('language', '');
 
-  server = new NaoServer(binaryPath, workspaceRoot, port, includeTests, outputChannel, contentFallback, language);
+  server = new NaoServer(binaryPath, workspaceRoot, port, includeTests, includeDocs, outputChannel, contentFallback, language);
 
   try {
     await server.start();
@@ -979,6 +980,45 @@ function fetchCommits(port: number, limit: number): Promise<CommitItemApi[]> {
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.end();
   });
+}
+
+/**
+ * Resolve a path reported by the graph to something on disk.
+ *
+ * The watch server relativises paths against the analyzed root, so the common
+ * case is a join. But `strip_prefix` falls back to the raw absolute path when
+ * a file sits outside that root (symlinked root, a `Select Git Repository…`
+ * override that disagrees with it), and `Uri.joinPath` *appends* an absolute
+ * segment rather than substituting it — turning `/elsewhere/a.ts` into
+ * `<root>/elsewhere/a.ts`, which exists nowhere. Test for it instead.
+ */
+function resolveWorkspacePath(filePath: string): string {
+  const workspaceRoot = getProjectRoot();
+  if (!workspaceRoot || path.isAbsolute(filePath)) return filePath;
+  return vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), filePath).fsPath;
+}
+
+/**
+ * Should this selection pull the editor to it?
+ *
+ * Two selections must not, and neither is a failure worth reporting:
+ *
+ *  • Module nodes. At module aggregation `collapseGraph` sets `file_path` to
+ *    the *directory* the entities share, and `openTextDocument` rejects on a
+ *    directory. There is no sensible file to pick, so don't try.
+ *  • A selection the caret is already inside. Cursor-sync turns a click in the
+ *    editor into a graph selection, which arrives back here — following it
+ *    would drag the caret from where the user clicked up to the entity's
+ *    declaration line. Same round-trip the drag-select guard in
+ *    `onDidChangeTextEditorSelection` blocks, reached by a plain click.
+ */
+function isOpenableSelection(payload: SelectionPayload): boolean {
+  if (payload.kind === 'module') return false;
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return true;
+  if (editor.document.uri.fsPath !== resolveWorkspacePath(payload.filePath)) return true;
+  const caret = editor.selection.active.line + 1;
+  return caret < payload.line || caret > (payload.endLine ?? payload.line);
 }
 
 async function openAtLine(

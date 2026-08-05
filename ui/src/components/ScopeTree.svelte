@@ -3,7 +3,6 @@
     indexData, selectedScopes, scopeRules, selectionStats, refreshing,
     treeLanguageFilter, availableLanguages,
     toggleScope, clearScope, selectAllScope, extendScopeToParents, refreshData,
-    ENTITY_THRESHOLD,
     filterText, openFolders, flatList,
     queryActive, queryMatches, matchOverflow, queryProjection, commitQuery,
     toggleFolderOpen, toggleTreeLanguage, clearLanguageFilter,
@@ -97,15 +96,14 @@
           {#if $matchOverflow > 0}
             <span class="truncated">showing first {$flatList.length}</span>
           {/if}
-          <!-- The cost of pressing Enter, before pressing it. A query that
-               would cross the threshold should read as a number here, not as
-               a warning after the canvas has already declined to draw. -->
+          <!-- The cost of pressing Enter, before pressing it — a number, not
+               a verdict. It used to turn red past `ENTITY_THRESHOLD` to warn
+               that the canvas would refuse; since UI-061 the canvas decides
+               from what it would draw, after collapse and filters, so a large
+               selection here usually renders fine and the red was a wrong
+               prediction rather than an early one. -->
           {#if $queryProjection}
-            <span
-              class="projection"
-              class:over={$queryProjection.entities > ENTITY_THRESHOLD}
-              title="Pressing Enter scopes to these matches"
-            >
+            <span class="projection" title="Pressing Enter scopes to these matches">
               ⏎ {formatCount($queryProjection.entities)} entities
             </span>
           {/if}
@@ -118,7 +116,6 @@
              whose only entities are excluded kinds (parameters, branches)
              isn't — so the row must survive `node` being absent. -->
         {@const node = $indexData.nodes[item.path]}
-        {@const oversized = (node?.entity_count ?? 0) > ENTITY_THRESHOLD}
         <!-- Direct = a rule names this exact path; inherited = it is in
              scope because some other rule covers it. Both come from
              evaluating the rule list, not from walking ancestors. -->
@@ -128,7 +125,6 @@
           class="tree-item"
           class:selected={directlySelected}
           class:inherited={inheritedSelected}
-          class:oversized
           style="padding-left: {item.depth * 12}px"
         >
           <!-- No expander while querying: results are a flat list, so an
@@ -166,9 +162,14 @@
               {$queryActive ? item.path : (displayName(item.path) || item.path)}
             {/if}
           </span>
+          <!-- Count only. A ⚠ used to appear past `ENTITY_THRESHOLD`, meaning
+               "this won't render" — which discouraged selecting exactly the
+               folders worth looking at, before anything had refused. Since
+               UI-061 a large folder is drawn collapsed rather than refused,
+               so the glyph asserted something untrue. The number is the
+               honest part and it stayed. -->
           <span class="count" title="{node?.entity_count ?? 0} entities, {node?.relationship_count ?? 0} relationships">
             {formatCount(node?.entity_count ?? 0)}
-            {#if oversized}<span class="warn">⚠</span>{/if}
           </span>
         </div>
       {/each}
@@ -263,10 +264,6 @@
 
   .tree-item.inherited {
     background: rgba(33, 150, 243, 0.08);
-  }
-
-  .tree-item.oversized .count {
-    color: var(--danger-fg);
   }
 
   .select-cb {
@@ -417,11 +414,6 @@
     white-space: nowrap;
   }
 
-  .warn {
-    color: var(--danger-fg);
-    margin-left: 2px;
-  }
-
   .loading {
     color: var(--text-dim);
     font-size: 0.8rem;
@@ -445,10 +437,6 @@
     margin-left: auto;
     color: var(--text-secondary);
     white-space: nowrap;
-  }
-
-  .projection.over {
-    color: var(--danger-fg);
   }
 
   /* Full paths are long; the folder prefix is what disambiguates two

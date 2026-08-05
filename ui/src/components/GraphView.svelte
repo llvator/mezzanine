@@ -6,16 +6,32 @@
   import { LINK_COLORS, KIND_CODES } from '../types/graph';
   import {
     graphData, selectedNode, hoveredNode, hoverLocked, hoverDepth, viewMode,
-    showLabels, showKindLabels, showLinkLabels, viewportWidth,
+    showLabels, showKindLabels, showLinkLabels, viewportWidth, graphLevel, hoverMode,
+    toggleExpanded,
   } from '../stores/graph';
+  import { focusedPane } from '../stores/keymap';
   import { displayPlan, displaySearchMatchIds, linkKeyFor, type DisplayPlan } from '../viewmodels/displayPlan';
+  import { drawnIdsOf } from '../viewmodels/drawCeiling';
   import { diffActive, diffStatusMap, diffSourceChangedMap, diffDimOpacity, DIFF_COLORS, normalizeEntityId } from '../stores/diff';
-  import { autoFitView, activeTheme } from '../stores/settings';
+  import { autoFitView, activeTheme, folderCohesion, showFolderHulls, hullDepth } from '../stores/settings';
+  import { forceFolderCohesion, cohesionStrengthFor, folderKeyOf, ancestorChainOf, type FolderCohesionForce } from '../utils/forceCohesion';
+  import { makeSeeder } from '../utils/layoutSeed';
+  import {
+    newcomers, worthMarking, noteArrivals, pruneArrivals, msUntilNextExpiry,
+    ARRIVAL_HIGHLIGHT_MS, type ArrivalLog,
+  } from '../utils/arrivals';
+  import { liveReloading } from '../stores/liveReload';
+  import { computeFolderHulls, type FolderHull } from '../viewmodels/folderHulls';
+  import { groupMemberIds } from '../viewmodels/hoverHighlight';
   import { canvasChrome, type CanvasChrome } from '../utils/canvasChrome';
-  import { drillIn } from '../stores/scope';
+  import { drillIn, refreshing } from '../stores/scope';
+  import { isMarked, markedPaths, toggleMark } from '../stores/marks';
   import { isMoreChildThan } from '../utils/kindPriority';
   import { nodeEncoding } from '../stores/encoding';
   import type { NodeEncoding } from '../viewmodels/nodeEncoding';
+  import { ARROW_LEN, arrowHeadPoint, linkStrokeWidth } from '../viewmodels/linkGeometry';
+  import { overviewDots, canvasViewport } from '../stores/overview';
+  import { centreTransform, type OverviewDot } from '../viewmodels/overviewFrame';
 
   /** Drill into a collapsed (file or module) node: narrow the scope to its
    *  path and re-enable auto-level so the view expands to the finest level
@@ -27,6 +43,47 @@
       return;
     }
     void drillIn(d.original_id);
+  }
+
+  /**
+   * Double-click on a collapsed node: drill in, or — with shift — open it in
+   * place (UI-057).
+   *
+   * The two are genuinely different operations and both are worth having.
+   * Drilling *replaces* the view with one scope and re-runs the whole
+   * pipeline; expanding *adds* one scope's contents to the view already on
+   * screen and touches nothing else. Plain double-click keeps its existing
+   * meaning because it is reachable from the details panel and the extension
+   * and people already have it in their hands; shift takes the new one.
+   */
+  function onNodeDoubleClick(event: MouseEvent, d: D3Node): void {
+    event.stopPropagation();
+    if (d.kind_raw !== 'File' && d.kind_raw !== 'Module') return;
+    if (event.shiftKey) {
+      toggleExpanded(d.original_id);
+      return;
+    }
+    drillInto(d);
+  }
+
+  /**
+   * Single click: make this the subject, or — with ⌘/Ctrl — mark it.
+   *
+   * The modifier is the one every list on every platform already uses for
+   * "add this to what I have picked", and it is free here: `mod+k` is the only
+   * modified key the graph pane binds, and the canvas has no native
+   * ⌘-click of its own. Marking deliberately does **not** move the subject:
+   * the Details and Description panes are answering about the node you last
+   * clicked, and having a third mark silently re-point them would make
+   * building a set destructive to the reading you built it from.
+   */
+  function onNodeClick(event: MouseEvent, d: D3Node): void {
+    if (!event.metaKey && !event.ctrlKey) {
+      selectedNode.set(d);
+      return;
+    }
+    event.stopPropagation();
+    toggleMark(d);
   }
 
   let container: HTMLDivElement;
@@ -53,6 +110,12 @@
   /** Pending auto-fit timer — cleared when a new layout starts so we don't
    *  queue multiple fits on rapid plan changes. */
   let autoFitTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Nodes that arrived on a recent reload, and when their mark lapses.
+   *  Survives a rebuild on purpose: a scope change mid-window should not
+   *  erase the answer to "what just appeared" (UI-066). */
+  let arrivals: ArrivalLog = new Map();
+  /** One sweep timer for the whole log — see `msUntilNextExpiry`. */
+  let arrivalTimer: ReturnType<typeof setTimeout> | null = null;
   /** Mirrors plan.selectedId so the force-tick and tree-positioning paths
    *  can decide whether to visually flip an edge's endpoints. The flip
    *  keeps the arrow head aligned with the reading direction of
@@ -155,6 +218,40 @@
   }
 
   /**
+   * Write both endpoints of every link in `sel`.
+   *
+   * `1` = tail, `2` = arrow head, flipped for reversed edges so
+   * "inherited by"/"called by" labels read with the arrow rather than against
+   * it. The head end stops at the rim of the node it points at rather than at
+   * its centre — the arrow is a fixed-size marker anchored to that point, and
+   * node radius is a user-chosen channel, so the setback has to be per link.
+   *
+   * One pass with direct attribute writes rather than four `.attr(fn)` calls:
+   * this runs on every simulation tick, and the `.attr` form would walk the
+   * selection four times and re-trim on each.
+   */
+  function positionLinks(
+    sel: d3.Selection<SVGLineElement, D3Link, SVGGElement, unknown>,
+    sx: (d: D3Link) => number, sy: (d: D3Link) => number,
+    tx: (d: D3Link) => number, ty: (d: D3Link) => number,
+  ): void {
+    sel.each(function (d) {
+      const rev = isReversed(d);
+      const tailX = rev ? tx(d) : sx(d);
+      const tailY = rev ? ty(d) : sy(d);
+      const headEnd = rev ? d.source : d.target;
+      // Still an id string until the simulation's first tick swaps in the
+      // node object; no radius to trim to yet, and one frame later there is.
+      const r = typeof headEnd === 'object' ? getNodeSize(headEnd as D3Node) : 0;
+      const p = arrowHeadPoint(tailX, tailY, rev ? sx(d) : tx(d), rev ? sy(d) : ty(d), r);
+      this.setAttribute('x1', String(tailX));
+      this.setAttribute('y1', String(tailY));
+      this.setAttribute('x2', String(p.x));
+      this.setAttribute('y2', String(p.y));
+    });
+  }
+
+  /**
    * UI-014 — the active metric→visual-channel mapping.
    *
    * Rebuilt whenever the data, the chosen channels, the aggregation level or
@@ -191,9 +288,250 @@
       .attr('fill-opacity', (d) => encoding.fillOpacity(d));
     nodeSel.select<SVGTextElement>('.kind-label').attr('fill', (d) => encoding.labelInk(d));
     nodeSel.select<SVGTextElement>('.name-label').attr('dy', (d) => encoding.radius(d) + 12);
+    // Both rings are sized off the radius the encoding just changed.
+    applyArrivals();
+    applyMarks();
+    // So is every dot in the overview. Switching channel or theme has to
+    // reach it, or the panel keeps describing the encoding the canvas left.
+    publishOverview(true);
     simulation?.force('collision', d3.forceCollide().radius(collisionRadius()));
+    // Arrow-head setbacks are measured from the radius that just changed, so
+    // they are stale until something repositions the links. In force mode the
+    // reheat below would get there eventually; in tree mode the simulation is
+    // pinned and nothing else would, and either way "eventually" is a visible
+    // frame of arrows sunk into or floating off the resized circles.
+    if (linkSel) {
+      positionLinks(
+        linkSel,
+        (d) => (d.source as D3Node).x ?? 0, (d) => (d.source as D3Node).y ?? 0,
+        (d) => (d.target as D3Node).x ?? 0, (d) => (d.target as D3Node).y ?? 0,
+      );
+    }
     simulation?.alpha(0.2).restart();
   }
+
+  // ── Arrival marks (UI-066) ────────────────────────────────────────────
+  //
+  // A node that appears on a live reload keeps a ring around it for
+  // `ARRIVAL_HIGHLIGHT_MS`. The bookkeeping is in `utils/arrivals.ts`; what
+  // is left here is painting it and one timer.
+
+  /**
+   * Paint the marks currently in the log.
+   *
+   * Idempotent, and deliberately not part of the enter selection: a
+   * structural rebuild throws the DOM away mid-window, and re-deriving the
+   * rings from the log means the marks come back with it. The ring is
+   * *inserted* before the labels so `nodeSel.select('circle')` — which
+   * `restyleEncoding` uses — still finds the node's own circle first.
+   *
+   * The `just-arrived` class carries no styling; it is the stable selector
+   * for anything asking *which* nodes are marked without reaching for the
+   * ring element.
+   */
+  function applyArrivals(): void {
+    if (!nodeSel || !encoding) return;
+    nodeSel.classed('just-arrived', (d) => arrivals.has(d.id));
+    nodeSel.each(function (d: D3Node) {
+      const group = d3.select(this);
+      const ring = group.select<SVGCircleElement>('circle.arrival-ring');
+      if (!arrivals.has(d.id)) {
+        ring.remove();
+        return;
+      }
+      if (ring.empty()) {
+        group.insert('circle', 'text')
+          .attr('class', 'arrival-ring')
+          .attr('fill', 'none')
+          .attr('pointer-events', 'none')
+          .attr('r', encoding.radius(d) + 6);
+      } else {
+        ring.attr('r', encoding.radius(d) + 6);
+      }
+    });
+  }
+
+  /**
+   * Ring every node whose scope is marked.
+   *
+   * Its own element rather than the node's own stroke, for the reason the
+   * arrival ring is: a marked node that is also selected, searched or
+   * diff-coloured has to keep saying all of those things, and there is exactly
+   * one stroke to say them with. Sits inside the arrival ring at radius + 4 so
+   * the two read as two rings when both apply.
+   *
+   * Matched on `file_path`, so at File level the file's own circle is ringed
+   * and at Entity level every entity in it is — the mark is on the scope, and
+   * both pictures are honest answers to "what did I pick".
+   */
+  function applyMarks(): void {
+    if (!nodeSel || !encoding) return;
+    const marks = get(markedPaths);
+    nodeSel.classed('marked', (d) => isMarked(d, marks));
+    nodeSel.each(function (d: D3Node) {
+      const group = d3.select(this);
+      const ring = group.select<SVGCircleElement>('circle.mark-ring');
+      if (!isMarked(d, marks)) {
+        ring.remove();
+        return;
+      }
+      if (ring.empty()) {
+        group.insert('circle', 'text')
+          .attr('class', 'mark-ring')
+          .attr('fill', 'none')
+          .attr('pointer-events', 'none')
+          .attr('r', encoding.radius(d) + 4);
+      } else {
+        ring.attr('r', encoding.radius(d) + 4);
+      }
+    });
+  }
+
+  /**
+   * Record a batch of arrivals.
+   *
+   * Callers gate on the update being reload-driven. Widening a scope also
+   * brings ids that were not there before, but those are nodes the user just
+   * asked for — marking them would answer a question nobody asked and bury
+   * the case the mark exists for.
+   */
+  function markArrivals(ids: string[]): void {
+    if (!worthMarking(ids.length)) {
+      if (ids.length) {
+        console.log(`[GraphView] ${ids.length} new nodes — a rebuild, not an arrival; not marking`);
+      }
+      return;
+    }
+    noteArrivals(arrivals, ids, Date.now(), ARRIVAL_HIGHLIGHT_MS);
+    scheduleArrivalSweep();
+  }
+
+  /** One timer for the whole log, re-aimed at the next deadline each sweep. */
+  function scheduleArrivalSweep(): void {
+    if (arrivalTimer) clearTimeout(arrivalTimer);
+    arrivalTimer = null;
+    const due = msUntilNextExpiry(arrivals, Date.now());
+    if (due === null) return;
+    arrivalTimer = setTimeout(() => {
+      arrivalTimer = null;
+      pruneArrivals(arrivals, Date.now());
+      applyArrivals();
+      scheduleArrivalSweep();
+    }, due + 50);
+  }
+  /** Re-read the folder-cohesion strength and reheat.
+   *
+   *  A strength change is a layout change, so unlike `restyleEncoding` it
+   *  does have to re-settle — but it is still not a rebuild: the same nodes
+   *  move to new positions. In tree mode the simulation is deliberately
+   *  stopped and the nodes are pinned to computed positions, so we record
+   *  the new strength and leave the restart alone; it takes effect when the
+   *  user returns to force mode. */
+  function applyCohesion(): void {
+    const force = simulation?.force('cohesion') as FolderCohesionForce | undefined;
+    if (!force) return;
+    force.strength(cohesionStrengthFor(get(graphLevel), get(folderCohesion)));
+    if (currentMode !== 'force') return;
+    simulation.alpha(0.3).restart();
+  }
+
+  // ── Folder hulls (UI-055) ──────────────────────────────────────────────
+
+  /** Node ids the plan is currently drawing. A hull is computed from these
+   *  rather than from the whole node set, or it would stretch to reach a
+   *  filtered-out node and enclose empty canvas — which reads as a sparse
+   *  folder rather than as a hidden one. */
+  let hullNodeIds: Set<string> = new Set();
+
+  /** Hulls recompute at most this often while the simulation runs. A hull
+   *  trailing its nodes by a frame is imperceptible; recomputing a polygon
+   *  per group on every one of ~60 ticks a second is not. */
+  const HULL_INTERVAL_MS = 100;
+  let lastHullDraw = 0;
+
+  const hullPath = d3.line<[number, number]>()
+    .x((p) => p[0])
+    .y((p) => p[1])
+    .curve(d3.curveCatmullRomClosed.alpha(0.5));
+
+  function hullsEnabled(): boolean {
+    if (!get(showFolderHulls)) return false;
+    // Tree mode draws no hulls, as before. The layout is a strict hierarchy
+    // and an outline over it fights the thing it is outlining.
+    if (currentMode !== 'force') return false;
+    // Module level: every node already *is* a folder, so outlining their
+    // parent directories stacks a second grouping tier on the first with
+    // nothing to tell them apart. Same rule as the cohesion force.
+    if (get(graphLevel) === 'module') return false;
+    return true;
+  }
+
+  function drawHulls(immediate = false): void {
+    if (!fileHullGroup || !nodeSel) return;
+    if (!hullsEnabled()) { fileHullGroup.selectAll('*').remove(); return; }
+    const now = performance.now();
+    if (!immediate && now - lastHullDraw < HULL_INTERVAL_MS) return;
+    lastHullDraw = now;
+
+    const drawn: D3Node[] = [];
+    nodeSel.each((d: D3Node) => { if (hullNodeIds.has(d.id)) drawn.push(d); });
+    // The whole chain, with the tier count passed separately (UI-070): a
+    // region has to hold every node beneath it whatever depth is on show, or
+    // its name promises more than its shape contains. `tiers: 1` is the
+    // UI-055 picture — the tiers are additive, never a different answer for
+    // the leaf regions.
+    const hulls = computeFolderHulls(drawn, {
+      radiusOf: (d) => encoding.radius(d),
+      keysOf: (d) => {
+        const key = folderKeyOf(d);
+        return key === null ? [] : ancestorChainOf(key, Infinity);
+      },
+      tiers: get(hullDepth),
+    });
+
+    const sel = fileHullGroup.selectAll<SVGGElement, FolderHull>('g.folder-hull')
+      .data(hulls, (h) => (h as FolderHull).path)
+      .join(
+        (enter) => {
+          const grp = enter.append('g').attr('class', 'folder-hull');
+          grp.append('path').attr('class', 'hull-shape');
+          grp.append('text').attr('class', 'hull-label').attr('text-anchor', 'middle');
+          return grp;
+        },
+        (update) => update,
+        (exit) => exit.remove(),
+      );
+
+    // `data-path` and the parent class are read by the probe, which cannot
+    // tell a region's ancestry from a label that carries only the last
+    // segment — and got it wrong by guessing from the basename before.
+    sel.attr('class', (h) => (h.hasChildren ? 'folder-hull parent' : 'folder-hull'))
+      .attr('data-path', (h) => h.path);
+
+    sel.select<SVGPathElement>('path.hull-shape')
+      .attr('d', (h) => hullPath(h.points))
+      .attr('fill', canvasColors.hullFill)
+      // A parent gets no wash at all. Three nested fills at 6% each stack to
+      // 17% over the innermost nodes, which is where a region starts shifting
+      // what the metric-driven fills inside it appear to say — the thing
+      // UI-055's achromatic decision exists to prevent. The outline and the
+      // name carry the parent; only the leaf region is filled.
+      .attr('fill-opacity', (h) => (h.hasChildren ? 0 : canvasColors.hullFillOpacity))
+      .attr('stroke', canvasColors.hullStroke)
+      .attr('stroke-opacity', canvasColors.hullStrokeOpacity)
+      .attr('stroke-width', 1.5);
+
+    // Upper-cased here rather than by `text-transform`, which SVG text
+    // support for is uneven. Small caps plus the dimmer ink is what keeps a
+    // region name from reading as an entity name; the extra size on a parent
+    // is what makes it read as the heading over the regions inside it.
+    sel.select<SVGTextElement>('text.hull-label')
+      .attr('x', (h) => h.labelX)
+      .attr('y', (h) => h.labelY)
+      .attr('fill', canvasColors.hullLabelFill)
+      .text((h) => h.label.toUpperCase());
+  }
+
   function sourceId(link: D3Link): string {
     return typeof link.source === 'object' ? (link.source as D3Node).id : link.source;
   }
@@ -319,11 +657,11 @@
     // immediately on selection change. In tree mode the tree branch
     // re-runs `positionEdgesAndLabels`, which already handles reversal.
     if (currentMode === 'force' && linkSel && prevSelectedId !== currentSelectedId) {
-      linkSel
-        .attr('x1', (d) => (isReversed(d) ? (d.target as D3Node) : (d.source as D3Node)).x ?? 0)
-        .attr('y1', (d) => (isReversed(d) ? (d.target as D3Node) : (d.source as D3Node)).y ?? 0)
-        .attr('x2', (d) => (isReversed(d) ? (d.source as D3Node) : (d.target as D3Node)).x ?? 0)
-        .attr('y2', (d) => (isReversed(d) ? (d.source as D3Node) : (d.target as D3Node)).y ?? 0);
+      positionLinks(
+        linkSel,
+        (d) => (d.source as D3Node).x ?? 0, (d) => (d.source as D3Node).y ?? 0,
+        (d) => (d.target as D3Node).x ?? 0, (d) => (d.target as D3Node).y ?? 0,
+      );
     }
 
     // Visibility: nodes. Visible nodes get opacity 1, dimmed nodes get
@@ -458,13 +796,7 @@
         const sy = (d: D3Link) => posOf(sourceId(d))?.y ?? (d.source as D3Node).y ?? 0;
         const tx = (d: D3Link) => posOf(targetId(d))?.x ?? (d.target as D3Node).x ?? 0;
         const ty = (d: D3Link) => posOf(targetId(d))?.y ?? (d.target as D3Node).y ?? 0;
-        // Endpoints `1` = tail, `2` = arrow-head. Flip for reversed edges so
-        // "inherited by"/"called by" labels read with the arrow, not against.
-        linkSel
-          .attr('x1', (d) => (isReversed(d) ? tx(d) : sx(d)))
-          .attr('y1', (d) => (isReversed(d) ? ty(d) : sy(d)))
-          .attr('x2', (d) => (isReversed(d) ? sx(d) : tx(d)))
-          .attr('y2', (d) => (isReversed(d) ? sy(d) : ty(d)));
+        positionLinks(linkSel, sx, sy, tx, ty);
         linkLabelSel.attr('transform', (d) => {
           const mx = (sx(d) + tx(d)) / 2;
           const my = (sy(d) + ty(d)) / 2;
@@ -505,6 +837,23 @@
         }
       }
     }
+
+    // Hulls last: `hullsEnabled` reads `currentMode`, which the branch above
+    // is what sets. Immediate rather than throttled — a filter change is a
+    // user action, and a region that keeps its old outline for a tenth of a
+    // second after its nodes vanish is visible as a glitch.
+    hullNodeIds = new Set<string>();
+    for (const id of plan.visibleNodeIds) hullNodeIds.add(id);
+    if (dimOpacity > 0) for (const id of plan.dimmedNodeIds) hullNodeIds.add(id);
+    drawHulls(true);
+
+    // Immediate for the same reason, and it is the *only* publish tree mode
+    // gets: the simulation is stopped there, so no tick handler will follow
+    // up. The tree branch above writes each node's final `d.x`/`d.y` inside
+    // the transition's attribute callback, which has already run by here, so
+    // these are the settled positions rather than the ones being animated
+    // away from.
+    publishOverview(true);
   }
 
   /** Hover-only dimming. BFS from the hovered node up to `$hoverDepth`
@@ -547,11 +896,109 @@
     orderBadgeSel.classed('dimmed', (l) => !edgeReachable(l));
   }
 
+  /** Hover-only dimming by *membership* rather than by reachability
+   *  (UI-054): everything sharing the hovered node's folder stays lit.
+   *
+   *  Shares `resetHighlight` and the `.dimmed` class with the connections
+   *  path deliberately — both are hover-scoped probes that clear on
+   *  mouseout, and giving them separate visual treatments would make the
+   *  canvas say two things where the user asked one question. */
+  function highlightGroup(d: D3Node) {
+    const members = groupMemberIds($graphData.nodes, d, folderKeyOf);
+    // A ghost is in no group. Lighting up every other ghost would invent a
+    // grouping that does not exist, so the honest answer is to light nothing
+    // — and leaving the canvas untouched says that more clearly than dimming
+    // the entire graph would.
+    if (members.size === 0) return;
+    nodeSel.classed('dimmed', (n) => !members.has(n.id));
+    const edgeInGroup = (l: D3Link) => members.has(sourceId(l)) && members.has(targetId(l));
+    linkSel.classed('dimmed', (l) => !edgeInGroup(l));
+    linkLabelSel.classed('dimmed', (l) => !edgeInGroup(l));
+    orderBadgeSel.classed('dimmed', (l) => !edgeInGroup(l));
+  }
+
+  /** Dispatch a hover to whichever question the user is asking. Module level
+   *  falls back to connections: every node there already *is* a folder, so
+   *  "what else lives here" has no answer to give. */
+  function highlightHover(d: D3Node) {
+    if ($hoverMode === 'group' && get(graphLevel) !== 'module') highlightGroup(d);
+    else highlightConnections(d);
+  }
+
   function resetHighlight() {
     nodeSel.classed('dimmed', false);
     linkSel.classed('dimmed', false);
     linkLabelSel.classed('dimmed', false);
     orderBadgeSel.classed('dimmed', false);
+  }
+
+  // --- Overview panel (UI-083) ---
+  //
+  // Two publishes, deliberately separate, because they change at completely
+  // different rates and for different reasons. The viewport is one small
+  // object written on a zoom or a resize — user-driven, so at most a few
+  // hundred a second and each one worth honouring immediately. The dots are
+  // up to a render budget's worth of objects rebuilt off the simulation,
+  // which fires ~60 times a second for as long as the layout is settling, and
+  // a panel a couple of frames behind the canvas during a settle is
+  // indistinguishable from one that isn't.
+
+  /** Same throttle as the folder hulls, for the same reason: this reads every
+   *  drawn node on a tick handler that has to stay cheap. */
+  const OVERVIEW_INTERVAL_MS = 100;
+  let lastOverviewPublish = 0;
+
+  /** Where the viewport is, for the overview's box. Takes the transform as an
+   *  argument rather than reading it back off the element, because the zoom
+   *  handler already has it and `d3.zoomTransform` during a transition
+   *  returns the interpolated value a frame late. */
+  function publishViewport(t: d3.ZoomTransform | { k: number; x: number; y: number }): void {
+    if (!container) return;
+    canvasViewport.set({ k: t.k, x: t.x, y: t.y, w: container.clientWidth, h: container.clientHeight });
+  }
+
+  /**
+   * The drawn nodes as flat world-space dots.
+   *
+   * Position, radius and fill come from the same `encoding` the canvas circles
+   * were drawn with, so the panel is a picture of *this* graph rather than a
+   * second opinion about it — the reader is meant to recognise one in the
+   * other, and a panel with its own size rule would defeat that.
+   *
+   * `display: none` is the same skip `visibleNodeExtents` makes: a filtered
+   * node is not on the canvas, so the overview claiming it would put the box
+   * around a region holding nothing.
+   */
+  function publishOverview(immediate = false): void {
+    if (!nodeSel) { overviewDots.set([]); return; }
+    const now = performance.now();
+    if (!immediate && now - lastOverviewPublish < OVERVIEW_INTERVAL_MS) return;
+    lastOverviewPublish = now;
+
+    const dots: OverviewDot[] = [];
+    nodeSel.each(function (d: D3Node) {
+      if ((this as SVGGElement).style.display === 'none') return;
+      if (d.x == null || d.y == null || !isFinite(d.x) || !isFinite(d.y)) return;
+      dots.push({
+        x: d.x,
+        y: d.y,
+        r: encoding.radius(d),
+        fill: encoding.fill(d),
+        opacity: encoding.fillOpacity(d),
+      });
+    });
+    overviewDots.set(dots);
+  }
+
+  /** Centre the viewport on a world point, keeping the current scale. The
+   *  overview's click and drag both land here. No transition: a drag has to
+   *  track the pointer, and a 500ms ease per pointermove would queue up
+   *  behind itself and lag the box off the cursor. */
+  export function panTo(wx: number, wy: number): void {
+    if (!svg || !zoom || !container) return;
+    const t = d3.zoomTransform(svgEl);
+    const next = centreTransform(wx, wy, t.k, container.clientWidth, container.clientHeight);
+    svg.call(zoom.transform, d3.zoomIdentity.translate(next.x, next.y).scale(next.k));
   }
 
   // --- Public methods for controls ---
@@ -648,6 +1095,39 @@
     viewMode.update((m) => m === 'graph' ? 'tree' : 'graph');
   }
 
+  /**
+   * The nodes and links the plan actually puts on screen.
+   *
+   * Dimmed nodes count as drawn — they render at reduced opacity rather than
+   * being removed, so dropping them here would delete the diff and search
+   * context the dimming exists to provide.
+   *
+   * Over the draw ceiling this is empty, which is what turns the overflow
+   * card from a cover over a fully-built canvas into an actual refusal to
+   * build one.
+   */
+  function renderSetFor(
+    plan: DisplayPlan,
+    data: import('../types/graph').GraphData,
+  ): import('../types/graph').GraphData {
+    const empty = { nodes: [], links: [], files: data.files, modules: data.modules };
+    if (plan.overflow) return empty;
+    // Same definition the ceiling is measured against — see `drawnIdsOf`.
+    // If these two ever disagree the gate is charging for a different set
+    // than the one being built, which is the bug UI-061 was about.
+    const keep = drawnIdsOf(plan);
+    if (keep.size === 0) return empty;
+    const nodes = data.nodes.filter((n) => keep.has(n.id));
+    // Both endpoint checks matter: `visibleLinkKeys` is computed against the
+    // visible set, and a dimmed endpoint can leave a key whose other end is
+    // filtered out. A link to a node that was never built renders as a line
+    // into empty space.
+    const links = data.links.filter(
+      (l) => plan.visibleLinkKeys.has(linkKeyFor(l)) && keep.has(sourceId(l)) && keep.has(targetId(l)),
+    );
+    return { nodes, links, files: data.files, modules: data.modules };
+  }
+
   function teardownGraph() {
     if (autoFitTimer) { clearTimeout(autoFitTimer); autoFitTimer = null; }
     simulation?.stop();
@@ -657,6 +1137,10 @@
       svg.on('click', null);
       svg.selectAll('*').remove();
     }
+    // An empty frame is what folds the overview away. Without this, tearing
+    // the canvas down over the draw ceiling would leave the panel showing the
+    // graph that is no longer there — the one picture guaranteed to be wrong.
+    overviewDots.set([]);
     nodeSel = null as any;
     linkSel = null as any;
     linkLabelSel = null as any;
@@ -674,8 +1158,18 @@
 
     // Reset positional state so node objects shared across selections
     // don't carry stale fx/fy or vx/vy from a previous render.
+    //
+    // UI-053: the reset seeds from the folder tree rather than clearing x/y.
+    // Cleared coordinates hand the starting arrangement to d3's default
+    // phyllotaxis spiral, which is ordered by array index — an ordering that
+    // carries no structural information and changes whenever the node set
+    // does. Since a force layout converges near where it began, that made
+    // the settled picture partly an artefact of array order, and made the
+    // same repo look different on consecutive loads.
+    const seeder = makeSeeder(data.nodes, w, h);
     data.nodes.forEach((n) => {
-      n.x = undefined; n.y = undefined;
+      const p = seeder.position(n);
+      n.x = p.x; n.y = p.y;
       (n as any).vx = 0; (n as any).vy = 0;
       n.fx = null; n.fy = null;
     });
@@ -686,7 +1180,10 @@
 
     zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.1, 4])
-      .on('zoom', (event) => g.attr('transform', event.transform));
+      .on('zoom', (event) => {
+        g.attr('transform', event.transform);
+        publishViewport(event.transform);
+      });
     svg.call(zoom);
     svg.call(zoom.transform, d3.zoomIdentity);
 
@@ -694,10 +1191,16 @@
       if (event.target === svgEl) selectedNode.set(null);
     });
 
+    // `markerUnits: userSpaceOnUse` is the load-bearing attribute: without it
+    // SVG scales the head by the line's stroke-width, and `positionLinks`
+    // would be trimming to a rim the arrow then overshoots by its own growth.
+    // `refX = ARROW_LEN` puts the tip — not the base — at the line's end,
+    // which is the point `arrowHeadPoint` computed. See viewmodels/linkGeometry.ts.
     svg.append('defs').selectAll('marker').data(['arrow']).join('marker')
-      .attr('id', 'arrow').attr('viewBox', '0 -5 10 10').attr('refX', 25)
-      .attr('refY', 0).attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto')
-      .append('path').attr('fill', canvasColors.arrowFill).attr('d', 'M0,-5L10,0L0,5');
+      .attr('id', 'arrow').attr('viewBox', '0 -5 10 10').attr('refX', ARROW_LEN)
+      .attr('refY', 0).attr('markerUnits', 'userSpaceOnUse')
+      .attr('markerWidth', ARROW_LEN).attr('markerHeight', ARROW_LEN).attr('orient', 'auto')
+      .append('path').attr('fill', canvasColors.arrowFill).attr('d', 'M0,-4L10,0L0,4');
 
     simulation = d3.forceSimulation<D3Node>(data.nodes)
       .force('link', d3.forceLink<D3Node, D3Link>(data.links).id((d) => d.id).distance(120))
@@ -713,16 +1216,18 @@
       // connected structure still dominates the layout.
       .force('x', d3.forceX(w / 2).strength(0.05))
       .force('y', d3.forceY(h / 2).strength(0.05))
-      .force('collision', d3.forceCollide().radius(collisionRadius()));
+      .force('collision', d3.forceCollide().radius(collisionRadius()))
+      // UI-052. Everything above is edge-driven or global; this is the only
+      // force that knows two nodes live in the same folder. Strength is a
+      // user setting, and `cohesionStrengthFor` zeroes it at Module level
+      // where each node already is a folder. See utils/forceCohesion.ts.
+      .force('cohesion', forceFolderCohesion()
+        .strength(cohesionStrengthFor(get(graphLevel), get(folderCohesion))));
 
     linkSel = g.append('g').attr('class', 'links-group').selectAll('line').data(data.links).join('line')
       .attr('class', 'link')
       .attr('stroke', (d) => linkStrokeColour(d))
-      .attr('stroke-width', (d) => {
-        const wt = d.weight ?? 1;
-        if (wt <= 1) return 1.5;
-        return Math.min(1.5 + Math.log2(wt) * 0.9, 6);
-      })
+      .attr('stroke-width', (d) => linkStrokeWidth(d.weight))
       .attr('stroke-dasharray', (d) => linkStrokeDashArray(d))
       .attr('stroke-opacity', 0.6)
       .attr('marker-end', 'url(#arrow)');
@@ -731,7 +1236,11 @@
       const parts = Object.entries(d.breakdown)
         .sort((a, b) => b[1] - a[1])
         .map(([k, n]) => `${n} × ${k}`);
-      return `${d.kind} — ${d.weight} underlying edges (${parts.join(', ')})`;
+      // Singular matters here now: UI-058 puts merged edges of weight 1 on
+      // screen routinely, where before they only appeared in fully collapsed
+      // views alongside plenty of plurals.
+      const noun = d.weight === 1 ? 'relationship' : 'relationships';
+      return `${d.kind} — ${d.weight} underlying ${noun} (${parts.join(', ')})`;
     });
 
     const linkLabelGroup = g.append('g').attr('class', 'link-labels');
@@ -769,10 +1278,10 @@
         .on('start', (event, d) => { if (!event.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
         .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
         .on('end', (event, d) => { if (!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }))
-      .on('click', (_, d) => selectedNode.set(d))
-      .on('dblclick', (event, d) => { event.stopPropagation(); drillInto(d); })
+      .on('click', (event, d) => onNodeClick(event, d))
+      .on('dblclick', (event, d) => onNodeDoubleClick(event, d))
       .on('mouseover', (_, d) => {
-        highlightConnections(d);
+        highlightHover(d);
         if (!$hoverLocked) hoveredNode.set(d);
       })
       .on('mouseout', () => {
@@ -796,7 +1305,19 @@
       .attr('font-size', '11px').attr('fill', canvasColors.nameLabelFill).attr('pointer-events', 'none')
       .text((d) => d.name);
 
+    // A rebuild in the middle of an arrival window keeps its rings, and a
+    // rebuild under a marked set keeps that too — a scope or level change is
+    // exactly when the reader is relying on the marks still being there.
+    applyArrivals();
+    applyMarks();
+
     attachTickHandler();
+    // Seed the overview off the layout seed rather than waiting for the first
+    // tick to clear the throttle. The previous graph's publish can be less
+    // than an interval old, and a panel still showing the graph before last
+    // for a tenth of a second is worse than one showing the pre-settle
+    // arrangement of the right one.
+    publishOverview(true);
   }
 
   /** Re-apply theme-derived colours to an already-rendered canvas.
@@ -823,6 +1344,10 @@
       encoding = get(nodeEncoding);
       restyleEncoding();
     }
+    // Hull fill, stroke and label ink are all theme-derived and baked onto
+    // attributes at join time, so they go stale on a theme swap exactly the
+    // way the rest of the canvas chrome does (UI-009).
+    drawHulls(true);
   }
 
   function attachTickHandler() {
@@ -836,20 +1361,23 @@
     // fitted at all. Namespaced so it doesn't clobber another 'end' handler.
     simulation.on('end.autofit', () => {
       if (get(autoFitView) && currentMode === 'force') fitView();
+      // The throttle can swallow the last tick's worth of movement, so the
+      // outline would keep a shape the nodes have already left. Redraw once
+      // against the final positions (UI-055). The overview is throttled the
+      // same way and goes stale the same way.
+      drawHulls(true);
+      publishOverview(true);
     });
 
     // Force-mode positioning. In tree mode the simulation is stopped, so
     // this tick handler doesn't fire — `applyDisplayPlan` positions edges
     // explicitly in that case.
     simulation.on('tick', () => {
-      // x1/y1 = tail, x2/y2 = arrow-head. Flip when the selection is the
-      // target so the passive-voice label ("inherited by"/"called by"/…)
-      // and the arrow agree on direction.
-      linkSel
-        .attr('x1', (d) => isReversed(d) ? (d.target as D3Node).x! : (d.source as D3Node).x!)
-        .attr('y1', (d) => isReversed(d) ? (d.target as D3Node).y! : (d.source as D3Node).y!)
-        .attr('x2', (d) => isReversed(d) ? (d.source as D3Node).x! : (d.target as D3Node).x!)
-        .attr('y2', (d) => isReversed(d) ? (d.source as D3Node).y! : (d.target as D3Node).y!);
+      positionLinks(
+        linkSel,
+        (d) => (d.source as D3Node).x!, (d) => (d.source as D3Node).y!,
+        (d) => (d.target as D3Node).x!, (d) => (d.target as D3Node).y!,
+      );
       linkLabelSel.attr('transform', (d) => {
         const sx = (d.source as D3Node).x!;
         const sy = (d.source as D3Node).y!;
@@ -871,6 +1399,8 @@
         return `translate(${hx * 0.75 + tx * 0.25},${hy * 0.75 + ty * 0.25})`;
       });
       nodeSel.attr('transform', (d) => `translate(${d.x},${d.y})`);
+      drawHulls();
+      publishOverview();
     });
   }
 
@@ -902,17 +1432,26 @@
     // Transfer positions to new node objects (collapseGraph creates fresh objects).
     const w = container.clientWidth;
     const h = container.clientHeight;
+    const seeder = makeSeeder(data.nodes, w, h);
     for (const n of data.nodes) {
       const old = oldPositions.get(n.id);
       if (old) {
         n.x = old.x; n.y = old.y;
         (n as any).vx = old.vx; (n as any).vy = old.vy;
         n.fx = old.fx; n.fy = old.fy;
-      } else {
-        // New node: place near center so it animates from a sensible origin.
-        n.x = w / 2 + (Math.random() - 0.5) * 100;
-        n.y = h / 2 + (Math.random() - 0.5) * 100;
+      } else if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) {
+        // New node: seed it in its folder's wedge rather than at a random
+        // offset from the centre (UI-053). A live-reload that adds a file
+        // should drop it next to its siblings, and the same reload twice
+        // should put it in the same place.
+        const p = seeder.position(n);
+        n.x = p.x; n.y = p.y;
       }
+      // Else: absent from the DOM but already carrying coordinates — a node
+      // a filter removed and the user just brought back. Since UI-065 the
+      // build set tracks the filters, so this is now the common case, and
+      // re-seeding it would make toggling a filter shuffle the layout. The
+      // node objects outlive the elements; their positions are the record.
     }
 
     // --- Update simulation data (keeps running, doesn't restart) ---
@@ -929,10 +1468,7 @@
         (enter) => enter.append('line')
           .attr('class', 'link')
           .attr('stroke', (d) => linkStrokeColour(d))
-          .attr('stroke-width', (d) => {
-            const wt = d.weight ?? 1;
-            return wt <= 1 ? 1.5 : Math.min(1.5 + Math.log2(wt) * 0.9, 6);
-          })
+          .attr('stroke-width', (d) => linkStrokeWidth(d.weight))
           .attr('stroke-dasharray', (d) => linkStrokeDashArray(d))
           .attr('stroke-opacity', 0)
           .attr('marker-end', 'url(#arrow)')
@@ -986,9 +1522,9 @@
               .on('start', (event, d) => { if (!event.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
               .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
               .on('end', (event, d) => { if (!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }))
-            .on('click', (_, d) => selectedNode.set(d))
-            .on('dblclick', (event, d) => { event.stopPropagation(); drillInto(d); })
-            .on('mouseover', (_, d) => { highlightConnections(d); if (!$hoverLocked) hoveredNode.set(d); })
+            .on('click', (event, d) => onNodeClick(event, d))
+            .on('dblclick', (event, d) => onNodeDoubleClick(event, d))
+            .on('mouseover', (_, d) => { highlightHover(d); if (!$hoverLocked) hoveredNode.set(d); })
             .on('mouseout', () => { resetHighlight(); if (!$hoverLocked) hoveredNode.set(null); });
 
           g.append('circle')
@@ -1011,7 +1547,17 @@
           return g;
         },
         (update) => update, // surviving nodes keep their DOM + position
-        (exit) => exit.transition().duration(300).attr('opacity', 0).remove(),
+        // Removed outright rather than faded out. `.transition().remove()`
+        // only removes if the transition reaches its end, and a transition
+        // is driven by requestAnimationFrame — which does not run in a
+        // background tab and does not survive being interrupted. That was
+        // survivable while this join only ran on scope and level changes;
+        // since UI-065 the exit set is whatever the filters just excluded,
+        // so a stranded exit means stale nodes sitting on the canvas that
+        // the plan has already stopped accounting for. A 300 ms fade is not
+        // worth a correctness hole that only appears when the tab is not
+        // being looked at.
+        (exit) => exit.remove(),
       );
 
     // Surviving nodes kept their DOM, so they still carry the radii and fills
@@ -1042,72 +1588,96 @@
       restyleEncoding();
     }));
 
-    // 1. Lifecycle: rebuild the DOM whenever the underlying graph changes.
-    //    The DOM is created with EVERY node/edge in `data`; visibility is
-    //    decided downstream by `applyDisplayPlan`. This separation matters:
-    //    D3's data join only needs to run once per dataset, not per filter
-    //    change.
-    unsubscribers.push(graphData.subscribe((data) => {
-      console.log(`[GraphView] graphData sub: nodes=${data.nodes.length} initialized=${initialized}`);
-      if (data.nodes.length > 0) {
+    // 0c. Folder cohesion (UI-052). A layout change, not a restyle — but it
+    //     moves the nodes already on screen rather than rebuilding them, so
+    //     it reheats the simulation instead of re-joining the DOM. Both
+    //     inputs are watched: the level usually arrives with new data and
+    //     rebuilds anyway, but the incremental update path reuses the
+    //     existing simulation, where nothing else would re-read the strength.
+    unsubscribers.push(folderCohesion.subscribe(() => applyCohesion()));
+    unsubscribers.push(graphLevel.subscribe(() => applyCohesion()));
+
+    // 0c-bis. Marks are a pure overlay for the same reason the hulls below
+    //     are: nothing about the plan, the layout or the filters depends on
+    //     them, so a mark is a ring appearing and never a re-settle. Watched
+    //     rather than applied at the click site because the toolbar's
+    //     "Clear marks" and `x` on the canvas write the same store.
+    unsubscribers.push(markedPaths.subscribe(() => {
+      if (initialized) applyMarks();
+    }));
+
+    // 0d. Folder hulls (UI-055). Pure overlay: it reads positions the
+    //     simulation already produced and draws behind everything, so it
+    //     neither re-settles the layout nor touches the display plan.
+    unsubscribers.push(showFolderHulls.subscribe(() => {
+      if (initialized) drawHulls(true);
+    }));
+    // Same overlay-only redraw for the tier count (UI-070): it changes which
+    // outlines exist, never which nodes are drawn or where they sit.
+    unsubscribers.push(hullDepth.subscribe(() => {
+      if (initialized) drawHulls(true);
+    }));
+
+    // 1. Lifecycle AND rendering, from one signal.
+    //
+    //    These were two subscribers, and the DOM was built from `graphData`:
+    //    every node in the collapsed scope, whether or not the plan would
+    //    draw it. Filtering then changed only `display`, never the build, so
+    //    a large scope paid the full cost of joining and simulating
+    //    thousands of nodes before anything hid them — pinning entity level
+    //    on a big scope froze the tab outright (UI-065). The gate the
+    //    overflow card describes never prevented any of that work; it only
+    //    hid the result afterwards.
+    //
+    //    The build set is now the drawn set, so a filter that narrows the
+    //    view narrows the work. Reading `graphData` here is safe because
+    //    `displayPlan` derives from it and therefore fires after it is
+    //    current. The reverse — reading the plan from a `graphData`
+    //    subscriber — would see the *previous* plan, which is exactly the
+    //    ordering hazard this file's header comment was written about.
+    unsubscribers.push(displayPlan.subscribe((plan) => {
+      const render = renderSetFor(plan, get(graphData));
+      console.log(`[GraphView] plan sub: mode=${plan.mode} visible=${plan.visibleNodeIds.size} render=${render.nodes.length} overflow=${plan.overflow ? plan.overflow.drawn : 'none'} initialized=${initialized}`);
+      // Only a reload can produce an *arrival*. A scope or level change
+      // brings new ids too, but the user asked for those (UI-066).
+      const reloadDriven = get(liveReloading) || get(refreshing);
+      if (render.nodes.length > 0) {
         if (initialized && nodeSel) {
           // Check how many node IDs survived — if most are the same, this
-          // is an incremental update (live reload) and we can patch the
-          // existing DOM without tearing everything down. If the IDs are
-          // largely different (level switch, scope change), full rebuild.
+          // is an incremental update (live reload, or a filter that kept
+          // most of the view) and we can patch the existing DOM without
+          // tearing everything down. If the IDs are largely different
+          // (level switch, scope change), full rebuild.
           const oldIds = new Set<string>();
           nodeSel.each((d: D3Node) => oldIds.add(d.id));
-          const newIds = new Set(data.nodes.map((n) => n.id));
+          const newIds = new Set(render.nodes.map((n) => n.id));
           const surviving = [...oldIds].filter((id) => newIds.has(id)).length;
           const isIncremental = oldIds.size > 0 && surviving / oldIds.size > 0.3;
 
+          if (reloadDriven) markArrivals(newcomers(oldIds, newIds));
+
           if (isIncremental) {
             console.log(`[GraphView] updateGraph (incremental: ${surviving}/${oldIds.size} survived)`);
-            updateGraph(data);
+            updateGraph(render);
           } else {
             console.log('[GraphView] teardownGraph + initGraph (structural change)');
             teardownGraph();
             initialized = true;
-            initGraph(data);
+            initGraph(render);
           }
         } else {
           if (initialized) teardownGraph();
           initialized = true;
-          console.log('[GraphView] initGraph with', data.nodes.length, 'nodes');
-          initGraph(data);
+          console.log('[GraphView] initGraph with', render.nodes.length, 'nodes');
+          initGraph(render);
         }
-      } else if (initialized) {
-        console.log('[GraphView] teardownGraph (empty data)');
-        teardownGraph();
-      }
-    }));
-
-    // 2. Rendering: every change that affects what's drawn (filters, level
-    //    overrides, view mode, selection, search) flows into `displayPlan`
-    //    and surfaces here as a single notification. No more multi-store
-    //    coordination inside the View.
-    unsubscribers.push(displayPlan.subscribe((plan) => {
-      console.log(`[GraphView] displayPlan sub: initialized=${initialized} mode=${plan.mode} visibleNodes=${plan.visibleNodeIds.size}`);
-      if (initialized) {
+        // Styling still comes from the plan: dimming, selection, tree
+        // pinning. What changed is that the elements it styles are only
+        // ever the ones the plan asked for.
         applyDisplayPlan(plan);
-        // DOM audit: count how many node elements are actually visible
-        // after applying the plan. If this is 0 but visibleNodes > 0,
-        // there's an ID mismatch between the plan and the DOM.
-        if (nodeSel && plan.visibleNodeIds.size > 0) {
-          let shown = 0, hidden = 0;
-          nodeSel.each(function (d: D3Node) {
-            if ((this as SVGGElement).style.display === 'none') hidden++;
-            else shown++;
-          });
-          console.log(`[GraphView] DOM audit: ${shown} shown, ${hidden} hidden out of ${shown + hidden} DOM nodes`);
-          if (shown === 0 && plan.visibleNodeIds.size > 0) {
-            // Log sample IDs to diagnose the mismatch
-            const planIds = [...plan.visibleNodeIds].slice(0, 3);
-            const domIds: string[] = [];
-            nodeSel.each((d: D3Node) => { if (domIds.length < 3) domIds.push(d.id); });
-            console.warn(`[GraphView] ID MISMATCH — plan wants: ${planIds.join(', ')} | DOM has: ${domIds.join(', ')}`);
-          }
-        }
+      } else if (initialized) {
+        console.log(`[GraphView] teardownGraph (${plan.overflow ? 'over the draw ceiling' : 'nothing to draw'})`);
+        teardownGraph();
       }
     }));
 
@@ -1153,6 +1723,10 @@
       viewportWidth.set(w);
       if (!initialized) return;
       svg.attr('width', w).attr('height', h);
+      // The transform is unchanged but the rectangle it maps into is not, so
+      // the box's size is stale until this runs — visibly, since collapsing a
+      // side panel is exactly when the canvas gets wider.
+      publishViewport(d3.zoomTransform(svgEl));
       simulation?.force('center', d3.forceCenter(w / 2, h / 2));
       if (currentMode === 'force') simulation?.alpha(0.3).restart();
     };
@@ -1163,10 +1737,12 @@
   onDestroy(() => {
     unsubscribers.forEach((u) => u());
     simulation?.stop();
+    if (arrivalTimer) clearTimeout(arrivalTimer);
   });
 </script>
 
-<div class="graph-container" bind:this={container}>
+<div class="graph-container" class:pane-focused={$focusedPane === 'graph'}
+  data-pane="graph" bind:this={container}>
   <svg bind:this={svgEl}></svg>
   <slot />
 </div>
@@ -1180,10 +1756,42 @@
     height: 100%;
   }
 
+  /* The canvas is the default pane, so its ring is the quietest of the five:
+     inset, one pixel, and drawn over the SVG rather than around it. */
+  .graph-container.pane-focused::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+
   :global(.graph-container svg) {
     width: 100%;
     height: 100%;
     background: var(--bg-body);
+  }
+
+  /* Folder hulls (UI-055). `pointer-events: none` on the whole group is
+     load-bearing, not tidiness: the background-click handler deselects only
+     when `event.target === svgEl`, and a hull covers most of the canvas, so
+     a hittable outline would silently break click-to-deselect everywhere it
+     reaches. It also costs the outline a <title> tooltip — the label carries
+     the name instead. */
+  :global(.folder-hull) { pointer-events: none; }
+  :global(.hull-label) {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+  }
+  /* A parent region's name is the heading over the regions inside it
+     (UI-070). Wider tracking as well as more size: two nested outlines cross,
+     and the reader has to tell at a glance which name belongs to which. It
+     stays clear of the 11px entity labels in the other direction, so a region
+     name still cannot be mistaken for a node's. */
+  :global(.folder-hull.parent .hull-label) {
+    font-size: 13px;
+    letter-spacing: 0.2em;
   }
 
   :global(.node) { cursor: pointer; }
@@ -1203,6 +1811,53 @@
   :global(.node.search-display-match circle) { stroke: #4DD0E1; stroke-width: 4px; filter: drop-shadow(0 0 5px rgba(77, 208, 225, 0.9)); }
   :global(.node.search-match.search-display-match circle) { stroke: #4DD0E1; filter: drop-shadow(0 0 4px rgba(255, 213, 79, 0.6)) drop-shadow(0 0 5px rgba(77, 208, 225, 0.9)); }
   :global(.node.search-display-match) { opacity: 1 !important; }
+  /* Arrival mark (UI-066): a node that appeared on a live reload wears this
+     ring for 30s. Magenta because every other stroke on the canvas is
+     already spoken for — gold and cyan are the two searches, green/red/amber
+     are the diff statuses, and `var(--accent)` is the selection. A separate
+     element rather than the node's own stroke, so a new node that is *also*
+     selected, searched or diff-coloured keeps saying all of those things.
+
+     Written as `circle.arrival-ring` and placed last so it outranks the
+     `.node circle` and `.node.selected circle` rules above, which would
+     otherwise repaint it. */
+  :global(.node circle.arrival-ring) {
+    fill: none;
+    stroke: #E040FB;
+    stroke-width: 3px;
+    stroke-dasharray: none;
+    filter: drop-shadow(0 0 4px rgba(224, 64, 251, 0.7));
+    animation: arrival-pulse 1.8s ease-in-out infinite;
+  }
+
+  @keyframes arrival-pulse {
+    0%, 100% { stroke-opacity: 0.95; }
+    50%      { stroke-opacity: 0.3; }
+  }
+
+  /* The pulse is the part that catches the eye across a busy canvas, so
+     without it the ring has to hold still and stay legible on its own. */
+  @media (prefers-reduced-motion: reduce) {
+    :global(.node circle.arrival-ring) {
+      animation: none;
+      stroke-opacity: 0.95;
+    }
+  }
+
+  /* The marked ring. `var(--accent)` is the selection's colour on purpose,
+     where the arrival ring went out of its way to avoid every other stroke:
+     a mark *is* a selection, and borrowing the hue is what says the two
+     belong to the same family rather than inventing a sixth meaning for a
+     sixth colour. Dashed and thinner is what separates them — the solid
+     4px stroke is the one subject, the dashes are the set. Placed after the
+     `.node.selected circle` rule for the same specificity reason as above. */
+  :global(.node circle.mark-ring) {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 2px;
+    stroke-dasharray: 3, 3;
+  }
+
   :global(.link.dimmed) { opacity: 0.1; }
   :global(.link-label-container.dimmed) { opacity: 0.1; }
   :global(.order-badge-container.dimmed) { opacity: 0.1; }

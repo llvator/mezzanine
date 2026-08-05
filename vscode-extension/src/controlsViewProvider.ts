@@ -34,12 +34,23 @@ export class ControlsViewProvider implements vscode.WebviewViewProvider {
   private lastFilterState?: FilterState;
   private lastLevelState?: LevelFilterState;
   private lastSelection?: { name: string; kind: string } | undefined;
+  /** Mirror of the extension's `followSelection`. The Options tab is otherwise
+   *  stateless button chrome, but this one toggle owns behaviour that outlives
+   *  the webview: without mirroring it, hiding and re-showing the view redraws
+   *  the checkbox unchecked while following stays on, and it then takes two
+   *  clicks to turn off what the UI claims is already off. */
+  private followSelection = false;
 
   onCommand(handler: (command: string, value: unknown) => void): void {
     this.commandHandler = handler;
   }
 
-  /** Options tab needs no push — it's stateless button chrome. */
+  /** Keep the checkbox honest about the extension-side toggle. Stamped into
+   *  the HTML rather than posted on `ready`, because `getHtml()` re-runs on
+   *  every resolve — the markup *is* the rehydration point. */
+  setFollowSelection(on: boolean): void {
+    this.followSelection = on;
+  }
 
   updateFilters(state: FilterState): void {
     this.lastFilterState = state;
@@ -253,7 +264,7 @@ export class ControlsViewProvider implements vscode.WebviewViewProvider {
     <div class="section">
       <div class="section-title">Editor Sync</div>
       <div class="toggle-row">
-        <label><input type="checkbox" data-toggle="setFollowSelection" /> Follow selection to editor</label>
+        <label><input type="checkbox" data-toggle="setFollowSelection"${this.followSelection ? ' checked' : ''} /> Follow selection to editor</label>
       </div>
       <div style="font-size:0.75em; color:var(--vscode-descriptionForeground); margin-top:2px">
         When on, clicking a node opens the file at its line.

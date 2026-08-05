@@ -13,7 +13,7 @@
 import { derived, writable } from 'svelte/store';
 import { hoveredNode, selectedNode, rawEntityGraph } from './graph';
 import { ensureDetailsLoaded } from './details';
-import { buildDescriptionChain, type DescriptionEntry } from '../viewmodels/descriptionChain';
+import { buildChildEntries, buildDescriptionChain, type DescriptionEntry } from '../viewmodels/descriptionChain';
 
 /** Whether hovering a node retargets the pane. Off ⇒ selection only.
  *
@@ -32,6 +32,11 @@ export interface DescriptionState {
    *  and a pinned one are never confused. */
   source: 'hover' | 'selection';
   chain: DescriptionEntry[];
+  /** Direct children of the subject — the chain's head — in declaration
+   *  order. The chain only ever climbs, so without this a Feature read as
+   *  its own description plus its parents' and never mentioned the
+   *  Functionalities that are most of what it means. */
+  children: DescriptionEntry[];
 }
 
 export const description = writable<DescriptionState | null>(null);
@@ -60,6 +65,7 @@ subject.subscribe((current) => {
     description.set({
       source: current.source,
       chain: buildDescriptionChain(current.node, current.nodes, docs),
+      children: buildChildEntries(current.node, current.nodes, docs),
     });
   });
 });

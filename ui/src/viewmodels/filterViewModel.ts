@@ -20,13 +20,15 @@ import {
   generalOutgoing,
   generalIncoming,
   generalLanguages,
+  hiddenLanguages,
   allLanguages,
   allFiles,
   visibleFiles,
   hiddenFiles,
   levelOverrides,
 } from '../stores/graph';
-import { parseQuery, matchesQuery } from '../utils/fuzzyPath';
+import { parseQuery, scoreQuery, violatesNegation } from '../utils/fuzzyPath';
+import { scoreEntity } from '../utils/entityScore';
 
 export { showDirectEdges, showCrossLevelEdges } from '../stores/graph';
 
@@ -37,6 +39,7 @@ export {
   generalOutgoing,
   generalIncoming,
   generalLanguages,
+  hiddenLanguages,
   visibleFiles,
   hiddenFiles,
   levelOverrides,
@@ -56,17 +59,16 @@ export {
 function seedFromGraph(data: GraphData): void {
   const entityTypes = new Set(data.nodes.map((n) => n.kind_raw));
   const relTypes = new Set(data.links.map((l) => l.kind_raw));
-  const languages = new Set(data.nodes.map((n) => n.language));
 
   generalEntityTypes.set(entityTypes);
   generalRelTypes.set(relTypes);
-  generalLanguages.set(languages);
-  // The file filter is deliberately absent here. Seeding the other three to
-  // "everything present" is what stops a stale entry from a previous dataset
-  // hiding nodes in the new one — they are dataset-derived allow-lists and
-  // nothing is lost by rebuilding them. The file filter is not: it holds a
-  // deliberate user exclusion, so it persists in `hiddenFiles` and
-  // `visibleFiles` derives from it (UI-047).
+  // The file and language filters are deliberately absent here. Seeding the
+  // two above to "everything present" is what stops a stale entry from a
+  // previous dataset hiding nodes in the new one — they are dataset-derived
+  // allow-lists and nothing is lost by rebuilding them. The other two are
+  // not: they hold a deliberate user exclusion, so they persist in
+  // `hiddenFiles` (UI-047) and `hiddenLanguages`, and `visibleFiles` /
+  // `generalLanguages` derive from them.
   levelOverrides.update((lo) => {
     [1, 2, 3].forEach((level) => {
       entityTypes.forEach((t) => (lo[level].entityTypes[t] = 'general'));
@@ -193,20 +195,43 @@ export function clearSearchEntityKinds(): void {
   searchEntityKinds.set(new Set());
 }
 
-/** Split a file path into (folder, filename) so each can be matched
- *  independently without the other's characters polluting the search. */
-function splitPath(fp: string): { folder: string; filename: string } {
-  const i = fp.lastIndexOf('/');
-  if (i < 0) return { folder: '', filename: fp };
-  return { folder: fp.slice(0, i), filename: fp.slice(i + 1) };
+/**
+ * Score a node against the query, or `null` when it does not match.
+ *
+ * Wires the matcher (`fuzzyPath`) to the field-weighting policy
+ * (`entityScore`); the policy lives apart so it can be unit-tested against a
+ * stub scorer, and because the Node test runner cannot load a module with
+ * extensionless imports.
+ *
+ * `s` is the raw trimmed term, *not* lowercased — the matcher does
+ * smart-case itself, and pre-lowercasing would throw away the signal it
+ * needs to tell `Graph` (the type) from `graph` (don't care).
+ */
+export function scoreSearch(
+  n: D3Node,
+  s: string,
+  inNames: boolean,
+  inFiles: boolean,
+  inFolders: boolean,
+  kinds: Set<string>,
+): number | null {
+  const terms = parseQuery(s);
+  if (terms.length === 0) return null;
+  return scoreEntity(
+    n,
+    { inNames, inFiles, inFolders },
+    kinds,
+    (c) => scoreQuery(terms, c),
+    (c) => violatesNegation(terms, c),
+  );
 }
 
 /** The single match predicate, shared by the in-scope search here and the
  *  cross-scope search in `entitySearch.ts`, so the two can never drift.
  *
- *  `s` is the raw trimmed term, *not* lowercased — the matcher does
- *  smart-case itself, and pre-lowercasing would throw away the signal it
- *  needs to tell `Graph` (the type) from `graph` (don't care). */
+ *  A thin wrapper over `scoreSearch` rather than a second implementation:
+ *  the two agreeing is a property the ranked list depends on, and two
+ *  parallel bodies would only agree until one of them was edited. */
 export function matchesSearch(
   n: D3Node,
   s: string,
@@ -215,22 +240,29 @@ export function matchesSearch(
   inFolders: boolean,
   kinds: Set<string>,
 ): boolean {
-  if (kinds.size > 0 && !kinds.has(n.kind_raw)) return false;
-  const terms = parseQuery(s);
-  if (terms.length === 0) return false;
-  if (inNames && (
-    matchesQuery(terms, n.name) ||
-    matchesQuery(terms, n.qualified_name)
-  )) return true;
-  if (inFiles || inFolders) {
-    const { folder, filename } = splitPath(n.file_path);
-    if (inFiles && matchesQuery(terms, filename)) return true;
-    if (inFolders && matchesQuery(terms, folder)) return true;
-  }
-  return false;
+  return scoreSearch(n, s, inNames, inFiles, inFolders, kinds) !== null;
 }
 
-export const searchMatches: Readable<D3Node[]> = derived(
+/** Rank order for search results: best score first, then a stable tiebreak
+ *  so equal-scoring rows do not reshuffle between keystrokes. */
+export function compareByScore(
+  a: { score: number; node: D3Node },
+  b: { score: number; node: D3Node },
+): number {
+  return (
+    b.score - a.score ||
+    a.node.name.localeCompare(b.node.name) ||
+    a.node.id.localeCompare(b.node.id)
+  );
+}
+
+/** In-scope matches, best-first.
+ *
+ *  Ranking is what makes the cap at the far end honest: the list is sliced
+ *  for rendering, and before this the slice kept whichever matches graph
+ *  order happened to put first, which on a 200-hit query meant the answer
+ *  was routinely not among the fifty rows shown. */
+export const scoredSearchMatches: Readable<{ node: D3Node; score: number }[]> = derived(
   [
     graphData,
     searchTerm,
@@ -241,9 +273,20 @@ export const searchMatches: Readable<D3Node[]> = derived(
   ],
   ([$data, $term, $inNames, $inFiles, $inFolders, $kinds]) => {
     const s = $term.trim();
-    if (!s) return [] as D3Node[];
-    return $data.nodes.filter((n) => matchesSearch(n, s, $inNames, $inFiles, $inFolders, $kinds));
+    if (!s) return [];
+    const out: { node: D3Node; score: number }[] = [];
+    for (const n of $data.nodes) {
+      const score = scoreSearch(n, s, $inNames, $inFiles, $inFolders, $kinds);
+      if (score === null) continue;
+      out.push({ node: n, score });
+    }
+    return out.sort(compareByScore);
   },
+);
+
+export const searchMatches: Readable<D3Node[]> = derived(
+  scoredSearchMatches,
+  ($m) => $m.map((r) => r.node),
 );
 
 /** Committed set — the only thing that actually narrows the graph. */
@@ -345,18 +388,20 @@ export const toggleEntityType = (type: string, checked: boolean) =>
   toggleInSet(generalEntityTypes, type, checked);
 export const toggleRelType = (type: string, checked: boolean) =>
   toggleInSet(generalRelTypes, type, checked);
-export const toggleLanguage = (lang: string, checked: boolean) =>
-  toggleInSet(generalLanguages, lang, checked);
 /** Checked means visible, so the stored set — the exclusions — moves the
- *  other way. */
+ *  other way. Same inversion as `toggleFile` below, and for the same reason:
+ *  the exclusion is the decision that has to outlive a republish. */
+export const toggleLanguage = (lang: string, checked: boolean) =>
+  toggleInSet(hiddenLanguages, lang, !checked);
 export const toggleFile = (path: string, checked: boolean) =>
   toggleInSet(hiddenFiles, path, !checked);
 
-/** Show every language in the current dataset, or none of them. Sourced
- *  from `allLanguages` (what the analyzer actually produced) rather than a
- *  static list, so "all" can never select a language the graph doesn't have. */
+/** Show every language in the current dataset, or none of them. "None" is
+ *  sourced from `allLanguages` (what the analyzer actually produced) rather
+ *  than a static list, so it can never exclude a language the graph doesn't
+ *  have; "all" is simply the empty exclusion set. */
 export function setAllLanguages(checked: boolean): void {
-  generalLanguages.set(checked ? new Set(get(allLanguages)) : new Set());
+  hiddenLanguages.set(checked ? new Set() : new Set(get(allLanguages)));
 }
 
 /** "These files, and nothing else." Expressed as the complement, since

@@ -23,6 +23,13 @@ export const nodeEncoding = derived(
     buildNodeEncoding($graphData.nodes, {
       sizeChannel: $sizeChannel,
       colorChannel: $colorChannel,
+      // The domain of the `degree` channel: the collapsed graph's links —
+      // current level, currently-open scopes. Deliberately the same source
+      // as `$graphData.nodes` above, one line up, so size is measured over
+      // exactly the population it is scaled against. That means a link the
+      // relationship filters hide still counts, which is how every other
+      // channel behaves too: `loc` does not shrink when a node is dimmed.
+      links: $graphData.links,
       level: $graphLevel,
       theme: $activeTheme,
       kindColors: NODE_COLORS,

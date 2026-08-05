@@ -16,14 +16,45 @@
 
 import type { D3Node, D3Link, GraphData, GraphLevel, EntityMetrics, ScopeMetrics } from '../types/graph';
 
-/** Return the scope id (file path or directory path) for a given entity. */
-function scopeIdFor(node: D3Node, level: GraphLevel): string {
-  if (level === 'file') return node.file_path;
+/** Shared empty set, so the default argument allocates nothing per call. */
+const EMPTY_EXPANSION: ReadonlySet<string> = new Set<string>();
+
+/** The directory holding a node's file. */
+function moduleOf(node: D3Node): string {
+  const i = node.file_path.lastIndexOf('/');
+  return i >= 0 ? node.file_path.slice(0, i) : '';
+}
+
+/**
+ * The scope a node collapses into — or the node itself, when its scope has
+ * been expanded (UI-057).
+ *
+ * `expanded` holds *paths*, never ids. A path survives a level change and a
+ * re-analysis; `sanitizeId` rewrites ids and `collapseGraph` builds fresh
+ * node objects on every level change, so an id-keyed expansion set would
+ * silently stop matching the moment the view moved.
+ *
+ * Expansion opens exactly one level: an expanded module renders as its
+ * files, an expanded file as its entities. Anything more would make a single
+ * gesture unpredictable — the reader would not know how much they were about
+ * to add to the canvas.
+ */
+function scopeIdFor(node: D3Node, level: GraphLevel, expanded: ReadonlySet<string>): string {
+  if (level === 'file') {
+    return expanded.has(node.file_path) ? node.id : node.file_path;
+  }
   if (level === 'module') {
-    const i = node.file_path.lastIndexOf('/');
-    return i >= 0 ? node.file_path.slice(0, i) : '';
+    const mod = moduleOf(node);
+    return expanded.has(mod) ? node.file_path : mod;
   }
   return node.id;
+}
+
+/** True when this scope id is a single entity rather than a rollup — i.e.
+ *  the node was expanded all the way. Used to decide whether an edge keeps
+ *  its real relationship kind (UI-058). */
+function isEntityScope(node: D3Node, scopeId: string): boolean {
+  return scopeId === node.id;
 }
 
 function sanitizeId(s: string): string {
@@ -76,28 +107,45 @@ function scopeToEntityMetrics(s: ScopeMetrics): EntityMetrics {
  * so the per-entity info panel can display meaningful numbers on a collapsed
  * node.
  */
-export function collapseGraph(raw: GraphData, level: GraphLevel): GraphData {
+export function collapseGraph(
+  raw: GraphData,
+  level: GraphLevel,
+  expanded: ReadonlySet<string> = EMPTY_EXPANSION,
+): GraphData {
   if (level === 'entity') return raw;
 
-  const scopeIndex = level === 'file'
-    ? new Map((raw.files ?? []).map((f) => [f.path, f]))
-    : new Map((raw.modules ?? []).map((m) => [m.path, m]));
+  const fileIndex = new Map((raw.files ?? []).map((f) => [f.path, f]));
+  const moduleIndex = new Map((raw.modules ?? []).map((m) => [m.path, m]));
 
   // Build one D3Node per unique scope id encountered. We preserve the set of
   // file paths per scope (mostly 1 for file level, N for module level) so
   // the detail panel can still show the underlying file list.
   const nodes = new Map<string, D3Node>();
   const entityToScope = new Map<string, string>();
+  /** Scope ids that are a single entity rather than a rollup. */
+  const entityScopes = new Set<string>();
 
   for (const n of raw.nodes) {
-    const scopeId = scopeIdFor(n, level);
+    const scopeId = scopeIdFor(n, level, expanded);
     entityToScope.set(n.id, scopeId);
+    if (isEntityScope(n, scopeId)) entityScopes.add(scopeId);
     if (nodes.has(scopeId)) continue;
 
+    // An expanded scope contributes the entity itself, untouched — same id,
+    // same metrics, same kind. Only the rollups below are synthesised.
+    if (isEntityScope(n, scopeId)) {
+      nodes.set(scopeId, n);
+      continue;
+    }
+
+    // A module expanded to files yields File nodes even though the requested
+    // level is Module; a file expanded to entities is handled above. This is
+    // what makes the view *mixed* rather than uniform.
+    const isFileNode = level === 'file' || expanded.has(moduleOf(n));
     const { name, dir } = splitPath(scopeId);
     const id = sanitizeId(scopeId) || '_root_';
-    const kindRaw = level === 'file' ? 'File' : 'Module';
-    const metricsSource = scopeIndex.get(scopeId);
+    const kindRaw = isFileNode ? 'File' : 'Module';
+    const metricsSource = isFileNode ? fileIndex.get(scopeId) : moduleIndex.get(scopeId);
 
     nodes.set(scopeId, {
       id,
@@ -106,7 +154,7 @@ export function collapseGraph(raw: GraphData, level: GraphLevel): GraphData {
       qualified_name: scopeId || '(root)',
       kind: kindRaw.toLowerCase(),
       kind_raw: kindRaw,
-      file_path: level === 'file' ? scopeId : (dir ? `${dir}/${name || ''}` : name),
+      file_path: isFileNode ? scopeId : (dir ? `${dir}/${name || ''}` : name),
       line: 1,
       visibility: 'Public',
       parent_id: null,
@@ -135,6 +183,8 @@ export function collapseGraph(raw: GraphData, level: GraphLevel): GraphData {
   // so the original fidelity is available on hover.
   type EdgeKey = string;
   const edgeMap = new Map<EdgeKey, D3Link>();
+  /** Edges kept at full fidelity because both ends are expanded entities. */
+  const passthrough: D3Link[] = [];
   for (const l of raw.links) {
     const srcEntity = typeof l.source === 'object' ? l.source.id : l.source;
     const tgtEntity = typeof l.target === 'object' ? l.target.id : l.target;
@@ -143,6 +193,18 @@ export function collapseGraph(raw: GraphData, level: GraphLevel): GraphData {
     if (!srcScope || !tgtScope || srcScope === tgtScope) continue;
     const srcNode = nodes.get(srcScope)!;
     const tgtNode = nodes.get(tgtScope)!;
+
+    // UI-058. Both ends expanded to entities means this is a real
+    // entity-to-entity relationship that happens to be drawn on a mixed
+    // canvas — it keeps its own kind, its order badge and its label. Only an
+    // edge with a *rollup* on at least one end becomes `DependsOn`, because
+    // that is the only case where the specific kind no longer describes the
+    // pair on screen.
+    if (entityScopes.has(srcScope) && entityScopes.has(tgtScope)) {
+      passthrough.push({ ...l, source: srcNode.id, target: tgtNode.id });
+      continue;
+    }
+
     const key: EdgeKey = `${srcNode.id}->${tgtNode.id}`;
     const existing = edgeMap.get(key);
     if (existing) {
@@ -164,7 +226,7 @@ export function collapseGraph(raw: GraphData, level: GraphLevel): GraphData {
   }
 
   const nodeList = Array.from(nodes.values());
-  const linkList = Array.from(edgeMap.values());
+  const linkList = [...passthrough, ...edgeMap.values()];
 
   return {
     nodes: nodeList,

@@ -48,8 +48,8 @@
         data-probe="pin-toggle"
         aria-pressed={!!$selectedNode}
         title={$selectedNode
-          ? 'Unpin — follow the cursor again'
-          : 'Pin this entity so hovering elsewhere does not replace it'}
+          ? 'Unpin — follow the cursor again (P)'
+          : 'Pin this entity so hovering elsewhere does not replace it (P)'}
         on:click={togglePin}
       >{$selectedNode ? '\u{1F4CC} Pinned' : '\u{1F4CD} Pin'}</button>
       <span class="detail-mode-hint">{modeHint}</span>

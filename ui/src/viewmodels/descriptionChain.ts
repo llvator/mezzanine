@@ -28,7 +28,9 @@ export interface DescriptionEntry {
    *  `description:`. Null when the entity has none — rendered as a
    *  placeholder rather than dropped, so a gap in the chain is visible. */
   documentation: string | null;
-  /** 0 for the node itself, 1 for its parent, and so on. */
+  /** Distance from the subject: 0 for the node itself, 1 for its parent,
+   *  and so on. Child entries are always one level down and all carry 0 —
+   *  the list is flat, and `buildChildEntries` never recurses. */
   depth: number;
 }
 
@@ -43,6 +45,20 @@ export interface DocLookup {
  * (Elevator tops out at 4) while still terminating on malformed data.
  */
 const MAX_DEPTH = 8;
+
+/** One entry from a node the graph actually holds. */
+function entryFor(node: D3Node, docs: DocLookup, depth: number): DescriptionEntry {
+  return {
+    entityId: node.original_id,
+    name: node.display_label || node.name,
+    qualifiedName: node.qualified_name,
+    kind: node.kind_raw,
+    filePath: node.file_path,
+    line: node.line,
+    documentation: docs[node.original_id]?.documentation ?? null,
+    depth,
+  };
+}
 
 /** Last `::`- or `/`-delimited segment of an entity id — the fallback label
  *  for an ancestor that has documentation but isn't in the loaded graph. */
@@ -78,16 +94,7 @@ export function buildDescriptionChain(
   for (let depth = 0; depth < MAX_DEPTH; depth++) {
     if (seen.has(current.original_id)) break;
     seen.add(current.original_id);
-    chain.push({
-      entityId: current.original_id,
-      name: current.display_label || current.name,
-      qualifiedName: current.qualified_name,
-      kind: current.kind_raw,
-      filePath: current.file_path,
-      line: current.line,
-      documentation: docs[current.original_id]?.documentation ?? null,
-      depth,
-    });
+    chain.push(entryFor(current, docs, depth));
 
     const parentId = current.parent_id;
     if (!parentId || seen.has(parentId)) break;
@@ -116,4 +123,42 @@ export function buildDescriptionChain(
   }
 
   return chain;
+}
+
+/**
+ * The direct children of `node`, one entry each.
+ *
+ * The chain answers "what is this *for*?" by climbing. Nothing answered
+ * "what is *in* it?", and for an Elevator spec that is the more common
+ * question: a Feature's meaning is largely the list of Functionalities
+ * under it, each with its own `description:`, and the walk can never reach
+ * them because it only ever goes up.
+ *
+ * Flat by design — one level, no recursion. A tree of descriptions is the
+ * scope tree with prose attached, and that pane already exists.
+ *
+ * Same `parent_id` quirk the walk allows for: a child normally carries its
+ * parent's `original_id`, but Rust impl blocks carry the bare type name. A
+ * name match is only honoured when no entity actually owns that id, so a
+ * type whose name collides with another entity's id cannot adopt its
+ * children.
+ *
+ * Ordered by declaration site (file, then line), which for a `.elv` file is
+ * the order the author wrote the entities in.
+ */
+export function buildChildEntries(
+  node: D3Node,
+  nodes: D3Node[],
+  docs: DocLookup,
+): DescriptionEntry[] {
+  const ownsId = new Set(nodes.map((n) => n.original_id));
+  const byName = node.name && !ownsId.has(node.name) ? node.name : null;
+
+  return nodes
+    .filter((n) => {
+      if (n.original_id === node.original_id || !n.parent_id) return false;
+      return n.parent_id === node.original_id || (byName != null && n.parent_id === byName);
+    })
+    .sort((a, b) => a.file_path.localeCompare(b.file_path) || a.line - b.line)
+    .map((n) => entryFor(n, docs, 0));
 }

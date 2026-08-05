@@ -25,9 +25,10 @@
  * `stores/graph` import cycle, which is why the scoring lives here.
  */
 
-import type { D3Node, GraphLevel } from '../types/graph';
+import type { D3Link, D3Node, GraphLevel } from '../types/graph';
 import type { ThemeId } from '../stores/settings';
 import { compositeScore, scopeCompositeScore, SCORE_TIERS } from '../stores/quality';
+import { linkDegrees } from './linkDegrees';
 
 // ── Severity ramp ────────────────────────────────────────────────────────
 //
@@ -212,8 +213,22 @@ export function isMetricFreeGraph(nodes: D3Node[]): boolean {
 
 // ── Channels ─────────────────────────────────────────────────────────────
 
-export type SizeChannel = 'loc' | 'coupling' | 'methodCount' | 'wmc' | 'cyclomatic' | 'pagerank' | 'kind';
+export type SizeChannel = 'loc' | 'degree' | 'coupling' | 'methodCount' | 'wmc' | 'cyclomatic' | 'pagerank' | 'kind';
 export type ColorChannel = 'severity' | 'kind';
+
+/**
+ * What a channel needs that a node doesn't carry on its own.
+ *
+ * `degree` is the only such channel: it is a property of the *drawn graph*,
+ * not of the entity, so it can't be read off `d.metrics` like every other
+ * one. Passed in rather than precomputed onto the node because the count
+ * changes with the aggregation level and with which scopes are open —
+ * `collapseGraph` rebuilds the links on every one of those changes.
+ */
+export interface SizeContext {
+  /** Links incident to a node in the graph being drawn. */
+  degree(id: string): number;
+}
 
 export interface SizeChannelDef {
   id: SizeChannel;
@@ -225,7 +240,7 @@ export interface SizeChannelDef {
    *  reading zero — `collapseGraph` genuinely has no file/module rollup for
    *  the per-callable complexity metrics. */
   levels: GraphLevel[];
-  value(d: D3Node): number | undefined;
+  value(d: D3Node, ctx: SizeContext): number | undefined;
 }
 
 const ALL_LEVELS: GraphLevel[] = ['entity', 'file', 'module'];
@@ -236,6 +251,28 @@ export const SIZE_CHANNELS: SizeChannelDef[] = [
   {
     id: 'loc', label: 'Lines of code', unit: 'LOC', levels: ALL_LEVELS,
     value: (d) => d.metrics?.loc,
+  },
+  // Two connectivity channels, deliberately, because they answer different
+  // questions and a reader comparing them learns something:
+  //
+  //   Relationships — edges touching this node *in the graph being drawn*.
+  //     Every relationship kind counts (containment, inheritance, calls), it
+  //     follows the aggregation level and the open scopes, and it needs no
+  //     metrics — so ghosts, parameters and branches size honestly too.
+  //
+  //   Coupling — the backend's `fan_in + fan_out`: distinct *dependency*
+  //     neighbours over the whole analysis. Containment and inheritance are
+  //     excluded on purpose (`populate_coupling_metrics`), and it does not
+  //     shrink when the view narrows.
+  //
+  // A node that is large under Relationships and small under Coupling holds
+  // a lot of children; large under both is a genuine hub.
+  {
+    id: 'degree', label: 'Relationships', unit: 'links', levels: ALL_LEVELS,
+    // Never undefined: an isolated node has zero relationships, which is a
+    // fact about it, not missing data — it should draw at R_MIN rather than
+    // at the "no data" radius.
+    value: (d, ctx) => ctx.degree(d.id),
   },
   {
     id: 'coupling', label: 'Coupling', unit: 'edges', levels: ALL_LEVELS,
@@ -308,6 +345,11 @@ export function severityScore(d: D3Node): number | undefined {
 export interface EncodingOptions {
   sizeChannel: SizeChannel;
   colorChannel: ColorChannel;
+  /** The graph's links — the domain of the `degree` channel. Optional so a
+   *  caller that never selects that channel doesn't have to supply one; the
+   *  channel then reads zero everywhere and the legend withholds itself,
+   *  rather than the build throwing. */
+  links?: D3Link[];
   level: GraphLevel;
   theme: ThemeId;
   /** Per-kind palette, injected so this module stays free of the type
@@ -422,12 +464,19 @@ export function buildNodeEncoding(nodes: D3Node[], opts: EncodingOptions): NodeE
   const metricSizing = !kindOnly && def.id !== 'kind' && def.levels.includes(level);
   const useSeverity = !kindOnly && colorChannel === 'severity';
 
+  // Counted once per encoding, only for the channel that reads it — an O(E)
+  // pass has no business running when size is on `loc`.
+  const degrees = metricSizing && def.id === 'degree'
+    ? linkDegrees(opts.links ?? [])
+    : null;
+  const ctx: SizeContext = { degree: (id) => degrees?.get(id) ?? 0 };
+
   // Size domain from the nodes actually in play, so the scale adapts to the
   // scope rather than to some global maximum the user can't see.
   let vMax = 0;
   if (metricSizing) {
     for (const d of nodes) {
-      const v = def.value(d);
+      const v = def.value(d, ctx);
       if (v != null && isFinite(v) && v > vMax) vMax = v;
     }
   }
@@ -440,7 +489,7 @@ export function buildNodeEncoding(nodes: D3Node[], opts: EncodingOptions): NodeE
 
   const radius = (d: D3Node): number => {
     if (!metricSizing) return kindRadius(d.kind_raw);
-    const v = def.value(d);
+    const v = def.value(d, ctx);
     if (v == null || !isFinite(v)) return NO_DATA_RADIUS;
     return radiusFor(v);
   };

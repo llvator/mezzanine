@@ -28,6 +28,12 @@ import { derived, get } from 'svelte/store';
 import type { D3Node, GraphData } from '../types/graph';
 import { fullGraphDataStore, setScopes, addScopes } from './scope';
 import { graphData, selectedNode } from './graph';
+import {
+  normalizeRefPath as normalize,
+  buildPathUniverse,
+  pathClaims,
+  bySpecificity,
+} from '../utils/refPaths';
 
 /** One spec entity's claim over a code path. */
 export interface CodeRefClaim {
@@ -49,45 +55,27 @@ export interface CodeRefClaim {
 export type CodeRefStatus = 'resolved' | 'unresolved';
 
 /**
- * Normalize a declared path for comparison against `file_path`s:
- * strip a leading `./` and any trailing `/`, so `./src/parser/` and
- * `src/parser` compare equal. Authors write both.
+ * Path arithmetic lives in `utils/refPaths.ts` so it can be tested without
+ * booting the store graph. Re-exported here because this module is the
+ * public face of code references.
  */
-export function normalizeRefPath(path: string): string {
-  let p = path.trim();
-  while (p.startsWith('./')) p = p.slice(2);
-  while (p.endsWith('/')) p = p.slice(0, -1);
-  return p;
-}
+export { normalizeRefPath } from '../utils/refPaths';
 
-/** Elevator entities carry this tag from the parser — the same
- *  predicate `elevator_code_map.rs` filters on. */
-export function isSpecEntity(node: D3Node): boolean {
-  return node.tags?.includes('elevator') ?? false;
-}
-
-/**
- * Every path in the tree that a `cr:` could legitimately name: each
- * file, plus each of its ancestor directories. Precomputing the
- * ancestors turns resolution into a set lookup instead of a prefix
- * scan over every file per reference.
+/** Entities that can claim code by declaring a path.
  *
- * Ghost nodes (external/stdlib refs, `file_path === ''`) contribute
- * nothing — they aren't files in this tree.
- */
-function buildPathUniverse(nodes: D3Node[]): Set<string> {
-  const universe = new Set<string>();
-  for (const node of nodes) {
-    const path = node.file_path;
-    if (!path) continue;
-    universe.add(path);
-    let cut = path.lastIndexOf('/');
-    while (cut > 0) {
-      universe.add(path.slice(0, cut));
-      cut = path.lastIndexOf('/', cut - 1);
-    }
-  }
-  return universe;
+ *  Two layers do. Elevator entities carry the `elevator` tag from the
+ *  parser — the same predicate `elevator_code_map.rs` filters on. Markdown
+ *  notes carry `markdown` and reach here for the same reason: a document
+ *  linking to `src/parser/mod.rs` is making the identical claim a `cr:`
+ *  makes ("this is the code I am about"), so it gets the identical
+ *  treatment — the panel listing, the re-scope, the reverse lookup, and
+ *  drift when the path stops resolving. ADR 0005 decided that pairing is
+ *  expressed as scope rather than as a visual channel; nothing about that
+ *  reasoning is specific to `.elv`. */
+export function isSpecEntity(node: D3Node): boolean {
+  const tags = node.tags;
+  if (!tags) return false;
+  return tags.includes('elevator') || tags.includes('markdown');
 }
 
 /**
@@ -120,7 +108,7 @@ function buildIndex(full: GraphData | null): CodeRefIndex {
   for (const node of full.nodes) {
     if (!isSpecEntity(node)) continue;
     for (const ref of node.codeRefs ?? []) {
-      const path = normalizeRefPath(ref.path);
+      const path = normalize(ref.path);
       if (!path) continue;
       const claims = byPath.get(path) ?? [];
       claims.push({ node, tag: ref.tag, path, duplicate: false });
@@ -145,30 +133,28 @@ function buildIndex(full: GraphData | null): CodeRefIndex {
     }
   }
 
-  const universe = buildPathUniverse(full.nodes);
-  // Declared paths, longest first: a file claimed by both
-  // `src/parser/rust/inference.rs` and `src/parser/` should hear about
-  // the precise claim before the folder-wide one.
-  const declaredPaths = [...byPath.keys()].sort((a, b) => b.length - a.length);
+  const universe = buildPathUniverse(full.nodes.map((n) => n.file_path));
+  const declaredPaths = bySpecificity(byPath.keys());
   const claimCache = new Map<string, CodeRefClaim[]>();
 
   return {
     empty: false,
     claimsFor(filePath: string): CodeRefClaim[] {
-      if (!filePath) return [];
-      const cached = claimCache.get(filePath);
+      const subject = normalize(filePath);
+      if (!subject) return [];
+      const cached = claimCache.get(subject);
       if (cached) return cached;
       const out: CodeRefClaim[] = [];
       for (const declared of declaredPaths) {
-        if (filePath === declared || filePath.startsWith(declared + '/')) {
+        if (pathClaims(declared, subject)) {
           out.push(...(byPath.get(declared) ?? []));
         }
       }
-      claimCache.set(filePath, out);
+      claimCache.set(subject, out);
       return out;
     },
     resolves(path: string): boolean {
-      return universe.has(normalizeRefPath(path));
+      return universe.has(normalize(path));
     },
   };
 }
@@ -207,7 +193,7 @@ export async function showImplementingCode(node: D3Node): Promise<void> {
   if (refs.length === 0) return;
   const scopes = new Set<string>();
   for (const ref of refs) {
-    const path = normalizeRefPath(ref.path);
+    const path = normalize(ref.path);
     if (path) scopes.add(path);
   }
   if (scopes.size === 0) return;

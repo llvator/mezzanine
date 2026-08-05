@@ -259,8 +259,16 @@ function extractCodeRefs(attributes: string[] | undefined): CodeRef[] {
  * display string would only force every consumer to re-split it
  * (UI-026).
  *
+ * A markdown note's `stem:` is skipped for the opposite reason: it is
+ * resolution plumbing, not a fact about the document. The analyzer needs
+ * it to match `[[wikilinks]]` written against a filename rather than a
+ * title, and by the time a note reaches the panel the reader can already
+ * see the filename on the FILE row.
+ *
  * UI-006.
  */
+const PLUMBING_KEYS = new Set(['stem']);
+
 function extractDetails(attributes: string[] | undefined): Record<string, string> {
   if (!attributes || attributes.length === 0) return {};
   const out: Record<string, string> = {};
@@ -270,7 +278,7 @@ function extractDetails(attributes: string[] | undefined): Record<string, string
     const key = raw.slice(0, idx).trim();
     const value = raw.slice(idx + 1).trim();
     if (!key || !value) continue;
-    if (isCodeRefKey(key)) continue;
+    if (isCodeRefKey(key) || PLUMBING_KEYS.has(key)) continue;
     out[key] = out[key] ? `${out[key]} | ${value}` : value;
   }
   return out;

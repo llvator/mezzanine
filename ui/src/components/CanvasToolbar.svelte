@@ -21,12 +21,17 @@
   import {
     selectedNode, viewMode, graphLevel,
     showLabels, showKindLabels, showLinkLabels,
-    treeDensity, treeMaxDepth, hoverDepth,
+    treeDensity, treeMaxDepth, hoverDepth, hoverMode,
     setTreeDepth, cycleTreeDensity, DENSITY_LABELS,
   } from '../stores/graph';
-  import { autoLevel } from '../stores/scope';
+  import { autoLevel, drillIntoMarks, markedStats } from '../stores/scope';
+  import { clearMarks, markCount } from '../stores/marks';
   import { autoFitView } from '../stores/settings';
   import type { GraphLevel } from '../types/graph';
+  import { HOVER_MODES, HOVER_MODE_LABELS, HOVER_MODE_TITLES } from '../viewmodels/hoverHighlight';
+  import { toolbarCollapsed, splitViewOpen } from '../stores/panes';
+  import { focusedPane } from '../stores/keymap';
+  import { specGraph } from '../stores/crossFilter';
 
   /** Bound instance of the graph, for the viewport actions. Undefined until
    *  App's `bind:this` lands, which is after this component's first render. */
@@ -34,22 +39,24 @@
 
   /** Collapse state, persisted. Expanded by default so the controls stay
    *  discoverable; the point of collapsing is reclaiming canvas on a small
-   *  window, which is a choice the user makes, not one to make for them. */
-  const TOOLBAR_KEY = 'nao-toolbar-collapsed';
-  let collapsed = (() => {
-    try { return localStorage.getItem(TOOLBAR_KEY) === 'true'; } catch { return false; }
-  })();
-  $: try { localStorage.setItem(TOOLBAR_KEY, String(collapsed)); } catch { /* ignore */ }
+   *  window, which is a choice the user makes, not one to make for them.
+   *
+   *  A store since UI-075, under the same localStorage key: focusing this pane
+   *  with `2` has to unfold it, and `c` has to fold it back. */
+  $: collapsed = $toolbarCollapsed;
 </script>
 
-<header class="canvas-toolbar" class:collapsed data-probe="canvas-toolbar">
+<header class="canvas-toolbar" class:collapsed
+  class:pane-focused={$focusedPane === 'view'}
+  data-pane="view"
+  data-probe="canvas-toolbar">
   <div class="canvas-toolbar-bar">
     <button
       type="button"
       class="canvas-toolbar-handle"
       aria-expanded={!collapsed}
       title={collapsed ? 'Show view controls' : 'Hide view controls'}
-      on:click={() => (collapsed = !collapsed)}
+      on:click={() => toolbarCollapsed.set(!collapsed)}
     >
       <span class="toolbar-chev">{collapsed ? '▶' : '▼'}</span>
       View
@@ -59,6 +66,10 @@
         <span class="toolbar-summary">
           {$viewMode === 'graph' ? 'Graph' : 'Tree'} · {$graphLevel}
           {$autoFitView ? ' · auto-fit' : ''}
+          <!-- A marked set has a ring on the canvas but its only *control* is
+               inside this bar, so a collapsed toolbar would leave the reader
+               with a gesture they could make and not spend. -->
+          {$markCount > 0 ? ` · ${$markCount} marked` : ''}
         </span>
       {/if}
     </button>
@@ -106,6 +117,19 @@
           <button class="control-btn" on:click={() => graphView?.toggleViewMode()}>
             {$viewMode === 'graph' ? 'Tree View' : 'Graph View'}
           </button>
+          <!-- Only offered when there is a spec to draw. A button that opens a
+               pane reading "no Elevator spec in this project" is a promise the
+               project cannot keep, and every project without `.elv` files
+               would carry it. -->
+          {#if !$specGraph.empty}
+            <button
+              class="control-btn"
+              class:active={$splitViewOpen}
+              aria-pressed={$splitViewOpen}
+              on:click={() => splitViewOpen.update((v) => !v)}
+              title="Draw the Elevator spec beside the code, and filter the code by clicking it"
+            >Spec Pane</button>
+          {/if}
           <!-- Level toggle: aggregates the graph to one node per file or
                module. Drives both Graph and Tree views, which share data. -->
           <div class="level-toggle" role="group" aria-label="Aggregation level">
@@ -125,6 +149,28 @@
         <span class="toolbar-group-label" id="tb-selection">Selection</span>
         <div class="toolbar-cluster" role="group" aria-labelledby="tb-selection">
           <button class="control-btn" on:click={() => selectedNode.set(null)}>Clear Selection</button>
+          <!-- Offered only once something is marked. With nothing marked the
+               button can only explain a gesture, and a permanently disabled
+               control that says "⌘-click some nodes first" is a worse teacher
+               than the ring that appears the moment you do it. -->
+          {#if $markCount > 0}
+            <button
+              class="control-btn primary"
+              data-probe="drill-marks"
+              on:click={() => void drillIntoMarks()}
+              title={$markedStats.fitsEntityLevel
+                ? `Narrow the scope to the ${$markCount} marked, and re-open at the finest level that fits — ${$markedStats.entities} entities`
+                : `Narrow the scope to the ${$markCount} marked. ${$markedStats.entities} entities is above the render budget, so it opens at file level; mark fewer, or drill again from there`}
+            >Drill into {$markCount} marked ↓</button>
+            <!-- The level the drill will land at, said before the click. The
+                 whole point of marking two files is to see the entities
+                 inside them, so a set too big to draw that way has to admit
+                 it here rather than silently return another file view. -->
+            {#if !$markedStats.fitsEntityLevel}
+              <span class="mark-note">{$markedStats.entities} entities · opens at file level</span>
+            {/if}
+            <button class="control-btn" on:click={() => clearMarks()}>Clear Marks</button>
+          {/if}
         </div>
       </div>
 
@@ -155,15 +201,40 @@
         </div>
       </div>
 
+      <!-- UI-054. The depth buttons only mean something in Links mode — in
+           Folder mode membership has no distance — so the two clusters sit
+           together and depth greys out rather than silently doing nothing. -->
+      <div class="toolbar-group">
+        <span class="toolbar-group-label" id="tb-hover-mode">On hover</span>
+        <div class="level-toggle" role="group" aria-labelledby="tb-hover-mode">
+          {#each HOVER_MODES as mode}
+            <button
+              class="control-btn"
+              class:active={$hoverMode === mode}
+              aria-pressed={$hoverMode === mode}
+              data-probe="hover-mode-{mode}"
+              disabled={mode === 'group' && $graphLevel === 'module'}
+              on:click={() => hoverMode.set(mode)}
+              title={mode === 'group' && $graphLevel === 'module'
+                ? 'No folder to highlight at Module level — each node is already one'
+                : HOVER_MODE_TITLES[mode]}
+            >{HOVER_MODE_LABELS[mode]}</button>
+          {/each}
+        </div>
+      </div>
+
       <div class="toolbar-group">
         <span class="toolbar-group-label" id="tb-highlight">Highlight depth</span>
         <div class="level-toggle" role="group" aria-labelledby="tb-highlight">
           {#each [1, 2, 3] as depth}
             <button
               class="control-btn level-btn"
-              class:active={$hoverDepth === depth}
+              class:active={$hoverDepth === depth && $hoverMode === 'connections'}
+              disabled={$hoverMode !== 'connections'}
               on:click={() => hoverDepth.set(depth)}
-              title="Highlight {depth} degree{depth > 1 ? 's' : ''} of relationships on hover"
+              title={$hoverMode === 'connections'
+                ? `Highlight ${depth} degree${depth > 1 ? 's' : ''} of relationships on hover`
+                : 'Only applies when hover highlights links'}
             >{depth}</button>
           {/each}
         </div>
@@ -204,10 +275,16 @@
     flex: none;
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
+    /* Same inset ring the flanking columns use, for the same reason: the
+       toolbar sits flush against the canvas below it. */
     /* Sized against the canvas column, not the window: since UI-040 the
        column can be 640px at a 1280px window, so a window-width media query
        would tighten at the wrong moments. */
     container-type: inline-size;
+  }
+
+  .canvas-toolbar.pane-focused {
+    box-shadow: inset 0 0 0 1px var(--accent);
   }
 
   .canvas-toolbar-bar {
@@ -316,10 +393,39 @@
   }
 
   .control-btn:hover { background: var(--bg-hover); }
+  /* A disabled control has to read as unavailable rather than as merely
+     unselected, or the depth buttons look like a setting that stopped
+     working (UI-054). `--text-disabled` is the one token deliberately below
+     the contrast floor, which is correct here: WCAG exempts inactive
+     controls, and this text carries no information the reader needs. */
+  .control-btn:disabled {
+    color: var(--text-disabled);
+    border-color: var(--border-subtle);
+    cursor: not-allowed;
+  }
+  .control-btn:disabled:hover { background: var(--bg-surface); }
   .control-btn.active {
     background: var(--accent);
     color: var(--accent-fg);
     border-color: var(--accent);
+  }
+
+  /* Filled like `.active` and meaning something else: `.active` is a toggle
+     that is on, this is the one button in a cluster that *does* something
+     rather than setting something. They share the accent because the marked
+     rings on the canvas are drawn in it — the button is the end of that
+     gesture, and the colour is what connects the two. */
+  .control-btn.primary {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+  }
+
+  .mark-note {
+    align-self: center;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    white-space: nowrap;
   }
 
   .level-toggle {

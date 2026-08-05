@@ -29,9 +29,60 @@ function persisted<T>(key: string, fallback: T, parse: (raw: string) => T): Writ
  *  on a node lands, and one click hides it. */
 export const detailsPaneOpen = persisted('nao-details-pane-open', true, (v) => v === 'true');
 
+/** Whether the left column is expanded. It was a plain `let` in App until the
+ *  shortcut layer needed to open it from a keystroke (`0`), which is a
+ *  decision taken outside the component that renders it. */
+export const sidebarPaneOpen = persisted('nao-sidebar-pane-open', true, (v) => v === 'true');
+
+/** Which of the sidebar's three tabs is showing. Same move, same reason: `f`,
+ *  `q` and `s` switch tabs from outside `Sidebar.svelte`. */
+export type SidebarTab = 'filters' | 'quality' | 'settings';
+const SIDEBAR_TABS: SidebarTab[] = ['filters', 'quality', 'settings'];
+export const sidebarTab = persisted<SidebarTab>('nao-sidebar-tab', 'filters', (v) =>
+  SIDEBAR_TABS.includes(v as SidebarTab) ? (v as SidebarTab) : 'filters');
+
+/** Whether the view controls above the canvas are folded away. The key is the
+ *  one `CanvasToolbar` used when it owned this as component state, so an
+ *  existing preference survives the move. */
+export const toolbarCollapsed = persisted('nao-toolbar-collapsed', false, (v) => v === 'true');
+
 /** Whether the Description column is expanded. Same key as when this lived in
  *  `description.ts`, so an existing preference survives the move. */
 export const describePaneOpen = persisted('nao-describe-pane-open', true, (v) => v === 'true');
+
+/** Whether the Elevator spec renders as its own pane beside the code canvas
+ *  (ADR 0011). Off by default: a project with no `.elv` layer gains nothing
+ *  from it, and the single canvas stays what the tool opens as. */
+export const splitViewOpen = persisted('nao-split-view-open', false, (v) => v === 'true');
+
+/**
+ * Whether the spec pane draws only entities whose `cr:` claims reach code the
+ * **analysis scope** has loaded.
+ *
+ * Off by default, because the pane is a map and a map that loses rows as you
+ * re-scope stops being one — you can no longer see that a Category exists
+ * outside your current slice. Off does not mean silent: an entity that can
+ * show nothing is marked either way, and this only decides whether it is
+ * dimmed in place or removed. On is for when you want the two panes to agree
+ * exactly.
+ *
+ * A preference rather than layout, but it lives here because it belongs with
+ * `splitViewOpen` — the pane and its one behavioural switch are read together
+ * and there is no second consumer of either.
+ */
+export const followAnalysisScope = persisted('nao-spec-follow-scope', false, (v) => v === 'true');
+
+/** Spec-pane width. Wider floor than Details: the pane draws a graph rather
+ *  than reading prose, and below ~260px the tier labels collide with the
+ *  nodes. */
+export const SPEC_MIN_WIDTH = 260;
+export const SPEC_MAX_WIDTH = 720;
+
+export const specWidth = persisted('nao-spec-width', 400, (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 400;
+  return Math.min(SPEC_MAX_WIDTH, Math.max(SPEC_MIN_WIDTH, n));
+});
 
 /** Narrow, deliberately: it is what the pane shrinks to at 1280×800 rather
  *  than vanishing, and a cramped Details column beats no Details column when

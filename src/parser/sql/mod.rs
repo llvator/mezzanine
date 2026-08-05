@@ -75,6 +75,7 @@ impl LanguageParser for SqlParser {
             size: content.len() as u64,
             line_count: content.lines().count(),
             content_hash: None,
+            documentation: None,
         });
 
         for chunk in lexer::split_statements(content) {

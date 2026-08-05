@@ -13,12 +13,61 @@ use crate::models::file_info::Language;
 use crate::output::{self, JsonRenderer, OutputFormat};
 use crate::settings::Settings;
 
+/// What a reload event is telling clients to re-fetch.
+///
+/// The channel used to carry `()`, which was enough while the only thing
+/// that ever changed was the graph. A working-tree diff that follows the
+/// watcher (UI-067) publishes a second kind of change, and the two have to
+/// be distinguishable for two reasons: a client should not re-fetch the
+/// whole graph because an overlay moved, and the task that refreshes the
+/// diff listens on this same channel and must not answer its own event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReloadKind {
+    /// The code was re-analyzed. Re-fetch index, graph and details.
+    Graph,
+    /// Only the diff overlay moved. Re-fetch `/api/diff`.
+    Diff,
+}
+
+impl ReloadKind {
+    /// The SSE event name clients listen for.
+    pub(crate) fn event_name(self) -> &'static str {
+        match self {
+            ReloadKind::Graph => "reload",
+            ReloadKind::Diff => "diff",
+        }
+    }
+}
+
+/// A working-tree diff the server keeps current as the watcher re-analyzes.
+///
+/// Only the base ref is remembered: the head is always the tree being
+/// watched, which is the whole point.
+#[derive(Clone, Debug)]
+pub(crate) struct LiveDiff {
+    pub from_ref: String,
+}
+
+/// The most recent base analysis, kept so that re-diffing an unchanged base
+/// on every file save does not re-create and re-analyze its worktree.
+///
+/// One entry, not a map: saves come in against the same base ref for as long
+/// as the user is looking at one comparison, and a full graph is not small
+/// enough to accumulate copies of speculatively.
+pub(crate) struct CachedBase {
+    pub sha: String,
+    pub graph: DependencyGraph,
+    pub config: Config,
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub tx: Arc<broadcast::Sender<()>>,
+    pub tx: Arc<broadcast::Sender<ReloadKind>>,
     pub output_dir: std::path::PathBuf,
     pub repo_root: Arc<RwLock<std::path::PathBuf>>,
     pub include_tests: bool,
+    /// Analyze Markdown alongside the code (see `AnalysisConfig::include_docs`).
+    pub include_docs: bool,
     pub languages: Option<Vec<String>>,
     /// The merged settings file, so handlers that rebuild a config from
     /// scratch honour it exactly as the initial analysis did.
@@ -29,6 +78,14 @@ pub(crate) struct AppState {
     pub config: Arc<std::sync::RwLock<Config>>,
     pub diff_result: Arc<std::sync::RwLock<Option<String>>>,
     pub base_details: Arc<std::sync::RwLock<Option<String>>>,
+    /// Set while a working-tree diff should track the watcher. `None` means
+    /// no diff, or one pinned to two commits — a fixed comparison, which a
+    /// file save has no business moving (UI-067).
+    pub live_diff: Arc<std::sync::RwLock<Option<LiveDiff>>>,
+    /// Base analysis reused across refreshes. See `CachedBase`.
+    pub base_cache: Arc<std::sync::RwLock<Option<CachedBase>>>,
+    /// False when `--pin-diff` asked for the diff to stay where it was put.
+    pub follow_diff: bool,
     /// Flipped to `true` to ask the active analyzer to abort. The
     /// analysis-scope handler sets this before acquiring the
     /// `analysis_in_progress` mutex, then resets it before launching
@@ -90,11 +147,13 @@ pub(crate) fn write_json_with_cancel(
 pub(crate) fn build_config(
     root: &Path,
     include_tests: bool,
+    include_docs: bool,
     languages: &Option<Vec<String>>,
     settings: &Settings,
 ) -> Config {
     let mut config = Config::for_path(root).with_output_format(OutputFormat::Json);
     config.analysis.include_tests = include_tests;
+    config.analysis.include_docs = include_docs;
     if let Some(langs) = languages {
         for lang in langs {
             if let Some(language) = Language::from_name(lang) {
