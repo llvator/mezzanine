@@ -28,7 +28,7 @@
     return [...byCommand.values()];
   }
 
-  /** The five pane digits get one combined row above, so drop them here —
+  /** The pane digits get one combined row above, so drop them here —
    *  listed individually they would bury the four global keys that have
    *  nowhere else to appear. */
   const globalRows = rows('global').filter((r) => !r.command.startsWith('pane.focus.'));
@@ -61,7 +61,10 @@
         <dl>
           <div class="row">
             <dt>{#each PANES as p, i}<kbd>{p.digit}</kbd>{#if i < PANES.length - 1}<span class="sep">/</span>{/if}{/each}</dt>
-            <dd>Focus Sidebar / Graph / View / Details / Description</dd>
+            <!-- Read off the same list as the digits beside it: written out,
+                 this row missed the spec pane for as long as that pane has
+                 existed. -->
+            <dd>Focus {PANES.map((p) => p.label).join(' / ')}</dd>
           </div>
           {#each globalRows as row}
             <div class="row">

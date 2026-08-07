@@ -138,6 +138,12 @@ impl ParseStore {
     /// `None` on a miss or on *any* error (missing file, corrupt JSON,
     /// unreadable dir) — the caller then parses fresh. Records a hit/miss
     /// for the end-of-run summary.
+    ///
+    /// Content decides *staleness*; it does not decide *applicability*. The
+    /// entry records the path it was walked at, and `abs_path` is canonical,
+    /// so a file reachable by two spellings resolves to one entry holding
+    /// one of them. The caller checks that before using a hit — see
+    /// `Analyzer::parse_file_standalone`.
     pub(crate) fn get(&self, abs_path: &Path, content_hash: &str) -> Option<ParsedFile> {
         let path = self.entry_path(abs_path)?;
         match std::fs::read(&path).ok().and_then(|bytes| {

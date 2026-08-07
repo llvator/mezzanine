@@ -168,6 +168,13 @@ const REL_KIND_MAP: Record<string, { raw: string; label: string }> = {
   interpolates: { raw: 'Interpolates', label: 'interpolates' },
 };
 
+/** The PascalCase spelling `LINK_COLORS` keys on, for a kind that arrives as
+ *  the snake_case the backend serializes — diff.json's relationship deltas,
+ *  which never pass through the link transform below. */
+export function relKindRaw(kind: string): string {
+  return REL_KIND_MAP[kind]?.raw ?? kind;
+}
+
 /**
  * Boolean-truthy metadata keys the parsers use as semantic
  * relationship tags. The parser writes `metadata.null_safe = "true"`;

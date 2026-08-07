@@ -19,6 +19,7 @@ pub mod graph;
 pub mod output;
 pub mod config;
 pub mod settings;
+pub mod init;
 pub mod diff;
 pub mod server;
 pub mod educator;

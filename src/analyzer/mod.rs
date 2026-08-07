@@ -138,9 +138,14 @@ impl Analyzer {
     /// Stage 1: walk the configured root and return the list of source files
     /// eligible for parsing. Filtering (exclude patterns, test heuristics,
     /// language gating) happens inside `FileWalker`.
+    ///
+    /// Two roots rather than one when `spec_dir` points outside the analyzed
+    /// tree — a docs repo beside the code, or the top of a monorepo whose
+    /// services are watched one at a time. The second walk yields `.elv`
+    /// files only, and yields nothing at all in the ordinary case, so the
+    /// concatenation costs nothing to leave in.
     fn discover_files(&self, cancel: &Arc<AtomicBool>) -> Result<Vec<PathBuf>> {
-        let walker = FileWalker::new(&self.config);
-        walker.walk_with_cancel(&self.config.root_path, cancel)
+        FileWalker::new(&self.config).walk_all(&self.config.root_path, cancel)
     }
 
     /// Stage 2: parse every discovered file in parallel, with a progress bar.
@@ -661,8 +666,9 @@ impl Analyzer {
 
     /// Parse a single file without requiring &mut self (suitable for
     /// parallel execution). Consults the AN-003 parse store first: on a
-    /// content-hash hit it returns the stored `ParsedFile` verbatim,
-    /// skipping tree-sitter entirely; on a miss it parses and persists.
+    /// usable hit ([`usable_hit`]) it returns the stored `ParsedFile`
+    /// verbatim, skipping tree-sitter entirely; on a miss it parses and
+    /// persists.
     fn parse_file_standalone(
         path: &Path,
         language: Language,
@@ -674,7 +680,7 @@ impl Analyzer {
         let content_hash = ParseStore::content_hash(&content);
         let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-        if let Some(parsed) = store.get(&abs_path, &content_hash) {
+        if let Some(parsed) = usable_hit(store, &abs_path, path, &content_hash) {
             return Ok(parsed);
         }
 
@@ -923,8 +929,10 @@ impl Analyzer {
 
     /// Apply configured filters to entities and relationships
     fn apply_filters(&mut self) {
+        self.drop_local_assignments();
+
         let filters = &self.config.filters;
-        
+
         // Filter entities by kind
         if !filters.entity_kinds.is_empty() {
             self.entities.retain(|_, e| filters.entity_kinds.contains(&e.kind));
@@ -945,7 +953,105 @@ impl Analyzer {
         // Filter by name patterns (if any)
         // TODO: Implement regex matching
     }
-    
+
+    /// Drop the assignments nothing reads, unless `include_locals` asks for
+    /// them (CFG-005).
+    ///
+    /// One entity per assignment is most of a real graph — 72% of tinygrad's
+    /// entities and 46% of its edges — while `mcp::tools::is_listed` hides
+    /// `Variable` from every agent answer and the canvas draws at most 2,000
+    /// nodes. So the default analysis built and shipped a population no
+    /// consumer displays.
+    ///
+    /// Two carve-outs, and they are what keeps this a *cost* cut rather than
+    /// a fidelity cut:
+    ///
+    /// - **Class fields stay.** The canvas injects `class_field`-tagged
+    ///   Variables as a class's field column, so they are drawn, not merely
+    ///   stored. (Per-class `field_count` is computed from `entity.fields` in
+    ///   the parsers and does not depend on these entities either way.)
+    /// - **Anything doing structural work stays.** A name whose whole edge
+    ///   set is `Contains` (its parent declaring it) and `WritesTo` (someone
+    ///   assigning it) is a leaf nobody navigates through. One that *calls*,
+    ///   *instantiates*, *returns* or is *used as a type* is a participant in
+    ///   the call graph, and dropping it would silently delete a real edge —
+    ///   Python's module-level registries and decorator tables are exactly
+    ///   this. On tinygrad that exemption keeps 200 entities and with them
+    ///   3,562 relationships, so fan-in, fan-out and every coupling metric
+    ///   downstream are untouched by the cut.
+    ///
+    /// Runs before the `entity_kinds` allow-list, and at graph assembly
+    /// rather than in the parsers: `ParseStore` is keyed by (path, parser
+    /// version) with nothing about the run in it, so a parser that honoured
+    /// this flag would hand a cached locals-included parse to a run with the
+    /// flag off and assemble a mixed graph with no hash mismatch to catch it.
+    /// The cost of filtering here is that parse time is unchanged; the
+    /// benefit is one cache generation per repo, and a flag whose flip
+    /// re-assembles without re-parsing anything.
+    fn drop_local_assignments(&mut self) {
+        if self.config.analysis.include_locals {
+            return;
+        }
+
+        let structural = self.structural_endpoints();
+
+        let dropped: HashSet<String> = self
+            .entities
+            .values()
+            .filter(|e| matches!(e.kind, EntityKind::Variable | EntityKind::Constant))
+            .filter(|e| !e.tags.contains("class_field"))
+            .filter(|e| {
+                !structural.contains(e.id.as_str()) && !structural.contains(e.name.as_str())
+            })
+            .map(|e| e.id.clone())
+            .collect();
+
+        if dropped.is_empty() {
+            return;
+        }
+
+        self.entities.retain(|id, _| !dropped.contains(id));
+        // An edge naming an entity the payload no longer holds is a dangling
+        // reference every consumer would have to guard against.
+        self.relationships
+            .retain(|r| !dropped.contains(&r.source_id) && !dropped.contains(&r.target_id));
+        // `file_entities` is the per-file view the same entities are also
+        // stored in; leaving it whole would let them back in through
+        // `analyze_file` and the diff path.
+        for entities in self.file_entities.values_mut() {
+            entities.retain(|e| !dropped.contains(&e.id));
+        }
+    }
+
+
+    /// Every name that appears at either end of an edge that is not mere
+    /// containment or assignment — plus the last dotted segment of each.
+    ///
+    /// The segments are why this is not a one-liner. At this point in the
+    /// pipeline a call's `target_id` is often still the name the source wrote
+    /// (`adder`, `mod.adder`) rather than an entity id;
+    /// `DependencyGraph::from_analysis` is what matches those against entity
+    /// *names*, minting a ghost when nothing matches. An exemption that
+    /// checked ids alone would therefore miss the case it exists for —
+    /// `adder = functools.partial(make, 1)` was dropped and the call to it
+    /// landed on `ghost:adder`. Matching what the graph builder matches keeps
+    /// the two passes agreeing about what a name refers to.
+    fn structural_endpoints(&self) -> HashSet<&str> {
+        let mut ends = HashSet::new();
+        for rel in &self.relationships {
+            if matches!(rel.kind, RelationshipKind::Contains | RelationshipKind::WritesTo) {
+                continue;
+            }
+            for end in [rel.source_id.as_str(), rel.target_id.as_str()] {
+                ends.insert(end);
+                if let Some(last) = end.rsplit('.').next() {
+                    ends.insert(last);
+                }
+            }
+        }
+        ends
+    }
+
     /// Analyze a specific file
     pub fn analyze_file(&mut self, path: &Path) -> Result<AnalysisResult> {
         let language = parser::detect_language(path);
@@ -1028,6 +1134,34 @@ impl Analyzer {
             current_level
         }
     }
+}
+
+/// A stored parse that may actually be used for this walk: right content,
+/// and parsed at the path being walked *now*.
+///
+/// The second half is not belt-and-braces. The store keys on the canonical
+/// path, while everything the entry records — `file_path`, `FileInfo::path`,
+/// every entity's `file_path` — is the path as walked, and one physical file
+/// has as many walked paths as there are ways to reach it: a symlinked spec
+/// directory, `nao analyze .` versus an absolute root, a repo checked out
+/// twice. Serving the entry regardless puts the *other* spelling on every
+/// entity, so click-to-open and `cr:` anchors name a path this run never
+/// saw — and since content is what decides a hit, it stays wrong until
+/// someone edits the file.
+///
+/// Keying on the walked path instead looks simpler and is worse: the store
+/// is machine-wide, so a bare `./src/main.rs` is not a unique name and two
+/// repos with an identical file would trade entries. Canonical for identity,
+/// walked path for validity.
+fn usable_hit(
+    store: &ParseStore,
+    abs_path: &Path,
+    walked: &Path,
+    content_hash: &str,
+) -> Option<ParsedFile> {
+    store
+        .get(abs_path, content_hash)
+        .filter(|parsed| parsed.file_path == walked)
 }
 
 /// Intermediate result from parsing a single file (used for parallel
@@ -1195,6 +1329,44 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// One physical file, two ways to reach it — which is all a symlink is,
+    /// and the normal shape of a spec directory kept outside the tree it
+    /// describes. The parse store keys on the canonical path, so both
+    /// spellings land on one entry; the entry records the path it was walked
+    /// at. Serving it to the other spelling puts a path this run never saw
+    /// on every entity, and since the content is what decides a hit, it
+    /// stays wrong until someone edits the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_path_to_one_file_does_not_inherit_the_first_path() {
+        let root = std::env::temp_dir().join(format!("nao-linked-parse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        let real = root.join("real").join("thing.rs");
+        std::fs::write(&real, "fn thing() {}\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let linked = root.join("link").join("thing.rs");
+
+        let store = ParseStore::open_at(root.join("cache"));
+        let first = Analyzer::parse_file_standalone(&real, Language::Rust, &store).unwrap();
+        assert_eq!(first.file_path, real);
+
+        let second = Analyzer::parse_file_standalone(&linked, Language::Rust, &store).unwrap();
+        assert_eq!(second.file_path, linked, "the cached entry's path leaked through");
+        assert!(
+            second.entities.iter().all(|e| e.file_path == linked),
+            "entities kept the other spelling: {:?}",
+            second.entities.iter().map(|e| &e.file_path).collect::<Vec<_>>()
+        );
+
+        // And the first spelling still hits, rather than each run evicting
+        // the other — the point is a correct memo, not a disabled one.
+        let again = Analyzer::parse_file_standalone(&real, Language::Rust, &store).unwrap();
+        assert_eq!(again.file_path, real);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A node label is a name, not a source excerpt. Whatever a language
     /// parser hands back as a type, the synthesized parameter/field label
     /// stays one short line.
@@ -1241,6 +1413,155 @@ mod tests {
         };
 
         assert_eq!(run(), run(), "two runs on an identical tree diverged");
+    }
+
+    /// The CFG-005 fixture: a module constant, a function local, two class
+    /// fields, and a module-level name that is *called* elsewhere.
+    fn assignments_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nao-cfg005-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("app.py"),
+            "import functools\n\
+             \n\
+             MAX_RETRIES = 3\n\
+             \n\
+             def make(op, value):\n\
+             \x20   return op + value\n\
+             \n\
+             adder = functools.partial(make, 1)\n\
+             \n\
+             def use():\n\
+             \x20   return adder(2)\n\
+             \n\
+             class Session:\n\
+             \x20   def __init__(self, token):\n\
+             \x20       self.token = token\n\
+             \x20       self.count = 0\n\
+             \n\
+             \x20   def bump(self):\n\
+             \x20       step = 1\n\
+             \x20       self.count += step\n\
+             \x20       return self.count\n",
+        )
+        .expect("fixture");
+        dir
+    }
+
+    fn analyze_fixture(dir: &Path, include_locals: bool) -> AnalysisResult {
+        let mut config = Config::for_path(dir);
+        config.analysis.include_locals = include_locals;
+        Analyzer::new(config).analyze().expect("analysis should succeed")
+    }
+
+    fn named<'a>(result: &'a AnalysisResult, name: &str) -> Vec<&'a CodeEntity> {
+        result.entities.iter().filter(|e| e.name == name).collect()
+    }
+
+    /// CFG-005. One entity per assignment is 72% of a real graph and no
+    /// consumer lists it — `is_listed` hides `Variable` from every agent
+    /// answer and the canvas draws at most 2,000 nodes.
+    #[test]
+    fn a_default_analysis_drops_the_names_nothing_navigates() {
+        let dir = assignments_fixture("drops");
+        let result = analyze_fixture(&dir, false);
+
+        assert!(named(&result, "MAX_RETRIES").is_empty(), "module constant survived");
+        assert!(named(&result, "step").is_empty(), "function local survived");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first carve-out. The canvas draws `class_field` Variables as a
+    /// class's field column, so they are displayed, not merely stored.
+    #[test]
+    fn a_class_keeps_its_fields_and_the_count_they_report() {
+        let dir = assignments_fixture("fields");
+        let with = analyze_fixture(&dir, true);
+        let without = analyze_fixture(&dir, false);
+
+        for field in ["token", "count"] {
+            let kept = named(&without, field);
+            assert!(
+                kept.iter().any(|e| e.tags.contains("class_field")),
+                "class field `{field}` was dropped with the locals"
+            );
+        }
+
+        let count_of = |r: &AnalysisResult| {
+            r.entities
+                .iter()
+                .find(|e| e.name == "Session")
+                .and_then(|e| e.metrics.field_count)
+        };
+        assert_eq!(count_of(&with), count_of(&without), "field_count moved with the cut");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second carve-out, and the one that keeps this a cost cut rather
+    /// than a fidelity cut. `adder = functools.partial(make, 1)` is a
+    /// function alias: drop it and the call to it resolves to `ghost:adder`
+    /// instead of the real name. The exemption has to match what
+    /// `DependencyGraph::from_analysis` matches — names, not just ids —
+    /// because at filter time a call's target is still the name as written.
+    #[test]
+    fn an_assignment_something_calls_is_not_a_leaf() {
+        let dir = assignments_fixture("alias");
+        let result = analyze_fixture(&dir, false);
+
+        assert!(
+            !named(&result, "adder").is_empty(),
+            "a called module-level name was dropped as a leaf"
+        );
+
+        let graph = crate::graph::DependencyGraph::from_analysis(&result);
+        assert!(
+            !graph.entities().any(|e| e.id == "ghost:adder"),
+            "the call fell through to a ghost, which is the defect this exemption exists for"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No consumer should have to guard against an edge naming an entity the
+    /// payload does not hold.
+    #[test]
+    fn the_cut_leaves_no_edge_pointing_at_a_dropped_name() {
+        let dir = assignments_fixture("dangling");
+        let result = analyze_fixture(&dir, false);
+
+        let ids: HashSet<&str> = result.entities.iter().map(|e| e.id.as_str()).collect();
+        let dangling: Vec<_> = result
+            .relationships
+            .iter()
+            .filter(|r| {
+                // Unresolved call targets are names, not ids, and are the
+                // graph builder's business (it ghosts them). Only edges that
+                // *had* an entity and lost it are this pass's fault.
+                r.source_id.contains(".py:") && !ids.contains(r.source_id.as_str())
+                    || r.target_id.contains(".py:") && !ids.contains(r.target_id.as_str())
+            })
+            .map(|r| (r.source_id.clone(), r.target_id.clone()))
+            .collect();
+        assert!(dangling.is_empty(), "edges left pointing nowhere: {dangling:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The flag is the whole escape hatch: a focused reading gets everything
+    /// back, without the parse store having to know which mode it is in.
+    #[test]
+    fn include_locals_restores_every_assignment() {
+        let dir = assignments_fixture("restores");
+        let result = analyze_fixture(&dir, true);
+
+        assert!(!named(&result, "MAX_RETRIES").is_empty(), "constant missing");
+        assert!(!named(&result, "step").is_empty(), "local missing");
+        assert!(!named(&result, "adder").is_empty(), "alias missing");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PY-028 end-to-end: a subscripted Python annotation must reach the

@@ -79,6 +79,13 @@ struct ServeState {
     repos: RepoRegistry,
     limiter: JobLimiter,
     jobs: JobConfig,
+    /// The settings this server is running under, for `GET /api/settings`.
+    ///
+    /// Built once at startup and never rebuilt, because nothing here can
+    /// change it: serve reads the user scope only (ADR-0008 — a repo that
+    /// arrived from a URL a stranger pasted does not get to configure the
+    /// server analyzing it), and there is no repo-scope file to write back.
+    settings: Arc<crate::settings::SettingsReport>,
 }
 
 /// Run the multi-repo server: check the flags, rehydrate the cache, analyze
@@ -112,6 +119,12 @@ fn serve_checked(
         languages,
         ..
     } = opts;
+
+    // User scope only, and the report says so: an empty repo scope here means
+    // "never looked", not "the repo had no file". Built before the seeds are
+    // analyzed so a warning about the operator's own settings file is printed
+    // in the same breath as the rest of startup.
+    let settings = Arc::new(settings_report(port, ui.as_deref(), include_tests, &languages));
 
     let mut repos: HashMap<String, Arc<RepoSlot>> = HashMap::new();
 
@@ -147,6 +160,7 @@ fn serve_checked(
             include_tests,
             languages,
         },
+        settings,
     };
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -159,6 +173,50 @@ fn serve_checked(
         axum::serve(listener, app).await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// The settings this server resolved, for the panel that reports them.
+///
+/// `serve` has no analyzed root of its own, so the report carries no repo
+/// path and `repo_scope_read: false` — the UI needs to say "never read"
+/// rather than let an empty repo scope read as "your repo has no settings".
+fn settings_report(
+    port: u16,
+    ui: Option<&std::path::Path>,
+    include_tests: bool,
+    languages: &Option<Vec<String>>,
+) -> crate::settings::SettingsReport {
+    use crate::settings::report::{Effective, Inputs};
+    let loaded = crate::settings::user_scoped();
+    let mut config = crate::config::Config::default();
+    config.analysis.include_tests = include_tests;
+    for name in languages.iter().flatten() {
+        if let Some(lang) = crate::models::file_info::Language::from_name(name) {
+            config.analysis.languages.insert(lang);
+        }
+    }
+    let effective =
+        Effective { port: Some(port), ui_dir: ui.map(|p| p.to_path_buf()), ..Default::default() };
+    let flags = crate::settings::report::named(&[
+        ("port", true),
+        ("include_tests", include_tests),
+        ("language", languages.is_some()),
+        ("ui_dir", ui.is_some()),
+    ]);
+    crate::settings::SettingsReport::build(
+        None,
+        &Inputs { loaded: &loaded, flags: &flags, config: &config, effective: &effective, repo_scope_read: false },
+    )
+}
+
+/// GET /api/settings — the user-scope settings this server is running under.
+async fn settings_report_handler(
+    State(state): State<ServeState>,
+) -> Json<crate::settings::SettingsReport> {
+    // Cloned rather than served behind the `Arc`: `serde` only serializes
+    // `Arc<T>` with its `rc` feature, and a settings report is a few dozen
+    // small rows on a route nobody polls.
+    Json((*state.settings).clone())
 }
 
 fn build_router(
@@ -177,6 +235,7 @@ fn build_router(
         .route("/api/repos/{slug}/details/base", get(repo_base_details))
         .route("/api/repos/{slug}/commits", get(repo_commits))
         .route("/api/repos/{slug}/scope", post(repo_scope))
+        .route("/api/settings", get(settings_report_handler))
         .with_state(state);
 
     // Same allowlist and token as watch mode — one policy type, two callers,

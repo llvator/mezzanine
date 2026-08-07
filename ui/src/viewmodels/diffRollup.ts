@@ -113,6 +113,44 @@ function verdict(t: Tally): ScopeChange {
  * resulting key set is the full file tree as of the moment the diff ran.
  * That is what makes a missing key meaningful.
  */
+/** How many entities under a scope landed in each bucket. */
+export interface ScopeTally {
+  added: number;
+  removed: number;
+  modified: number;
+  unchanged: number;
+  /** Changed entities whose own source or intrinsic metrics moved. */
+  core: number;
+}
+
+/**
+ * The same rollup as `rollUpByScope`, kept as counts rather than a verdict.
+ *
+ * A separate function rather than a richer `ScopeChange`, because the canvas
+ * asks a yes/no question of every drawn node on every filter change and has
+ * no use for the arithmetic — while the details pane, looking at exactly one
+ * file, has nothing *but* the arithmetic to show: a file node has no diff row
+ * of its own to report metric deltas from (UI-097).
+ */
+export function rollUpCounts(entities: readonly EntityDiff[]): Map<string, ScopeTally> {
+  const tallies = new Map<string, Tally>();
+  for (const e of entities) {
+    const path = normalizeScopePath(e.file_path ?? '');
+    const isCore = (e.source_changed ?? true) && e.status !== 'unchanged';
+    for (const scope of scopeChain(path)) {
+      const t = tallyOf(tallies, scope);
+      switch (e.status) {
+        case 'added': t.added++; break;
+        case 'removed': t.removed++; break;
+        case 'modified': t.modified++; break;
+        default: t.unchanged++; break;
+      }
+      if (isCore) t.core++;
+    }
+  }
+  return tallies;
+}
+
 export function rollUpByScope(entities: readonly EntityDiff[]): Map<string, ScopeChange> {
   const tallies = new Map<string, Tally>();
   for (const e of entities) {

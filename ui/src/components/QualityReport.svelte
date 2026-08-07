@@ -20,6 +20,7 @@
     type Tier,
   } from '../stores/quality';
   import { clearHiddenFiles } from '../viewmodels/filterViewModel';
+  import { couplingCell } from '../viewmodels/scopeCoupling';
   import { diffData } from '../stores/diff';
   import { setScopes, selectedScopes } from '../stores/scope';
   import { fetchRefactorPrompt, spawnAgentTerminal } from '../viewmodels/contextScope';
@@ -361,8 +362,11 @@
       String(s.internal_edges),
       String(s.external_edges),
       s.cohesion != null ? `${Math.round(s.cohesion * 100)}%` : '—',
-      String(s.fan_in),
-      String(s.fan_out),
+      // Same em dash the cohesion cell above already exports for an
+      // undefined ratio — a copied row should not claim a zero the graph
+      // never measured (UI-091).
+      couplingCell(s.fan_in, s.ref_fan_in ?? 0, 'in').text,
+      couplingCell(s.fan_out, s.ref_fan_out ?? 0, 'out').text,
       s.in_cycle ? 'yes' : 'no',
     ];
   }
@@ -530,13 +534,17 @@
    * population was wrong and had exactly one thing to do about it. Naming a
    * population you cannot change is a label, not a control.
    */
-  const POPULATIONS: { value: QualityAnalysisScope; label: string }[] = [
-    { value: 'scope', label: 'whole analysis scope' },
-    { value: 'visualScope', label: 'the scope tree selection' },
-    { value: 'visualSelection', label: 'what the canvas is drawing' },
-    { value: 'selection', label: 'the current selection' },
-    { value: 'currentFile', label: 'the file open in the editor' },
-    { value: 'changedFiles', label: 'files changed in the diff' },
+  /* `short` is the same fact sized for the banner above. Both come from this
+   * one table so they cannot drift: the banner used to say "repo score"
+   * whatever the picker was set to, which contradicted the population named
+   * a few rows below it over the very same numbers. */
+  const POPULATIONS: { value: QualityAnalysisScope; label: string; short: string }[] = [
+    { value: 'scope', label: 'the whole analysis scope', short: 'repo score' },
+    { value: 'visualScope', label: 'the scope tree selection', short: 'scope tree score' },
+    { value: 'visualSelection', label: 'what the canvas is drawing', short: 'canvas score' },
+    { value: 'selection', label: 'the current selection', short: 'selection score' },
+    { value: 'currentFile', label: 'the file open in the editor', short: 'file score' },
+    { value: 'changedFiles', label: 'files changed in the diff', short: 'diff score' },
   ];
 
   /**
@@ -553,8 +561,9 @@
     ...($diffData ? [] : ['changedFiles' as const]),
   ]);
 
-  $: populationLabel =
-    POPULATIONS.find((p) => p.value === $qualityAnalysisScope)?.label ?? $qualityAnalysisScope;
+  $: population = POPULATIONS.find((p) => p.value === $qualityAnalysisScope);
+  $: populationLabel = population?.label ?? $qualityAnalysisScope;
+  $: scoreLabel = population?.short ?? 'score';
 
   /** True when the panel is measuring a population the canvas is not drawing.
    *  Suppressed before a scope exists, when everything is empty anyway. */
@@ -582,13 +591,16 @@
       <button type="button" on:click={() => (filterNotice = null)} aria-label="Dismiss">×</button>
     </div>
   {/if}
-  <!-- Repo-level health banner: always visible, aggregates all entity scores. -->
+  <!-- Health banner: aggregates every entity score in the chosen population,
+       which is not always the repo — the label has to move with the picker
+       below, or the banner names one population while the header names
+       another over the identical numbers. -->
   {#if $repoQuality.entityCount > 0}
     {@const rq = $repoQuality}
     <section class="repo-banner tier-bg-{rq.tier}">
-      <div class="repo-score help" data-tip="Average entity composite score across the entire scope. Green ≤0.5 (most entities healthy), amber ≤1.0 (some trouble), red >1.0 (widespread issues). Each entity's score is a weighted blend of CC, cognitive complexity, fan-out, LOC, params, and nesting." aria-label="Repo quality score explanation">
+      <div class="repo-score help" data-tip="Average entity composite score across {populationLabel}. Green ≤0.5 (most entities healthy), amber ≤1.0 (some trouble), red >1.0 (widespread issues). Each entity's score is a weighted blend of CC, cognitive complexity, fan-out, LOC, params, and nesting." aria-label="Quality score explanation">
         <span class="repo-score-value tier-{rq.tier}">{rq.avgScore.toFixed(2)}</span>
-        <span class="repo-score-label">repo score</span>
+        <span class="repo-score-label" data-probe="score-label">{scoreLabel}</span>
         <!-- A bare decimal says nothing: no scale, no units, no direction.
              (UI-018) -->
         <span class="repo-score-scale" data-probe="score-scale">{SCORE_SCALE_LABEL}</span>
@@ -950,6 +962,10 @@
           <tbody>
             {#each scopeVisible as r (r.scope.path)}
               {@const agg = r.aggregate}
+              <!-- UI-091: an unmeasured coupling count renders as an em dash,
+                   like the cohesion cell beside it, not as a flattering zero. -->
+              {@const fin = couplingCell(r.scope.fan_in, r.scope.ref_fan_in ?? 0, 'in')}
+              {@const fout = couplingCell(r.scope.fan_out, r.scope.ref_fan_out ?? 0, 'out')}
               <tr class:selected={activeScopePath === r.scope.path} on:click={() => selectScope(r)}>
                 <td class="score-cell">
                   <div class="score-bar" style="width: {scorePct(r.score)}%"></div>
@@ -970,8 +986,8 @@
                 <td class="num">{r.scope.callable_count}</td>
                 <td class="num {tierClass(r.tiers.loc)}">{r.scope.loc}</td>
                 <td class="num {tierClass(r.tiers.cohesion)}">{r.scope.cohesion != null ? `${Math.round(r.scope.cohesion * 100)}%` : '—'}</td>
-                <td class="num">{r.scope.fan_in}</td>
-                <td class="num {tierClass(r.tiers.fanOut)}">{r.scope.fan_out}</td>
+                <td class="num" title={fin.tip}>{fin.text}</td>
+                <td class="num {fout.unmeasured ? '' : tierClass(r.tiers.fanOut)}" title={fout.tip}>{fout.text}</td>
                 <td class="num">{r.scope.in_cycle ? '●' : ''}</td>
                 <td class="copy-cell">
                   <button

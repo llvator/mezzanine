@@ -25,8 +25,8 @@ f model {
 }
 
 f pipeline {
-    d: "Analyzer is the orchestration everything else calls: FileWalker selects files, each is parsed (cache first), the per-file results merge, then resolution, dep edges and metrics run in that fixed order. Returns one AnalysisResult carrying graph, files and the parser warnings. Long runs are interruptible — check_cancel yields Cancelled at the phase boundaries rather than mid-merge."
-    cr: "src/analyzer/mod.rs"
+    d: "Analyzer is the orchestration everything else calls: FileWalker selects files, each is parsed (cache first), the per-file results merge, then resolution, dep edges and metrics run in that fixed order. Returns one AnalysisResult carrying graph, files and the parser warnings. Long runs are interruptible — check_cancel yields Cancelled at the phase boundaries rather than mid-merge. discover_files walks one root, or two when spec_dir names a directory outside it: the second walk admits .elv alone, so pointing at a docs repo costs a traversal and not a second analysis. Set at all, spec_dir also decides which .elv files are the spec — outside it they stop counting, which is the half that lets a tree with .elv fixtures have a spec at all. A spec_dir that is not a directory says so and falls back to every .elv under the root, because a typo and a repo with no spec are otherwise the same empty picture."
+    cr: "src/analyzer/mod.rs", "src/analyzer/file_walker.rs"
 }
 
 f dep_paths {
@@ -110,6 +110,13 @@ f metrics {
     d: "Coupling and the numbers derived from it — fan-in/out, instability, WMC, chain depth, PageRank, composite_score — plus per-file and per-module rollups, computed after the edge set is final. The complexity triple (cyclomatic, cognitive_complexity, max_nesting) is not computed here: each parser measures its own bodies and this layer only reads them, through unwrap_or(0) in populate_wmc and populate_composite_scores. That default is the silent part — a language whose parser ships no complexity pass scores 0, and the quality/hotspots ranking filters on composite_score > 0.0, so it disappears from the ranking entirely rather than appearing as unmeasured."
     cr: "src/graph.rs"
     references: f.parsers
+    fu roll_up
+}
+
+fu f.metrics.roll_up {
+    d: "Rolling per-entity numbers up to files and directories, and what that rollup is allowed to count. populate_scope_metrics runs four phases in order — scan_entity_files, scan_file_edges, compute_file_cycles, then assemble_file_metrics and compute_module_metrics — and a module is nothing but a directory prefix, so the same classify_module_edges answers for every ancestor of a file. scan_file_edges is where the second silent part lives: it admits only RelationshipKind::is_dependency, so a graph whose relationships are all References — every Markdown link, Elevator, Impex and folded SQL edge — produced fan_in 0, fan_out 0, cohesion None on every scope while the canvas drew arrows between them. cohesion is Option and reads as unmeasured; the counts had no such escape hatch, and 0 is the flattering end of that scale, so a folder nobody measured reported as a folder with nothing to answer for. The scan therefore fills two EdgeBuckets of the same shape, deps and refs, which is what lets the module rollup run the existing classification over either instead of keeping a second copy: ref_fan_in and ref_fan_out ride beside the coupling pair and feed no ratio, no cycle and no composite_score. References was deliberately not added to is_dependency — that predicate is global, so admitting it would move cohesion, instability and every composite_score for four languages that never asked. The counts travel to the browser through JsonScopeMetrics, not ScopeMetrics, and were correct in the graph and absent from the payload for one round of the work; they are skipped when zero, so a code graph's JSON is byte-identical to what it was."
+    cr: "src/graph.rs", "src/output/json_renderer.rs"
+    references: f.model
 }
 
 f smells {
@@ -118,12 +125,18 @@ f smells {
 }
 
 f parse_store {
-    d: "Content-hashed per-file parse cache on disk, and the whole of the incremental mechanism: there is no separate dirty tracking, unchanged files simply hit. One entry per path — the hash rides inside the entry, so a re-parse overwrites rather than accumulating a new entry per edit."
+    d: "Content-hashed per-file parse cache on disk, and the whole of the incremental mechanism: there is no separate dirty tracking, unchanged files simply hit. One entry per canonical path — key_stem hashes the path, the content hash rides inside the entry, so a re-parse overwrites rather than accumulating a new entry per edit. Canonical is what makes the key an identity; it is not what makes a hit applicable, which is why reuse is a step of its own."
     cr: "src/analyzer/parse_store.rs"
     fu invalidate
+    fu reuse
 }
 
 fu f.parse_store.invalidate {
     d: "Entries are scoped by a generation key derived at build time: build.rs hashes src/parser/, src/models/ and the resolved tree-sitter versions, so anything that changes what unchanged source parses to mints a new generation on its own. PARSE_CACHE_SALT survives only as a manual escape hatch for what the fingerprint cannot see — it was load-bearing and was forgotten twice, serving pre-change parses from warm caches indefinitely (ADR 0004). Abandoned generations are reclaimed after STALE_GENERATION_DAYS, late enough that an older installed binary keeps its own cache warm."
     cr: "src/analyzer/parse_store.rs"
+}
+
+fu f.parse_store.reuse {
+    d: "Content decides whether an entry is stale; it does not decide whether the entry applies. usable_hit filters ParseStore::get on ParsedFile.file_path and parse_file_standalone takes the hit only if it equals the path being walked now. The two differ because the key is canonical while everything the entry records — file_path, FileInfo::path, every entity's file_path — is the path as walked, and one file has as many walked paths as there are ways to reach it: a symlinked spec directory, `nao analyze .` against an absolute root, one repo cloned twice. Serving the entry regardless put the other spelling on every entity, so click-to-open and cr: anchors named a path the run never visited, and since content decides a hit it stayed wrong until someone edited the file. Keying on the walked path instead is the obvious simplification and is worse: the store is machine-wide, so `./src/main.rs` is not a unique name and two repos with an identical file would trade entries."
+    cr: "src/analyzer/mod.rs"
 }

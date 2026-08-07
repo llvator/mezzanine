@@ -9,7 +9,8 @@
 import { writable } from 'svelte/store';
 import type { PaneId } from '../viewmodels/keymap';
 import {
-  detailsPaneOpen, describePaneOpen, sidebarPaneOpen, toolbarCollapsed, splitViewOpen,
+  canvasPaneOpen, detailsPaneOpen, describePaneOpen, sidebarPaneOpen, toolbarCollapsed,
+  splitViewOpen,
 } from './panes';
 
 /**
@@ -34,15 +35,24 @@ export function requestSearchFocus(): void {
   searchFocusRequest.update((n) => n + 1);
 }
 
-/** Focus a pane, opening it if it is closed. */
+/**
+ * Focus a pane, opening it if it is closed.
+ *
+ * `view` opens the canvas as well as unfolding the toolbar, because the
+ * toolbar is drawn inside the canvas column: with the canvas closed there is
+ * nothing for an unfolded toolbar to be unfolded *in*, and asking for a pane
+ * would put the keyboard somewhere invisible. That the two travel together is
+ * also why `1` and `2` are the way back — the shortcut bar draws both chips
+ * whether or not the column is on screen (UI-098).
+ */
 export function focusPane(pane: PaneId): void {
   switch (pane) {
     case 'sidebar': sidebarPaneOpen.set(true); break;
-    case 'view': toolbarCollapsed.set(false); break;
+    case 'view': canvasPaneOpen.set(true); toolbarCollapsed.set(false); break;
     case 'details': detailsPaneOpen.set(true); break;
     case 'description': describePaneOpen.set(true); break;
     case 'spec': splitViewOpen.set(true); break;
-    case 'graph': break;
+    case 'graph': canvasPaneOpen.set(true); break;
   }
   focusedPane.set(pane);
 }

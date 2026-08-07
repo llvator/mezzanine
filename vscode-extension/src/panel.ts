@@ -122,6 +122,10 @@ export interface LevelFilterState {
 }
 type LevelFilterHandler = (state: LevelFilterState) => void;
 
+/** The rungs of the diff detail ladder, narrowest first. Mirrors
+ *  `ui/src/viewmodels/diffLevels.ts` — the webview is the authority. */
+export type DiffLevel = 'edits' | 'rewiring' | 'neighbourhood';
+
 export interface DiffState {
   active: boolean;
   fromRef?: string;
@@ -134,8 +138,15 @@ export interface DiffState {
     modifiedImpact?: number;
     unchanged: number;
   };
-  changesOnly: boolean;
-  coreOnly: boolean;
+  /** How wide the diff draws, narrow → wide (UI-088). Replaced the
+   *  `changesOnly` / `coreOnly` pair, which were two independent booleans
+   *  describing one ordered choice. */
+  level: DiffLevel;
+  /** Reported relationship changes the canvas cannot draw at any rung:
+   *  disappeared edges (no line exists in the head graph) plus ones whose far
+   *  end the diff could not resolve. Surfaced so the view can say what it is
+   *  leaving out rather than implying full coverage. */
+  undrawableEdges: number;
   dimOpacity: number;
   computing: boolean;
   error?: string | null;

@@ -46,7 +46,18 @@ pub(crate) async fn analysis_scope_state_handler(
         // Empty means "no filter", which is what `null` means on the wire.
         languages: (!languages.is_empty()).then_some(languages),
         include_docs: config.analysis.include_docs,
+        spec_dir: spec_dir_display(&config),
     }))
+}
+
+/// The spec directory as a string the panel can put in a text field, or
+/// `None` for the default (every `.elv` under the root).
+fn spec_dir_display(config: &Config) -> Option<String> {
+    config
+        .analysis
+        .spec_dir
+        .as_ref()
+        .map(|p| p.display().to_string())
 }
 
 /// POST /api/analysis/scope — replace the analyzer's language filter
@@ -87,7 +98,7 @@ pub(crate) async fn analysis_scope_handler(
     // set. We don't mutate the existing `state.config` until the run
     // succeeds — that keeps readers (the live SSE clients, scope_handler)
     // observing the previous, valid scope.
-    let new_config = match build_config_with_languages(&state, &requested, include_docs) {
+    let new_config = match build_config_with_scope(&state, &requested, include_docs, req.spec_dir.as_deref()) {
         Ok(c) => c,
         Err(msg) => {
             let mut in_progress = state.analysis_in_progress.lock().await;
@@ -143,12 +154,20 @@ pub(crate) async fn analysis_scope_handler(
     }
 }
 
-/// Clone the current config and swap in the requested language filter.
-/// Returns Err with a human-readable message for unknown language names.
-fn build_config_with_languages(
+/// Clone the current config and swap in the requested scope: the language
+/// filter, the docs switch, and the spec directory. Returns Err with a
+/// human-readable message for an unknown language name or a spec directory
+/// that isn't there.
+///
+/// Validating the directory here rather than letting the walker discover it
+/// is what makes the mistake visible: the walker's fallback is a line on the
+/// server's stderr, and the person who typed the path is looking at a
+/// browser.
+fn build_config_with_scope(
     state: &AppState,
     requested: &Option<Vec<String>>,
     include_docs: Option<bool>,
+    spec_dir: Option<&str>,
 ) -> Result<Config, String> {
     let mut config = state
         .config
@@ -173,7 +192,35 @@ fn build_config_with_languages(
             }
         }
     }
+    apply_spec_dir(&mut config, spec_dir)?;
     Ok(config)
+}
+
+/// The three states of `spec_dir` on the wire — absent, empty, a path —
+/// resolved against the analyzed root and checked before anything expensive
+/// runs. See [`AnalysisScopeRequest::spec_dir`].
+///
+/// Stores the path as it was typed rather than the resolved one: a relative
+/// `docs/domain` that survives as `docs/domain` still means the right thing
+/// after the root moves, and is what the panel should show back.
+fn apply_spec_dir(config: &mut Config, requested: Option<&str>) -> Result<(), String> {
+    let Some(raw) = requested else { return Ok(()) };
+    let typed = raw.trim();
+    if typed.is_empty() {
+        config.analysis.spec_dir = None;
+        return Ok(());
+    }
+    let candidate = PathBuf::from(typed);
+    let resolved = if candidate.is_absolute() {
+        candidate.clone()
+    } else {
+        config.root_path.join(&candidate)
+    };
+    if !resolved.is_dir() {
+        return Err(format!("Spec folder not found: {}", resolved.display()));
+    }
+    config.analysis.spec_dir = Some(candidate);
+    Ok(())
 }
 
 /// Run the analysis on a blocking thread. Maps `Cancelled` to a

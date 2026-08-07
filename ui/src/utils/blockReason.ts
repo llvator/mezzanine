@@ -8,6 +8,11 @@
  * screen saying so. The out-of-scope group had answered the equivalent
  * question for the scope tier since UI-016; this is the missing half.
  *
+ * The per-node half of a pair. `viewmodels/filterPipeline` answers the same
+ * question for the *view* — what is narrowing the canvas at all — and the two
+ * are deliberately separate: this one is asked about a row the reader is
+ * looking at, that one about a picture they are not sure they can trust.
+ *
  * A leaf module by the rule in `context-for-issues-of-fuzzy-scope.md`: pure
  * functions, no store imports, so the view-model that owns the stores can
  * pass a snapshot and the result stays unit-testable. The caller maps a

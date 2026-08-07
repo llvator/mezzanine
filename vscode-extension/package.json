@@ -2,7 +2,7 @@
   "name": "nao-code-visualizer",
   "displayName": "Nao — Code Visualizer",
   "description": "Visualize code relationships and dependencies for the file open in your editor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "nao-team",
   "license": "AGPL-3.0-only",
   "repository": {

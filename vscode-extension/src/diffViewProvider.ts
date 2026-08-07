@@ -274,27 +274,36 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     const s = state.summary;
     const core = s.modifiedSource != null ? s.modifiedSource : s.modified;
     const impact = s.modifiedImpact != null ? s.modifiedImpact : 0;
-    // The summary reflects the active filters so counts match what the graph
-    // actually renders. Added / removed are always shown (no core/impact split).
-    const modifiedShown = state.coreOnly ? core : s.modified;
-    const modTip = state.coreOnly ? 'core' : 'modified';
-    const hiddenNote = state.coreOnly && impact > 0
-      ? '<div class="count-note">\u21B3 <span data-tip="impact">' + impact + ' impact</span> hidden by <b>Core only</b></div>'
-      : (!state.coreOnly && (s.modifiedSource != null || s.modifiedImpact != null))
+    // The summary reflects the active rung so counts match what the graph
+    // actually renders. Added / removed are always shown (no core/impact
+    // split). Only the Edits rung narrows to core; the wider rungs keep
+    // impact-only entities, for a reason they can name.
+    const editsOnly = state.level === 'edits';
+    const modifiedShown = editsOnly ? core : s.modified;
+    const modTip = editsOnly ? 'core' : 'modified';
+    const hiddenNote = editsOnly && impact > 0
+      ? '<div class="count-note">\u21B3 <span data-tip="impact">' + impact + ' impact</span> hidden by <b>Edits</b></div>'
+      : (!editsOnly && (s.modifiedSource != null || s.modifiedImpact != null))
         ? '<div class="count-note">'
             + '<span data-tip="core">' + core + ' core</span>'
             + ' \u00B7 '
             + '<span data-tip="impact">' + impact + ' impact</span>'
           + '</div>'
         : '';
-    // Suggest the core-only filter only when it's off AND impact dominates.
-    const rippleHint = (!state.coreOnly && impact >= 10 && core <= impact / 10)
+    // Suggest narrowing only when the rung is wide AND impact dominates.
+    const rippleHint = (!editsOnly && impact >= 10 && core <= impact / 10)
       ? '<div class="count-note ripple-hint">'
         + '\u2139\uFE0F Most of the modified count is <b>ripple</b> (fan-in/fan-out shifts caused by added/removed entities, not source edits).'
-        + ' Turn on <b>Core changes only</b> below to hide them.'
+        + ' Drop to <b>Edits</b> below to hide them.'
         + '</div>'
       : '';
     const hasChanges = state.changedFileCount > 0;
+    // It clears the overlay *and* tells the engine to stop recomputing it on
+    // every save, which is the half that was missing (UI-100) — so say so,
+    // because "clear" invites the reading that a diff is still being tracked.
+    const clearTip = state.toRef === 'working'
+      ? 'Leave diff mode — stop following the working tree and clear the overlay'
+      : 'Leave diff mode — clear the overlay';
     const actions = '<div class="summary-actions">'
       + (hasChanges
           ? '<button class="accent" id="btn-scope-all" title="Replace the current scope with every file that has changes">'
@@ -306,7 +315,7 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     return '<div class="summary">'
       + '<div class="summary-head">'
       +   '<span class="refs">' + escape(state.fromRef) + '<span class="arrow">\u2192</span>' + escape(state.toRef) + '</span>'
-      +   '<button class="close-btn" id="btn-clear" title="Clear diff overlay">\u00D7</button>'
+      +   '<button class="close-btn" id="btn-clear" title="' + clearTip + '">\u00D7</button>'
       + '</div>'
       + '<div class="counts">'
       +   '<span class="count-add" data-tip="added">+' + s.added + ' added</span>'
@@ -322,7 +331,6 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
   function renderFilters() {
     if (!state?.active) return '';
     const dimPct = Math.round((state.dimOpacity || 0) * 100);
-    const showDim = state.changesOnly || state.coreOnly;
     const disabledAttr = state.filtersEnabled ? '' : ' disabled';
     const disabledClass = state.filtersEnabled ? '' : ' disabled';
     const masterOffHint = !state.filtersEnabled
@@ -336,14 +344,36 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
         + ' <button class="scope-btn" id="btn-clear-sel" style="padding:2px 8px; margin-top:4px">Clear selection</button>'
         + '</div>'
       : '';
+    // One ordered ladder, not two checkboxes: each rung says what it adds to
+    // the one before it, which is what the pair it replaced could not.
+    const rungs = [
+      ['edits', 'Edits', 'Only what you edited, and only the relationships that changed'],
+      ['rewiring', 'Rewiring', 'Adds the far end of every relationship that appeared, edited or not'],
+      ['neighbourhood', 'Neighbourhood', 'Adds every direct neighbour, and draws all the wiring between them'],
+    ];
+    const ladder = rungs
+      .map((r) =>
+        '<div class="toggle-row"><label title="' + escape(r[2]) + '">'
+        + '<input type="radio" name="diff-level"'
+        + (state.level === r[0] ? ' checked' : '') + disabledAttr
+        + ' data-level="' + r[0] + '"> ' + escape(r[1])
+        + '</label></div>')
+      .join('');
+    // Never let the panel imply the canvas drew every reported change.
+    const undrawable = (state.undrawableEdges > 0 && state.level !== 'neighbourhood')
+      ? '<div class="count-note">'
+        + state.undrawableEdges + ' relationship change(s) cannot be drawn — a disappeared edge has'
+        + ' no line in the current graph. Select an entity to read them in Details.'
+        + '</div>'
+      : '';
     return '<div class="filters' + disabledClass + '">'
-      + '<div class="section-title">Filters</div>'
+      + '<div class="section-title">Detail level</div>'
       + masterOffHint
       + selectionHint
-      + '<div class="toggle-row"><label><input type="checkbox"' + (state.changesOnly ? ' checked' : '') + disabledAttr + ' data-toggle="setDiffChangesOnly"> Show only changed entities</label></div>'
-      + '<div class="toggle-row"><label><input type="checkbox"' + (state.coreOnly ? ' checked' : '') + disabledAttr + ' data-toggle="setDiffCoreOnly"> Core changes only (hide impact-only)</label></div>'
-      + (showDim && !state.hasSelection
-          ? '<div class="dim-row"><span>Dim opacity</span><input type="range" min="0" max="15" value="' + (dimPct) + '" id="dim-slider"' + disabledAttr + ' title="Opacity of dimmed entities"><span class="dim-val">' + dimPct + '%</span></div>'
+      + ladder
+      + undrawable
+      + (!state.hasSelection
+          ? '<div class="dim-row"><span>Rest opacity</span><input type="range" min="0" max="15" value="' + (dimPct) + '" id="dim-slider"' + disabledAttr + ' title="Opacity of the entities the ladder left out"><span class="dim-val">' + dimPct + '%</span></div>'
           : '')
       + '</div>';
   }
@@ -382,6 +412,13 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     root.querySelectorAll('input[type="checkbox"][data-toggle]').forEach((cb) => {
       cb.addEventListener('change', () => {
         vscode.postMessage({ type: 'command', command: cb.getAttribute('data-toggle'), value: cb.checked });
+      });
+    });
+
+    root.querySelectorAll('input[type="radio"][data-level]').forEach((rb) => {
+      rb.addEventListener('change', () => {
+        if (!rb.checked) return;
+        vscode.postMessage({ type: 'command', command: 'setDiffLevel', value: rb.getAttribute('data-level') });
       });
     });
 

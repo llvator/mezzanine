@@ -13,6 +13,8 @@
    * ticket and the probe guards them.
    */
 
+  import { axisMax, sampleScatter } from '../viewmodels/scatterPoints';
+
   /** One plotted point. `datum` is handed back to `onSelect` untouched. */
   export let points: { x: number; y: number; datum: unknown }[] = [];
   export let xTitle: string;
@@ -52,8 +54,13 @@
     return out;
   }
 
-  $: maxX = Math.max(1, ...points.map((p) => p.x));
-  $: maxY = Math.max(1, ...points.map((p) => p.y));
+  // A fold, not `Math.max(1, ...points.map(...))`: the spread passes one
+  // argument per point and overflowed the stack above ~125k of them, taking
+  // the whole Quality tab down on a large repo. See `scatterPoints.ts`.
+  $: maxX = axisMax(points, (p) => p.x);
+  $: maxY = axisMax(points, (p) => p.y);
+  // Scaled by the whole population, drawn from a sample of it.
+  $: sample = sampleScatter(points);
   $: sx = (x: number) => PAD_L + (x / maxX) * (W - PAD_L - PAD_R);
   $: sy = (y: number) => H - PAD_B - (y / maxY) * (H - PAD_B - PAD_T);
   $: xTicks = ticksFor(maxX);
@@ -98,7 +105,7 @@
       <text class="axis-title" x={-(PAD_T + H - PAD_B) / 2} y={9}
         text-anchor="middle" transform="rotate(-90)">{yTitle}</text>
 
-      {#each points as p}
+      {#each sample.shown as p}
         <!-- In-cycle points get a ring rather than a fourth fill: the cycle
              red and the bad red were near-identical, so two distinct meanings
              rendered as effectively one colour. -->
@@ -123,6 +130,13 @@
       <span class="key"><i class="swatch t-warn"></i>warn</span>
       <span class="key"><i class="swatch t-bad"></i>bad</span>
       <span class="key"><i class="swatch t-bad ring"></i>in cycle</span>
+      <!-- Says so when it is a sample. The axes still measure the whole
+           population, so silence here would read as "this is all of it". -->
+      {#if sample.sampled}
+        <span class="key sampled" data-probe="chart-sampled"
+          title="Too many points to draw. Every {Math.ceil(sample.total / sample.shown.length)}th is plotted, plus both extremes; the axes and the table below still measure all {sample.total.toLocaleString()}."
+        >{sample.shown.length.toLocaleString()} of {sample.total.toLocaleString()} drawn</span>
+      {/if}
     </div>
   {/if}
 </div>
@@ -173,6 +187,7 @@
     color: var(--text-dim);
   }
   .key { display: inline-flex; align-items: center; gap: 3px; }
+  .key.sampled { color: var(--text-muted); font-style: italic; cursor: help; }
 
   .swatch {
     width: 8px;

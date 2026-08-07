@@ -7,7 +7,10 @@ import { writable, derived, get } from 'svelte/store';
 import type { Readable } from 'svelte/store';
 import { apiUrl } from '../vscodeAdapter';
 import { isServeMode } from './serveMode';
-import { rollUpByScope, type ScopeChange } from '../viewmodels/diffRollup';
+import { rollUpByScope, rollUpCounts, normalizeScopePath, type ScopeChange, type ScopeTally } from '../viewmodels/diffRollup';
+import type { DiffLevel } from '../viewmodels/diffLevels';
+
+export type { DiffLevel };
 
 export type ChangeStatus = 'added' | 'removed' | 'modified' | 'unchanged';
 
@@ -16,6 +19,32 @@ export interface MetricDelta {
   old?: number;
   new?: number;
   delta: number;
+}
+
+/** Which end of a changed edge the entity carrying it sits on. */
+export type RelDirection = 'outgoing' | 'incoming';
+
+/**
+ * One relationship that appeared or disappeared, as the engine reports it
+ * (`rel_deltas` in diff.json).
+ *
+ * Only entities present on both sides carry these: every edge of a brand-new
+ * function is new by construction, so listing them there would bury the ones
+ * that say something.
+ */
+export interface RelationshipDelta {
+  /** Always 'added' or 'removed' — an edge either exists or it doesn't. */
+  status: 'added' | 'removed';
+  direction: RelDirection;
+  /** Snake-case kind, matching the graph links (`calls`, `imports`). */
+  kind: string;
+  /** Already inflected for the direction: "calls" / "called by". */
+  label: string;
+  other_name: string;
+  other_kind: string;
+  other_file: string;
+  /** Head-graph ID of the far end, when it still exists there. */
+  other_entity_id?: string;
 }
 
 export interface EntityDiff {
@@ -28,6 +57,8 @@ export interface EntityDiff {
    *  False if only relational metrics (fan_in/fan_out) changed (impact). */
   source_changed: boolean;
   metric_deltas: MetricDelta[];
+  /** Absent when this entity gained and lost nothing. */
+  rel_deltas?: RelationshipDelta[];
   base_entity_id?: string;
 }
 
@@ -42,6 +73,10 @@ export interface DiffSummary {
   /** Subset of modified: entities where only relational metrics changed. */
   modified_impact: number;
   unchanged: number;
+  /** Edges that appeared / disappeared with at least one end that survived
+   *  the diff. Absent from a diff.json written before UI-086. */
+  relationships_added?: number;
+  relationships_removed?: number;
 }
 
 export interface DiffData {
@@ -54,13 +89,21 @@ export interface DiffData {
 /** Whether diff mode is active. */
 export const diffActive = writable(false);
 
-/** When true, only show added/removed/modified entities — hide unchanged. */
-export const diffChangesOnly = writable(false);
-
-/** When true, only show core changes (source_changed=true) — hide impact-only changes.
- *  Defaults to true: for most diffs the impact-only "ripple" entities outnumber the actual
- *  code-changed entities and drown the signal. The user can turn the filter off to see them. */
-export const diffCoreOnly = writable(true);
+/**
+ * How wide the diff draws — the ladder that replaced the `Changes` and `Core`
+ * checkboxes (UI-088).
+ *
+ * Those two read as near-synonyms and needed three paragraphs of tooltip
+ * apiece to tell apart, while neither said anything about *edges*: both were
+ * node filters, and the canvas drew whatever wiring happened to run between
+ * the survivors. The rungs are ordered narrow → wide, so the control says
+ * which way it moves the picture. See `viewmodels/diffLevels.ts`.
+ *
+ * Defaults to `edits`, the narrowest — which is what `coreOnly: true` meant
+ * before, for the same reason: on most diffs the ripple outnumbers the real
+ * edits and drowns them.
+ */
+export const diffLevel = writable<DiffLevel>('edits');
 
 /** Master toggle for whether diff filters (changesOnly / coreOnly / dimOpacity)
  *  affect the graph. When false, a diff can still be loaded (entities colored
@@ -143,6 +186,19 @@ export const diffScopeChanges: Readable<Map<string, ScopeChange>> = derived(
   ($d) => rollUpByScope($d?.entities ?? []),
 );
 
+/**
+ * Scope path → how many entities under it changed, and how.
+ *
+ * What the details pane shows for a file or folder node. Such a node has no
+ * row in the diff at all — `compute_diff` walks entities, and a file is not
+ * one — so without this the pane could say nothing about the very node the
+ * canvas is most often drawing (UI-097).
+ */
+export const diffScopeCounts: Readable<Map<string, ScopeTally>> = derived(
+  diffData,
+  ($d) => rollUpCounts($d?.entities ?? []),
+);
+
 /** Map from normalized entity ID → metric deltas (only for modified entities). */
 export const diffDeltaMap: Readable<Map<string, MetricDelta[]>> = derived(
   diffData,
@@ -158,14 +214,143 @@ export const diffDeltaMap: Readable<Map<string, MetricDelta[]>> = derived(
   },
 );
 
-/** Map from head entity ID → base entity ID (for loading base details). */
+/** Normalized entity ID → the relationships it gained and lost. */
+export const diffRelDeltaMap: Readable<Map<string, RelationshipDelta[]>> = derived(
+  diffData,
+  ($d) => {
+    const map = new Map<string, RelationshipDelta[]>();
+    if (!$d) return map;
+    for (const e of $d.entities) {
+      if (e.rel_deltas && e.rel_deltas.length > 0) {
+        map.set(normalizeEntityId(e.entity_id), e.rel_deltas);
+      }
+    }
+    return map;
+  },
+);
+
+/**
+ * Normalized ids of entities the diff reported as `added`.
+ *
+ * Needed because UI-086 deliberately gives an added entity no `rel_deltas`:
+ * every edge of a brand-new function is new by construction, and listing them
+ * under it would bury the deltas that carry information. True for a *list*,
+ * false for the canvas — without this set the newest code draws with no wiring
+ * at all, which on the measured repo is 45 of 86 real changes. `displayPlan`
+ * reads it to call every head edge touching one of these entities `added`.
+ */
+export const diffAddedEntityIds: Readable<Set<string>> = derived(
+  diffData,
+  ($d) => {
+    const ids = new Set<string>();
+    if (!$d) return ids;
+    for (const e of $d.entities) {
+      if (e.status === 'added') ids.add(normalizeEntityId(e.entity_id));
+    }
+    return ids;
+  },
+);
+
+/** The edges a diff reported, indexed for the canvas. */
+export interface ChangedEdges {
+  /** Every edge that appeared, keyed twice over.
+   *
+   *  At entity level: `${src}->${tgt}|${kind}`, on normalized entity ids.
+   *  The kind belongs in the key there — two entities can be joined by a
+   *  `calls` edge and an `imports` edge, and only one of them may have moved.
+   *
+   *  Above entity level: `${srcScope}->${tgtScope}`, with no kind, for file →
+   *  file and directory → directory. `collapseGraph` merges every underlying
+   *  edge between two scopes into one line and relabels it `DependsOn`, so
+   *  the kind it would be matched against no longer exists; the claim a
+   *  collapsed line can carry is "something between these two scopes moved",
+   *  and that is what this key says. */
+  added: Set<string>;
+  /** Edges that disappeared, counted rather than keyed: a lost edge has no
+   *  line in the head graph, so there is nothing to match it against. Kept so
+   *  the UI can say how many it cannot draw instead of dropping them in
+   *  silence. */
+  removedCount: number;
+  /** Reported changes whose far end carried no `other_entity_id` — the diff
+   *  saw them but cannot place them on either side. */
+  unplaceable: number;
+}
+
+const edgeKey = (src: string, tgt: string, kind: string) => `${src}->${tgt}|${kind}`;
+
+/**
+ * Every appeared/disappeared edge, keyed the way the canvas keys its links.
+ *
+ * The deltas arrive per *endpoint* — one row on the caller, a mirrored row on
+ * the callee — so the same edge is seen twice and the `Set` deduplicates it.
+ * Direction is normalized here: a row is stored source → target regardless of
+ * which end reported it.
+ */
+export const diffChangedEdges: Readable<ChangedEdges> = derived(
+  diffData,
+  ($d) => {
+    const added = new Set<string>();
+    let removedCount = 0;
+    let unplaceable = 0;
+    if (!$d) return { added, removedCount, unplaceable };
+
+    for (const e of $d.entities) {
+      const selfId = normalizeEntityId(e.entity_id);
+      const selfFile = normalizeScopePath(e.file_path ?? '');
+      for (const r of e.rel_deltas ?? []) {
+        if (r.status === 'removed') {
+          // Counted once, not twice: only the outgoing row, so a delta
+          // mirrored onto both ends doesn't inflate the total.
+          if (r.direction === 'outgoing') removedCount++;
+          continue;
+        }
+        if (!r.other_entity_id) {
+          if (r.direction === 'outgoing') unplaceable++;
+          continue;
+        }
+        const otherId = normalizeEntityId(r.other_entity_id);
+        const otherFile = normalizeScopePath(r.other_file ?? '');
+        const [src, tgt] = r.direction === 'outgoing' ? [selfId, otherId] : [otherId, selfId];
+        const [srcFile, tgtFile] = r.direction === 'outgoing'
+          ? [selfFile, otherFile]
+          : [otherFile, selfFile];
+        added.add(edgeKey(src, tgt, r.kind));
+        for (const [s, t] of scopePairs(srcFile, tgtFile)) {
+          if (s !== t) added.add(`${s}->${t}`);
+        }
+      }
+    }
+    return { added, removedCount, unplaceable };
+  },
+);
+
+/** File → file and directory → directory, the two scope levels the collapsed
+ *  canvas draws. Mixed pairs are never drawn, so they aren't emitted. */
+function scopePairs(srcFile: string, tgtFile: string): [string, string][] {
+  if (!srcFile || !tgtFile) return [];
+  const dir = (p: string) => {
+    const i = p.lastIndexOf('/');
+    return i < 0 ? '' : p.slice(0, i);
+  };
+  return [[srcFile, tgtFile], [dir(srcFile), dir(tgtFile)]];
+}
+
+/**
+ * Normalized head entity ID → base entity ID, for looking up before-source.
+ *
+ * Keyed the same way as `diffStatusMap` and every other map here. It wasn't:
+ * the key went in raw while the panel looked it up normalized, so on any repo
+ * whose paths contain one of `normalizeEntityId`'s markers — `src/` among them
+ * — every lookup missed, no base source was found, and the details pane fell
+ * back to printing the head source with no diff at all.
+ */
 export const diffBaseIdMap: Readable<Map<string, string>> = derived(
   diffData,
   ($d) => {
     const map = new Map<string, string>();
     if (!$d) return map;
     for (const e of $d.entities) {
-      if (e.base_entity_id) map.set(e.entity_id, e.base_entity_id);
+      if (e.base_entity_id) map.set(normalizeEntityId(e.entity_id), e.base_entity_id);
     }
     return map;
   },
@@ -242,6 +427,44 @@ export function getBaseSource(baseEntityId: string | undefined): string | undefi
   return get(baseDetailsCache)?.[baseEntityId]?.source_code;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// How the details pane draws a changed entity's source
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Unified is one column with +/- markers; split is before and after
+ *  side by side, the way a review tool shows them. */
+export type DiffViewMode = 'unified' | 'split';
+
+const VIEW_MODE_KEY = 'nao-diff-view-mode';
+const FULL_CONTEXT_KEY = 'nao-diff-full-context';
+
+function loadStored<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key) as T | null;
+    if (v !== null && allowed.includes(v)) return v;
+  } catch { /* SSR / blocked storage */ }
+  return fallback;
+}
+
+/** Unified by default: the details pane is a ~340px column, and two code
+ *  columns in it wrap every second line. Split is there for the reader who
+ *  widens it. */
+export const diffViewMode = writable<DiffViewMode>(
+  loadStored(VIEW_MODE_KEY, ['unified', 'split'] as const, 'unified'),
+);
+diffViewMode.subscribe((v) => {
+  try { localStorage.setItem(VIEW_MODE_KEY, v); } catch { /* ignore */ }
+});
+
+/** When false (the default), unchanged stretches more than three lines from
+ *  a change collapse to a "N lines unchanged" note, as `git diff` does. */
+export const diffFullContext = writable<boolean>(
+  loadStored(FULL_CONTEXT_KEY, ['true', 'false'] as const, 'false') === 'true',
+);
+diffFullContext.subscribe((v) => {
+  try { localStorage.setItem(FULL_CONTEXT_KEY, String(v)); } catch { /* ignore */ }
+});
+
 /** Color for each change status (used by GraphView node stroke). */
 export const DIFF_COLORS: Record<ChangeStatus, string> = {
   added: '#4CAF50',
@@ -314,5 +537,40 @@ export async function triggerDiff(fromRef: string, toRef: string): Promise<void>
     diffApiError.set(`Failed to compute diff: ${err}`);
   } finally {
     diffComputing.set(false);
+  }
+}
+
+/** Drop the overlay in this page. Says nothing to the server — see `stopDiff`. */
+export function clearDiffOverlay(): void {
+  diffActive.set(false);
+  diffData.set(null);
+  baseDetailsCache.set(null);
+  diffApiError.set(null);
+}
+
+/**
+ * Leave diff mode: tell the server to forget the comparison, then drop the
+ * overlay here.
+ *
+ * The DELETE is the half that matters, and its absence is what left "Current
+ * Changes" with no way out (UI-100). Clearing these stores alone leaves the
+ * server following the working tree, so the next save pushes a `diff` event
+ * that turns the overlay straight back on — and a reload re-fetches the
+ * result the server is still serving.
+ *
+ * Local first, so the button answers immediately rather than after a round
+ * trip. The server's own `diff` broadcast arrives shortly after and clears
+ * every other window looking at the same engine.
+ */
+export async function stopDiff(): Promise<void> {
+  clearDiffOverlay();
+  // Serve mode has no diff endpoint at all (SRV-003), so there is nothing
+  // there to stop — and no diff could have been started either.
+  if (isServeMode()) return;
+  try {
+    await fetch(apiUrl('/api/diff'), { method: 'DELETE' });
+  } catch {
+    // Nothing to report and nothing to retry: the overlay is already gone
+    // here, and a server we cannot reach is not recomputing anything for us.
   }
 }

@@ -61,6 +61,22 @@ pub(crate) struct AnalysisScopeRequest {
     /// passed on the command line.
     #[serde(default)]
     pub include_docs: Option<bool>,
+    /// Where the Elevator spec lives, for a repo that keeps it somewhere the
+    /// walk would miss or mixes it with `.elv` files that aren't spec — see
+    /// [`crate::config::AnalysisConfig::spec_dir`].
+    ///
+    /// Three states on the wire, because two are not enough: absent means
+    /// "leave it alone" (an older client must not clear an operator's
+    /// `--spec-dir`), the empty string means "clear it — every `.elv` under
+    /// the root again", and a path means that path. Relative resolves
+    /// against the analyzed root.
+    ///
+    /// This one *may* name a directory outside the root, unlike the settings
+    /// file's key. The asymmetry is deliberate and is the same one `/api/root`
+    /// already lives with: this request comes from a page the operator opened
+    /// on their own machine, not from a file that arrived with a clone.
+    #[serde(default)]
+    pub spec_dir: Option<String>,
 }
 
 /// `GET /api/analysis/scope` — what the analyzer is *currently* configured
@@ -72,6 +88,9 @@ pub(crate) struct AnalysisScopeState {
     /// Canonical filter names, or `null` for "no filter".
     pub languages: Option<Vec<String>>,
     pub include_docs: bool,
+    /// The spec directory as configured — by flag, by settings file, or by
+    /// an earlier POST — or `null` when every `.elv` under the root counts.
+    pub spec_dir: Option<String>,
 }
 
 #[derive(Serialize)]

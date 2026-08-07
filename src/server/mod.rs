@@ -8,6 +8,7 @@ mod jobs;
 mod refactor_prompt;
 mod repo;
 mod scope_handler;
+mod settings_handler;
 mod serve;
 mod state;
 mod types;
@@ -45,6 +46,12 @@ pub struct WatchOptions {
     /// Analyze Markdown alongside the code (see `AnalysisConfig::include_docs`).
     pub include_docs: bool,
     pub languages: Option<Vec<String>>,
+    /// `--spec-dir`: where the Elevator spec lives, when it isn't simply
+    /// every `.elv` under the root. Unlike the settings-file key of the same
+    /// name it may point outside the tree — see
+    /// [`crate::settings::Settings::spec_dir`] for why that difference
+    /// exists.
+    pub spec_dir: Option<PathBuf>,
     pub debounce_ms: u64,
     /// Fallback Educator content root; see the CLI flag's documentation.
     pub content_fallback: Option<PathBuf>,
@@ -55,10 +62,16 @@ pub struct WatchOptions {
     /// `ui_dir` from the user settings file, already loaded by the caller.
     /// Ranks below `--ui-dir` and `NAO_UI_DIR`; see [`ui_dir::resolve`].
     pub settings_ui_dir: Option<PathBuf>,
-    /// The merged settings file. Watch analyzes a path the operator chose,
-    /// so both scopes apply — unlike `serve`, which never reads a submitted
-    /// repo's own file (see [`crate::settings`]).
-    pub settings: crate::settings::Settings,
+    /// Both settings scopes, still unmerged. Watch analyzes a path the
+    /// operator chose, so both apply — unlike `serve`, which never reads a
+    /// submitted repo's own file (see [`crate::settings`]).
+    ///
+    /// Unmerged because `/api/settings` has to say which file a value came
+    /// from, and merging is exactly where that is lost.
+    pub loaded: crate::settings::Loaded,
+    /// Which settings keys arrived as command-line flags, by name. See
+    /// [`crate::settings::report::named`].
+    pub flags_named: std::collections::BTreeSet<String>,
     /// `--allow-agent-spawn`: register the route that opens a Claude Code
     /// terminal on this machine (SRV-017). Off by default — it is the one
     /// route that executes code, so it should not exist unless asked for.
@@ -107,17 +120,37 @@ fn run_watch(opts: WatchOptions, policy: AccessPolicy, ui_dir: Option<PathBuf>) 
         include_tests,
         include_docs,
         languages,
+        spec_dir,
         debounce_ms,
         content_fallback,
         allow_agent_spawn,
         pin_diff,
-        settings,
+        loaded,
+        flags_named,
         ..
     } = opts;
-    let settings = Arc::new(settings);
+    let settings = Arc::new(loaded.merged());
+    let settings_view = Arc::new(state::SettingsView {
+        effective: crate::settings::report::Effective {
+            port: Some(port),
+            debounce_ms: Some(debounce_ms),
+            output_dir: Some(output_dir.clone()),
+            ui_dir: ui_dir.clone(),
+            content_fallback: content_fallback.clone(),
+        },
+        loaded: std::sync::RwLock::new(loaded),
+        flags: flags_named,
+    });
 
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-    let config = build_config(&canonical_path, include_tests, include_docs, &languages, &settings);
+    let config = build_config(
+        &canonical_path,
+        include_tests,
+        include_docs,
+        &languages,
+        spec_dir.clone(),
+        &settings,
+    );
 
     // Initial analysis
     eprintln!("🔍 Initial analysis of {}...", path.display());
@@ -140,8 +173,9 @@ fn run_watch(opts: WatchOptions, policy: AccessPolicy, ui_dir: Option<PathBuf>) 
 
     rt.block_on(run_http_server(
         HttpServer {
-            path, output_dir, port, include_tests, include_docs, languages,
+            path, output_dir, port, include_tests, include_docs, languages, spec_dir,
             content_fallback, policy, ui_dir, allow_agent_spawn, pin_diff, settings,
+            settings_view,
         },
         tx, shared_graph, shared_config,
     ));
@@ -154,18 +188,6 @@ fn run_watch(opts: WatchOptions, policy: AccessPolicy, ui_dir: Option<PathBuf>) 
 // ------------------------------------------------------------------
 //  File watcher
 // ------------------------------------------------------------------
-
-/// True if the given extension belongs to a language nao can parse.
-/// Sourced from `Language::from_extension` so the watcher and the
-/// file walker agree by construction — adding a new language to the
-/// `Language` enum makes `nao watch` re-analyze on its files
-/// automatically, no second list to remember.
-fn is_source_extension(ext: &str) -> bool {
-    !matches!(
-        crate::models::file_info::Language::from_extension(ext),
-        crate::models::file_info::Language::Unknown,
-    )
-}
 
 fn spawn_file_watcher(
     watch_path: PathBuf,
@@ -192,12 +214,26 @@ fn spawn_file_watcher(
 
         eprintln!("👁  Watching {} for changes...", watch_path.display());
 
+        // A spec kept outside the analyzed tree is still a thing people edit,
+        // and a spec pane that only refreshes when some *unrelated* source
+        // file happens to change reads as broken. Watched as a second root
+        // rather than by widening the first: the point of `--spec-dir
+        // ../../` is to see one repo's specs, not to watch its code.
+        watch_outside_spec(debouncer.watcher(), &config);
+
         loop {
             if stop_rx.try_recv().is_ok() { break; }
             match notify_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(Ok(events)) => {
-                    if !has_source_change(&events) { continue; }
-                    log_changed_files(&events);
+                    // Asked of the *live* scope, not the watcher's startup
+                    // copy, for the same reason `handle_reanalysis` analyzes
+                    // with the live one: a reader who narrowed the analysis
+                    // from the browser changed which files are worth waking
+                    // up for.
+                    let scoped = with_live_scope(&config, &shared_config);
+                    let worth_it = analyzable_changes(&events, &scoped);
+                    if worth_it.is_empty() { continue; }
+                    log_changed_files(&worth_it);
                     handle_reanalysis(&config, &output_dir, &graph, &shared_config, &tx);
                 }
                 Ok(Err(e)) => eprintln!("   ⚠ Watch error: {:?}", e),
@@ -208,18 +244,56 @@ fn spawn_file_watcher(
     })
 }
 
-fn has_source_change(events: &[notify_debouncer_mini::DebouncedEvent]) -> bool {
-    events.iter().any(|e| {
-        matches!(e.kind, DebouncedEventKind::Any)
-            && e.path.extension()
-                .and_then(|ext| ext.to_str())
-                .map(is_source_extension)
-                .unwrap_or(false)
-    })
+/// Add the spec directory as a second watched root when it lies outside the
+/// analyzed one. A failure here is reported and survived: the graph is still
+/// correct, it just stops following spec edits, and that is not worth
+/// refusing to start over.
+fn watch_outside_spec(watcher: &mut dyn notify::Watcher, config: &crate::config::Config) {
+    let Some(spec) = config.spec_root().filter(|_| config.spec_is_outside_root()) else {
+        return;
+    };
+    match watcher.watch(&spec, notify::RecursiveMode::Recursive) {
+        Ok(()) => eprintln!("👁  Watching spec at {} for changes...", spec.display()),
+        Err(e) => eprintln!("   ⚠ Cannot watch spec dir {}: {e}", spec.display()),
+    }
 }
 
-fn log_changed_files(events: &[notify_debouncer_mini::DebouncedEvent]) {
-    let changed: Vec<_> = events.iter().map(|e| e.path.display().to_string()).collect();
+/// The paths in this batch that a re-analysis would actually look at.
+///
+/// Two filters, and the split between them is the point. What the *config*
+/// admits — language, test files, exclude and include patterns, the spec
+/// directory — is answered by the walker itself, so the watcher cannot drift
+/// from the walk it is triggering. What *git* ignores is answered by git, per
+/// batch, because ignore rules are edited while the server runs and an
+/// answer cached at startup would be wrong by the time it mattered.
+///
+/// Before this, the test was the file extension alone, so every write a build
+/// made under `target/`, `dist/` or `node_modules/` re-analyzed the repo —
+/// and, in diff mode, re-checked-out and re-analyzed the base worktree with
+/// it. The result never changed, since those paths are excluded from the
+/// analysis anyway. It was pure churn on every build.
+fn analyzable_changes(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    config: &crate::config::Config,
+) -> Vec<String> {
+    let walker = crate::analyzer::FileWalker::new(config);
+    // An ignore file is never itself analyzed, and is exactly the thing whose
+    // edit changes which files are. Left out, adding a line to `.gitignore`
+    // moves nothing until the next source save — and a reader who has just
+    // excluded a directory is watching for it to disappear.
+    let wakes = |p: &std::path::Path| walker.would_analyze(p) || crate::diff::names_ignore_file(p);
+    let candidates: Vec<String> = events
+        .iter()
+        .filter(|e| matches!(e.kind, DebouncedEventKind::Any))
+        .filter(|e| wakes(&e.path))
+        .map(|e| e.path.display().to_string())
+        .collect();
+
+    let ignored = crate::diff::ignored_paths(&config.root_path, &candidates);
+    candidates.into_iter().filter(|p| !ignored.contains(p)).collect()
+}
+
+fn log_changed_files(changed: &[String]) {
     eprintln!("📝 Change detected in: {}", changed.join(", "));
 }
 
@@ -235,6 +309,13 @@ fn log_changed_files(events: &[notify_debouncer_mini::DebouncedEvent]) {
 ///
 /// `config` here is the one the watcher analyzed with — the live, watched
 /// root — so publishing it is what restores the pair.
+///
+/// The *scope* is taken from the published config rather than from the
+/// watcher's own copy, which is the other half of the same pairing problem.
+/// A reader who narrows the analysis from the browser — languages, docs, the
+/// spec directory — has changed what the graph is supposed to contain, and
+/// the next keystroke in any watched file would otherwise re-analyze with
+/// the scope the process started with and silently undo them.
 fn handle_reanalysis(
     config: &crate::config::Config,
     output_dir: &PathBuf,
@@ -242,6 +323,7 @@ fn handle_reanalysis(
     shared_config: &Arc<std::sync::RwLock<crate::config::Config>>,
     tx: &Arc<broadcast::Sender<ReloadKind>>,
 ) {
+    let config = &with_live_scope(config, shared_config);
     match write_json(config, output_dir) {
         Ok((ents, rels, new_graph)) => {
             if let Ok(mut g) = graph.write() { *g = new_graph; }
@@ -251,6 +333,21 @@ fn handle_reanalysis(
         }
         Err(e) => eprintln!("   ⚠ Re-analysis failed: {}", e),
     }
+}
+
+/// The watcher's root with the published scope. Only `analysis` and
+/// `filters` cross over: `root_path` must stay the watched one, which is the
+/// whole point of SRV-019 above.
+fn with_live_scope(
+    config: &crate::config::Config,
+    shared: &Arc<std::sync::RwLock<crate::config::Config>>,
+) -> crate::config::Config {
+    let mut config = config.clone();
+    if let Ok(live) = shared.read() {
+        config.analysis = live.analysis.clone();
+        config.filters = live.filters.clone();
+    }
+    config
 }
 
 // ------------------------------------------------------------------
@@ -267,6 +364,7 @@ struct HttpServer {
     include_tests: bool,
     include_docs: bool,
     languages: Option<Vec<String>>,
+    spec_dir: Option<PathBuf>,
     content_fallback: Option<PathBuf>,
     policy: AccessPolicy,
     ui_dir: Option<PathBuf>,
@@ -274,6 +372,8 @@ struct HttpServer {
     pin_diff: bool,
     /// The merged settings file, handed to handlers that rebuild a config.
     settings: Arc<crate::settings::Settings>,
+    /// The same file kept attributable, for `/api/settings`.
+    settings_view: Arc<state::SettingsView>,
 }
 
 async fn run_http_server(
@@ -289,12 +389,14 @@ async fn run_http_server(
         include_tests,
         include_docs,
         languages,
+        spec_dir,
         content_fallback,
         policy,
         ui_dir,
         allow_agent_spawn,
         pin_diff,
         settings,
+        settings_view,
     } = opts;
     let repo_root = path.canonicalize().unwrap_or(path);
 
@@ -331,7 +433,9 @@ async fn run_http_server(
         include_tests,
         include_docs,
         languages,
+        spec_dir,
         settings: settings.clone(),
+        settings_view,
         diff_in_progress: Arc::new(tokio::sync::Mutex::new(false)),
         analysis_in_progress: Arc::new(tokio::sync::Mutex::new(false)),
         graph: shared_graph,
@@ -340,6 +444,7 @@ async fn run_http_server(
         base_details: Arc::new(std::sync::RwLock::new(None)),
         live_diff: Arc::new(std::sync::RwLock::new(None)),
         base_cache: Arc::new(std::sync::RwLock::new(None)),
+        diff_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         follow_diff: !pin_diff,
         cancel: Arc::new(AtomicBool::new(false)),
         educator: Arc::new(educator),
@@ -395,13 +500,23 @@ fn build_router(
     let app = Router::new()
         .route("/events", get(handlers::sse_handler))
         .route("/api/commits", get(handlers::commits_handler))
-        .route("/api/diff", get(handlers::diff_get_handler).post(diff_handler::diff_handler))
+        .route(
+            "/api/diff",
+            get(handlers::diff_get_handler)
+                .post(diff_handler::diff_handler)
+                .delete(diff_handler::stop_diff_handler),
+        )
         .route("/api/root", get(handlers::get_root_handler).post(diff_handler::set_root_handler))
         .route("/api/graph", get(handlers::graph_handler))
         .route("/api/index", get(handlers::index_handler))
         .route("/api/details", get(handlers::details_handler))
         .route("/api/details/base", get(handlers::base_details_handler))
         .route("/api/scope", post(scope_handler::scope_handler))
+        .route("/api/settings", get(settings_handler::settings_handler))
+        .route(
+            "/api/settings/analysis",
+            post(settings_handler::save_analysis_scope_handler),
+        )
         .route(
             "/api/analysis/scope",
             post(analysis_handler::analysis_scope_handler)
@@ -456,13 +571,81 @@ fn print_startup_banner(port: u16, policy: &AccessPolicy, ui: Option<&std::path:
     eprintln!("   Data files:     http://localhost:{}/data/data.json", port);
     eprintln!("   API:            GET  /api/commits   - list recent commits");
     eprintln!("                   POST /api/diff      - compute diff between commits");
+    eprintln!("                   DEL  /api/diff      - leave diff mode");
     eprintln!("                   GET  /api/root      - get current analyzed path");
     eprintln!("                   POST /api/root      - change root path and re-analyze");
     eprintln!("                   GET  /api/analysis/scope - current analyzed languages");
     eprintln!("                   POST /api/analysis/scope - narrow analyzed languages");
+    eprintln!("                   GET  /api/settings  - settings in effect, and where each came from");
+    eprintln!("                   POST /api/settings/analysis - save the analysis scope as this repo's default");
     access::print_allowed_origins(policy);
     access::print_pairing_token(policy);
     ui_dir::print_banner_line(port, ui);
     eprintln!();
     eprintln!("Press Ctrl+C to stop.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify_debouncer_mini::DebouncedEvent;
+
+    fn touched(paths: &[&std::path::Path]) -> Vec<DebouncedEvent> {
+        paths
+            .iter()
+            .map(|p| DebouncedEvent { path: p.to_path_buf(), kind: DebouncedEventKind::Any })
+            .collect()
+    }
+
+    /// The watcher used to test the file extension and nothing else, so a
+    /// build writing generated `.rs` files under `target/` re-analyzed the
+    /// whole repo — and, in diff mode, re-checked-out and re-analyzed the
+    /// base worktree with it. The graph never changed: those paths are
+    /// excluded from the analysis anyway. It was churn on every build.
+    #[test]
+    fn a_write_no_analysis_would_read_does_not_wake_the_watcher() {
+        let root = std::path::Path::new("/repo");
+        let config = crate::config::Config::for_path(root);
+
+        for quiet in ["target/debug/build_script.rs", "node_modules/pkg/index.js", "notes.txt"] {
+            let events = touched(&[&root.join(quiet)]);
+            assert!(
+                analyzable_changes(&events, &config).is_empty(),
+                "{quiet} is not in the graph, so changing it cannot change the graph",
+            );
+        }
+    }
+
+    /// The other direction, which is the one that would break a user's
+    /// session silently: a source file the analysis *does* read has to come
+    /// through, even in a batch that is mostly noise.
+    #[test]
+    fn a_source_write_still_wakes_the_watcher() {
+        let root = std::path::Path::new("/repo");
+        let config = crate::config::Config::for_path(root);
+        let events = touched(&[
+            &root.join("target/debug/build_script.rs"),
+            &root.join("src/main.rs"),
+        ]);
+
+        let woke = analyzable_changes(&events, &config);
+        assert_eq!(woke, vec![root.join("src/main.rs").display().to_string()]);
+    }
+
+    /// An ignore file is not analyzed and never was — but it decides what is.
+    /// A reader who has just excluded a directory is watching for it to
+    /// disappear from the graph, not waiting for their next unrelated save.
+    #[test]
+    fn editing_an_ignore_file_wakes_the_watcher() {
+        let root = std::path::Path::new("/repo");
+        let config = crate::config::Config::for_path(root);
+
+        for ignore in [".gitignore", "src/.gitignore", ".ignore"] {
+            let events = touched(&[&root.join(ignore)]);
+            assert!(
+                !analyzable_changes(&events, &config).is_empty(),
+                "{ignore} changes what an analysis contains",
+            );
+        }
+    }
 }

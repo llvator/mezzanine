@@ -24,7 +24,8 @@
     connectLiveReload, liveConnected, liveReloading, liveStatus,
     liveIsBroken, reconnectLiveReload, stopLiveReload,
   } from './stores/liveReload';
-  import { loadDiff, diffActive, diffData, diffChangesOnly, diffCoreOnly, diffDimOpacity } from './stores/diff';
+  import { loadDiff, diffActive, diffData, diffLevel, diffChangedEdges, diffDimOpacity } from './stores/diff';
+  import { DIFF_LEVELS, isDiffLevel, type DiffLevel } from './viewmodels/diffLevels';
   import { refreshData, refreshing } from './stores/scope';
   import CommitPicker from './components/CommitPicker.svelte';
 
@@ -86,7 +87,6 @@
   // Whether the left column is open lives in `panes.ts` since UI-075: `0`
   // focuses it, and focusing a collapsed pane has to open it.
   $: leftCollapsed = !$sidebarPaneOpen;
-  let leftWidth = 360;
 
   /** Window width, so the layout can decide whether a column still fits. */
   let winWidth = typeof window !== 'undefined' ? window.innerWidth : 1600;
@@ -108,27 +108,52 @@
   // than a missing Description. It sits on the left, next to the sidebar, so
   // the reading order matches the direction of the interaction — pick a
   // concept, watch the code narrow to its right.
-  $: sidebarUsed = leftCollapsed ? 0 : leftWidth;
-  /** 20px per collapse strip. The fourth appears with the spec pane. */
-  $: toggleStrips = 60 + (specToggleShown ? 20 : 0);
+  /** 20px per collapse strip. The fourth appears with the spec pane, and the
+   *  canvas earns one of its own now that it folds like the rest (UI-098). */
   $: specToggleShown = !isVscode() && !$specGraph.empty;
-  $: specRoom = winWidth - sidebarUsed - toggleStrips - MIN_CANVAS_WIDTH;
-  $: specShownWidth = Math.min($specWidth, specRoom);
-  $: showSpec = $splitViewOpen && specToggleShown && specShownWidth >= SPEC_MIN_WIDTH;
-  $: specSquashed = $splitViewOpen && specToggleShown && !showSpec;
+  $: canvasToggleShown = !isVscode();
+  $: strips = (specToggleShown ? 4 : 3) + (canvasToggleShown ? 1 : 0);
 
-  $: leftUsed = sidebarUsed + (showSpec ? specShownWidth : 0);
-  $: rightRoom = winWidth - leftUsed - toggleStrips - MIN_CANVAS_WIDTH;
+  /**
+   * Everything the budget needs, in one object (UI-093). The arithmetic itself
+   * is `layoutPanes`, which is pure and tested — this is only the reading of
+   * the stores it runs on.
+   *
+   * `focus` is null unless focus-expand is on, which is what makes the mode a
+   * change of *inputs* rather than a second code path: with it off the
+   * function behaves exactly as the reactive statements it replaced.
+   */
+  $: layoutInput = {
+    winWidth,
+    strips,
+    sidebar: { present: !isVscode(), open: !leftCollapsed, want: $sidebarWidth, min: SIDEBAR_MIN_WIDTH },
+    spec: { present: specToggleShown, open: $splitViewOpen, want: $specWidth, min: SPEC_MIN_WIDTH },
+    details: { present: !isVscode(), open: $detailsPaneOpen, want: $detailsWidth, min: DETAILS_MIN_WIDTH },
+    description: { present: !isVscode(), open: $describePaneOpen, want: $describeWidth, min: DESCRIPTION_MIN_WIDTH },
+    // VS Code hosts the canvas and nothing else — the panes are native views
+    // there — so the switch is a standalone-UI affair and the webview is
+    // always drawing a graph.
+    canvasOpen: !canvasToggleShown || $canvasPaneOpen,
+    focus: $focusExpand ? $focusedPane : null,
+  } satisfies LayoutInput;
 
-  $: detailsShownWidth = Math.min($detailsWidth, rightRoom);
-  $: showDetails = $detailsPaneOpen && detailsShownWidth >= DETAILS_MIN_WIDTH;
-  $: showDescription = $describePaneOpen
-    && rightRoom - (showDetails ? detailsShownWidth : 0) >= DESCRIPTION_WIDTH;
+  $: layout = layoutPanes(layoutInput);
+
+  $: sidebarShownWidth = layout.widths.sidebar;
+  $: specShownWidth = layout.widths.spec;
+  $: detailsShownWidth = layout.widths.details;
+  $: descriptionShownWidth = layout.widths.description;
+
+  $: showSpec = specShownWidth > 0;
+  $: showDetails = detailsShownWidth > 0;
+  $: showDescription = descriptionShownWidth > 0;
+  $: showCanvas = layout.widths.canvas > 0;
 
   /** Was a pane hidden by the window rather than by the user? The toggle
    *  says so, so a button that does nothing visible still explains itself. */
-  $: detailsSquashed = $detailsPaneOpen && !showDetails;
-  $: descriptionSquashed = $describePaneOpen && !showDescription;
+  $: specSquashed = layout.squashed.spec;
+  $: detailsSquashed = layout.squashed.details;
+  $: descriptionSquashed = layout.squashed.description;
 
   /** Details outranks Description in the budget, so asking for Description
    *  when Details has eaten the room has to close Details — otherwise the
@@ -137,9 +162,9 @@
   function toggleDescription() {
     const next = !$describePaneOpen;
     describePaneOpen.set(next);
-    if (next && rightRoom - (showDetails ? detailsShownWidth : 0) < DESCRIPTION_WIDTH) {
-      detailsPaneOpen.set(false);
-    }
+    if (!next) return;
+    const opened = layoutPanes({ ...layoutInput, description: { ...layoutInput.description, open: true } });
+    if (opened.widths.description === 0) detailsPaneOpen.set(false);
   }
 
   // Load data at startup: prefer embedded __GRAPH_DATA__ (HTML mode), otherwise
@@ -155,10 +180,14 @@
   } from './vscodeAdapter';
   import { description, describeOnHover } from './stores/description';
   import {
-    detailsPaneOpen, describePaneOpen, detailsWidth,
-    DETAILS_MIN_WIDTH, DETAILS_MAX_WIDTH, DESCRIPTION_WIDTH, MIN_CANVAS_WIDTH,
-    splitViewOpen, specWidth, SPEC_MIN_WIDTH, SPEC_MAX_WIDTH,
+    detailsPaneOpen, describePaneOpen, detailsWidth, describeWidth, sidebarWidth,
+    splitViewOpen, specWidth, focusExpand, canvasPaneOpen,
   } from './stores/panes';
+  import {
+    layoutPanes, maxWidthFor,
+    DETAILS_MIN_WIDTH, SPEC_MIN_WIDTH, DESCRIPTION_MIN_WIDTH, SIDEBAR_MIN_WIDTH,
+    type ColumnId, type LayoutInput,
+  } from './viewmodels/paneLayout';
   import SpecGraphView from './components/SpecGraphView.svelte';
   import { specGraph, specSelection, clearSpecFocus } from './stores/crossFilter';
   import DescriptionPanel from './components/DescriptionPanel.svelte';
@@ -167,15 +196,15 @@
   import ShortcutHelp from './components/ShortcutHelp.svelte';
   import { sidebarPaneOpen } from './stores/panes';
   import { focusedPane, shortcutHelpOpen } from './stores/keymap';
-  import { matchBinding, isTypingTarget, type PaneId } from './viewmodels/keymap';
+  import { matchBinding, isTypingTarget, PANE_DIGIT, type PaneId } from './viewmodels/keymap';
   import { runCommand } from './viewmodels/keymapActions';
   import { focusScope, setScopes, drillIn, analysisScopes, setAnalysisScopes, ensureFullData, autoLevel } from './stores/scope';
   import { qualityRows, repoQuality, qualityAnalysisScope, qualitySortBy, currentEditorFile, tierFromScore } from './stores/quality';
   import type { QualityAnalysisScope, QualitySortKey } from './stores/quality';
   import {
-    diffComputing, diffApiError, baseDetailsCache, triggerDiff, diffFiltersEnabled,
+    diffComputing, diffApiError, triggerDiff, stopDiff, diffFiltersEnabled,
   } from './stores/diff';
-  import { derived as svelteDerived, get } from 'svelte/store';
+  import { derived as svelteDerived, get, type Writable } from 'svelte/store';
   import {
     generalEntityTypes, generalRelTypes, generalOutgoing, generalIncoming, generalLanguages,
     allEntityTypes, allRelTypes, allLanguages,
@@ -227,19 +256,63 @@
     graphLevel.set(coarserLevel as GraphLevel);
   }
 
-  /** Turn on the diff filter the old card recommended but could not deliver.
-   *  Both flags are needed: `diffChangesOnly` is only consulted when the
-   *  master toggle is on. */
+  /** Narrow the diff to the edits themselves — the remedy the overflow card
+   *  offers. The master toggle comes too: the ladder is only consulted when
+   *  it is on. */
   function showChangesOnly() {
     diffFiltersEnabled.set(true);
-    diffChangesOnly.set(true);
+    diffLevel.set('edits');
   }
 
-  /** Both diff filters off — the one-click way out of a canvas they emptied. */
+  /** Stop the ladder filtering at all — the one-click way out of a canvas it
+   *  emptied. The diff stays loaded and the colours stay on. */
   function clearDiffFilters() {
-    diffChangesOnly.set(false);
-    diffCoreOnly.set(false);
+    diffFiltersEnabled.set(false);
   }
+
+  /* Hover copy for the diff level ladder (UI-088). The two checkboxes this
+     replaced read as near-synonyms and each needed a paragraph to say how it
+     differed from the other; rungs on an ordered ladder only have to say what
+     they add to the rung below. The slider says it is the way back to the
+     parts of the graph the ladder took away. */
+  const LEVEL_LABEL: Record<DiffLevel, string> = {
+    edits: 'Edits',
+    rewiring: 'Rewiring',
+    neighbourhood: 'Neighbourhood',
+  };
+  const LEVEL_TIP: Record<DiffLevel, string> = {
+    edits:
+      'Edits — only what you actually edited.\n\n'
+      + 'Entities whose own source or intrinsic metrics moved, plus everything '
+      + 'added and removed. Between them, only the relationships that changed.\n\n'
+      + 'Drops impact-only ripple: entities whose code is byte-for-byte '
+      + 'identical and whose only movement is a fan-in / fan-out count. The '
+      + 'narrowest rung, and the default — on most diffs the ripple outnumbers '
+      + 'the real edits and drowns them.',
+    rewiring:
+      'Rewiring — the edits, plus what they now point at.\n\n'
+      + 'Adds the far end of every relationship that appeared, even when that '
+      + 'entity was never edited. This is the rung that shows a function you '
+      + 'changed calling a helper you did not — the case a filter on entities '
+      + 'alone can never draw.\n\n'
+      + 'Still only changed relationships get a line.',
+    neighbourhood:
+      'Neighbourhood — the edits, plus everything one hop away.\n\n'
+      + 'Adds every direct neighbour of a changed entity and draws all the '
+      + 'wiring between what is shown, changed or not. Use it to see what your '
+      + 'change sits next to; expect most of the lines to be untouched.',
+  };
+  const REST_TIP =
+    'Rest — how visible the entities the ladder left out stay.\n\n'
+    + 'At 0% everything below the current rung is gone from the canvas. Raise '
+    + 'it to fade the rest of the graph back in as faint context around the '
+    + 'changed nodes, so you can see what your changes sit next to without '
+    + 'losing track of which nodes changed.';
+
+  /** Reported edge changes with nowhere to go on the canvas: the ones that
+   *  disappeared (no line in the head graph) plus the ones whose far end the
+   *  diff could not resolve. */
+  $: undrawableEdges = $diffChangedEdges.removedCount + $diffChangedEdges.unplaceable;
 
   /** Non-null when the scope produced nodes and every one of them is
    *  filtered out of sight (UI-064). The decision is in `emptyCanvas.ts`;
@@ -571,10 +644,10 @@
             break;
           }
           case 'clearDiff':
-            diffActive.set(false);
-            diffData.set(null);
-            baseDetailsCache.set(null);
-            diffApiError.set(null);
+            // Goes through the server, like the badge's own button: clearing
+            // the four stores locally left the engine still following the
+            // working tree, so the next save pushed the overlay back (UI-100).
+            void stopDiff();
             break;
           case 'scopeToChangedFiles': {
             // Replace the current scope with files that contain entities
@@ -617,7 +690,7 @@
             if (droppedImpactOnly > 0) {
               console.log(`[nao] scopeToChangedFiles: ignored ${droppedImpactOnly} impact-only / unchanged entities (not scoped)`);
             }
-            diffChangesOnly.set(true);
+            diffLevel.set('edits');
             diffFiltersEnabled.set(true);
             // No `force` needed since UI-061: the diff filters set just
             // above run upstream of the render gate, so they narrow the
@@ -625,11 +698,19 @@
             void setScopes(leafFiles);
             break;
           }
-          case 'setDiffChangesOnly':
-            diffChangesOnly.set(!!value);
+          case 'setDiffLevel':
+            if (isDiffLevel(value)) diffLevel.set(value);
             break;
+          // The two toggles the ladder replaced (UI-088). Still accepted so an
+          // extension host that hasn't been rebuilt alongside the webview
+          // keeps working: `coreOnly` was the narrow rung, `changesOnly`
+          // without it was the one that also kept impact-only ripple, which
+          // `rewiring` now shows for a reason rather than by blanket.
           case 'setDiffCoreOnly':
-            diffCoreOnly.set(!!value);
+            if (value) diffLevel.set('edits');
+            break;
+          case 'setDiffChangesOnly':
+            if (value) diffLevel.set('rewiring');
             break;
           case 'setDiffDimOpacity':
             diffDimOpacity.set(Number(value));
@@ -726,9 +807,9 @@
       // Broadcast diff state — active flag, refs, summary counts, filter
       // toggles, compute/error status. The native Diff view mirrors this.
       const diffState = svelteDerived(
-        [diffActive, diffData, diffChangesOnly, diffCoreOnly, diffDimOpacity,
+        [diffActive, diffData, diffLevel, diffChangedEdges, diffDimOpacity,
          diffComputing, diffApiError, selectedScopes, diffFiltersEnabled, selectedNode],
-        ([$act, $data, $chg, $core, $dim, $comp, $err, $sel, $filtEn, $selNode]) => {
+        ([$act, $data, $lvl, $edges, $dim, $comp, $err, $sel, $filtEn, $selNode]) => {
           // Match the filter used by `scopeToChangedFiles` — files with
           // real (core) changes only, not impact-only ripples.
           const changedFiles = $data
@@ -756,8 +837,12 @@
                   unchanged: $data.summary.unchanged,
                 }
               : undefined,
-            changesOnly: $chg,
-            coreOnly: $core,
+            level: $lvl,
+            // How many reported edge changes the canvas cannot draw at any
+            // rung: a disappeared edge has no line in the head graph, and an
+            // endpoint the diff couldn't resolve has nowhere to attach. Sent
+            // so the native view can say so rather than imply full coverage.
+            undrawableEdges: $edges.removedCount + $edges.unplaceable,
             dimOpacity: $dim,
             computing: $comp,
             error: $err,
@@ -975,71 +1060,49 @@
     unsubAnalysisScopes?.();
   });
 
-  // Panel resize
-  function startResize(e: MouseEvent) {
+  /**
+   * Every column resizes the same way, so there is one handler (UI-093).
+   *
+   * The two things that differ are which store the drag writes and which way
+   * widening runs: the columns left of the canvas grow rightwards, the ones
+   * right of it grow leftwards. `sign` is that, and the rest is shared.
+   *
+   * The ceiling comes from `maxWidthFor`, which runs the same budget the
+   * layout runs. That is the point of asking rather than computing it here:
+   * the handle can never stop somewhere the layout won't follow, because both
+   * answers come out of one function.
+   */
+  const RESIZE: Record<ColumnId, { store: Writable<number>; min: number; sign: 1 | -1 }> = {
+    sidebar: { store: sidebarWidth, min: SIDEBAR_MIN_WIDTH, sign: 1 },
+    spec: { store: specWidth, min: SPEC_MIN_WIDTH, sign: 1 },
+    details: { store: detailsWidth, min: DETAILS_MIN_WIDTH, sign: -1 },
+    description: { store: describeWidth, min: DESCRIPTION_MIN_WIDTH, sign: -1 },
+  };
+
+  function startPaneResize(id: ColumnId, e: MouseEvent) {
     e.preventDefault();
+    const { store, min, sign } = RESIZE[id];
+
+    // Grabbing an edge is a claim of manual control, and it cannot coexist
+    // with a mode that derives the width from where the keyboard is: the
+    // focused column is already at its ceiling and every other one is pinned
+    // to its floor, so the drag would have nothing to move. Seeding the store
+    // from what is on screen first is what stops the pane snapping back to a
+    // remembered width the moment the mode goes off (UI-094).
+    if ($focusExpand) {
+      store.set(Math.max(min, layout.widths[id]));
+      focusExpand.set(false);
+    }
+
     const startX = e.clientX;
-    const startWidth = leftWidth;
+    const startWidth = get(store);
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
 
-    const onMove = (e: MouseEvent) => {
-      leftWidth = Math.max(200, startWidth + (e.clientX - startX));
-    };
-
-    const onUp = () => {
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }
-
-  /** The spec column grows rightwards, so its handle is on its right edge.
-   *  Same ceiling rule as Details: the drag stops where the pane would stop
-   *  rendering, so the handle never goes somewhere the layout won't follow. */
-  function startSpecResize(e: MouseEvent) {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startWidth = $specWidth;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    const onMove = (e: MouseEvent) => {
-      const next = startWidth + (e.clientX - startX);
-      const ceiling = Math.min(SPEC_MAX_WIDTH, specRoom);
-      specWidth.set(Math.min(ceiling, Math.max(SPEC_MIN_WIDTH, next)));
-    };
-
-    const onUp = () => {
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-    };
-
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }
-
-  /** The Details column grows leftwards, so its handle is on its left edge
-   *  and a drag towards the canvas widens it. */
-  function startDetailsResize(e: MouseEvent) {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startWidth = $detailsWidth;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    const onMove = (e: MouseEvent) => {
-      const next = startWidth - (e.clientX - startX);
-      // Stops at the canvas floor as well as the pane's own maximum, so the
-      // handle can't be dragged somewhere the pane won't actually render.
-      const ceiling = Math.min(DETAILS_MAX_WIDTH, rightRoom);
-      detailsWidth.set(Math.min(ceiling, Math.max(DETAILS_MIN_WIDTH, next)));
+    const onMove = (ev: MouseEvent) => {
+      const next = startWidth + sign * (ev.clientX - startX);
+      const ceiling = maxWidthFor(id, { ...layoutInput, focus: null });
+      store.set(Math.min(Math.max(min, ceiling), Math.max(min, next)));
     };
 
     const onUp = () => {
@@ -1120,15 +1183,22 @@
     <div class="panel left-panel" class:collapsed={leftCollapsed}
       class:pane-focused={$focusedPane === 'sidebar'}
       data-pane="sidebar"
-      style="width: {leftCollapsed ? 0 : leftWidth}px">
+      data-probe="sidebar-panel"
+      style="width: {sidebarShownWidth}px">
       {#if !leftCollapsed}
         <Sidebar />
-        <div class="resize-handle right" on:mousedown={startResize}></div>
+        <div class="resize-handle right" on:mousedown={(e) => startPaneResize('sidebar', e)}></div>
       {/if}
     </div>
+    <!-- Collapsed, the strip carries the pane's digit as well as its arrow:
+         folded columns are otherwise identical 20px arrows, and the reader
+         has to open one to find out which it was. The digit is also the key
+         that opens it, so the strip teaches the shortcut it stands in for. -->
     <button class="panel-toggle left" class:collapsed={leftCollapsed}
+      title={leftCollapsed ? `Show the sidebar (${PANE_DIGIT.sidebar})` : 'Hide the sidebar'}
       on:click={() => sidebarPaneOpen.set(leftCollapsed)}>
-      {leftCollapsed ? '\u25B6' : '\u25C0'}
+      {#if leftCollapsed}<span class="toggle-digit">{PANE_DIGIT.sidebar}</span>{/if}
+      <span class="toggle-arrow">{leftCollapsed ? '\u25B6' : '\u25C0'}</span>
     </button>
   {/if}
 
@@ -1140,23 +1210,39 @@
       class:pane-focused={$focusedPane === 'spec'}
       data-pane="spec"
       data-probe="spec-panel"
-      style="width: {showSpec ? specShownWidth : 0}px">
+      style="width: {specShownWidth}px">
       {#if showSpec}
         <SpecGraphView />
-        <div class="resize-handle right" on:mousedown={startSpecResize}></div>
+        <div class="resize-handle right" on:mousedown={(e) => startPaneResize('spec', e)}></div>
       {/if}
     </div>
     <button class="panel-toggle spec" class:collapsed={!showSpec}
       class:squashed={specSquashed}
       title={specSquashed
         ? 'The spec pane is hidden \u2014 the window is too narrow for it and the canvas'
-        : showSpec ? 'Hide the spec pane' : 'Show the spec pane'}
+        : showSpec ? 'Hide the spec pane' : `Show the spec pane (${PANE_DIGIT.spec})`}
       on:click={() => splitViewOpen.set(!$splitViewOpen)}>
-      {showSpec ? '\u25C0' : '\u25B6'}
+      {#if !showSpec}<span class="toggle-digit">{PANE_DIGIT.spec}</span>{/if}
+      <span class="toggle-arrow">{showSpec ? '\u25C0' : '\u25B6'}</span>
     </button>
   {/if}
 
-  <!-- Graph -->
+  <!-- Graph. Foldable since UI-098: a window mirroring another one is a real
+       place to put panes and a pointless place to put a graph, and the floor
+       the canvas stops reserving is what lets four columns fit a window that
+       could never hold five. The strip stays behind when the column goes —
+       otherwise a window with no canvas has no mouse route back to one. -->
+  {#if canvasToggleShown}
+    <button class="panel-toggle canvas" class:collapsed={!showCanvas}
+      data-probe="canvas-toggle"
+      title={showCanvas ? 'Hide the graph' : `Show the graph (${PANE_DIGIT.graph})`}
+      on:click={() => canvasPaneOpen.set(!$canvasPaneOpen)}>
+      {#if !showCanvas}<span class="toggle-digit">{PANE_DIGIT.graph}</span>{/if}
+      <span class="toggle-arrow">{showCanvas ? '◀' : '▶'}</span>
+    </button>
+  {/if}
+
+  {#if showCanvas}
   <div class="canvas-column">
   <!-- Toolbar lives above the canvas, not on top of it. As an overlay it
        covered nodes at small window sizes, and fitView measures
@@ -1182,24 +1268,79 @@
           <span style="color:#FFCC80" title="{$diffData.summary.modified_source ?? $diffData.summary.modified} core, {$diffData.summary.modified_impact ?? 0} impact">
             ~{$diffData.summary.modified}
           </span>
+          <!-- Entity counts say how much code moved; this says how much the
+               graph rewired, which the three above cannot: a swapped call
+               changes no count of entities at all. -->
+          {#if ($diffData.summary.relationships_added ?? 0) + ($diffData.summary.relationships_removed ?? 0) > 0}
+            <span
+              class="diff-edge-counts"
+              data-probe="diff-edge-counts"
+              title="Relationships that appeared or disappeared. Select an entity to see which — the Details pane lists its own."
+            >
+              ⇄ <span style="color:#A5D6A7">+{$diffData.summary.relationships_added ?? 0}</span>
+              <span style="color:#EF9A9A">−{$diffData.summary.relationships_removed ?? 0}</span>
+            </span>
+          {/if}
           <span class="diff-filter-group">
-            <label class="diff-filter-toggle" title="Show only added, removed, and modified entities (hide unchanged)">
-              <input type="checkbox" bind:checked={$diffChangesOnly} />
-              Changes
+            <!-- The ladder, narrow → wide (UI-088). A segmented control rather
+                 than checkboxes because the rungs are ordered: the reader can
+                 see which way each one moves the picture, which two
+                 independent toggles could never say. -->
+            <span class="diff-level" role="radiogroup" aria-label="Diff detail level" data-probe="diff-level">
+              {#each DIFF_LEVELS as level (level)}
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={$diffLevel === level}
+                  class="diff-level-rung"
+                  class:active={$diffLevel === level}
+                  data-probe="diff-level-{level}"
+                  title={LEVEL_TIP[level]}
+                  on:click={() => diffLevel.set(level)}
+                >{LEVEL_LABEL[level]}</button>
+              {/each}
+            </span>
+            <label class="diff-filter-toggle diff-opacity-control" title={REST_TIP}>
+              <span class="diff-opacity-name">Rest</span>
+              <input type="range" min="0" max="15" step="1"
+                value={$diffDimOpacity * 100}
+                on:input={(e) => diffDimOpacity.set(Number(e.currentTarget.value) / 100)} />
+              <span class="diff-opacity-label">{Math.round($diffDimOpacity * 100)}%</span>
             </label>
-            <label class="diff-filter-toggle" title="Show only core changes (source code modified) — hide impact-only changes (only relational metrics changed)">
-              <input type="checkbox" bind:checked={$diffCoreOnly} />
-              Core
-            </label>
-            {#if $diffChangesOnly || $diffCoreOnly}
-              <label class="diff-filter-toggle diff-opacity-control" title="Opacity of unchanged/filtered nodes (0 = hidden, 100 = fully visible)">
-                <input type="range" min="0" max="15" step="1"
-                  value={$diffDimOpacity * 100}
-                  on:input={(e) => diffDimOpacity.set(Number(e.currentTarget.value) / 100)} />
-                <span class="diff-opacity-label">{Math.round($diffDimOpacity * 100)}%</span>
-              </label>
+            <!-- Never let the canvas imply it drew every reported change. A
+                 disappeared edge has no line in the head graph to colour, and
+                 an unresolved far end has nowhere to attach — so they are
+                 counted here rather than dropped in silence. -->
+            {#if undrawableEdges > 0 && $diffLevel !== 'neighbourhood'}
+              <span
+                class="diff-undrawable"
+                data-probe="diff-undrawable"
+                title={'Relationships the diff reported but the canvas cannot draw.\n\n'
+                  + `${$diffChangedEdges.removedCount} disappeared — a lost edge has no line in the `
+                  + 'current graph, by construction.\n'
+                  + `${$diffChangedEdges.unplaceable} could not be placed — the diff saw the change but `
+                  + 'could not resolve the entity at the far end.\n\n'
+                  + 'Select an entity to read its own gained and lost relationships in the Details pane.'}
+              >{undrawableEdges} undrawn</span>
             {/if}
           </span>
+          <!-- The way out. Diff mode is the one mode of this canvas that
+               nothing else turns off: a `→ working` comparison is a
+               subscription the engine keeps current on every save, and it
+               outlived the page it was started from because the result is
+               served to whoever reloads (UI-100). Sits at the end of the
+               badge, so the strip that says a diff is on is also the strip
+               that ends it. -->
+          <button
+            type="button"
+            class="diff-stop"
+            data-probe="diff-stop"
+            on:click={() => void stopDiff()}
+            title={$diffData.to_ref === 'working'
+              ? 'Leave diff mode — stop following the working tree and clear the overlay'
+              : 'Leave diff mode — clear the overlay'}
+            aria-label="Leave diff mode"
+          >×</button>
         </span>
       {/if}
     </div>
@@ -1305,7 +1446,7 @@
                   — library and stdlib nodes outside this repo
                 </li>
               {/if}
-              {#if $diffActive && !$diffChangesOnly}
+              {#if $diffActive && !($diffFiltersEnabled && $diffLevel === 'edits')}
                 <li>
                   <button type="button" class="link-btn" on:click={showChangesOnly}>
                     Show changed entities only
@@ -1337,13 +1478,21 @@
             </p>
             <p>Show more:</p>
             <ul class="remedies">
-              {#if $diffActive && ($diffChangesOnly || $diffCoreOnly)}
+              {#if $diffActive && $diffFiltersEnabled}
                 <li>
                   <button type="button" class="link-btn" on:click={clearDiffFilters}>
                     Clear the diff filters
                   </button>
-                  — nothing in this scope changed{$diffCoreOnly && !$diffChangesOnly ? ' at the source level' : ''}
+                  — nothing in this scope changed{$diffLevel === 'edits' ? ' at the source level' : ''}
                 </li>
+                {#if $diffLevel !== 'neighbourhood'}
+                  <li>
+                    <button type="button" class="link-btn" on:click={() => diffLevel.set('neighbourhood')}>
+                      Widen to the neighbourhood
+                    </button>
+                    — draw what the changes sit next to
+                  </li>
+                {/if}
                 {#if $diffDimOpacity === 0}
                   <li>
                     <button type="button" class="link-btn" on:click={() => diffDimOpacity.set(0.15)}>
@@ -1441,6 +1590,7 @@
     <OverviewPanel {graphView} />
   </GraphView>
   </div>
+  {/if}
 
   <!-- Details: the entity under the pointer, or the pinned one. Its own
        column since UI-040 — as the sidebar's bottom half it took a third of
@@ -1451,17 +1601,18 @@
       class:squashed={detailsSquashed}
       title={detailsSquashed
         ? 'Details is hidden — the window is too narrow for it and the canvas'
-        : showDetails ? 'Hide details' : 'Show details'}
+        : showDetails ? 'Hide details' : `Show details (${PANE_DIGIT.details})`}
       on:click={() => detailsPaneOpen.set(!$detailsPaneOpen)}>
-      {showDetails ? '▶' : '◀'}
+      {#if !showDetails}<span class="toggle-digit">{PANE_DIGIT.details}</span>{/if}
+      <span class="toggle-arrow">{showDetails ? '▶' : '◀'}</span>
     </button>
     <div class="panel details-panel" class:collapsed={!showDetails}
       class:pane-focused={$focusedPane === 'details'}
       data-pane="details"
       data-probe="details-panel"
-      style="width: {showDetails ? detailsShownWidth : 0}px">
+      style="width: {detailsShownWidth}px">
       {#if showDetails}
-        <div class="resize-handle left" on:mousedown={startDetailsResize}></div>
+        <div class="resize-handle left" on:mousedown={(e) => startPaneResize('details', e)}></div>
         <DetailsPanel />
       {/if}
     </div>
@@ -1477,15 +1628,18 @@
       class:squashed={descriptionSquashed}
       title={descriptionSquashed
         ? 'Descriptions are hidden — the window is too narrow for a third column'
-        : showDescription ? 'Hide descriptions' : 'Show descriptions'}
+        : showDescription ? 'Hide descriptions' : `Show descriptions (${PANE_DIGIT.description})`}
       on:click={toggleDescription}>
-      {showDescription ? '▶' : '◀'}
+      {#if !showDescription}<span class="toggle-digit">{PANE_DIGIT.description}</span>{/if}
+      <span class="toggle-arrow">{showDescription ? '▶' : '◀'}</span>
     </button>
     <div class="panel right-panel" class:collapsed={!showDescription}
       class:pane-focused={$focusedPane === 'description'}
       data-pane="description"
-      style="width: {showDescription ? DESCRIPTION_WIDTH : 0}px">
+      data-probe="description-panel"
+      style="width: {descriptionShownWidth}px">
       {#if showDescription}
+        <div class="resize-handle left" on:mousedown={(e) => startPaneResize('description', e)}></div>
         <DescriptionPanel />
       {/if}
     </div>
@@ -1582,17 +1736,34 @@
     color: var(--text-muted);
     cursor: pointer;
     display: flex;
+    /* Column, because the strip is 20px wide and full height: what room it
+       has for a second glyph is vertical. */
+    flex-direction: column;
+    gap: 4px;
     align-items: center;
     justify-content: center;
     font-size: 0.7rem;
     flex-shrink: 0;
   }
 
+  /* The arrow says what the click does; the digit says which pane it does it
+     to, and which key does the same thing without the mouse. Accent-coloured
+     so it reads as a key rather than as a count. */
+  .toggle-digit {
+    font-size: 0.65rem;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--accent);
+  }
+
+  .panel-toggle.squashed .toggle-digit { color: inherit; }
+
   .panel-toggle:hover { background: var(--bg-hover); color: var(--text); }
   .panel-toggle.left { border-left: none; border-right: none; }
   .panel-toggle.spec { border-left: none; border-right: none; }
   .panel-toggle.details { border-left: none; border-right: none; }
   .panel-toggle.right { border-left: none; border-right: none; }
+  .panel-toggle.canvas { border-left: none; border-right: none; }
 
   /* Wanted, but the window has no room for it. Dimmed rather than hidden:
      the strip is where the pane comes back from once the window grows. */
@@ -1634,6 +1805,15 @@
     gap: 8px;
   }
 
+  .diff-edge-counts {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding-left: 6px;
+    border-left: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+
   .diff-filter-group {
     display: inline-flex;
     align-items: center;
@@ -1654,10 +1834,42 @@
   .diff-filter-toggle:hover {
     color: var(--text, #e0e0e0);
   }
-  .diff-filter-toggle input[type="checkbox"] {
-    margin: 0;
+  /* One segmented track, not three buttons: the rungs are an ordered ladder,
+     and a shared groove with a single lit segment says "pick one position"
+     where separate chips would say "toggle each of these". */
+  .diff-level {
+    display: inline-flex;
+    border: 1px solid rgba(255, 167, 38, 0.35);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .diff-level-rung {
+    appearance: none;
+    border: none;
+    border-left: 1px solid rgba(255, 167, 38, 0.25);
+    background: transparent;
+    color: var(--text-muted, #aaa);
+    font: inherit;
+    font-size: 0.7rem;
+    padding: 1px 7px;
     cursor: pointer;
-    accent-color: #FFA726;
+    user-select: none;
+  }
+  .diff-level-rung:first-child {
+    border-left: none;
+  }
+  .diff-level-rung:hover {
+    background: rgba(255, 167, 38, 0.12);
+    color: var(--text, #e0e0e0);
+  }
+  .diff-level-rung.active {
+    background: rgba(255, 167, 38, 0.28);
+    color: var(--text, #e0e0e0);
+  }
+  .diff-level-rung:focus-visible {
+    outline: 1px solid #FFA726;
+    outline-offset: -1px;
   }
 
   .diff-opacity-control input[type="range"] {
@@ -1665,6 +1877,49 @@
     height: 4px;
     cursor: pointer;
     accent-color: #FFA726;
+  }
+
+  /* Sits just past the ladder, so the slider reads as the counterpart to it
+     rather than as an unlabelled control. */
+  .diff-opacity-name {
+    padding-left: 4px;
+    border-left: 1px solid rgba(255, 167, 38, 0.3);
+  }
+
+  /* Deliberately plain — a count of what is NOT on screen should not compete
+     with the +/− totals beside it, but it must not be invisible either. */
+  .diff-undrawable {
+    font-size: 0.65rem;
+    color: var(--text-dim, #888);
+    padding-left: 6px;
+    border-left: 1px solid rgba(255, 167, 38, 0.3);
+    cursor: help;
+  }
+
+  /* Quiet until reached for. It is the only control here that throws work
+     away, so it should not read as the next thing to press — but it is also
+     the only way out, so it must be findable without a tooltip. */
+  .diff-stop {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--text-dim, #888);
+    font: inherit;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 1px 4px 1px 8px;
+    margin-left: 2px;
+    border-radius: 3px;
+    cursor: pointer;
+    border-left: 1px solid rgba(255, 167, 38, 0.3);
+  }
+  .diff-stop:hover {
+    background: rgba(255, 167, 38, 0.2);
+    color: var(--text, #e0e0e0);
+  }
+  .diff-stop:focus-visible {
+    outline: 1px solid #FFA726;
+    outline-offset: -1px;
   }
 
   .diff-opacity-label {

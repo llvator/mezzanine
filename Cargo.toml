@@ -1,6 +1,6 @@
 [package]
 name = "nao"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Visualize code relationships, dependencies, and quality metrics"
 authors = ["Nao Team"]

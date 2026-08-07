@@ -35,6 +35,9 @@ import {
 } from '../src/viewmodels/specGraph.ts';
 import type { D3Node, D3Link, GraphData } from '../src/types/graph.ts';
 import { buildPathUniverse } from '../src/utils/refPaths.ts';
+import {
+  regionSpecClaim, clampDescription, documentationLookup, hasSpecLayer,
+} from '../src/viewmodels/regionSpec.ts';
 
 // ---------------------------------------------------------------------
 // Fixtures
@@ -776,4 +779,83 @@ test('the same kind always draws on the same row', () => {
 
 test('a kind the language grows later is visibly unplaced, not silently a Feature', () => {
   assert.ok(tierOf(node('x', 'SomethingNew')) > tierOf(node('f', 'Feature')));
+});
+
+// ---------------------------------------------------------------------
+// regionSpecClaim (UI-090)
+// ---------------------------------------------------------------------
+
+/** A folder region asks the same question a file does — the join is prefix
+ *  arithmetic and has no opinion about which side is a directory. */
+const noDocs = () => null;
+const docsFor = (map: Record<string, string>) => (id: string) => map[id] ?? null;
+
+test('a folder claimed by a cr: gets that entity', () => {
+  const g = buildSpecGraph(fixture());
+  const claim = regionSpecClaim(g, 'ui/src/viewmodels', noDocs);
+  assert.equal(claim?.name, 'f_filters');
+  assert.equal(claim?.kind, 'Feature');
+  assert.equal(claim?.exact, true);
+});
+
+test('the description comes from the sidecar, keyed by the analyzer id', () => {
+  const g = buildSpecGraph(fixture());
+  const claim = regionSpecClaim(g, 'ui/src/viewmodels', docsFor({ f_filters: 'Filtering.' }));
+  assert.equal(claim?.description, 'Filtering.');
+});
+
+test('a claim inherited from a folder above says so', () => {
+  // `cr: "ui/src/viewmodels/"` genuinely covers `ui/src/viewmodels/deep`, but
+  // the words it carries are about the folder the author named. Reading them
+  // as a description of the subfolder would put words in their mouth.
+  const g = buildSpecGraph(fixture());
+  const claim = regionSpecClaim(g, 'ui/src/viewmodels/deep', noDocs);
+  assert.equal(claim?.name, 'f_filters');
+  assert.equal(claim?.exact, false);
+  assert.equal(claim?.claimPath, 'ui/src/viewmodels');
+});
+
+test('an unclaimed folder reports nothing rather than the nearest name', () => {
+  const g = buildSpecGraph(fixture());
+  assert.equal(regionSpecClaim(g, 'src/parser', noDocs), null);
+});
+
+test('a description that has not loaded is a null, not a claim of silence', () => {
+  const g = buildSpecGraph(fixture());
+  const claim = regionSpecClaim(g, 'ui/src/viewmodels', documentationLookup(null));
+  assert.equal(claim?.description, null);
+});
+
+test('the most specific claim wins over the folder-wide one', () => {
+  const g = buildSpecGraph({
+    nodes: [
+      node('f_wide', 'Feature', { refs: ['ui/'] }),
+      node('f_tight', 'Feature', { refs: ['ui/src/stores'] }),
+    ],
+    links: [],
+    files: [],
+    modules: [],
+  } as unknown as GraphData);
+  assert.equal(regionSpecClaim(g, 'ui/src/stores', noDocs)?.name, 'f_tight');
+  assert.equal(regionSpecClaim(g, 'ui/src/utils', noDocs)?.name, 'f_wide');
+});
+
+test('a project with no spec layer claims nothing', () => {
+  const g = buildSpecGraph(null);
+  assert.equal(regionSpecClaim(g, 'ui/src/stores', noDocs), null);
+  assert.equal(hasSpecLayer(g), false);
+});
+
+test('a paragraph is cut to a card-sized line, on a word boundary', () => {
+  const long = `${'word '.repeat(120)}end`;
+  const out = clampDescription(long)!;
+  assert.ok(out.length <= 221, `clamped to ${out.length}`);
+  assert.ok(out.endsWith('…'));
+  assert.ok(!out.includes('  '), 'newlines and runs of space should collapse');
+});
+
+test('a short description is left exactly as written', () => {
+  assert.equal(clampDescription('Lexer/parser for .elv.'), 'Lexer/parser for .elv.');
+  assert.equal(clampDescription(''), null);
+  assert.equal(clampDescription(null), null);
 });

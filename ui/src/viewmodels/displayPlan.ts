@@ -46,8 +46,9 @@ import {
   type TreeDensity,
 } from '../stores/graph';
 import { searchMatchIds, searchNeighborIds } from './filterViewModel';
-import { diffActive, diffChangesOnly, diffCoreOnly, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges, diffDimOpacity, normalizeEntityId, type ChangeStatus } from '../stores/diff';
+import { diffActive, diffLevel, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges, diffChangedEdges, diffAddedEntityIds, diffDimOpacity, normalizeEntityId, type ChangeStatus } from '../stores/diff';
 import type { ScopeChange } from './diffRollup';
+import { planDiffLevel, type DiffLevel, type LevelEdge } from './diffLevels';
 import { gateByDrawCeiling, type DrawOverflow } from './drawCeiling';
 import { rankHubs } from './hubs';
 import { demoteHubs, hubCount } from '../stores/settings';
@@ -162,10 +163,18 @@ interface ComputeArgs {
   searchHides: boolean;
   searchDim: number;
   diffDim: number;
-  diffChangesOnly: boolean;
-  diffCoreOnly: boolean;
+  /** How wide the diff draws. Only consulted when `diffFiltersOn`. */
+  diffLevel: DiffLevel;
+  /** Master toggle — off means a diff can be loaded and coloured while the
+   *  ladder has no effect on what is drawn. */
+  diffFiltersOn: boolean;
   diffStatuses: Map<string, ChangeStatus>;
   diffSourceChanged: Map<string, boolean>;
+  /** `${src}->${tgt}|${kind}` for every edge the diff reported as appeared. */
+  diffAddedEdges: Set<string>;
+  /** Normalized ids of added entities, whose edges carry no delta of their
+   *  own but are new all the same. */
+  diffAddedEntities: Set<string>;
   /** Scope path → rolled-up change, for the collapsed levels where a node's
    *  `original_id` is a path rather than an entity id (UI-064). */
   diffScopes: Map<string, ScopeChange>;
@@ -243,16 +252,29 @@ function nodePassesFilters(n: D3Node, args: ComputeArgs): FilterResult {
       return args.searchHides ? 'hidden' : 'dimmed';
     }
   }
-  // Diff filter: when diff mode is active, dim (not hide) filtered nodes.
-  if (args.diffIsActive && (args.diffChangesOnly || args.diffCoreOnly)) {
-    const change = changeOf(n, args);
-    if (!change) return diffUnknown(n, args);
-    if (args.diffChangesOnly && change.status === 'unchanged') return 'dimmed';
-    if (args.diffCoreOnly && (change.status === 'unchanged' || !change.sourceChanged)) {
-      return 'dimmed';
-    }
-  }
+  // The diff is deliberately absent here. It used to be one more predicate on
+  // a single node, which is why it could only ever filter nodes; the rungs
+  // need the whole graph at once (a far end, a neighbour), so they run as
+  // their own pass over the survivors — see `applyDiffLevel`.
   return 'visible';
+}
+
+/**
+ * Does the diff call this node *edited*?
+ *
+ * Two ways to qualify, and the second is the one that is easy to lose:
+ *
+ * - the diff says it changed, at the source level. Impact-only movement
+ *   (`fan_in`/`fan_out` shifting because something nearby changed) is not an
+ *   edit — on most diffs the ripple outnumbers the real edits and drowns them.
+ * - the diff never *looked*. A file created since the diff ran is absent from
+ *   every map, and treating unknown as unchanged hides exactly the thing the
+ *   reader opened a diff to see. `diffUnknown` draws that line.
+ */
+function isEdit(n: D3Node, args: ComputeArgs): boolean {
+  const change = changeOf(n, args);
+  if (!change) return diffUnknown(n, args) === 'visible';
+  return change.status !== 'unchanged' && change.sourceChanged;
 }
 
 /**
@@ -296,6 +318,91 @@ function changeOf(n: D3Node, args: ComputeArgs): ScopeChange | null {
 function diffUnknown(n: D3Node, args: ComputeArgs): FilterResult {
   if (n.file_path && !args.diffScopes.has(n.file_path)) return 'visible';
   return 'dimmed';
+}
+
+/**
+ * Did the diff report this link as new?
+ *
+ * Two sources, because the engine deliberately reports only one of them.
+ * `rel_deltas` covers edges on entities that exist on both sides. An *added*
+ * entity carries none — every edge it has is new by construction, and UI-086
+ * leaves them off the list so they don't bury the deltas that carry
+ * information. That reasoning holds for a list and fails for a canvas, so any
+ * head edge touching an added entity counts as added here.
+ *
+ * Two key shapes, because the graph changes under aggregation. At entity
+ * level an edge is `(src, tgt, kind)`. Above it, `collapseGraph` merges every
+ * edge between two scopes into one line relabelled `DependsOn`, so the kind
+ * is gone and the honest question becomes "did anything between these two
+ * scopes move".
+ *
+ * Known under-report above entity level: a collapsed line is *not* marked
+ * changed when the only new edges behind it belong to an added entity. Those
+ * edges have no delta to roll up and the collapsed graph does not carry its
+ * constituent edges, so there is nothing to read. It errs toward drawing
+ * fewer lines than changed, never more.
+ */
+function isChangedLink(
+  l: D3Link,
+  src: string,
+  tgt: string,
+  orig: Map<string, string>,
+  args: ComputeArgs,
+): boolean {
+  const s = orig.get(src);
+  const t = orig.get(tgt);
+  if (s === undefined || t === undefined) return false;
+  if (args.diffAddedEntities.has(s) || args.diffAddedEntities.has(t)) return true;
+  return args.diffAddedEdges.has(`${s}->${t}|${l.kind_raw}`)
+    || args.diffAddedEdges.has(`${s}->${t}`);
+}
+
+/** What one rung of the ladder draws, over the nodes that already passed
+ *  every other filter. */
+interface DiffLevelResult {
+  visible: Set<string>;
+  dimmed: Set<string>;
+  /** Link keys the diff reported as new — the whole edge budget at `edits`
+   *  and `rewiring`, and merely decorative at `neighbourhood`. */
+  changedLinkKeys: Set<string>;
+  changedEdgesOnly: boolean;
+}
+
+/**
+ * Run the diff ladder over `candidates` (UI-088).
+ *
+ * The rungs need the graph, not one node at a time — `rewiring` asks for the
+ * far end of a changed edge and `neighbourhood` for anything one hop out —
+ * which is why this is a pass of its own rather than another clause in
+ * `nodePassesFilters`. The membership decision itself lives in `diffLevels`,
+ * where it can be tested without a graph; what happens here is the
+ * translation from nodes and links into the ids that module speaks.
+ */
+function applyDiffLevel(
+  graph: GraphData,
+  candidates: Set<string>,
+  args: ComputeArgs,
+): DiffLevelResult {
+  const orig = new Map(graph.nodes.map((n) => [n.id, normalizeEntityId(n.original_id)]));
+  const changedLinkKeys = new Set<string>();
+  const levelEdges: LevelEdge[] = [];
+  for (const l of graph.links) {
+    const src = sourceIdOf(l);
+    const tgt = targetIdOf(l);
+    const changed = isChangedLink(l, src, tgt, orig, args);
+    if (changed) changedLinkKeys.add(linkKey(src, tgt, l.kind_raw, l.order));
+    levelEdges.push({ src, tgt, changed });
+  }
+
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  const edits = new Set<string>();
+  for (const id of candidates) {
+    const n = byId.get(id);
+    if (n && isEdit(n, args)) edits.add(id);
+  }
+
+  const plan = planDiffLevel(args.diffLevel, candidates, edits, levelEdges);
+  return { ...plan, changedLinkKeys };
 }
 
 /** BFS over dependency edges from `start`, limited by maxLevel and the
@@ -909,12 +1016,22 @@ function compute(args: ComputeArgs): DisplayPlan {
   }
 
   // Force mode.
-  const filterOk = new Set<string>();
+  let filterOk = new Set<string>();
   const dimmedIds = new Set<string>();
   for (const n of graph.nodes) {
     const result = nodePassesFilters(n, args);
     if (result === 'visible') filterOk.add(n.id);
     else if (result === 'dimmed') dimmedIds.add(n.id);
+  }
+
+  // The diff ladder narrows what survived the other filters, and says whether
+  // untouched wiring may be drawn between what is left (UI-088).
+  let changedLinkKeys: Set<string> | null = null;
+  if (args.diffIsActive && args.diffFiltersOn) {
+    const level = applyDiffLevel(graph, filterOk, args);
+    for (const id of level.dimmed) dimmedIds.add(id);
+    filterOk = level.visible;
+    if (level.changedEdgesOnly) changedLinkKeys = level.changedLinkKeys;
   }
 
   let nodeDistances: Map<string, number> | null = null;
@@ -944,6 +1061,11 @@ function compute(args: ComputeArgs): DisplayPlan {
     const s = sourceIdOf(l), t = targetIdOf(l);
     if (!visibleNodeIds.has(s) || !visibleNodeIds.has(t)) continue;
     if (!args.rels.has(l.kind_raw)) continue;
+    // Below `neighbourhood`, an edge has to have moved to earn a line. This
+    // is the whole point of the ladder: three quarters of what the old view
+    // drew was untouched wiring that merely happened to run between two
+    // changed entities.
+    if (changedLinkKeys && !changedLinkKeys.has(linkKey(s, t, l.kind_raw, l.order))) continue;
     // Suppress edges *into* a demoted hub. Inbound is what makes a utility
     // module unreadable — everything points at it — while its own outgoing
     // edges are few and carry real information. The node stays drawn, so the
@@ -1014,13 +1136,14 @@ export const displayPlan: Readable<DisplayPlan> = derived(
     showDirectEdges, showCrossLevelEdges,
     searchMatchIds, searchNeighborIds,
     viewportWidth, treeDensity, treeMaxDepth,
-    diffActive, diffChangesOnly, diffCoreOnly, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges,
+    diffActive, diffLevel, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges,
+    diffChangedEdges, diffAddedEntityIds,
     showGhostNodes, showBuiltinGhosts, showTemplateVars,
     searchHidesNonMatches, searchDimOpacity, diffDimOpacity,
     demoteHubs, hubCount,
     splitViewOpen, crossFilterPaths,
   ],
-  ([$g, $sel, $vm, $kinds, $rels, $langs, $files, $genOut, $genIn, $lo, $sde, $scle, $sm, $sn, $vpW, $den, $dep, $diffAct, $diffCO, $diffCore, $diffFilt, $diffStat, $diffSrc, $diffScopes, $ghosts, $builtinGhosts, $templateVars, $searchHides, $searchDim, $diffDim, $demoteHubs, $hubCount, $splitView, $crossPaths]) => {
+  ([$g, $sel, $vm, $kinds, $rels, $langs, $files, $genOut, $genIn, $lo, $sde, $scle, $sm, $sn, $vpW, $den, $dep, $diffAct, $diffLvl, $diffFilt, $diffStat, $diffSrc, $diffScopes, $diffEdges, $diffAdded, $ghosts, $builtinGhosts, $templateVars, $searchHides, $searchDim, $diffDim, $demoteHubs, $hubCount, $splitView, $crossPaths]) => {
     // The plan is always computed. The render gate is applied to its result
     // rather than in front of it (UI-061): every filter above narrows
     // `visibleNodeIds`, so gating on that count is what makes filtering a
@@ -1045,13 +1168,16 @@ export const displayPlan: Readable<DisplayPlan> = derived(
       vpWidth: $vpW,
       density: $den,
       maxDepth: $dep,
-      // Diff filters are only effective when the master toggle is ON.
-      diffIsActive: $diffAct && $diffFilt,
-      diffChangesOnly: $diffCO,
-      diffCoreOnly: $diffCore,
+      diffIsActive: $diffAct,
+      // The ladder is only effective when the master toggle is ON — a diff
+      // can be loaded and coloured with no filtering at all.
+      diffFiltersOn: $diffFilt,
+      diffLevel: $diffLvl,
       diffStatuses: $diffStat,
       diffSourceChanged: $diffSrc,
       diffScopes: $diffScopes,
+      diffAddedEdges: $diffEdges.added,
+      diffAddedEntities: $diffAdded,
       showGhosts: $ghosts,
       showBuiltinGhosts: $builtinGhosts,
       showTemplateVars: $templateVars,

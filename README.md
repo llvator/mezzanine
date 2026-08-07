@@ -166,6 +166,10 @@ A `nao` binary is installed as a prerequisite of the extension and can
 also be used directly:
 
 ```bash
+# Set a repo up: pin the languages it is written in, in .nao/settings.json
+# (--vscode also adds tasks that start, open and stop the browser UI)
+nao init ./my-project --vscode
+
 # Serve an analysis with live reload (used by the extension)
 nao watch ./my-project --port 3200
 
@@ -187,11 +191,11 @@ A snapshot of `src/` against the same complexity ceiling CI enforces (cyclomatic
 <!-- repo-health:start -->
 | Metric | Value |
 |---|---|
-| Source files (Rust) | 160 |
-| Functions analyzed | 1817 |
-| Functions above ceiling (grandfathered) | 111 |
-| Cyclomatic complexity (p50 / p90 / max) | 3 / 9 / 41 |
-| Cognitive complexity (p50 / p90 / max) | 2 / 13 / 129 |
+| Source files (Rust) | 163 |
+| Functions analyzed | 2048 |
+| Functions above ceiling (grandfathered) | 110 |
+| Cyclomatic complexity (p50 / p90 / max) | 2 / 9 / 41 |
+| Cognitive complexity (p50 / p90 / max) | 1 / 12 / 129 |
 | Max nesting depth (p50 / p90 / max) | 1 / 3 / 12 |
 <!-- repo-health:end -->
 

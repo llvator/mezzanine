@@ -134,8 +134,8 @@ impl AccessPolicy {
     ///
     /// Replaces `CorsLayer::permissive()`. The method and header lists are
     /// the ones the API actually uses — `POST` for `/api/diff`, `/api/scope`
-    /// and friends, `content-type` for their JSON bodies — rather than
-    /// mirroring whatever the request asked for.
+    /// and friends, `DELETE` for leaving diff mode, `content-type` for their
+    /// JSON bodies — rather than mirroring whatever the request asked for.
     pub fn cors_layer(&self) -> CorsLayer {
         let policy = self.clone();
         CorsLayer::new()
@@ -149,7 +149,7 @@ impl AccessPolicy {
                 policy.report_refusal(origin);
                 false
             }))
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
     }
 }

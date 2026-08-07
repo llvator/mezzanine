@@ -32,7 +32,7 @@
  *   scope-query · file-filter · file-tree
  *   quality-summary · metric-threshold · quality-population
  *   quality-population-picker · visual-filter-state · filter-notice
- *   quality-chart · tick · chart-legend · chart-empty
+ *   quality-chart · tick · chart-legend · chart-empty · chart-sampled
  *   overview-panel
  *
  * Checks that need human eyes are NOT modelled here. Each ticket lists them
@@ -104,6 +104,23 @@ class Page {
 
   async goto(url) {
     await this.send('Page.navigate', { url });
+  }
+
+  /**
+   * One keystroke, delivered the way a keyboard delivers it.
+   *
+   * The keymap layer matches on `event.key`, but Chrome will not synthesise a
+   * keydown it cannot place on a physical keyboard, so `code` and the virtual
+   * key code have to be right too — a dispatch missing them arrives with an
+   * empty `code` and the layer's own focus handling ignores it.
+   */
+  async key(k) {
+    const NAMED = { '[': ['BracketLeft', 219], ']': ['BracketRight', 221], '/': ['Slash', 191] };
+    const [code, vk] = NAMED[k]
+      ?? (/^[0-9]$/.test(k) ? [`Digit${k}`, k.charCodeAt(0)] : [`Key${k.toUpperCase()}`, k.toUpperCase().charCodeAt(0)]);
+    const base = { key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
+    await this.send('Input.dispatchKeyEvent', { ...base, type: 'keyDown', text: k });
+    await this.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
   }
 
   close() {
@@ -1018,7 +1035,12 @@ function installProbeLib() {
           d: path?.getAttribute('d')?.slice(0, 12) ?? null,
           fillOpacity: path ? Number(path.getAttribute('fill-opacity')) : null,
           fill: cs?.fill ?? null,
+          // The shape's own value and the group's, separately: since UI-071
+          // the layer opts in part by part — inert group, hittable shape and
+          // label — and a single number could not tell that from a layer that
+          // is hittable all over.
           pointerEvents: cs?.pointerEvents ?? null,
+          groupPointerEvents: getComputedStyle(g).pointerEvents,
           fontSize: text ? getComputedStyle(text).fontSize : null,
         };
       });
@@ -1061,6 +1083,41 @@ function installProbeLib() {
       });
     },
 
+    /**
+     * Every region name as a screen-space box, with the pairs that collide.
+     *
+     * Measured off `getBoundingClientRect` rather than the hull geometry
+     * because the failure is typographic: two names are unreadable when the
+     * *glyphs* overlap, and how wide a name is is a fact about the rendered
+     * text that `computeFolderHulls` cannot know. A pair is reported when the
+     * boxes intersect on both axes.
+     */
+    hullLabelBoxes() {
+      const labels = [...document.querySelectorAll('g.folder-hull text.hull-label')].map((t) => {
+        const r = t.getBoundingClientRect();
+        const g = t.closest('g.folder-hull');
+        return {
+          label: t.textContent.trim(),
+          path: g?.getAttribute('data-path') ?? null,
+          parent: g?.classList.contains('parent') ?? false,
+          x: Math.round(r.x), y: Math.round(r.y),
+          w: Math.round(r.width), h: Math.round(r.height),
+        };
+      // A name scrolled off the canvas is not one the reader can misread.
+      }).filter((l) => l.w > 0 && l.h > 0);
+
+      const collisions = [];
+      for (let i = 0; i < labels.length; i++) {
+        for (let j = i + 1; j < labels.length; j++) {
+          const a = labels[i], b = labels[j];
+          const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+          const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+          if (ox > 0 && oy > 0) collisions.push({ a: a.path, b: b.path, overlapX: ox, overlapY: oy });
+        }
+      }
+      return { labels, collisions };
+    },
+
     /** Index of the hull layer among the canvas's top-level groups. Lower
      *  means painted earlier, i.e. further back. */
     hullPaintOrder() {
@@ -1099,6 +1156,335 @@ function installProbeLib() {
       }));
     },
 
+    // ── standing in a region (UI-071 / UI-089) ───────────────────────────
+
+    /**
+     * Is `(x, y)` inside this outline with room to spare, in local units?
+     *
+     * The margin is the whole point. The canvas strokes a Catmull-Rom curve
+     * *through* the hull polygon, so the drawn shape bulges a few units past
+     * the polygon the app hit-tests — and `isPointInFill` measures the drawn
+     * shape. A sample near a boundary can therefore be inside for the probe
+     * and outside for the card, which is a disagreement between two rulers
+     * rather than a bug in either.
+     */
+    deepInside(shape, x, y, m) {
+      return shape.isPointInFill(new DOMPoint(x, y))
+        && shape.isPointInFill(new DOMPoint(x + m, y))
+        && shape.isPointInFill(new DOMPoint(x - m, y))
+        && shape.isPointInFill(new DOMPoint(x, y + m))
+        && shape.isPointInFill(new DOMPoint(x, y - m));
+    },
+
+    /**
+     * A point unambiguously inside `shape`, in client space, with the regions
+     * it stands in.
+     *
+     * "Unambiguously" is enforced against *every* drawn region, not just this
+     * one: a sample that sits on some other outline's edge would have the
+     * card and the probe disagreeing about that region, and the check would
+     * fail for a reason that has nothing to do with what it is testing.
+     *
+     * The point is also required to be one where a region is the topmost
+     * element, so a check that clicks there exercises the region's own
+     * handler and not a node sitting over it.
+     *
+     * `paths` comes back in paint order — outermost first — which is the
+     * order the card is supposed to list.
+     */
+    regionSampleIn(shapes, shape, ctm) {
+      const MARGIN = 12;
+      const dirOf = (s) => s.parentElement.getAttribute('data-path');
+      const bb = shape.getBBox();
+      for (let gy = 1; gy < 12; gy++) {
+        for (let gx = 1; gx < 12; gx++) {
+          const x = bb.x + (bb.width * gx) / 12;
+          const y = bb.y + (bb.height * gy) / 12;
+          if (!this.deepInside(shape, x, y, MARGIN)) continue;
+          const c = new DOMPoint(x, y).matrixTransform(ctm);
+          const top = document.elementFromPoint(c.x, c.y);
+          if (!top || !top.classList.contains('hull-shape')) continue;
+          let ambiguous = false;
+          const paths = [];
+          for (const other of shapes) {
+            const inside = other.isPointInFill(new DOMPoint(x, y));
+            if (inside !== this.deepInside(other, x, y, MARGIN)) { ambiguous = true; break; }
+            if (inside) paths.push(dirOf(other));
+          }
+          if (ambiguous || paths.length === 0) continue;
+          return {
+            x: c.x,
+            y: c.y,
+            // The region that owns this point is the one painted last among
+            // those containing it — the same rule the double-click follows,
+            // and not necessarily the shape whose box was being sampled.
+            tightest: paths[paths.length - 1],
+            paths,
+          };
+        }
+      }
+      return null;
+    },
+
+    /** A point inside the innermost region that yields one. Innermost
+     *  outward: a tight region can be so full of nodes that every sample
+     *  lands on one, and giving up there would report "no region drawn"
+     *  against a canvas covered in them. */
+    regionProbePoint() {
+      const shapes = [...document.querySelectorAll('g.folder-hull path.hull-shape')];
+      if (!shapes.length) return null;
+      // All the hulls share one parent transform, so one local coordinate
+      // system serves every containment test here.
+      const ctm = shapes[0].getScreenCTM();
+      if (!ctm) return null;
+      for (let i = shapes.length - 1; i >= 0; i--) {
+        const found = this.regionSampleIn(shapes, shapes[i], ctm);
+        if (found) return found;
+      }
+      return null;
+    },
+
+    /** One probe point per drawn region, innermost first.
+     *
+     *  Which folders a spec happens to claim is a property of the repo under
+     *  test, so a check about the spec join has to sweep the regions rather
+     *  than assert against whichever one came out tightest. */
+    regionProbePoints() {
+      const shapes = [...document.querySelectorAll('g.folder-hull path.hull-shape')];
+      if (!shapes.length) return [];
+      const ctm = shapes[0].getScreenCTM();
+      if (!ctm) return [];
+      const out = [];
+      for (let i = shapes.length - 1; i >= 0; i--) {
+        const found = this.regionSampleIn(shapes, shapes[i], ctm);
+        if (found) out.push(found);
+      }
+      return out;
+    },
+
+    /** A client-space point over the canvas that is in no region at all —
+     *  where the card has to be absent rather than showing the nearest
+     *  guess. */
+    pointOutsideRegions() {
+      const svg = document.querySelector('.graph-container svg');
+      if (!svg) return null;
+      const r = svg.getBoundingClientRect();
+      for (let gy = 1; gy < 12; gy++) {
+        for (let gx = 1; gx < 12; gx++) {
+          const x = r.left + (r.width * gx) / 12;
+          const y = r.top + (r.height * gy) / 12;
+          if (document.elementFromPoint(x, y) === svg) return { x, y };
+        }
+      }
+      return null;
+    },
+
+    /** Move the pointer to a client point and report what the card says.
+     *
+     *  The wait is not padding: the card is Svelte state, so it renders on
+     *  the tick after the event. Reading synchronously returns the *previous*
+     *  hover — which reads as a pass anywhere the answer did not change, and
+     *  as "no card" only on the first move.
+     *
+     *  Polled to stability rather than slept on a fixed delay. A single 60ms
+     *  sleep passed most of the time and failed a few runs in ten on a loaded
+     *  machine, which is the worst kind of check: it reports a bug that is
+     *  really the harness reading too early. Two identical consecutive
+     *  samples is the same "settled" test `waitSettled` uses on positions. */
+    async hoverPoint(x, y) {
+      const svg = document.querySelector('.graph-container svg');
+      if (!svg) return null;
+      svg.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: x, clientY: y }));
+      let prev = null;
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 40));
+        const now = this.regionCard();
+        const key = now === null ? 'none' : now.rows.map((r) => r.path).join('>') + '|' + (now.spec?.head ?? '');
+        if (prev === key) return now;
+        prev = key;
+      }
+      return this.regionCard();
+    },
+
+    /** The "where am I" card, or null when there isn't one. */
+    regionCard() {
+      const card = document.querySelector('[data-probe="region-card"]');
+      if (!card) return null;
+      const box = card.getBoundingClientRect();
+      return {
+        rows: [...card.querySelectorAll('[data-probe="region-row"]')].map((r) => ({
+          path: r.getAttribute('data-region-path'),
+          text: r.textContent.replace(/\s+/g, ' ').trim(),
+          tightest: r.classList.contains('tightest'),
+        })),
+        path: card.querySelector('[data-probe="region-path"]')?.textContent.trim() ?? null,
+        hint: card.querySelector('[data-probe="region-hint"]')?.textContent.trim() ?? null,
+        // The spec claim (UI-097): who says something about this folder, and
+        // whether the words are about the folder itself or an ancestor.
+        spec: (() => {
+          const s = card.querySelector('[data-probe="region-spec"]');
+          if (!s) return null;
+          return {
+            id: s.getAttribute('data-spec-id'),
+            head: s.querySelector('.region-spec-head')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+            via: s.querySelector('[data-probe="region-spec-via"]')?.textContent.trim() ?? null,
+            desc: s.querySelector('[data-probe="region-spec-desc"]')?.textContent.trim() ?? null,
+          };
+        })(),
+        unclaimed: card.querySelector('[data-probe="region-spec-none"]') !== null,
+        // What the region's relationships do (UI-071's second half). Read as
+        // text on purpose: the claim is that the card makes a readable
+        // statement about containment, not that a number reached the DOM.
+        traffic: card.querySelector('[data-probe="region-traffic"]')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+        counts: [...card.querySelectorAll('[data-probe="region-count"]')].map((c) => ({
+          text: c.textContent.trim(),
+          partial: c.classList.contains('partial'),
+        })),
+        box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
+        pointerEvents: getComputedStyle(card).pointerEvents,
+      };
+    },
+
+    /** Polled for the same reason `hoverPoint` is: the disappearance is a
+     *  render, and a fixed sleep turns a slow frame into a failed check. */
+    async leaveCanvas() {
+      const svg = document.querySelector('.graph-container svg');
+      if (!svg) return null;
+      svg.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true }));
+      for (let i = 0; i < 15; i++) {
+        if (document.querySelector('[data-probe="region-card"]') === null) return true;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return false;
+    },
+
+    /** Click whatever is on top at a client point — the deselect regression
+     *  (UI-071): over a region that is now hittable, this still has to be a
+     *  click on nothing. */
+    clickPoint(x, y) {
+      const el = document.elementFromPoint(x, y);
+      if (!el) return null;
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: x, clientY: y }));
+      return {
+        on: el.getAttribute('class'),
+        selected: document.querySelectorAll('g.node.selected').length,
+      };
+    },
+
+    /** Double-click a region — the focus gesture (UI-089).
+     *
+     *  Dispatched on whatever is topmost, which is what a real pointer hits.
+     *  Deliberately *not* aimed at the outline element: the outline is the
+     *  backmost layer, so an edge crossing the region gets the event instead,
+     *  and a probe that reached past it would be testing a gesture no reader
+     *  can make. The class it landed on is returned so a failure says which. */
+    dblclickPoint(x, y) {
+      const el = document.elementFromPoint(x, y);
+      if (!el) return null;
+      el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, clientX: x, clientY: y }));
+      return el.getAttribute('class');
+    },
+
+    /** The folder of every drawn node that has one — what a focused view is
+     *  allowed to contain.
+     *
+     *  Ghosts are excluded. An external symbol has no file, so it belongs to
+     *  no folder and cannot be "outside" the region: drilling into a small
+     *  scope reopens it at entity level, which is exactly when ghosts appear
+     *  in numbers. Counting them as strangers would fail the check for doing
+     *  the right thing. */
+    drawnFolders() {
+      return [...document.querySelectorAll('g.node')]
+        .filter((g) => g.style.display !== 'none' && !g.classList.contains('ghost'))
+        .map((g) => g.__data__?.file_path ?? '')
+        .filter((p) => p !== '')
+        .map((p) => this.folderOfPath(p));
+    },
+
+    /** UI-092. The wayback's two controls, plus how deep the stack is.
+     *
+     *  Depth comes off `data-depth` because it is the one thing about this
+     *  feature no pixel answers: "did that gesture record a frame" is
+     *  invisible until you press the button, and a check that has to press
+     *  the button to find out cannot then assert that nothing moved. */
+    wayback() {
+      const back = document.querySelector('[data-probe="wayback-back"]');
+      const fwd = document.querySelector('[data-probe="wayback-forward"]');
+      if (!back || !fwd) return null;
+      return {
+        depth: Number(back.closest('.wayback')?.getAttribute('data-depth') ?? -1),
+        backEnabled: !back.disabled,
+        forwardEnabled: !fwd.disabled,
+        backTitle: back.getAttribute('title') ?? '',
+        forwardTitle: fwd.getAttribute('title') ?? '',
+      };
+    },
+
+    clickWayback(dir) {
+      const b = document.querySelector(`[data-probe="wayback-${dir}"]`);
+      if (!b || b.disabled) return false;
+      b.click();
+      return true;
+    },
+
+    /** UI-095. The address strip: what it says, and what of it is climbable.
+     *
+     *  `clickable` is read off the tag rather than a class, because the claim
+     *  is that the crumb you are standing on is not a control at all — a
+     *  `<span>` styled to look inert would still be clickable if someone gave
+     *  it a handler. */
+    crumbs() {
+      const nav = document.querySelector('[data-probe="scope-crumbs"]');
+      if (!nav) return null;
+      return {
+        parts: [...nav.querySelectorAll('.crumb')].map((c) => ({
+          label: c.textContent.trim(),
+          clickable: c.tagName === 'BUTTON',
+          current: c.classList.contains('current'),
+        })),
+        elided: !!nav.querySelector('.elided'),
+        filtered: !!nav.querySelector('.filtered'),
+      };
+    },
+
+    clickCrumb(label) {
+      const b = [...document.querySelectorAll('[data-probe="scope-crumbs"] button.crumb')]
+        .find((c) => c.textContent.trim() === label);
+      if (!b) return false;
+      b.click();
+      return true;
+    },
+
+    /** Double-click the first drawn collapsed node — the canonical drill,
+     *  and the gesture every other one in UI-092 is measured against. */
+    drillFirstCollapsed() {
+      const g = [...document.querySelectorAll('g.node')].find(
+        (n) => n.style.display !== 'none' && ['File', 'Module'].includes(n.__data__?.kind_raw),
+      );
+      if (!g) return null;
+      g.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      return g.__data__.original_id;
+    },
+
+    /** The paths the scope tree says are in scope — what a restore has to
+     *  put back. */
+    scopeSelection() {
+      return [...document.querySelectorAll('.scope-tree .tree-item')]
+        .filter((r) => r.querySelector('.select-cb')?.checked)
+        .map((r) => r.querySelector('.label')?.getAttribute('title') ?? '')
+        .filter(Boolean)
+        .sort();
+    },
+
+    /** Select the first drawn node, so the deselect check has something to
+     *  lose. Returns how many nodes ended up selected. */
+    selectFirstNode() {
+      const g = [...document.querySelectorAll('g.node')].find((n) => n.style.display !== 'none');
+      if (!g) return 0;
+      g.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return document.querySelectorAll('g.node.selected').length;
+    },
+
     setCohesion(level) {
       const b = document.querySelector(`[data-probe="cohesion-${level}"]`);
       if (!b) return false;
@@ -1111,7 +1497,7 @@ function installProbeLib() {
         .map((b) => ({ label: b.textContent.trim(), active: b.getAttribute('aria-pressed') === 'true' }));
     },
 
-    /** Turn the diff filters off, and report whether a diff was active.
+    /** Widen the diff to its top rung, and report whether a diff was active.
      *
      *  Originally a workaround: with a diff loaded, File and Module
      *  aggregation drew nothing at all, so a layout suite measured an empty
@@ -1119,42 +1505,115 @@ function installProbeLib() {
      *  scope rollup instead of missing an entity-keyed lookup.
      *
      *  It stays because the layout suites want *every* node in the scope,
-     *  not the changed ones. With `diffCoreOnly` defaulting to true, a
-     *  suite that did not clear it would now measure a real but partial
-     *  canvas — which is worse than an obviously empty one. */
+     *  not the changed ones. The ladder defaults to its narrowest rung
+     *  (UI-088), so a suite that did not widen would measure a real but
+     *  partial canvas — which is worse than an obviously empty one. */
     clearDiffFilters() {
-      const boxes = [...document.querySelectorAll('.diff-filter-group input[type=checkbox]')];
-      let cleared = 0;
-      for (const cb of boxes) {
-        if (!cb.checked) continue;
-        cb.click();
-        cleared++;
-      }
-      return { diffActive: boxes.length > 0, cleared };
+      const rungs = [...document.querySelectorAll('[data-probe="diff-level"] button')];
+      const top = document.querySelector('[data-probe="diff-level-neighbourhood"]');
+      const cleared = top && !top.classList.contains('active') ? (top.click(), 1) : 0;
+      return { diffActive: rungs.length > 0, cleared };
     },
 
-    /** Set the two diff filter checkboxes and report where they landed.
-     *  Order matches the bar: [Changes, Core]. */
-    setDiffFilters(want) {
-      const boxes = [...document.querySelectorAll('.diff-filter-group input[type=checkbox]')];
-      want.forEach((on, i) => { if (boxes[i] && boxes[i].checked !== on) boxes[i].click(); });
-      return boxes.map((b) => b.checked);
+    /** Move the diff ladder to one rung: 'edits' | 'rewiring' |
+     *  'neighbourhood'. Returns the rung that ended up active. */
+    setDiffLevel(level) {
+      document.querySelector(`[data-probe="diff-level-${level}"]`)?.click();
+      return document.querySelector('[data-probe="diff-level"] button.active')?.dataset.probe ?? null;
     },
 
     /** Enough of the diff bar to tell "no diff loaded" from "diff loaded and
      *  drawing nothing" — the two look identical on the canvas and only one
      *  of them is a bug. */
     diffState() {
-      const boxes = [...document.querySelectorAll('.diff-filter-group input[type=checkbox]')];
+      const rungs = [...document.querySelectorAll('[data-probe="diff-level"] button')];
       const nodes = [...document.querySelectorAll('g.node')];
+      const active = rungs.find((b) => b.classList.contains('active'));
+      const counts = document.querySelector('[data-probe="stats-counts"]')?.textContent ?? '';
       return {
-        active: boxes.length > 0,
-        filters: boxes.map((b) => b.checked),
+        active: rungs.length > 0,
+        level: active ? active.textContent.trim().toLowerCase() : null,
         dom: nodes.length,
         shown: nodes.filter((n) => getComputedStyle(n).display !== 'none').length,
-        level: [...document.querySelectorAll('button.level-btn')]
-          .find((b) => b.classList.contains('active'))?.textContent.trim() ?? null,
+        // The stats bar is the one place that reports *edges*, and edges are
+        // what UI-088 is about — a rung that changed only the node count
+        // would have missed the point entirely.
+        links: Number((counts.match(/(\d+)\s+relationships/) ?? [0, 0])[1]),
+        undrawable: document.querySelector('[data-probe="diff-undrawable"]')?.textContent.trim() ?? null,
       };
+    },
+
+    /** What the details pane is drawing for the selected entity's source
+     *  (UI-085). `null` when there is no diff renderer on the page at all,
+     *  which is the state that shipped for as long as the base-source lookup
+     *  was keyed the wrong way. */
+    sourceDiff() {
+      const el = document.querySelector('[data-probe="source-diff"]');
+      if (!el) return null;
+      const counts = el.querySelector('.counts')?.textContent ?? '';
+      const num = (re) => Number((counts.match(re) ?? [0, 0])[1]);
+      const rows = [...el.querySelectorAll('.split-row')];
+      return {
+        mode: el.dataset.diffMode,
+        added: num(/\+(\d+)/),
+        removed: num(/[−-](\d+)/),
+        unifiedLines: el.querySelectorAll('.diff-line').length,
+        splitRows: rows.length,
+        splitCells: rows.reduce((n, r) => n + r.querySelectorAll('.cell').length, 0),
+        addedLines: el.querySelectorAll('.diff-line-added').length,
+        removedLines: el.querySelectorAll('.diff-line-removed').length,
+        gaps: [...el.querySelectorAll('[data-probe="diff-gap"]')].map((g) => g.textContent.trim()),
+        fits: el.scrollWidth <= el.clientWidth + 1,
+      };
+    },
+
+    /** Click one of the diff view's own controls by probe name. */
+    clickProbe(name) {
+      const b = document.querySelector(`[data-probe="${name}"]`);
+      if (!b) return false;
+      b.click();
+      return true;
+    },
+
+    /** The relationships the selected entity gained and lost (UI-086). */
+    relChanges() {
+      return [...document.querySelectorAll('[data-probe="rel-change"]')].map((r) => ({
+        status: r.classList.contains('rc-added') ? 'added' : 'removed',
+        text: r.textContent.replace(/\s+/g, ' ').trim(),
+        navigable: !r.disabled,
+      }));
+    },
+
+    /** Type into the dataset search. The one route to a named entity that
+     *  does not depend on where the canvas happened to draw it. */
+    searchFor(name) {
+      const input = el('search-input');
+      if (!input) return false;
+      const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      set.call(input, name);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    },
+
+    /** Pin a search result into the details pane, matched on name *and*
+     *  file. Neither alone is enough: the search also matches file and
+     *  folder names, so asking for a function in `diff.rs` by either half
+     *  can pin the file entity instead and every later assertion then
+     *  describes the wrong subject. */
+    searchPick(name, file) {
+      const items = [...document.querySelectorAll('[data-probe="search-results"] .search-result-item')];
+      const hit = items.find((li) =>
+        li.querySelector('.result-name')?.textContent.trim() === name
+        && (li.getAttribute('title') ?? '').includes(file));
+      const btn = hit?.querySelector('.row-btn');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    },
+
+    /** Which entity the details pane is currently pinned to. */
+    pinnedEntity() {
+      return document.querySelector('[data-probe="entity-name"]')?.textContent.trim() ?? null;
     },
 
     /** Persisted like the theme — raw, not JSON (settings.ts). Set this
@@ -1366,6 +1825,18 @@ async function ready(page, ms = 6000) {
   await page.eval(installProbeLib);
   await sleep(ms);
   await page.eval(installProbeLib); // survive the app's own re-render
+  // …and survive a navigation that commits *after* that install. `goto` is
+  // `Page.navigate`, which returns before the new document exists, so both
+  // installs above can land in the outgoing one — leaving `window.__probe`
+  // undefined and every check in the suite failing on a TypeError rather than
+  // on anything it was written to measure. Seen once in ten runs on a loaded
+  // machine, which is exactly often enough to be believed as a real failure.
+  for (let i = 0; i < 20; i++) {
+    const there = await page.eval(() => typeof window.__probe);
+    if (there === 'object') break;
+    await page.eval(installProbeLib);
+    await sleep(250);
+  }
   // The canvas toolbar's collapsed state persists in localStorage and the
   // probe reuses whatever Chrome instance is already on the debug port, so a
   // previous session — or a human poking at the app — can leave it collapsed
@@ -3208,6 +3679,23 @@ const SUITES = {
         },
       },
       {
+        id: 'region-names-stay-readable',
+        criterion: 'No two region names are drawn on top of each other',
+        async run(page) {
+          // The whole point of a region is that it is *named*; two names
+          // stacked on one another name nothing. Nesting is what makes this
+          // structural rather than unlucky — a parent's outline touches its
+          // child's along the top, so their names are anchored within a few
+          // pixels of each other by construction, not by accident.
+          await page.eval(() => window.__probe.setHullDepth(3));
+          await sleep(1500);
+          const { labels, collisions } = await page.eval(() => window.__probe.hullLabelBoxes());
+          return ok(collisions.length === 0, { names: labels.length, collisions },
+            collisions.length === 0 ? ''
+              : `${collisions.length} pair(s) overlap, worst ${collisions.reduce((w, c) => Math.max(w, c.overlapX), 0)}px across`);
+        },
+      },
+      {
         id: 'parents-read-as-headings',
         criterion: 'A parent is outline-only, and its name is the larger one',
         async run(page) {
@@ -3263,6 +3751,319 @@ const SUITES = {
           await sleep(500);
           const segs = await page.eval(() => window.__probe.hullDepthState());
           return ok(segs.find((s) => s.active)?.depth === 2, segs);
+        },
+      },
+    ],
+  },
+
+  'ui-071': {
+    ticket: 'UI-071/UI-089', title: 'Which region am I in, and focusing it',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      // Scope, then *confirm* it took. A toggle sent while the index is still
+      // arriving finds no row and silently does nothing, and every check then
+      // fails with "no region to stand in" — which reads as a broken feature
+      // and is an empty canvas. Retried a few times rather than assumed.
+      const scope = await widestScope(page);
+      for (let i = 0; i < 6; i++) {
+        const state = await page.eval((p) => window.__probe.scopeRowState(p), scope);
+        if (!state?.checked) await page.eval((p) => window.__probe.toggleScopePath(p), scope);
+        await sleep(1500);
+        if (await page.eval(() => window.__probe.renderedNodes()) > 0) break;
+      }
+      await clearDiff(page);
+      // High cohesion and two tiers for the same reason ui-070 uses them: a
+      // nested trail is the thing under test, and zero separable regions is a
+      // legitimate outcome of the default setting.
+      await page.eval(() => window.__probe.setCohesion('high'));
+      await page.eval(() => window.__probe.setHulls(true));
+      await page.eval(() => window.__probe.setHullDepth(2));
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'card-names-the-region',
+        criterion: 'Standing in a region raises a card naming it',
+        async run(page) {
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in — did any outline get drawn?');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const named = card?.rows?.some((r) => r.path === p.tightest);
+          return ok(!!named, { point: p, card },
+            card ? (named ? '' : 'the card names a different region than the one under the pointer') : 'no card appeared inside a region');
+        },
+      },
+      {
+        id: 'card-lists-every-enclosing-region',
+        criterion: 'The card lists the whole enclosing stack, widest first',
+        async run(page) {
+          // The plural is the point: with tiers the pointer is inside several
+          // regions at once, and one name hides the more useful half of the
+          // answer.
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const rows = card?.rows?.map((r) => r.path) ?? [];
+          const same = rows.length === p.paths.length && rows.every((r, i) => r === p.paths[i]);
+          return ok(same, { shape: p.paths, card: rows },
+            same ? '' : 'the card and the shapes under the pointer disagree about where you are');
+        },
+      },
+      {
+        id: 'card-says-what-the-relationships-do',
+        criterion: 'The card says how much of the region\'s coupling stays inside it',
+        async run(page) {
+          // The question the outline exists to raise and never answered: is
+          // this a subsystem, or a directory someone filed things in?
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const line = card?.traffic ?? '';
+          const label = (p.tightest || '').split('/').pop();
+          const speaks = /relationships/.test(line) && (!label || line.includes(label));
+          return ok(speaks, { traffic: line, tightest: p.tightest },
+            speaks ? '' : 'the card still says nothing about what the region is coupled to');
+        },
+      },
+      {
+        id: 'the-sentence-does-not-impersonate-cohesion',
+        criterion: 'It states counts, not a percentage the Quality panel would contradict',
+        async run(page) {
+          // Two numbers under one name is worse than one: the Quality panel
+          // measures every dependency edge in the repo, this measures what is
+          // drawn, and they legitimately disagree.
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const line = card?.traffic ?? '';
+          const clean = line !== '' && !/%/.test(line) && !/cohesion/i.test(line);
+          return ok(clean, line,
+            clean ? '' : 'the card is quoting a ratio that the Quality panel measures differently');
+        },
+      },
+      {
+        id: 'tightest-region-is-the-focus-target',
+        criterion: 'The last row is the tightest region, and the hint names it',
+        async run(page) {
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const rows = card?.rows ?? [];
+          const last = rows[rows.length - 1];
+          const marked = rows.filter((r) => r.tightest);
+          const pass = !!last && last.path === p.tightest && marked.length === 1
+            && marked[0].path === p.tightest && !!card.path && !!card.hint;
+          return ok(pass, { card, tightest: p.tightest },
+            pass ? '' : 'the row a double-click would act on is not the one the card emphasises');
+        },
+      },
+      {
+        id: 'card-is-inert',
+        criterion: 'The card cannot intercept the gestures it describes',
+        async run(page) {
+          // It tracks the cursor, so anything it caught would be aimed at the
+          // region or the node underneath it — including the double-click it
+          // is advertising.
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          return ok(card?.pointerEvents === 'none', { pointerEvents: card?.pointerEvents });
+        },
+      },
+      {
+        id: 'card-stays-inside-the-canvas',
+        criterion: 'Near an edge the card flips rather than being clipped',
+        async run(page) {
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          // Two moves: the flip is computed from the box measured on the
+          // previous frame, so a card that has never been shown has no size
+          // to reason about yet.
+          await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const view = await page.eval(() => {
+            const r = document.querySelector('.graph-container').getBoundingClientRect();
+            return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+          });
+          const b = card?.box;
+          const inside = !!b && b.left >= view.left - 1 && b.right <= view.right + 1
+            && b.top >= view.top - 1 && b.bottom <= view.bottom + 1;
+          return ok(inside, { box: b, view },
+            inside ? '' : 'the card hangs off the canvas');
+        },
+      },
+      {
+        id: 'no-region-no-card',
+        criterion: 'Off every region the card goes away rather than guessing',
+        async run(page) {
+          // Two different nothings, told apart: a canvas with no regions on
+          // it, and a canvas so covered in them that no sample lands outside.
+          // The old note claimed the second whichever it was, which sent the
+          // last debugging session looking for a hull bug that was an empty
+          // canvas.
+          const drawn = await page.eval(() => document.querySelectorAll('g.folder-hull').length);
+          const out = await page.eval(() => window.__probe.pointOutsideRegions());
+          if (!out) return ok(false, { regions: drawn }, drawn === 0
+            ? 'no regions on the canvas at all — the scope or the outline toggle did not take'
+            : 'every sampled point was inside a region');
+          const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [out.x, out.y]);
+          return ok(card === null, { point: out, card },
+            card === null ? '' : 'the card named a region the pointer is not in');
+        },
+      },
+      {
+        id: 'leaving-the-canvas-clears-the-card',
+        criterion: 'The card does not outlive the pointer',
+        async run(page) {
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to stand in');
+          await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+          const gone = await page.eval(() => window.__probe.leaveCanvas());
+          return ok(gone === true, { gone });
+        },
+      },
+      {
+        id: 'a-claimed-folder-carries-its-spec-entity',
+        criterion: 'A folder a `cr:` claims shows the entity and its description',
+        async run(page) {
+          // Swept rather than asserted on one region: which folders a spec
+          // claims is a property of the repo under test. Every region is
+          // required to say *something* — an entity or "no spec entity claims
+          // this folder" — and at least one must find a claim, or the join is
+          // not running at all.
+          const points = await page.eval(() => window.__probe.regionProbePoints());
+          if (!points.length) return ok(false, null, 'no regions drawn to hover');
+          const cards = [];
+          for (const p of points) {
+            cards.push(await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]));
+          }
+          const said = cards.filter((c) => c && (c.spec || c.unclaimed));
+          const claimed = cards.filter((c) => c?.spec?.head);
+          const pass = said.length === cards.length && claimed.length > 0;
+          return ok(pass, {
+            regions: cards.length,
+            claimed: claimed.map((c) => ({ path: c.path, head: c.spec.head, via: c.spec.via, desc: !!c.spec.desc })),
+            silent: cards.length - said.length,
+          }, pass
+            ? ''
+            : (claimed.length === 0
+              ? 'no region found a claiming entity — is the spec graph loaded, and does this repo`s spec name folders?'
+              : 'a region said nothing at all about the spec, neither a claim nor its absence'));
+        },
+      },
+      {
+        id: 'an-inherited-claim-says-whose-words-they-are',
+        criterion: 'A claim from a folder above is labelled with the path it describes',
+        async run(page) {
+          // `cr: "ui/"` genuinely covers `ui/src/stores`, but its words are
+          // about `ui`. Passing them off as the subfolder's own description
+          // would put words in the author's mouth.
+          const points = await page.eval(() => window.__probe.regionProbePoints());
+          const seen = [];
+          for (const p of points) {
+            const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+            if (card?.spec) seen.push({ path: card.path, via: card.spec.via });
+          }
+          if (!seen.length) return ok(false, null, 'no claimed region to inspect');
+          // Every claim is either exact — no `via` line — or labelled with a
+          // path that is a proper ancestor of the folder being described.
+          const wrong = seen.filter((s) => s.via && !s.path.startsWith(`${s.via.replace(/^claims /, '')}/`));
+          return ok(wrong.length === 0, { seen, wrong },
+            wrong.length === 0 ? '' : 'an inherited claim names a path that does not contain the folder');
+        },
+      },
+      {
+        id: 'a-paragraph-does-not-become-a-wall',
+        criterion: 'A spec description leaves the card a card',
+        async run(page) {
+          // `d:` is one string by grammar and a paragraph in practice — this
+          // repo's longest runs past 300 words. The clamp is the reason the
+          // join could ship on a hover surface at all.
+          const points = await page.eval(() => window.__probe.regionProbePoints());
+          let worst = null;
+          for (const p of points) {
+            const card = await page.eval(([x, y]) => window.__probe.hoverPoint(x, y), [p.x, p.y]);
+            if (!card) continue;
+            const h = card.box.bottom - card.box.top;
+            if (worst && h <= worst.h) continue;
+            // Captured here, while this card is the one on screen. Measuring
+            // after the loop reports whichever card was hovered last, which
+            // is how the first version of this diagnostic sent the reader
+            // after an innocent 86px card.
+            const parts = await page.eval(() => {
+              const c = document.querySelector('[data-probe="region-card"]');
+              return c === null ? null : [...c.children].map((e) => ({
+                part: e.getAttribute('data-probe') ?? (e.getAttribute('class') ?? '').split(' ')[0],
+                h: Math.round(e.getBoundingClientRect().height),
+              }));
+            });
+            worst = { h, path: card.path, desc: card.spec?.desc?.length ?? 0, parts };
+          }
+          if (!worst) return ok(false, null, 'no card measured');
+          // 215, raised from 200 when the card gained the traffic sentence
+          // (UI-071's second half). Deliberate, not a concession: the budget
+          // is protecting against a card that reads as a panel, and every
+          // cheaper saving was worse — eliding the trail would reverse
+          // UI-089's decision that the card names the *whole* enclosing
+          // stack, and the description is already CSS line-clamped to two
+          // lines and cannot give anything back. The card also went from
+          // 260px to 300px wide, which paid for most of the new line.
+          const CEILING = 215;
+          return ok(worst.h <= CEILING, worst,
+            worst.h <= CEILING ? '' : `the card grew to ${Math.round(worst.h)}px — something on it is not paying its way`);
+        },
+      },
+      {
+        id: 'a-region-click-still-deselects',
+        criterion: 'Clicking a region with no node under the pointer deselects',
+        async run(page) {
+          // The regression the whole feature was skipped for the first time
+          // round: deselect used to fire only when the click landed on the
+          // <svg> itself, so a hittable region would have swallowed it
+          // everywhere a hull reaches.
+          // Select first and let the canvas settle: selecting opens the
+          // details column, which narrows the canvas and restarts the layout,
+          // so a point picked beforehand aims at where the region used to be.
+          const selected = await page.eval(() => window.__probe.selectFirstNode());
+          await waitSettled(page);
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, { selected }, 'no region to click');
+          const after = await page.eval(([x, y]) => window.__probe.clickPoint(x, y), [p.x, p.y]);
+          const pass = selected > 0 && after?.on?.includes('hull-shape') && after.selected === 0;
+          return ok(pass, { selected, after },
+            pass ? '' : 'a click on a region no longer counts as a click on nothing');
+        },
+      },
+      {
+        id: 'double-click-focuses-the-region',
+        criterion: 'Double-clicking a region narrows the view to it',
+        async run(page) {
+          const p = await page.eval(() => window.__probe.regionProbePoint());
+          if (!p) return ok(false, null, 'no region to focus');
+          const before = await page.eval(() => window.__probe.drawnFolders());
+          const on = await page.eval(([x, y]) => window.__probe.dblclickPoint(x, y), [p.x, p.y]);
+          await waitSettled(page);
+          // Poll for the narrowed view rather than sampling once. Focusing is
+          // a scope change, a re-fetch and a re-level, and `waitSettled` only
+          // proves the *positions* stopped moving — which they also do while
+          // the old picture is still on screen waiting for the new one. Asserts
+          // on the transition, not on a moment.
+          const outsideOf = (fs) => fs.filter((f) => f !== p.tightest && !f.startsWith(`${p.tightest}/`));
+          let after = await page.eval(() => window.__probe.drawnFolders());
+          for (let i = 0; i < 10 && (after.length === 0 || outsideOf(after).length > 0); i++) {
+            await sleep(600);
+            after = await page.eval(() => window.__probe.drawnFolders());
+          }
+          const outside = outsideOf(after);
+          // Not a node count: focusing re-enables auto-level, so a small
+          // region legitimately opens at entity level and draws *more* nodes
+          // than the file-level view it came from. Narrower means narrower in
+          // what the view is *about*, which is the folder test below.
+          const widerBefore = before.some((f) => f !== p.tightest && !f.startsWith(`${p.tightest}/`));
+          const pass = after.length > 0 && outside.length === 0 && widerBefore;
+          return ok(pass, { on, focused: p.tightest, before: before.length, after: after.length, outside: [...new Set(outside)].slice(0, 8) },
+            pass ? '' : (widerBefore ? 'the view still holds folders from outside the region that was focused' : 'the view was already only that region — nothing was narrowed'));
         },
       },
     ],
@@ -3364,15 +4165,28 @@ const SUITES = {
         },
       },
       {
-        id: 'does-not-steal-clicks',
-        criterion: 'Outlines are not hit-testable, so click-to-deselect survives',
+        id: 'only-the-region-itself-is-hittable',
+        criterion: 'The outline takes events; the empty space around it does not',
         async run(page) {
-          // A hittable hull covers most of the canvas and would silently
-          // break the background-click deselect, which only fires when the
-          // event target is the <svg> itself.
+          // This check used to read "outlines are not hit-testable", which was
+          // the *mechanism* UI-055 used to protect click-to-deselect: the
+          // deselect test fired only when the event target was the <svg>
+          // itself, and a hull covers most of the canvas. UI-071 made the
+          // region hittable and widened that test to count a hull as
+          // background, so the mechanism moved and the claim did not.
+          //
+          // What is still ui-055's to assert is the layering: the group stays
+          // inert and only the two drawn parts opt in, so the gap between one
+          // region and the next is empty canvas. That deselect still happens
+          // is asserted behaviourally in `ui-071`, which is where the gesture
+          // now lives — it is deliberately not repeated here, because
+          // selecting a node refocuses the whole graph and would leave the
+          // rest of this suite measuring a different picture.
           const hulls = await page.eval(() => window.__probe.hulls());
-          const pass = hulls.length > 0 && hulls.every((h) => h.pointerEvents === 'none');
-          return ok(pass, hulls.map((h) => h.pointerEvents), pass ? '' : 'a hull is hit-testable');
+          const pass = hulls.length > 0
+            && hulls.every((h) => h.groupPointerEvents === 'none' && h.pointerEvents === 'fill');
+          return ok(pass, hulls.map((h) => ({ path: h.path, group: h.groupPointerEvents, shape: h.pointerEvents })),
+            pass ? '' : 'the region layer no longer opts in part by part');
         },
       },
       {
@@ -3438,46 +4252,120 @@ const SUITES = {
       },
       {
         id: 'collapsed-canvas-draws',
-        criterion: 'A scope that auto-collapses to File level draws nodes under the default filters',
+        criterion: 'A scope that auto-collapses to File level draws nodes at the narrowest rung',
         async run(page) {
           // The bug, exactly: `Shown: 0` on a scope that was just reported as
           // in-scope and collapsed, with every sidebar filter permissive.
-          await page.eval((w) => window.__probe.setDiffFilters(w), [false, true]);
+          await page.eval(() => window.__probe.setDiffLevel('edits'));
           await sleep(3000);
           const s = await page.eval(() => window.__probe.diffState());
           return ok(s.shown > 0, s,
-            s.shown > 0 ? '' : 'diff filters emptied the collapsed canvas — the entity-keyed lookup is back');
+            s.shown > 0 ? '' : 'the narrowest rung emptied the collapsed canvas — the entity-keyed lookup is back');
         },
       },
       {
-        id: 'filters-narrow-rather-than-erase',
-        criterion: 'core ⊆ changes ⊆ everything, with each step a real count',
+        id: 'rungs-narrow-rather-than-erase',
+        criterion: 'edits ⊆ rewiring ⊆ neighbourhood, with each step a real count',
         async run(page) {
           // A filter that hides everything and a filter that hides nothing
           // are both easy to ship by accident. What says the rollup is being
           // read is the ladder between them.
-          const at = async (want) => {
-            await page.eval((w) => window.__probe.setDiffFilters(w), want);
+          const at = async (level) => {
+            await page.eval((l) => window.__probe.setDiffLevel(l), level);
             await sleep(2500);
             return (await page.eval(() => window.__probe.diffState())).shown;
           };
-          const core = await at([false, true]);
-          const changes = await at([true, false]);
-          const all = await at([false, false]);
-          const pass = core > 0 && core <= changes && changes <= all && changes < all;
-          return ok(pass, { core, changes, all },
-            pass ? '' : 'expected 0 < core ≤ changes < all — a flat ladder means the filter is not consulting the rollup');
+          const edits = await at('edits');
+          const rewiring = await at('rewiring');
+          const neighbourhood = await at('neighbourhood');
+          const pass = edits > 0 && edits <= rewiring && rewiring <= neighbourhood
+            && rewiring < neighbourhood;
+          return ok(pass, { edits, rewiring, neighbourhood },
+            pass ? '' : 'expected 0 < edits ≤ rewiring < neighbourhood — a flat ladder means the rungs are not consulting the rollup');
+        },
+      },
+    ],
+  },
+
+  'ui-088': {
+    ticket: 'UI-088', title: 'The diff ladder draws what changed, edges included',
+    // Needs a diff loaded. Against your own engine, not the one you are using:
+    //   nao watch <repo> --port 3010 --allow-origin http://localhost:5210
+    //   curl -XPOST localhost:3010/api/diff -H 'content-type: application/json' \
+    //        -d '{"from_ref":"HEAD~1","to_ref":"WORKING"}'
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await sleep(14000);
+    },
+    checks: [
+      {
+        id: 'diff-is-loaded',
+        criterion: 'A diff is active, so the rest of this suite means something',
+        async run(page) {
+          const s = await page.eval(() => window.__probe.diffState());
+          return ok(s.active, s, s.active ? '' : 'no diff ladder on screen — compute a diff (see the suite header)');
         },
       },
       {
-        id: 'clearing-restores-everything',
-        criterion: 'With both filters off, every node in the scope is back',
+        id: 'edits-draws-no-untouched-wiring',
+        criterion: 'The narrowest rung draws strictly fewer edges than the widest',
         async run(page) {
-          await page.eval((w) => window.__probe.setDiffFilters(w), [false, false]);
-          await sleep(2500);
+          // The finding UI-088 exists for: three quarters of the edges the
+          // old view drew were untouched wiring that merely happened to run
+          // between two changed entities. If these two counts are equal, the
+          // rung is not filtering edges at all and the ticket is unbuilt.
+          const at = async (level) => {
+            await page.eval((l) => window.__probe.setDiffLevel(l), level);
+            await sleep(2500);
+            return await page.eval(() => window.__probe.diffState());
+          };
+          const edits = await at('edits');
+          const neighbourhood = await at('neighbourhood');
+          const pass = edits.links < neighbourhood.links;
+          return ok(pass, { edits: edits.links, neighbourhood: neighbourhood.links },
+            pass ? '' : 'the narrow rung drew as many edges as the wide one — edges are not being filtered');
+        },
+      },
+      {
+        id: 'rewiring-reaches-unedited-far-ends',
+        criterion: 'Rewiring draws nodes that Edits does not — the far ends of changed edges',
+        async run(page) {
+          const at = async (level) => {
+            await page.eval((l) => window.__probe.setDiffLevel(l), level);
+            await sleep(2500);
+            return await page.eval(() => window.__probe.diffState());
+          };
+          const edits = await at('edits');
+          const rewiring = await at('rewiring');
+          // Equal is a legitimate outcome on a diff where every changed edge
+          // happens to land between two edited entities, so this reports
+          // rather than fails on equality — but it must never shrink.
+          const pass = rewiring.shown >= edits.shown;
+          return ok(pass, { editsNodes: edits.shown, rewiringNodes: rewiring.shown },
+            pass ? '' : 'widening the rung removed nodes — the ladder is not ordered');
+        },
+      },
+      {
+        id: 'undrawable-edges-are-counted-not-dropped',
+        criterion: 'Reported edge changes the canvas cannot draw are stated on screen',
+        async run(page) {
+          // A removed edge has no line in the head graph, by construction.
+          // Saying nothing about it is the failure mode: the canvas would
+          // read as complete coverage of the diff when it is not.
+          await page.eval(() => window.__probe.setDiffLevel('edits'));
+          await sleep(2000);
           const s = await page.eval(() => window.__probe.diffState());
-          return ok(s.dom > 0 && s.shown === s.dom, s,
-            s.shown === s.dom ? '' : 'nodes stayed hidden with no diff filter asking for it');
+          const summary = await page.eval(() => ({
+            edges: document.querySelector('[data-probe="diff-edge-counts"]')?.textContent.trim() ?? null,
+          }));
+          // If the diff reported removals, the note must be there. If it
+          // reported none, its absence is correct.
+          const removals = Number((summary.edges?.match(/[−-]\s*(\d+)/) ?? [0, 0])[1]);
+          const pass = removals === 0 ? s.undrawable === null : s.undrawable !== null;
+          return ok(pass, { ...summary, removals, undrawable: s.undrawable },
+            pass ? '' : `${removals} removed edges reported but nothing on screen says they cannot be drawn`);
         },
       },
     ],
@@ -4004,7 +4892,589 @@ const SUITES = {
       },
     ],
   },
+
+  'ui-085': {
+    ticket: 'UI-085', title: 'The details pane diffs the code it is showing',
+    /**
+     * Needs a diff. Compute one first:
+     *   curl -XPOST localhost:3000/api/diff -H 'content-type: application/json' \
+     *        -d '{"from_ref":"HEAD~1","to_ref":"WORKING"}'
+     *
+     * The line arithmetic — pairing, folding, counting — is unit-tested
+     * (`npm run test:linediff`). What needs a browser is everything between
+     * the engine and the pixels: that a base source is actually *found* for
+     * the pinned entity (it wasn't, for as long as the lookup keys
+     * disagreed), that both sides get drawn, and that the two controls do
+     * what they say.
+     */
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      const subject = await changedSubject();
+      if (!subject) throw new Error('no modified entity with source on both sides — compute a diff (see the suite header)');
+      await ensureScope(page, topScopeOf(subject.file_path));
+      await selectByName(page, subject.name, subject.file_path);
+    },
+    checks: [
+      {
+        id: 'a-changed-entity-is-drawn-as-a-diff',
+        criterion: 'The pinned entity shows a diff, not a printout of its current source',
+        async run(page) {
+          const d = await page.eval(() => window.__probe.sourceDiff());
+          const pinned = await page.eval(() => window.__probe.pinnedEntity());
+          const pass = !!d && d.added + d.removed > 0;
+          return ok(pass, { pinned, ...(d ?? {}) },
+            d ? (pass ? '' : 'a diff frame with nothing marked in it')
+              : 'no diff renderer in the pane — the base source was not found');
+        },
+      },
+      {
+        id: 'every-counted-line-is-marked',
+        criterion: 'Unified view marks exactly the lines it counted, on both sides',
+        async run(page) {
+          // Not "there is at least one of each": which entity the engine
+          // reports as the biggest edit is a property of the working tree,
+          // and a pure insertion is a perfectly good diff. What must hold on
+          // any fixture is that the header and the body agree.
+          await page.eval(() => window.__probe.clickProbe('diff-mode-unified'));
+          await sleep(400);
+          const d = await page.eval(() => window.__probe.sourceDiff());
+          const pass = d?.mode === 'unified' && d.addedLines === d.added && d.removedLines === d.removed;
+          return ok(pass, d, pass ? '' : 'the +/- header and the marked lines disagree');
+        },
+      },
+      {
+        id: 'split-puts-before-beside-after',
+        criterion: 'Split view draws two cells per row and nothing spills sideways',
+        async run(page) {
+          await page.eval(() => window.__probe.clickProbe('diff-mode-split'));
+          await sleep(400);
+          const d = await page.eval(() => window.__probe.sourceDiff());
+          const paired = !!d && d.splitRows > 0 && d.splitCells === d.splitRows * 2;
+          return ok(paired && d.mode === 'split', d,
+            paired ? '' : 'the two columns are not row-aligned');
+        },
+      },
+      {
+        id: 'the-choice-survives-a-reload',
+        criterion: 'The view mode is remembered',
+        async run(page) {
+          await page.goto(APP); await ready(page);
+          // The scope survives the reload and the row *toggles*, so this
+          // re-selects only if something cleared it.
+          const subject = await changedSubject();
+          await ensureScope(page, topScopeOf(subject.file_path));
+          await selectByName(page, subject.name, subject.file_path);
+          const d = await page.eval(() => window.__probe.sourceDiff());
+          // Put it back for the checks below, which read the unified rows.
+          await page.eval(() => window.__probe.clickProbe('diff-mode-unified'));
+          await sleep(300);
+          return ok(d?.mode === 'split', d, d?.mode === 'split' ? '' : 'the pane forgot the split view');
+        },
+      },
+      {
+        id: 'unchanged-stretches-fold-away',
+        criterion: 'Far-from-the-change lines collapse, and the toggle brings them back',
+        async run(page) {
+          const folded = await page.eval(() => window.__probe.sourceDiff());
+          await page.eval(() => window.__probe.clickProbe('diff-context-toggle'));
+          await sleep(400);
+          const whole = await page.eval(() => window.__probe.sourceDiff());
+          await page.eval(() => window.__probe.clickProbe('diff-context-toggle'));
+          await sleep(400);
+          // A short entity has nothing to fold, and that is not a failure —
+          // what must hold is that "whole entity" never shows *less*.
+          const pass = !!whole && whole.unifiedLines >= (folded?.unifiedLines ?? 0)
+            && whole.gaps.length === 0;
+          return ok(pass, { folded: { lines: folded?.unifiedLines, gaps: folded?.gaps }, whole: { lines: whole?.unifiedLines, gaps: whole?.gaps } },
+            pass ? '' : 'the context toggle did not restore the hidden lines');
+        },
+      },
+      {
+        id: 'a-changed-file-diffs-itself',
+        criterion: 'A file node shows the file\'s own diff, and what changed inside it',
+        async run(page) {
+          // The state a reader is actually in: Current Changes on anything
+          // bigger than a small scope opens at File level, so the node under
+          // the cursor is a file — which has no row in the diff at all, since
+          // `compute_diff` walks entities and a file is not one. Before
+          // UI-097 this pane printed the file's source with nothing marked.
+          const file = await changedFile();
+          if (!file) return ok(false, null, 'no changed file with text on both sides — fixture, not the code');
+          await page.eval((l) => window.__probe.setLevel(l), 'File');
+          await sleep(3000);
+          const clicked = await page.eval((n) => window.__probe.selectNode(n), file.name);
+          await sleep(2500);
+          const d = await page.eval(() => window.__probe.sourceDiff());
+          const tally = await page.eval(() => {
+            const el = document.querySelector('[data-probe="scope-tally"]');
+            return el ? el.textContent.replace(/\s+/g, ' ').trim() : null;
+          });
+          const pinned = await page.eval(() => window.__probe.pinnedEntity());
+          // Put the level back: it persists, and a later suite that searches
+          // for an entity would find it "collapsed into its file" and select
+          // the file instead — measuring the wrong subject entirely.
+          await page.eval((l) => window.__probe.setLevel(l), 'Entity');
+          await sleep(2000);
+          const pass = clicked && !!d && d.added + d.removed > 0 && !!tally;
+          return ok(pass, { file: file.name, pinned, tally, diff: d && { added: d.added, removed: d.removed, gaps: d.gaps.length } },
+            pass ? '' : 'the file node still says nothing about what changed in it');
+        },
+      },
+    ],
+  },
+
+  'ui-086': {
+    ticket: 'UI-086', title: 'Relationships that appeared or disappeared',
+    /**
+     * Same fixture as ui-085 — a computed diff. The engine's own arithmetic
+     * is unit-tested in `cargo test --lib diff::`; this asserts the pane
+     * reports exactly what the engine found, including the edges that are in
+     * neither the head graph nor the canvas and so have nowhere else to
+     * appear.
+     */
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      const subject = await rewiredSubject();
+      if (!subject) throw new Error('no entity with edge changes in the engine diff');
+      await ensureScope(page, topScopeOf(subject.file_path));
+      // These rows belong to an entity, and the level persists across runs:
+      // at File level the search hit is "collapsed into its file" and
+      // selecting it pins the file, whose deltas are a different question.
+      await page.eval((l) => window.__probe.setLevel(l), 'Entity');
+      await sleep(2500);
+      await selectByName(page, subject.name, subject.file_path);
+    },
+    checks: [
+      {
+        id: 'the-engine-counts-rewiring',
+        criterion: 'The diff reports edges appearing or disappearing at all',
+        async run() {
+          const d = await engineDiff();
+          const n = (d.summary.relationships_added ?? 0) + (d.summary.relationships_removed ?? 0);
+          return ok(n > 0, d.summary, n > 0 ? '' : 'no edge deltas in this diff — the checks below prove nothing');
+        },
+      },
+      {
+        id: 'every-changed-edge-is-listed',
+        criterion: 'The pane lists exactly the deltas the engine gave for this entity',
+        async run(page) {
+          const subject = await rewiredSubject();
+          const rows = await page.eval(() => window.__probe.relChanges());
+          const want = subject.rel_deltas.length;
+          const added = rows.filter((r) => r.status === 'added').length;
+          const wantAdded = subject.rel_deltas.filter((r) => r.status === 'added').length;
+          const pass = rows.length === want && added === wantAdded;
+          return ok(pass, { entity: subject.name, rows: rows.length, want, added, wantAdded, sample: rows.slice(0, 3) },
+            pass ? '' : 'the pane and the engine disagree about what moved');
+        },
+      },
+      {
+        id: 'a-changed-edge-names-its-far-end',
+        criterion: 'Each row says which entity is at the other end',
+        async run(page) {
+          const subject = await rewiredSubject();
+          const rows = await page.eval(() => window.__probe.relChanges());
+          const missing = subject.rel_deltas.filter(
+            (d) => !rows.some((r) => r.text.includes(d.other_name)),
+          );
+          return ok(missing.length === 0, { missing: missing.map((m) => m.other_name).slice(0, 5) },
+            missing.length ? 'a delta was counted but its far end is not named' : '');
+        },
+      },
+      {
+        id: 'a-listed-edge-navigates',
+        criterion: 'A row whose far end is on the canvas selects it',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.pinnedEntity());
+          const moved = await page.eval(() => {
+            const r = [...document.querySelectorAll('[data-probe="rel-change"]')].find((x) => !x.disabled);
+            if (!r) return false;
+            r.click();
+            return true;
+          });
+          await sleep(1200);
+          const after = await page.eval(() => window.__probe.pinnedEntity());
+          // No navigable row is a legitimate state — every far end may be
+          // off-canvas — but then this claim is untested, and saying so is
+          // better than a green tick.
+          return ok(moved && after !== before, { moved, before, after },
+            moved ? (after === before ? 'the row did not move the selection' : '')
+              : 'no navigable row in this diff to click');
+        },
+      },
+    ],
+  },
+
+  'ui-092': {
+    ticket: 'UI-092', title: 'A way back from every drill',
+    /**
+     * Every check here is about a *sequence*, because that is where a history
+     * goes wrong: one step looks right in isolation and the third one lands
+     * somewhere nobody was. So the suite drills, adjusts, steps back, steps
+     * forward and drills again, asserting the stack depth at each point —
+     * depth being the thing that says whether a gesture was remembered, which
+     * is the claim the pixels cannot make.
+     */
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'the-controls-are-there-and-empty',
+        criterion: 'Back and forward exist, disabled, before anything has been navigated',
+        async run(page) {
+          const w = await page.eval(() => window.__probe.wayback());
+          if (!w) return ok(false, null, 'no wayback controls in the toolbar bar');
+          // Ticking a folder in the scope tree is an adjustment, not a
+          // navigation — and the first-run auto-scope replaced an empty
+          // canvas, which is not a picture worth returning to.
+          const pass = w.depth === 0 && !w.backEnabled && !w.forwardEnabled;
+          return ok(pass, w, pass ? '' : 'the stack is not empty before the first navigation');
+        },
+      },
+      {
+        id: 'a-drill-is-remembered',
+        criterion: 'Drilling into a collapsed node records the picture it left',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.scopeSelection());
+          const target = await page.eval(() => window.__probe.drillFirstCollapsed());
+          if (!target) return ok(false, { before }, 'nothing collapsed on the canvas to drill into');
+          await waitSettled(page);
+          const w = await page.eval(() => window.__probe.wayback());
+          const after = await page.eval(() => window.__probe.scopeSelection());
+          const narrowed = JSON.stringify(after) !== JSON.stringify(before);
+          const pass = narrowed && w.depth === 1 && w.backEnabled && !w.forwardEnabled;
+          return ok(pass, { target, before, after, w },
+            pass ? '' : 'the drill either did not narrow the scope or was not recorded');
+        },
+      },
+      {
+        id: 'the-button-names-where-it-leads',
+        criterion: 'Back says which picture it goes to, not just "Back"',
+        async run(page) {
+          const w = await page.eval(() => window.__probe.wayback());
+          const pass = /^Back to .+/.test(w.backTitle) && !/^Back to\s*$/.test(w.backTitle);
+          return ok(pass, w.backTitle, pass ? '' : 'the control names a direction and no destination');
+        },
+      },
+      {
+        id: 'an-adjustment-is-not-a-navigation',
+        criterion: 'Toggling a filter adds no frame to the stack',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.wayback());
+          // Node labels: a display toggle, on the far side of UI-082's line —
+          // it changes how the picture looks, not which entities reach it.
+          const clicked = await page.eval(() => window.__probe.clickText('Node Labels'));
+          await sleep(400);
+          const after = await page.eval(() => window.__probe.wayback());
+          const pass = clicked && after.depth === before.depth;
+          return ok(pass, { clicked, before: before.depth, after: after.depth },
+            pass ? '' : 'an adjustment grew the history — back would now undo a checkbox');
+        },
+      },
+      {
+        id: 'back-returns-the-previous-picture',
+        criterion: 'Back restores the scope the drill left',
+        async run(page) {
+          const drilled = await page.eval(() => window.__probe.scopeSelection());
+          const moved = await page.eval(() => window.__probe.clickWayback('back'));
+          await waitSettled(page);
+          const now = await page.eval(() => window.__probe.scopeSelection());
+          const w = await page.eval(() => window.__probe.wayback());
+          const pass = moved && JSON.stringify(now) !== JSON.stringify(drilled)
+            && w.depth === 0 && !w.backEnabled && w.forwardEnabled;
+          return ok(pass, { drilled, now, w },
+            pass ? '' : 'back did not restore the previous scope, or recorded itself');
+        },
+      },
+      {
+        id: 'forward-goes-back-in',
+        criterion: 'Forward returns the picture back was pressed from',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.scopeSelection());
+          const moved = await page.eval(() => window.__probe.clickWayback('forward'));
+          await waitSettled(page);
+          const now = await page.eval(() => window.__probe.scopeSelection());
+          const w = await page.eval(() => window.__probe.wayback());
+          const pass = moved && JSON.stringify(now) !== JSON.stringify(before)
+            && w.depth === 1 && !w.forwardEnabled;
+          return ok(pass, { before, now, w },
+            pass ? '' : 'forward did not return to the drilled picture');
+        },
+      },
+      {
+        id: 'a-new-navigation-drops-the-forward-stack',
+        criterion: 'Stepping back and then drilling elsewhere makes forward unreachable',
+        async run(page) {
+          await page.eval(() => window.__probe.clickWayback('back'));
+          await waitSettled(page);
+          const mid = await page.eval(() => window.__probe.wayback());
+          const target = await page.eval(() => window.__probe.drillFirstCollapsed());
+          await waitSettled(page);
+          const w = await page.eval(() => window.__probe.wayback());
+          const pass = mid.forwardEnabled && !w.forwardEnabled && w.backEnabled;
+          return ok(pass, { mid, after: w, target },
+            pass ? '' : 'forward survived a new navigation and now points somewhere nobody was');
+        },
+      },
+      {
+        id: 'the-keys-work-from-anywhere',
+        criterion: '[ and ] step the history whichever pane has focus',
+        async run(page) {
+          const before = await page.eval(() => window.__probe.wayback());
+          if (!before.backEnabled) return ok(false, before, 'nothing to step back to');
+          await page.key('0');   // focus the sidebar — the pane furthest from the canvas
+          await page.key('[');
+          await waitSettled(page);
+          const after = await page.eval(() => window.__probe.wayback());
+          const pass = after.depth === before.depth - 1 && after.forwardEnabled;
+          return ok(pass, { before, after },
+            pass ? '' : '`[` did nothing from the sidebar — the binding is not global');
+        },
+      },
+    ],
+  },
+
+  'ui-095': {
+    ticket: 'UI-095', title: 'The canvas says where you are',
+    /**
+     * The claims worth measuring are the ones where a strip could *lie*: an
+     * address shown for a scope that has none, a crumb that looks clickable
+     * and is where you already are, and a climb that silently keeps the
+     * aggregation level the deep scope picked.
+     */
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      await page.eval((n) => window.__probe.pickScope(n), 'ui');
+      await clearDiff(page);
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'the-address-is-rooted-and-deepest-last',
+        criterion: 'A single-path scope reads as its ancestors, rooted at repo',
+        async run(page) {
+          const c = await page.eval(() => window.__probe.crumbs());
+          if (!c) return ok(false, null, 'no address strip in the toolbar bar');
+          const labels = c.parts.map((p) => p.label);
+          const pass = labels[0] === 'repo' && labels[labels.length - 1] === 'ui';
+          return ok(pass, c, pass ? '' : 'the strip does not name where the reader is');
+        },
+      },
+      {
+        id: 'where-you-are-is-not-a-link',
+        criterion: 'The deepest crumb is not clickable — there is nowhere for it to go',
+        async run(page) {
+          const c = await page.eval(() => window.__probe.crumbs());
+          const last = c.parts[c.parts.length - 1];
+          const others = c.parts.slice(0, -1);
+          const pass = last.current && !last.clickable && others.every((p) => p.clickable);
+          return ok(pass, c.parts,
+            pass ? '' : 'either the current crumb is a control or an ancestor is not');
+        },
+      },
+      {
+        id: 'a-crumb-climbs-and-is-undoable',
+        criterion: 'Clicking an ancestor widens the scope and Back returns',
+        /**
+         * Drills first, so the climb under test is to a *middle* crumb — the
+         * real case, and the one `repo` cannot stand in for. Climbing to the
+         * root would also reload the whole repo, which is the heaviest thing
+         * this suite could ask for and made it flake under load.
+         *
+         * It ends where it started, at `ui`, because the next check needs a
+         * scope with two folders in it to mark from.
+         */
+        async run(page) {
+          // Read the address, not the scope tree: a single-file scope renders
+          // no checked row, so `scopeSelection` is `[]` both before and after
+          // and would pass a Back that did nothing.
+          const where = async () => {
+            const c = await page.eval(() => window.__probe.crumbs());
+            return c?.parts.map((p) => p.label).join('/') ?? null;
+          };
+          const target = await page.eval(() => window.__probe.drillFirstCollapsed());
+          if (!target) return ok(false, null, 'nothing collapsed to drill into');
+          await waitSettled(page);
+          const drilled = await where();
+          const depth0 = (await page.eval(() => window.__probe.wayback())).depth;
+
+          const clicked = await page.eval(() => window.__probe.clickCrumb('ui'));
+          await waitSettled(page);
+          const climbed = await where();
+          const depth1 = (await page.eval(() => window.__probe.wayback())).depth;
+
+          await page.eval(() => window.__probe.clickWayback('back'));
+          await waitSettled(page);
+          const back = await where();
+          // And back to where the check started, for whoever runs next.
+          await page.eval(() => window.__probe.clickWayback('back'));
+          await waitSettled(page);
+
+          const pass = clicked && depth1 === depth0 + 1
+            && climbed === 'repo/ui' && drilled !== climbed && back === drilled;
+          return ok(pass, { target, drilled, climbed, back, depth0, depth1 },
+            pass ? '' : 'the climb either did not move, was not recorded, or did not come back');
+        },
+      },
+      {
+        id: 'a-scope-with-no-address-is-not-given-one',
+        criterion: 'A multi-path scope says how many paths, and offers no climb',
+        async run(page) {
+          // Mark two files in different folders and drill: the result has no
+          // single folder, which is exactly the case a naive strip invents an
+          // answer for.
+          const marked = await page.eval(() => {
+            const nodes = [...document.querySelectorAll('g.node')]
+              .filter((g) => g.style.display !== 'none' && g.__data__?.file_path);
+            const seen = new Set(); const picked = [];
+            for (const g of nodes) {
+              const dir = g.__data__.file_path.split('/').slice(0, -1).join('/');
+              if (seen.has(dir)) continue;
+              seen.add(dir); picked.push(g);
+              if (picked.length === 2) break;
+            }
+            for (const g of picked) {
+              g.dispatchEvent(new MouseEvent('click', { bubbles: true, metaKey: true }));
+            }
+            return picked.length;
+          });
+          if (marked < 2) return ok(false, { marked }, 'could not mark two files in different folders');
+          await page.eval(() => window.__probe.clickText('Drill into'));
+          await waitSettled(page);
+          const c = await page.eval(() => window.__probe.crumbs());
+          const pass = c && c.parts.length === 1 && !c.parts[0].clickable
+            && /\d+ paths/.test(c.parts[0].label);
+          return ok(pass, c, pass ? '' : 'the strip invented a folder for a scope that has none');
+        },
+      },
+      {
+        id: 'the-strip-does-not-crowd-the-counts',
+        criterion: 'At 1280 the address never overlaps the counts',
+        async run(page) {
+          await page.viewport(1280, 800);
+          await sleep(600);
+          const hit = await page.eval(() => window.__probe.overlap('scope-crumbs', 'stats-bar'));
+          const crumbBox = await page.eval(() => window.__probe.box('scope-crumbs'));
+          await page.viewport(1600, 1000);
+          await sleep(400);
+          return ok(hit === null, { overlap: hit, crumbBox },
+            hit === null ? '' : 'the address strip pushed into the counts');
+        },
+      },
+    ],
+  },
 };
+
+// ── Diff fixture helpers (ui-085 / ui-086) ───────────────────────────────
+//
+// Read from the engine rather than written down here: which entity changed
+// is a property of the working tree the probe happens to run against, and a
+// name hard-coded in this file would go stale on the next commit.
+
+let engineDiffCache = null;
+async function engineDiff() {
+  if (!engineDiffCache) {
+    const resp = await fetch(`${ENGINE}/api/diff`);
+    if (!resp.ok) throw new Error(`no diff on ${ENGINE} — compute one first`);
+    engineDiffCache = await resp.json();
+  }
+  return engineDiffCache;
+}
+
+/** The detail sidecars, head and base. Fetched because "modified" in the
+ *  diff does not imply "has source on both sides" — a Svelte component
+ *  entity, for instance, carries none — and a subject with nothing to show
+ *  would fail these checks for a reason that is not the one under test. */
+let sidecarCache = null;
+async function sidecars() {
+  if (!sidecarCache) {
+    const [head, base] = await Promise.all([
+      fetch(`${ENGINE}/api/details`).then((r) => r.json()),
+      fetch(`${ENGINE}/api/details/base`).then((r) => r.json()),
+    ]);
+    sidecarCache = { head, base };
+  }
+  return sidecarCache;
+}
+
+/** A modified entity whose own source moved and whose text exists on both
+ *  sides, preferring the biggest edit — a one-line change would leave the
+ *  folding checks with nothing to fold. */
+async function changedSubject() {
+  const d = await engineDiff();
+  const { head, base } = await sidecars();
+  const loc = (e) => Math.abs(e.metric_deltas?.find((m) => m.name === 'loc')?.delta ?? 0);
+  return d.entities
+    .filter((e) => e.status === 'modified' && e.source_changed && e.base_entity_id)
+    .filter((e) => head[e.entity_id]?.source_code && base[e.base_entity_id]?.source_code)
+    .sort((a, b) => loc(b) - loc(a))[0] ?? null;
+}
+
+/** A file the diff changed, with its text on both sides — the fixture for
+ *  the file-level checks. */
+async function changedFile() {
+  const subject = await changedSubject();
+  if (!subject) return null;
+  const { head, base } = await sidecars();
+  const path = subject.file_path;
+  if (!head[path]?.source_code || !base[path]?.source_code) return null;
+  return { path, name: path.split('/').pop() };
+}
+
+/** The top-level scope holding a path — what the scope tree offers, rather
+ *  than a directory written down in this file. `src` was hard-coded here and
+ *  the suite went red the day the working tree's edits landed under `ui/`. */
+function topScopeOf(filePath) {
+  const i = filePath.indexOf('/');
+  return i < 0 ? filePath : filePath.slice(0, i);
+}
+
+/** The entity the diff has the most to say about, edge-wise. */
+async function rewiredSubject() {
+  const d = await engineDiff();
+  return d.entities
+    .filter((e) => (e.rel_deltas?.length ?? 0) > 0)
+    .sort((a, b) => b.rel_deltas.length - a.rel_deltas.length)[0] ?? null;
+}
+
+/**
+ * Get the app to a state where `path` is the analysis scope.
+ *
+ * Two pieces of leaked state to undo first, both persisted and both of which
+ * turn every later assertion into a measurement of an empty app:
+ *
+ *  - The sidebar tab. On `quality`, `.sidebar-top` holds the Quality panel and
+ *    the scope tree is not in the DOM at all, so `pickScope` silently finds
+ *    nothing. Any earlier suite that opened Quality leaves it that way.
+ *  - The scope itself. The row *toggles* and survives a reload, so an
+ *    unguarded pick clears a scope a previous run selected.
+ */
+async function ensureScope(page, path) {
+  await page.eval(() => window.__probe.pickTab('Filters'));
+  await sleep(500);
+  const st = await page.eval((p) => window.__probe.scopeRowState(p), path);
+  if (!st?.checked) await page.eval((n) => window.__probe.pickScope(n), path);
+  await sleep(6000);
+  return st;
+}
+
+/** Search for an entity and pin it, disambiguating by file path. */
+async function selectByName(page, name, file) {
+  await page.eval((n) => window.__probe.searchFor(n), name);
+  await sleep(1500);
+  const picked = await page.eval(([n, f]) => window.__probe.searchPick(n, f), [name, file]);
+  // The detail sidecar (source, fields) loads after the selection lands.
+  await sleep(2000);
+  return picked;
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 

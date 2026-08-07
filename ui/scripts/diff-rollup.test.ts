@@ -24,7 +24,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { rollUpByScope, scopeChain, normalizeScopePath } from '../src/viewmodels/diffRollup.ts';
+import { rollUpByScope, rollUpCounts, scopeChain, normalizeScopePath } from '../src/viewmodels/diffRollup.ts';
 import { collapseGraph } from '../src/viewmodels/collapseGraph.ts';
 import type { EntityDiff, ChangeStatus } from '../src/stores/diff.ts';
 import type { D3Node, GraphData } from '../src/types/graph.ts';
@@ -256,4 +256,56 @@ test('a file that changed reaches its own module node and no other', () => {
   // to walk up from.
   assert.ok(drawn.includes(''), 'a top-level file should produce a root module node');
   assert.equal(scopes.get('')?.status, 'unchanged');
+});
+
+// ── Counts, for the details pane (UI-097) ────────────────────────────────
+//
+// A file node has no row in the diff — `compute_diff` walks entities and a
+// file is not one — so when the pane is asked what changed in the file the
+// reader just clicked, this rollup is the only thing that can answer.
+
+test('the counts add up to the entities that reported', () => {
+  const counts = rollUpCounts([
+    entry('ui/src/a.ts', 'added'),
+    entry('ui/src/a.ts', 'modified', true),
+    entry('ui/src/a.ts', 'modified', false, 'ripple'),
+    entry('ui/src/a.ts', 'removed'),
+    entry('ui/src/a.ts', 'unchanged', false),
+  ]);
+  const t = counts.get('ui/src/a.ts');
+  assert.deepEqual(t, { added: 1, removed: 1, modified: 2, unchanged: 1, core: 3 });
+  assert.equal(
+    (t?.added ?? 0) + (t?.removed ?? 0) + (t?.modified ?? 0) + (t?.unchanged ?? 0),
+    5,
+    'every entity in the file lands in exactly one bucket',
+  );
+});
+
+test('core counts the edits, not the ripple', () => {
+  // The distinction the pane shows as "N edited": an entity whose fan-in
+  // moved because something else changed did not itself change.
+  const counts = rollUpCounts([
+    entry('ui/src/a.ts', 'modified', true),
+    entry('ui/src/a.ts', 'modified', false, 'ripple'),
+    entry('ui/src/a.ts', 'modified', false, 'ripple2'),
+  ]);
+  assert.equal(counts.get('ui/src/a.ts')?.core, 1);
+  assert.equal(counts.get('ui/src/a.ts')?.modified, 3);
+});
+
+test('a file\'s counts also reach the module drawn above it', () => {
+  const counts = rollUpCounts([
+    entry('ui/src/stores/diff.ts', 'modified', true),
+    entry('ui/src/stores/graph.ts', 'unchanged', false),
+  ]);
+  assert.equal(counts.get('ui/src/stores')?.modified, 1);
+  assert.equal(counts.get('ui/src/stores')?.unchanged, 1);
+  // Same rule as the verdict rollup: one module up, not every ancestor.
+  assert.equal(counts.get('ui/src'), undefined);
+});
+
+test('an unchanged file still reports, so "no rollup" means "not in the diff"', () => {
+  const counts = rollUpCounts([entry('ui/src/a.ts', 'unchanged', false)]);
+  assert.deepEqual(counts.get('ui/src/a.ts'), { added: 0, removed: 0, modified: 0, unchanged: 1, core: 0 });
+  assert.equal(counts.get('ui/src/never-seen.ts'), undefined);
 });

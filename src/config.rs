@@ -55,6 +55,29 @@ pub struct AnalysisConfig {
     /// the file set rather than narrowing it.
     pub include_docs: bool,
 
+    /// Whether local and module-level assignments become entities.
+    ///
+    /// Off by default, because on any real repo they are most of the graph
+    /// and no consumer lists them. Measured on tinygrad (449 files): 162,550
+    /// of 225,606 real entities are `Variable` or `Constant` — 72% — and they
+    /// carry 104k of the 228k relationships. Meanwhile `mcp::tools::is_listed`
+    /// hides `Variable` from every agent-facing answer, and the canvas draws
+    /// at most `DRAW_CEILING` (2,000) nodes. The default analysis was paying
+    /// to build, serialize and ship a population nothing displays (CFG-005).
+    ///
+    /// The same widening-switch shape as `include_docs`, and for the same
+    /// reason: `filters.entity_kinds` is an *allow-list*, so "everything
+    /// except variables" would mean naming all twenty kinds by hand.
+    ///
+    /// What "off" does not touch is in [`crate::analyzer::Analyzer`]'s
+    /// filter: class fields survive, and so does any assignment doing
+    /// structural work. See `apply_filters`.
+    ///
+    /// `serde(default)` so a config serialized before this field existed
+    /// still loads — and loads with the new default, which is the point.
+    #[serde(default)]
+    pub include_locals: bool,
+
     /// Whether to include standard library references
     pub include_stdlib: bool,
 
@@ -77,6 +100,33 @@ pub struct AnalysisConfig {
     /// cannot re-enable the pass under serve.
     #[serde(default = "default_allow_unsafe_passes")]
     pub allow_unsafe_passes: bool,
+
+    /// Where the Elevator (`.elv`) spec lives, when it isn't simply
+    /// "wherever it happens to be under the root".
+    ///
+    /// `None` — the default and the behaviour nao has always had — means
+    /// every `.elv` file the walk finds is part of the spec. That is right
+    /// for a repo whose only `.elv` files *are* its spec, and wrong for two
+    /// layouts that turn up often enough to need saying:
+    ///
+    /// - The specs live outside the analyzed tree — a docs repo beside the
+    ///   code, or a monorepo where you watch one service and the domain
+    ///   model sits at the top. Those files are never walked, so the spec
+    ///   layer is simply empty.
+    /// - The specs live inside the tree, but so do other `.elv` files —
+    ///   fixtures, examples, a tutorial. Those are entities in the spec
+    ///   graph that no one meant to publish.
+    ///
+    /// Set, it answers both at once with one rule: **a `.elv` file is part
+    /// of the spec if and only if it lives here.** Files elsewhere under
+    /// the root stop counting, and a directory outside the root gets walked
+    /// for `.elv` files that would otherwise never be seen.
+    ///
+    /// Relative paths resolve against [`Config::root_path`], so a repo file
+    /// can say `"spec_dir": "docs/domain"` without knowing where it was
+    /// cloned. See [`Config::spec_root`].
+    #[serde(default)]
+    pub spec_dir: Option<PathBuf>,
 }
 
 fn default_allow_unsafe_passes() -> bool {
@@ -255,6 +305,7 @@ impl Default for AnalysisConfig {
             include_external: false,
             include_tests: false,
             include_docs: false,
+            include_locals: false,
             include_stdlib: false,
             exclude_patterns: vec![
                 "**/node_modules/**".to_string(),
@@ -267,6 +318,7 @@ impl Default for AnalysisConfig {
             ],
             include_patterns: Vec::new(), // Include all by default
             allow_unsafe_passes: default_allow_unsafe_passes(),
+            spec_dir: None, // Every .elv under the root is the spec
         }
     }
 }
@@ -312,6 +364,35 @@ impl Config {
             root_path: path.into(),
             ..Default::default()
         }
+    }
+
+    /// [`AnalysisConfig::spec_dir`] resolved into the same path space as the
+    /// walk: relative to [`Self::root_path`] unless it is already absolute.
+    ///
+    /// Deliberately lexical — no `canonicalize`, no existence check. The
+    /// walk starts at `root_path` and yields paths that begin with it
+    /// verbatim, so `nao analyze .` produces `./spec/nao.elv` and this
+    /// produces `./spec`. Canonicalizing one side and not the other would
+    /// compare `/abs/repo/spec` against `./spec/nao.elv`, match nothing, and
+    /// leave the spec layer silently empty — which is the one failure mode
+    /// worth engineering against here, because it looks exactly like a repo
+    /// that has no spec.
+    pub fn spec_root(&self) -> Option<PathBuf> {
+        let dir = self.analysis.spec_dir.as_ref()?;
+        Some(if dir.is_absolute() {
+            dir.clone()
+        } else {
+            self.root_path.join(dir)
+        })
+    }
+
+    /// Whether the spec directory needs a walk of its own — true when it
+    /// lies outside the analyzed root, which is the case `spec_dir` mainly
+    /// exists for (specs in a sibling docs repo, or above a watched
+    /// subdirectory of a monorepo).
+    pub fn spec_is_outside_root(&self) -> bool {
+        self.spec_root()
+            .is_some_and(|spec| !spec.starts_with(&self.root_path))
     }
 
     /// Builder: set output format

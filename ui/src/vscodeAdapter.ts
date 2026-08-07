@@ -182,8 +182,8 @@ export function reportFilters(state: {
   }
 }
 
-/** Report current diff state (active flag, refs, summary counts, filter
- *  toggles) so the native Diff side view can render a summary + controls. */
+/** Report current diff state (active flag, refs, summary counts, detail
+ *  level) so the native Diff side view can render a summary + controls. */
 export function reportDiff(state: {
   active: boolean;
   fromRef?: string;
@@ -196,8 +196,10 @@ export function reportDiff(state: {
     modifiedImpact?: number;
     unchanged: number;
   };
-  changesOnly: boolean;
-  coreOnly: boolean;
+  /** Which rung of the diff detail ladder is active (UI-088). */
+  level: 'edits' | 'rewiring' | 'neighbourhood';
+  /** Reported relationship changes the canvas cannot draw at any rung. */
+  undrawableEdges: number;
   dimOpacity: number;
   computing: boolean;
   error?: string | null;

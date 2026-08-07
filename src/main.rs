@@ -25,6 +25,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Set a repo up for nao: write `.nao/settings.json` with the languages
+    /// the tree is actually written in, and optionally add the VS Code tasks
+    /// that start, open and stop the browser UI.
+    Init {
+        /// Repo to set up (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Also add the Nao tasks to `.vscode/tasks.json`, creating it or
+        /// merging into what is already there.
+        #[arg(long)]
+        vscode: bool,
+
+        /// Replace what is already there. Without it, an existing settings
+        /// file is left alone and existing tasks keep their current bodies.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Analyze a codebase and generate dependency visualization
     Analyze {
         /// Path to analyze (defaults to current directory)
@@ -60,6 +79,13 @@ enum Commands {
         /// analysis; `-l markdown` narrows it to docs only.
         #[arg(long)]
         include_docs: bool,
+
+        /// Keep local and module-level assignments as entities. Off by
+        /// default because they are most of a graph and nothing lists them;
+        /// worth turning on for a focused reading of a few files. The durable
+        /// answer for a repo is `include_locals` in `.nao/settings.json`.
+        #[arg(long)]
+        include_locals: bool,
 
         /// Include external dependencies
         #[arg(long)]
@@ -102,9 +128,10 @@ enum Commands {
         /// Target file or entity to analyze
         target: PathBuf,
 
-        /// Maximum depth to traverse
-        #[arg(short, long, default_value = "2")]
-        depth: usize,
+        /// Maximum depth to traverse. Unset falls back to `max_depth` in the
+        /// settings file, then to 2.
+        #[arg(short, long)]
+        depth: Option<usize>,
 
         /// Show reverse dependencies (what depends on this)
         #[arg(short, long)]
@@ -255,6 +282,15 @@ enum Commands {
         /// Filter by language
         #[arg(short, long)]
         language: Option<Vec<String>>,
+
+        /// Directory holding this repo's Elevator (`.elv`) spec. Unset —
+        /// the usual case — means every `.elv` under the analyzed root is
+        /// the spec. Set it when the spec lives somewhere the walk misses
+        /// (a sibling docs repo, or above the service you're watching), or
+        /// when the tree also contains `.elv` files that aren't spec.
+        /// Unlike the settings-file key it may point outside the root.
+        #[arg(long)]
+        spec_dir: Option<PathBuf>,
 
         /// Debounce interval in milliseconds.
         /// Unset falls back to the settings file, then to 300.
@@ -536,6 +572,10 @@ fn main() -> Result<()> {
     // The match is exhaustive over `Commands`, so the compiler — not a
     // catch-all — guarantees every subcommand is routed somewhere.
     match cli.command {
+        // Its own arm rather than a group: `init` is the one subcommand that
+        // writes the repo's own configuration instead of reading a codebase.
+        Commands::Init { path, vscode, force } => nao::init::run(&path, vscode, force),
+
         c @ (Commands::Analyze { .. }
         | Commands::Deps { .. }
         | Commands::Find { .. }
@@ -567,6 +607,7 @@ fn dispatch_analysis(command: Commands) -> Result<()> {
             kind,
             include_tests,
             include_docs,
+            include_locals,
             include_external,
             layout,
             group_by_file,
@@ -583,6 +624,7 @@ fn dispatch_analysis(command: Commands) -> Result<()> {
             kind,
             include_tests,
             include_docs,
+            include_locals,
             include_external,
             layout.into(),
             group_by_file,
@@ -629,6 +671,7 @@ fn dispatch_server(command: Commands) -> Result<()> {
             include_tests,
             include_docs,
             language,
+            spec_dir,
             debounce_ms,
             content_fallback,
             allow_origin,
@@ -638,15 +681,35 @@ fn dispatch_server(command: Commands) -> Result<()> {
             ui_dir,
         } => {
             // Watch analyzes a path the operator chose, so both scopes apply.
-            let settings = nao::settings::load(&path);
+            // Kept unmerged: `/api/settings` reports which file each value
+            // came from, and merging is where that is lost.
+            let loaded = nao::settings::load_scoped(&path);
+            let settings = loaded.merged();
+            // What the command line named, so the report can say a flag won
+            // rather than guessing from a value it cannot distinguish.
+            let flags_named = nao::settings::report::named(&[
+                ("output_dir", output_dir.is_some()),
+                ("port", port.is_some()),
+                ("include_tests", include_tests),
+                ("include_docs", include_docs),
+                ("language", language.is_some()),
+                ("spec_dir", spec_dir.is_some()),
+                ("debounce_ms", debounce_ms.is_some()),
+                ("content_fallback", content_fallback.is_some()),
+                ("ui_dir", ui_dir.is_some()),
+            ]);
             nao::server::run(nao::server::WatchOptions {
                 output_dir: output_dir
                     .or_else(|| settings.output_dir.clone())
                     .unwrap_or_else(|| PathBuf::from("ui/public")),
-                port: port.or(settings.port).unwrap_or(3000),
+                port: port.or(settings.port).unwrap_or(nao::settings::DEFAULT_PORT),
                 include_tests: include_tests || settings.include_tests.unwrap_or(false),
                 include_docs: include_docs || settings.include_docs.unwrap_or(false),
                 languages: language.or_else(|| settings.language.clone()),
+                // The flag first, then the repo's own answer — and the repo's
+                // is guaranteed to stay inside the repo, which the flag's
+                // deliberately isn't. See `settings::Settings::spec_dir`.
+                spec_dir: spec_dir.or(settings.spec_dir.clone()),
                 debounce_ms: debounce_ms.or(settings.debounce_ms).unwrap_or(300),
                 content_fallback: content_fallback.or_else(|| settings.content_fallback.clone()),
                 access: nao::server::AccessOptions {
@@ -657,7 +720,8 @@ fn dispatch_server(command: Commands) -> Result<()> {
                 settings_ui_dir: settings.ui_dir.clone(),
                 allow_agent_spawn,
                 pin_diff,
-                settings,
+                loaded,
+                flags_named,
                 path,
             })
         }
@@ -680,7 +744,7 @@ fn dispatch_server(command: Commands) -> Result<()> {
             // analyzing it.
             let settings = nao::settings::user();
             run_serve(ServeArgs {
-                port: port.or(settings.port).unwrap_or(3000),
+                port: port.or(settings.port).unwrap_or(nao::settings::DEFAULT_PORT),
                 seed,
                 cache_dir,
                 jobs,
@@ -1026,6 +1090,7 @@ fn run_analyze(
     kinds: Option<Vec<EntityKindArg>>,
     include_tests: bool,
     include_docs: bool,
+    include_locals: bool,
     include_external: bool,
     layout: LayoutDirection,
     group_by_file: bool,
@@ -1037,12 +1102,10 @@ fn run_analyze(
     let mut config = Config::for_path(&path)
         .with_output_format(format)
         .with_layout_direction(layout);
-    if let Some(d) = depth {
-        config = config.with_max_depth(d);
-    }
 
     config.analysis.include_tests = include_tests;
     config.analysis.include_docs = include_docs;
+    config.analysis.include_locals = include_locals;
     config.analysis.include_external = include_external;
     config.display.group_by_file = group_by_file;
     config.display.show_line_numbers = line_numbers;
@@ -1053,7 +1116,10 @@ fn run_analyze(
     apply_filters(&mut config, languages, kinds);
 
     // Last: the settings file fills only what the flags above left alone.
-    nao::settings::load(&path).apply_to_config(&mut config);
+    // `depth` travels separately because a defaulted `max_depth` and a typed
+    // one are the same number by the time the config gets here.
+    let flags = nao::settings::Flags { max_depth: depth, ..Default::default() };
+    nao::settings::load(&path).apply_with(&mut config, flags);
 
     // Run analysis
     eprintln!("Analyzing {}...", path.display());
@@ -1100,17 +1166,27 @@ fn run_analyze(
     Ok(())
 }
 
+/// `deps` traverses shallower than the rest of nao — two hops, not three —
+/// because it answers "what does this file touch" rather than "what shape is
+/// this repo". That 2 is the bottom of the chain, under both the flag and the
+/// settings file.
+const DEPS_DEFAULT_DEPTH: usize = 2;
+
 fn run_deps(
     target: PathBuf,
-    depth: usize,
+    depth: Option<usize>,
     reverse: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let root = target.parent().unwrap_or(&target);
     let mut config = Config::for_path(root)
         .with_output_format(format)
-        .with_max_depth(depth);
-    nao::settings::load(root).apply_to_config(&mut config);
+        .with_max_depth(DEPS_DEFAULT_DEPTH);
+    let flags = nao::settings::Flags { max_depth: depth, ..Default::default() };
+    nao::settings::load(root).apply_with(&mut config, flags);
+    // The settled depth, whichever link of the chain supplied it. The
+    // printing below walks the same levels the traversal did.
+    let depth = config.analysis.max_depth;
 
     let mut analyzer = Analyzer::new(config.clone());
     let result = analyzer.analyze_file(&target)?;
@@ -1320,7 +1396,7 @@ fn run_diff(
 ) -> Result<()> {
     use nao::diff::{
         compute_diff, verify_git_repo, resolve_git_ref,
-        create_worktree, remove_worktree, analyze_at, write_diff_outputs,
+        create_worktree, remove_worktree, analyze_at, render_base_details, write_diff_outputs,
     };
 
     let repo_root = path.canonicalize()?;
@@ -1353,9 +1429,11 @@ fn run_diff(
         diff.summary.added, diff.summary.removed, diff.summary.modified, diff.summary.unchanged,
     );
 
-    // Write output files.
+    // Write output files. The base details are rendered before the worktrees
+    // go, since the file half of them is read off disk.
     let data_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
-    write_diff_outputs(data_dir, &head_graph, &head_config, &base_graph, &base_config, &diff)?;
+    let base_details = render_base_details(&base_graph, &base_config)?;
+    write_diff_outputs(data_dir, &head_graph, &head_config, &base_details, &diff)?;
     eprintln!("  Output written to {}", data_dir.display());
 
     // Clean up worktrees.

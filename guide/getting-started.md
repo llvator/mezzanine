@@ -129,6 +129,27 @@ live-connect page is not — measured, with versions, in
 ADR 0006.
 The loopback-to-loopback recipe above is unaffected.
 
+### VS Code tasks for the browser UI
+
+`nao init --vscode` writes three tasks into `.vscode/tasks.json`, so the UI is
+a **Run Task** away rather than a terminal you have to keep:
+
+| Task | Does |
+|---|---|
+| `Nao: Start web UI` | `nao watch .`, in the background |
+| `Nao: Open web UI in browser` | opens the port, starting the engine first |
+| `Nao: Stop web UI` | kills the engine holding that port — and only if it *is* nao |
+
+The stop task exists because `nao watch` has no idle shutdown: closing the
+browser tab leaves the engine running and the port taken. All three agree on
+one port — whatever `.nao/settings.json` pins, else 3000.
+
+An existing `tasks.json` is merged into by label, leaving your own tasks
+alone; `--force` replaces Nao tasks whose bodies have since changed. One
+refusal is deliberate: VS Code accepts comments in `tasks.json` and JSON does
+not, so a file nao cannot parse is left **untouched** with the tasks printed
+for you to paste — rewriting it would delete the comments.
+
 ### `elevator` CLI (`.elv` spec files)
 
 ```bash
@@ -190,7 +211,24 @@ names. **JSON means no comments and no trailing commas** — nao warns and
 discards the whole file on a parse error, so one stray `//` costs you every
 setting in it.
 
-There is a ready-made template in
+`nao init` writes the repo file for you. It walks the tree — honoring
+`.gitignore`, so vendored code never votes — and pins the languages the repo
+is *actually* written in, plus `spec_dir` when every `.elv` file sits in one
+directory:
+
+```sh
+nao init                 # in the repo you want set up
+nao init --vscode        # also add the browser-UI tasks (below)
+nao init --force         # replace a settings file that is already there
+```
+
+It writes only what it inferred. Keys with working defaults — `port`,
+`output_dir` — are left out on purpose: a scaffold that spelled out today's
+defaults would freeze them into every repo that ran it. A stray `.py` script
+does not make yours a Python repo either; a language has to hold a twentieth
+of the tree, with Elevator exempt because a spec is outnumbered by design.
+
+For the fuller starting point, there is a ready-made template in
 [`.nao.example/`](../.nao.example/README.md) — copy it to `.nao/`, edit, and
 commit:
 
@@ -229,7 +267,7 @@ CLI flag  →  env var  →  repo settings  →  user settings  →  built-in de
 | Key | User | Repo |
 |---|:---:|:---:|
 | `ui_dir`, `content_fallback` | ✓ | — |
-| `output_dir` | — | ✓ |
+| `output_dir`, `spec_dir` | — | ✓ |
 | `language`, `kind` | ✓ | ✓ |
 | `include_tests`, `include_external` | ✓ | ✓ |
 | `exclude_patterns`, `include_patterns` | ✓ | ✓ |
@@ -244,8 +282,23 @@ scripts out of the tree — and a repo you cloned should not be able to turn any
 of them on by existing. They are flag-and-env only. `nao serve` goes further
 and ignores a submitted repo's settings file entirely.
 
-Two behaviours worth knowing:
+`spec_dir` is the odd one out: a path nao *reads from*, rather than a filter
+over what it already found. A repo-scope one must therefore stay inside the
+repo — relative, no `..` — for the same reason as the last row. Specs that
+live somewhere else entirely (a sibling docs repo, or the top of a monorepo
+whose services you watch one at a time) are a real layout, but naming that
+directory takes an operator: `nao watch . --spec-dir ../docs/domain`, or the
+**Spec folder** field in the browser UI's Analysis scope panel, which changes
+the running session without touching any file.
 
+Three behaviours worth knowing:
+
+- **`spec_dir` narrows as well as widens.** Once set, an `.elv` file counts as
+  spec only if it lives there — which is the fix for a tree whose `examples/`
+  or fixtures contain `.elv` files nobody meant to publish. Unset, every
+  `.elv` under the root is the spec, as it has always been. A `spec_dir`
+  pointing at a directory that isn't there says so and falls back to that
+  default, rather than reporting an empty spec.
 - **`exclude_patterns` and `include_patterns` extend the defaults**, they don't
   replace them. Adding `**/generated/**` does not re-enable scanning
   `node_modules`. `language` and `kind` work the other way — they're a choice,

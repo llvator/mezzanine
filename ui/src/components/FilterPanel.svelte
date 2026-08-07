@@ -267,10 +267,14 @@
         aria-expanded={analysisScopeOpen}
         on:click={() => (analysisScopeOpen = !analysisScopeOpen)}
       >
-        Parsed Languages <span class="toggle-arrow">{analysisScopeOpen ? '\u25BC' : '\u25B6'}</span>
+        Parsed Sources <span class="toggle-arrow">{analysisScopeOpen ? '\u25BC' : '\u25B6'}</span>
       </button>
     </h2>
-    <p class="layer-note">Which languages the analyzer reads at all. Apply re-parses the repo.</p>
+    <!-- Named for the section's contents rather than its first control. It
+         held languages alone when it was called "Parsed Languages"; the spec
+         folder then landed inside it and was unfindable, the heading having
+         promised something narrower than what was there. -->
+    <p class="layer-note">What the analyzer reads at all \u2014 languages, docs, and where the spec lives. Apply re-parses the repo.</p>
     <AnalysisScopePanel open={analysisScopeOpen} />
   </div>
 {/if}

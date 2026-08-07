@@ -17,6 +17,7 @@
   import { PANES, bindingsForScope, displayKeys, type Binding } from '../viewmodels/keymap';
   import { focusedPane, focusPane, shortcutHelpOpen } from '../stores/keymap';
   import { runCommand, type KeymapContext } from '../viewmodels/keymapActions';
+  import { mirrorOn, mirrorPeers } from '../stores/mirror';
 
   /** Carries `graphView`, which the viewport commands need and no store has. */
   export let ctx: KeymapContext = {};
@@ -66,6 +67,23 @@
       </button>
     {/each}
   </div>
+
+  <!-- Only while mirroring, and only ever a status: the switch is in Settings.
+       A mirror is invisible from the window you are typing in — the effect is
+       on the other screen — so the one thing worth a permanent chip is whether
+       anybody is actually on the other end (UI-095). -->
+  {#if $mirrorOn}
+    <span
+      class="chip mirror-chip"
+      class:alone={$mirrorPeers === 0}
+      data-probe="mirror-status"
+      title={$mirrorPeers === 0
+        ? 'Synced windows: nothing else is listening. A second window has to be open in this browser.'
+        : `Synced with ${$mirrorPeers} other window${$mirrorPeers > 1 ? 's' : ''}`}
+    >
+      ⧉ {$mirrorPeers === 0 ? 'alone' : $mirrorPeers}
+    </span>
+  {/if}
 
   <button
     type="button"
@@ -160,4 +178,13 @@
   }
 
   .help-chip { flex: none; }
+
+  /* A status, not a control — no hover, no pointer. Dimmed when nothing is
+     listening, so "on but alone" and "on and working" don't look alike. */
+  .mirror-chip {
+    flex: none;
+    cursor: default;
+    color: var(--accent);
+  }
+  .mirror-chip.alone { color: var(--text-disabled); }
 </style>

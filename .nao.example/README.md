@@ -26,7 +26,7 @@ CLI flag  >  env var  >  <repo>/.nao/settings.json  >  ~/.config/nao/settings.js
 Each key is valid in one scope, the other, or both. Put a key in the wrong
 file and nao names it back to you rather than ignoring it.
 
-**Repo scope only** — `output_dir`.
+**Repo scope only** — `output_dir`, `spec_dir`.
 
 **User scope only** — `ui_dir`, `content_fallback`. Both are absolute paths to
 somewhere on one machine; in a repo file they would be a path everyone else
@@ -46,6 +46,13 @@ The file is committed, so it is read by machines that are not yours.
   output to a directory that exists on one laptop.
 - **No home directories, usernames, or anything outside the repo.**
 - Add `.nao/data/` to your `.gitignore`. It is generated on every analysis.
+
+`spec_dir` is held to that rule by nao rather than by convention: an absolute
+path, or one that climbs out with `..`, is refused and named back to you. It
+decides which directories nao *reads*, and a cloned file does not get to pick
+those. When the spec genuinely lives outside the repo, an operator says so —
+`nao watch . --spec-dir ../docs/domain`, or the **Spec folder** field in the
+browser UI.
 
 ## Patterns extend, they do not replace
 

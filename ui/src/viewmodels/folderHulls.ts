@@ -93,6 +93,103 @@ const OUTLIER_FLOOR = 120;
  */
 const MAX_FOREIGN_SHARE = 0.35;
 
+/**
+ * Font sizes the two kinds of region name are drawn at, mirroring the
+ * `.hull-label` rules in GraphView.
+ *
+ * World units, and that is what makes a pure module able to reason about
+ * text at all: the names live inside the canvas's zoom transform, so they
+ * scale with it and a collision in these coordinates is a collision on screen
+ * at every magnification.
+ */
+const LEAF_LABEL_PX = 10;
+const PARENT_LABEL_PX = 13;
+
+/**
+ * Width of one upper-case character as a share of the font size, tracking
+ * included.
+ *
+ * Measured off the rendered canvas across six region names at both sizes:
+ * 0.65 to 0.75. Taken at the top of that range deliberately. Over-estimating
+ * separates two names that would just have cleared, which costs a few pixels
+ * of lift nobody can see; under-estimating leaves the collision this exists
+ * to prevent. The ux-probe's `region-names-stay-readable` check measures the
+ * real boxes, so a font change that outgrows the estimate surfaces there
+ * rather than silently.
+ */
+const CHAR_ADVANCE = 0.75;
+
+/** Blank kept between two names that would otherwise touch. */
+const LABEL_GAP = 4;
+
+export interface LabelBox { x0: number; x1: number; y0: number; y1: number }
+
+/**
+ * The space a region's name occupies.
+ *
+ * `text-anchor: middle` centres it on `labelX`, and an upper-cased name has
+ * no descenders, so the baseline at `labelY` is the bottom of the box.
+ */
+export function labelBoxOf(h: FolderHull): LabelBox {
+  const size = h.hasChildren ? PARENT_LABEL_PX : LEAF_LABEL_PX;
+  const half = (h.label.length * size * CHAR_ADVANCE) / 2;
+  return { x0: h.labelX - half, x1: h.labelX + half, y0: h.labelY - size, y1: h.labelY };
+}
+
+/**
+ * Lift any region name that lands on one already placed.
+ *
+ * Nesting makes this structural rather than unlucky. A parent's outline is
+ * sampled from the same ring points as its children's and padded by the same
+ * amount, so wherever the child holding the parent's topmost node is itself a
+ * drawn region the two hulls share that vertex — and both names, anchored a
+ * fixed six pixels above their own hull top, are drawn on the same line.
+ * Measured on this repo's `src` scope: `SRC` and `SERVER` three pixels apart,
+ * one name over the other and neither readable.
+ *
+ * Innermost first, so it is the *enclosing* name that moves. Geometrically it
+ * is the cheaper move — a parent has open canvas above it where a child has
+ * its parent's outline — and it is the right reading: a parent's name is the
+ * heading over the regions inside it (UI-070), so it belongs above them and
+ * not below.
+ *
+ * Only ever upward, which keeps UI-055's promise that a name sits outside the
+ * shape it names. Pushed down, a name would be inside its own region, over
+ * the nodes it is there to describe.
+ */
+function separateLabels(hulls: FolderHull[]): void {
+  const placed: LabelBox[] = [];
+  for (let i = hulls.length - 1; i >= 0; i--) {
+    const h = hulls[i];
+    let box = labelBoxOf(h);
+    // Each pass clears the topmost name currently hit, so this one rises past
+    // that one for good and a pass per already-placed name is the ceiling.
+    // Rising can bring it under a name it did not touch before, which is why
+    // this is a loop and not a single correction.
+    for (let guard = 0; guard <= placed.length; guard++) {
+      const ceiling = topOfHighestHit(box, placed);
+      if (ceiling === null) break;
+      const lift = box.y1 - (ceiling - LABEL_GAP);
+      box = { ...box, y0: box.y0 - lift, y1: box.y1 - lift };
+    }
+    h.labelY = box.y1;
+    placed.push(box);
+  }
+}
+
+/** Top edge of the highest already-placed name this box runs into, or `null`
+ *  when it runs into none — which is the whole answer `separateLabels` needs,
+ *  since clearing the highest clears every other it was touching. */
+function topOfHighestHit(box: LabelBox, placed: LabelBox[]): number | null {
+  let top: number | null = null;
+  for (const p of placed) {
+    if (box.x1 <= p.x0 || box.x0 >= p.x1) continue;
+    if (box.y1 <= p.y0 || box.y0 >= p.y1) continue;
+    if (top === null || p.y0 < top) top = p.y0;
+  }
+  return top;
+}
+
 function median(xs: number[]): number {
   const s = [...xs].sort((a, b) => a - b);
   const mid = s.length >> 1;
@@ -134,7 +231,9 @@ export interface FolderHull {
   hasChildren: boolean;
   /** Padded hull polygon, world coordinates. */
   points: [number, number][];
-  /** Anchor for the label, just above the hull's topmost vertex. */
+  /** Anchor for the label: the hull's topmost vertex, raised clear of it —
+   *  and raised further still if a name already placed was sitting there.
+   *  See `separateLabels`. */
   labelX: number;
   labelY: number;
 }
@@ -308,5 +407,8 @@ export function computeFolderHulls(nodes: D3Node[], opts: HullOptions): FolderHu
   // tie-break keeps two regions of equal size from swapping places between
   // frames, which would flicker.
   hulls.sort((a, b) => b.size - a.size || (a.path < b.path ? -1 : 1));
+  // After the sort, because the order is what decides which of two colliding
+  // names holds its place and which one rises.
+  separateLabels(hulls);
   return hulls;
 }

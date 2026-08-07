@@ -19,7 +19,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  BINDINGS, PANES, bindingsForScope, matchBinding, parseKeys, displayKeys,
+  BINDINGS, PANES, PANE_DIGIT, bindingsForScope, matchBinding, parseKeys, displayKeys,
   isTypingTarget, needsModifier, type Scope, type PaneId,
 } from '../src/viewmodels/keymap.ts';
 
@@ -160,11 +160,9 @@ test('isTypingTarget catches text fields and nothing else', () => {
 // --- the pane list ---
 
 test('the digits are contiguous from 0', () => {
-  // Contiguity is the invariant that survived the spec pane (ADR 0011); layout
-  // order did not. `5` is the Elevator pane, appended rather than inserted at
-  // its screen position between the sidebar and the canvas — inserting would
-  // have renumbered four panes people already have in their hands, to give a
-  // *conditionally present* pane the most memorable digit of the set.
+  // Contiguity is the invariant every renumbering has to keep: a gap in the
+  // row means a key that focuses nothing, which the bar and the overlay both
+  // print as if it did.
   assert.deepEqual(PANES.map((p) => p.digit), ['0', '1', '2', '3', '4', '5']);
 });
 
@@ -173,6 +171,36 @@ test('the always-present panes stay in layout order', () => {
   assert.deepEqual(PANES.filter((p) => p.id !== 'spec').map((p) => p.id), ids);
 });
 
-test('the optional pane is the one out of position', () => {
-  assert.equal(PANES.at(-1)?.id, 'spec');
+test('the canvas keeps 1, and the spec pane sits next to it', () => {
+  // The two canvases are numbered together: `1` is the code graph the app
+  // opens onto, `2` the Elevator one beside it. Geometry alone would hand `1`
+  // to the spec pane — it is drawn to the left of the canvas — and that is the
+  // one digit no reader should have to look up, in a pane a project without
+  // `.elv` files never draws at all.
+  assert.equal(PANES.find((p) => p.id === 'graph')?.digit, '1');
+  assert.equal(PANES.find((p) => p.id === 'spec')?.digit, '2');
+});
+
+test('PANE_DIGIT agrees with the list it is derived from', () => {
+  // The collapsed strips print from this map. A digit that drifts from the
+  // table would advertise a key that focuses a different pane.
+  for (const pane of PANES) assert.equal(PANE_DIGIT[pane.id], pane.digit);
+  assert.equal(Object.keys(PANE_DIGIT).length, PANES.length);
+});
+
+// --- Escape ---
+
+test('Escape resolves from every pane, and no pane takes it back', () => {
+  // Global on purpose: the help overlay covers whichever pane has focus, so a
+  // pane-scoped Escape would win the resolution order and strand `?` open.
+  for (const pane of PANES) {
+    assert.equal(matchBinding(ev('Escape'), pane.id, false)?.command, 'ui.dismiss');
+  }
+});
+
+test('Escape is ignored while typing, so a text field keeps its own', () => {
+  // Filter boxes and rename fields bind Escape to abandon the edit. Collapsing
+  // the pane out from under a caret would be a second, larger answer to one
+  // keystroke.
+  assert.equal(matchBinding(ev('Escape'), 'sidebar', true), null);
 });

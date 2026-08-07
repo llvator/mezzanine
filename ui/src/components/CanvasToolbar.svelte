@@ -18,19 +18,26 @@
    */
   import type GraphView from './GraphView.svelte';
   import StatsBar from './StatsBar.svelte';
+  import ScopeCrumbs from './ScopeCrumbs.svelte';
+  import FilterPipeline from './FilterPipeline.svelte';
   import {
-    selectedNode, viewMode, graphLevel,
+    selectedNode, viewMode, graphLevel, rawEntityGraph,
     showLabels, showKindLabels, showLinkLabels,
     treeDensity, treeMaxDepth, hoverDepth, hoverMode,
     setTreeDepth, cycleTreeDensity, DENSITY_LABELS,
   } from '../stores/graph';
+  import { everyFileIsOneEntity } from '../viewmodels/collapseGraph';
   import { autoLevel, drillIntoMarks, markedStats } from '../stores/scope';
+  import {
+    canGoBack, canGoForward, backTitle, forwardTitle, backDepth, goBack, goForward,
+  } from '../stores/viewHistory';
   import { clearMarks, markCount } from '../stores/marks';
   import { autoFitView } from '../stores/settings';
   import type { GraphLevel } from '../types/graph';
   import { HOVER_MODES, HOVER_MODE_LABELS, HOVER_MODE_TITLES } from '../viewmodels/hoverHighlight';
   import { toolbarCollapsed, splitViewOpen } from '../stores/panes';
   import { focusedPane } from '../stores/keymap';
+  import { PANE_DIGIT } from '../viewmodels/keymap';
   import { specGraph } from '../stores/crossFilter';
 
   /** Bound instance of the graph, for the viewport actions. Undefined until
@@ -42,8 +49,29 @@
    *  window, which is a choice the user makes, not one to make for them.
    *
    *  A store since UI-075, under the same localStorage key: focusing this pane
-   *  with `2` has to unfold it, and `c` has to fold it back. */
+   *  with its digit has to unfold it, and `c` (or Escape) has to fold it
+   *  back. */
   $: collapsed = $toolbarCollapsed;
+
+  /** UI-090. In a graph where every file holds exactly one entity — a
+   *  document graph, where one note *is* one file — Entity and File are the
+   *  same picture, and pressing Entity looks like pressing a broken control.
+   *  Measured off the pre-collapse nodes, never off a language name, so any
+   *  graph with that shape says so. */
+  $: entityIsFile = everyFileIsOneEntity($rawEntityGraph.nodes);
+
+  /** What each level button says on hover. Two of them state the plain
+   *  definition — a module is a folder, and nothing in nao makes it mean
+   *  anything else — so the meaning is reachable without leaving the canvas. */
+  const LEVEL_TITLES: Record<GraphLevel, string> = {
+    entity: 'One node per entity — function, class, note.',
+    file: 'One node per file.',
+    module: 'One node per folder. A module is a directory, in every language.',
+  };
+  $: levelTitle = (lvl: GraphLevel): string =>
+    lvl === 'entity' && entityIsFile
+      ? 'Every file in this graph holds exactly one entity, so this is the same picture as File.'
+      : LEVEL_TITLES[lvl];
 </script>
 
 <header class="canvas-toolbar" class:collapsed
@@ -55,12 +83,15 @@
       type="button"
       class="canvas-toolbar-handle"
       aria-expanded={!collapsed}
-      title={collapsed ? 'Show view controls' : 'Hide view controls'}
+      title={collapsed ? `Show view controls (${PANE_DIGIT.view})` : 'Hide view controls'}
       on:click={() => toolbarCollapsed.set(!collapsed)}
     >
       <span class="toolbar-chev">{collapsed ? '▶' : '▼'}</span>
       View
       {#if collapsed}
+        <!-- The digit, for the same reason the folded side strips carry one:
+             what is folded away should say which key brings it back. -->
+        <span class="toolbar-digit">{PANE_DIGIT.view}</span>
         <!-- Collapsed, the bar still has to say what it is hiding, or the
              active level and view mode become invisible state. -->
         <span class="toolbar-summary">
@@ -73,11 +104,53 @@
         </span>
       {/if}
     </button>
+    <!-- The wayback (UI-092). In the bar rather than in a cluster below, for
+         two reasons: these are not view controls — they replace the picture,
+         they do not adjust it — and the bar is the part that survives
+         collapsing, so the way back out of a drill cannot be folded away by
+         a reader who wanted more canvas.
+
+         Each button names its destination rather than its direction, which
+         is what makes a stack several deep navigable without walking it. -->
+    <!-- `data-depth` is for the probe, and stated rather than smuggled: how
+         many frames deep the stack is decides whether a gesture recorded
+         one, and that is the only claim in UI-092 no pixel can carry. -->
+    <div class="wayback" role="group" aria-label="View history" data-depth={$backDepth}>
+      <button
+        type="button"
+        class="control-btn icon-btn"
+        data-probe="wayback-back"
+        disabled={!$canGoBack}
+        title={$backTitle}
+        aria-label="Back to the previous view"
+        on:click={() => void goBack()}
+      >←</button>
+      <button
+        type="button"
+        class="control-btn icon-btn"
+        data-probe="wayback-forward"
+        disabled={!$canGoForward}
+        title={$forwardTitle}
+        aria-label="Forward to the next view"
+        on:click={() => void goForward()}
+      >→</button>
+    </div>
+    <!-- Where the reader is, next to where they were (UI-095). The two
+         navigation axes belong side by side: the arrows walk the history,
+         the crumbs walk the folder tree, and until now only the first of
+         those was on the canvas at all. -->
+    <ScopeCrumbs />
     <!-- Counts live here rather than floating bottom-left. Down there they
          covered nodes, and UI-010's fuller wording wrapped to three lines on
          a narrow canvas — the same complaint the toolbar move fixed. -->
     <span class="canvas-toolbar-stats" data-probe="stats-bar"><StatsBar /></span>
   </div>
+
+  <!-- What is narrowing the canvas (UI-099). Outside the collapse, and that
+       is the point: folding the view controls asks for canvas room, not for
+       the filters to go back to being invisible. Draws nothing when nothing
+       is filtering, which is the common case. -->
+  <FilterPipeline />
 
   {#if !collapsed}
     <div class="toolbar-rows" data-probe="toolbar">
@@ -134,9 +207,16 @@
                module. Drives both Graph and Tree views, which share data. -->
           <div class="level-toggle" role="group" aria-label="Aggregation level">
             {#each ['entity', 'file', 'module'] as lvl}
+              <!-- A redundant Entity button stays *enabled*: it is the
+                   baseline the expansion set is expressed against, and a
+                   control the reader cannot come back through is worse than
+                   one that repeats itself. It only says so (UI-090). -->
               <button
                 class="control-btn level-btn"
                 class:active={$graphLevel === lvl}
+                class:level-redundant={lvl === 'entity' && entityIsFile}
+                data-probe="level-{lvl}"
+                title={levelTitle(lvl as GraphLevel)}
                 on:click={() => { autoLevel.set(false); graphLevel.set(lvl as GraphLevel); }}
               >{lvl[0].toUpperCase() + lvl.slice(1)}</button>
             {/each}
@@ -326,6 +406,19 @@
 
   .toolbar-chev { font-size: 0.6rem; color: var(--text-dim); }
 
+  /* The same accent digit the folded side strips print, in the shape this bar
+     has room for: inline, beside the pane's own name. */
+  .toolbar-digit {
+    font-size: 0.65rem;
+    line-height: 1;
+    color: var(--accent);
+  }
+
+  /* Tighter than the clusters below: the bar is one line high and shared
+     with the stats, so these carry the row's height rather than setting it. */
+  .wayback { display: flex; gap: 4px; }
+  .wayback .control-btn { padding: 3px 8px; min-width: 26px; font-size: 0.8rem; }
+
   .toolbar-summary {
     margin-left: 6px;
     font-weight: 400;
@@ -446,6 +539,14 @@
     background: var(--accent);
     color: var(--accent-fg);
     border-color: var(--accent);
+  }
+  /* UI-090. A level that would redraw the same picture is dimmed, so the
+     redundancy is visible before the reader spends a click on it. Dropped
+     the moment it is the active level: the level you are looking at should
+     never be the faintest thing in the group. */
+  .level-toggle .level-btn.level-redundant:not(.active) {
+    opacity: 0.55;
+    font-style: italic;
   }
 
   /* Eight clusters no longer clear two rows once the canvas column drops

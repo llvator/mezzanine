@@ -41,16 +41,57 @@ struct FileTally {
     scores: HashMap<String, Vec<(f32, u32)>>,
 }
 
-/// Per-file edge data produced by scanning all dependency edges.
-struct FileEdgeData {
-    /// Number of dependency edges where source and target share a file.
+/// Per-file tallies for one *family* of edges. The shape is the same
+/// whichever family it holds, so the rollup helpers below take a bucket
+/// rather than the whole of [`FileEdgeData`] and run over either.
+#[derive(Default)]
+struct EdgeBuckets {
+    /// Number of edges where source and target share a file.
     internal: HashMap<String, u32>,
-    /// Distinct other files depending on each file (incoming cross-file).
+    /// Distinct other files pointing at each file (incoming cross-file).
     fan_in: HashMap<String, HashSet<String>>,
-    /// Distinct other files each file depends on (outgoing cross-file).
+    /// Distinct other files each file points at (outgoing cross-file).
     fan_out: HashMap<String, HashSet<String>>,
     /// All cross-file (source_file, target_file) pairs for SCC + module rollup.
     pairs: Vec<(String, String)>,
+}
+
+impl EdgeBuckets {
+    /// File one edge into whichever tally its endpoints call for.
+    fn record(&mut self, sf: &str, tf: &str) {
+        if sf == tf {
+            *self.internal.entry(sf.to_string()).or_insert(0) += 1;
+            return;
+        }
+        self.fan_out.entry(sf.to_string()).or_default().insert(tf.to_string());
+        self.fan_in.entry(tf.to_string()).or_default().insert(sf.to_string());
+        self.pairs.push((sf.to_string(), tf.to_string()));
+    }
+
+    fn fan_in_of(&self, path: &str) -> u32 {
+        self.fan_in.get(path).map(|s| s.len() as u32).unwrap_or(0)
+    }
+
+    fn fan_out_of(&self, path: &str) -> u32 {
+        self.fan_out.get(path).map(|s| s.len() as u32).unwrap_or(0)
+    }
+}
+
+/// Per-file edge data, split by what the edges *mean*.
+///
+/// UI-091. Coupling is measured over dependency edges, and a scope whose
+/// edges are all `References` — a Markdown link, an Elevator or Impex
+/// reference, a folded SQL foreign key — used to report a fan-out of `0`
+/// while the canvas drew arrows leaving it. Tallying references alongside
+/// (never inside) the dependency counts lets the reader be told the
+/// difference between "measured, and it is zero" and "not measured here".
+struct FileEdgeData {
+    /// Edges that imply a dependency (`RelationshipKind::is_dependency`).
+    /// Every existing metric is computed from this bucket alone.
+    deps: EdgeBuckets,
+    /// `References` edges. Reported separately; they feed no ratio, no
+    /// cycle and no composite score.
+    refs: EdgeBuckets,
 }
 
 impl DependencyGraph {
@@ -827,28 +868,25 @@ impl DependencyGraph {
 
     /// Phase 2: scan dependency edges and bucket them per file.
     fn scan_file_edges(&self, entity_file: &HashMap<NodeIndex, String>) -> FileEdgeData {
-        let mut data = FileEdgeData {
-            internal: HashMap::new(),
-            fan_in: HashMap::new(),
-            fan_out: HashMap::new(),
-            pairs: Vec::new(),
-        };
+        let mut data = FileEdgeData { deps: EdgeBuckets::default(), refs: EdgeBuckets::default() };
         for edge_idx in self.graph.edge_indices() {
             let rel = &self.graph[edge_idx];
-            if !rel.kind.is_dependency() {
+            // Only these two families are tallied. Structural kinds like
+            // `Contains` are containment rather than coupling, and counting
+            // them would put the new number in exactly the position the old
+            // one was in (UI-091).
+            let bucket = if rel.kind.is_dependency() {
+                &mut data.deps
+            } else if rel.kind == RelationshipKind::References {
+                &mut data.refs
+            } else {
                 continue;
-            }
+            };
             let Some((src, tgt)) = self.graph.edge_endpoints(edge_idx) else { continue };
             let (Some(sf), Some(tf)) = (entity_file.get(&src), entity_file.get(&tgt)) else {
                 continue;
             };
-            if sf == tf {
-                *data.internal.entry(sf.clone()).or_insert(0) += 1;
-            } else {
-                data.fan_out.entry(sf.clone()).or_default().insert(tf.clone());
-                data.fan_in.entry(tf.clone()).or_default().insert(sf.clone());
-                data.pairs.push((sf.clone(), tf.clone()));
-            }
+            bucket.record(sf, tf);
         }
         data
     }
@@ -861,7 +899,7 @@ impl DependencyGraph {
             let idx = file_graph.add_node(path.clone());
             idx_map.insert(path.clone(), idx);
         }
-        for (a, b) in &edges.pairs {
+        for (a, b) in &edges.deps.pairs {
             if let (Some(&ai), Some(&bi)) = (idx_map.get(a), idx_map.get(b)) {
                 file_graph.add_edge(ai, bi, ());
             }
@@ -887,9 +925,9 @@ impl DependencyGraph {
         paths.sort();
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
-            let internal = edges.internal.get(path).copied().unwrap_or(0);
-            let fi = edges.fan_in.get(path).map(|s| s.len() as u32).unwrap_or(0);
-            let fo = edges.fan_out.get(path).map(|s| s.len() as u32).unwrap_or(0);
+            let internal = edges.deps.internal.get(path).copied().unwrap_or(0);
+            let fi = edges.deps.fan_in_of(path);
+            let fo = edges.deps.fan_out_of(path);
             let external = fi + fo;
             let total = internal + external;
             let cohesion = if total == 0 { None } else { Some(internal as f32 / total as f32) };
@@ -907,6 +945,8 @@ impl DependencyGraph {
                 fan_out: fo,
                 in_cycle: cycles.contains(path),
                 instability: if fi + fo > 0 { Some(fo as f32 / (fi + fo) as f32) } else { None },
+                ref_fan_in: edges.refs.fan_in_of(path),
+                ref_fan_out: edges.refs.fan_out_of(path),
                 avg_quality: avg_q,
                 max_quality: max_q,
                 quality_ok: q_ok,
@@ -943,7 +983,15 @@ impl DependencyGraph {
 
             let mut m = Self::aggregate_file_counts(tally, &descendants);
             let (internal, external, fan_in, fan_out) =
-                Self::classify_module_edges(edges, &descendants);
+                Self::classify_module_edges(&edges.deps, &descendants);
+            // Same classification over the reference bucket. Only the fan
+            // counts are kept: references feed no ratio and no score, they
+            // exist so the reader can tell an unmeasured scope from a
+            // decoupled one (UI-091).
+            let (_, _, ref_fan_in, ref_fan_out) =
+                Self::classify_module_edges(&edges.refs, &descendants);
+            m.ref_fan_in = ref_fan_in;
+            m.ref_fan_out = ref_fan_out;
             m.internal_edges = internal;
             m.external_edges = external;
             let total = internal + external;
@@ -1061,7 +1109,7 @@ impl DependencyGraph {
     /// defined by `descendants`. Returns `(internal_edges, external_edges,
     /// fan_in_count, fan_out_count)`.
     fn classify_module_edges(
-        edges: &FileEdgeData,
+        edges: &EdgeBuckets,
         descendants: &[&String],
     ) -> (u32, u32, u32, u32) {
         // Intra-file edges are always internal to any ancestor module.
@@ -2082,5 +2130,114 @@ mod language_guard_tests {
         let forward = resolve_call(vec![x.clone(), y.clone(), caller.clone()], &caller, "dup");
         let reversed = resolve_call(vec![y, x, caller.clone()], &caller, "dup");
         assert_eq!(forward, reversed);
+    }
+}
+
+#[cfg(test)]
+mod reference_edge_tests {
+    //! UI-091: reference edges are counted, apart from coupling.
+    //!
+    //! A document graph's edges are all `References`, which
+    //! `RelationshipKind::is_dependency` excludes — so every scope used to
+    //! report a fan-out of `0` while the canvas drew arrows leaving it. Zero
+    //! is the flattering end of that scale, so an unmeasured folder read as a
+    //! perfectly decoupled one.
+
+    use super::DependencyGraph;
+    use crate::analyzer::AnalysisResult;
+    use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, ScopeMetrics, Span};
+
+    fn note(path: &str, name: &str) -> CodeEntity {
+        let mut span = Span::default();
+        span.start.line = 1;
+        CodeEntity::new(name, EntityKind::Note, path, span)
+    }
+
+    fn graph_of(entities: Vec<CodeEntity>, edges: &[(usize, usize, RelationshipKind)]) -> DependencyGraph {
+        let relationships = edges
+            .iter()
+            .map(|(a, b, k)| Relationship::new(entities[*a].id.clone(), entities[*b].id.clone(), *k))
+            .collect();
+        DependencyGraph::from_analysis(&AnalysisResult {
+            entities,
+            relationships,
+            files: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    fn file<'a>(g: &'a DependencyGraph, path: &str) -> &'a ScopeMetrics {
+        &g.file_metrics().iter().find(|f| f.path == path).expect("a file rollup").metrics
+    }
+
+    fn module<'a>(g: &'a DependencyGraph, path: &str) -> &'a ScopeMetrics {
+        &g.module_metrics().iter().find(|m| m.path == path).expect("a module rollup").metrics
+    }
+
+    /// `docs/a.md` links its neighbour and one note in another folder.
+    fn note_graph() -> DependencyGraph {
+        graph_of(
+            vec![note("docs/a.md", "A"), note("docs/b.md", "B"), note("guide/c.md", "C")],
+            &[
+                (0, 1, RelationshipKind::References),
+                (0, 2, RelationshipKind::References),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_note_that_links_two_others_reports_no_coupling_and_two_references() {
+        let g = note_graph();
+        let m = file(&g, "docs/a.md");
+        // Unchanged: coupling is still dependency-only, so it is still zero.
+        assert_eq!((m.fan_in, m.fan_out), (0, 0));
+        assert_eq!((m.internal_edges, m.external_edges), (0, 0));
+        // New: and now the graph can say that zero measured nothing.
+        assert_eq!(m.ref_fan_out, 2);
+        assert_eq!(m.ref_fan_in, 0);
+    }
+
+    #[test]
+    fn the_linked_note_carries_the_incoming_reference() {
+        let g = note_graph();
+        assert_eq!(file(&g, "docs/b.md").ref_fan_in, 1);
+        assert_eq!(file(&g, "docs/b.md").ref_fan_out, 0);
+        assert_eq!(file(&g, "guide/c.md").ref_fan_in, 1);
+    }
+
+    #[test]
+    fn a_folder_of_notes_counts_only_the_references_that_leave_it() {
+        // `docs/a.md -> docs/b.md` stays inside; only the `guide/` link is a
+        // reference out of the folder. Same rule the dependency rollup uses.
+        let g = note_graph();
+        assert_eq!(module(&g, "docs").ref_fan_out, 1);
+        assert_eq!(module(&g, "docs").ref_fan_in, 0);
+        assert_eq!(module(&g, "guide").ref_fan_in, 1);
+        assert_eq!(module(&g, "guide").ref_fan_out, 0);
+    }
+
+    #[test]
+    fn cohesion_and_score_are_left_exactly_as_they_were() {
+        // The point of the separate tally: references inform the reader,
+        // they do not quietly become a second opinion on coupling.
+        let g = note_graph();
+        assert_eq!(file(&g, "docs/a.md").cohesion, None);
+        assert_eq!(file(&g, "docs/a.md").instability, None);
+        assert_eq!(module(&g, "docs").cohesion, None);
+        assert!(!module(&g, "docs").in_cycle);
+    }
+
+    #[test]
+    fn a_measured_zero_stays_a_zero() {
+        // A code graph must be untouched by any of this: real coupling on
+        // the dependency counts, nothing on the reference ones.
+        let g = graph_of(
+            vec![note("src/a.rs", "a"), note("src/b.rs", "b")],
+            &[(0, 1, RelationshipKind::Calls)],
+        );
+        let a = file(&g, "src/a.rs");
+        assert_eq!((a.fan_out, a.ref_fan_out), (1, 0));
+        let b = file(&g, "src/b.rs");
+        assert_eq!((b.fan_in, b.ref_fan_in), (1, 0));
     }
 }

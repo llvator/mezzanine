@@ -9,21 +9,84 @@
  * Widths live here rather than as component state because the app has to
  * answer "does the canvas still have room for this pane" before deciding
  * whether to render it, and that sum needs every pane's width in one place.
+ *
+ * The *arithmetic* of that question moved to `viewmodels/paneLayout.ts` in
+ * UI-093, along with the floors it is expressed in. What is left here is
+ * persistence: what the reader last asked for, so the next window opens on it.
  */
 import { writable, type Writable } from 'svelte/store';
+import {
+  DETAILS_MIN_WIDTH, SPEC_MIN_WIDTH, DESCRIPTION_MIN_WIDTH, SIDEBAR_MIN_WIDTH,
+} from '../viewmodels/paneLayout';
 
-function persisted<T>(key: string, fallback: T, parse: (raw: string) => T): Writable<T> {
-  let initial = fallback;
+/**
+ * Which browser store a preference lives in, and therefore how far it reaches.
+ *
+ * `local` is per-browser: every window of it shares one value, so the last
+ * window to change something decides what the next one opens on. `session` is
+ * per-tab and survives a reload of that tab, which is the scope a *window's*
+ * layout actually wants now that two windows are a supported way to work
+ * (UI-095).
+ *
+ * The existing flags stay on `local`. Changing them would silently drop
+ * everyone's remembered layout, and being handed the other window's pane
+ * widths is a small wrong compared with what it buys.
+ */
+type Area = 'local' | 'session';
+
+function areaOf(area: Area): Storage | null {
   try {
-    const raw = localStorage.getItem(key);
-    if (raw !== null) initial = parse(raw);
-  } catch { /* SSR / blocked storage */ }
+    return area === 'local' ? localStorage : sessionStorage;
+  } catch {
+    return null; // SSR / blocked storage
+  }
+}
+
+function persistedIn<T>(area: Area, key: string, fallback: T, parse: (raw: string) => T): Writable<T> {
+  let initial = fallback;
+  const raw = areaOf(area)?.getItem(key);
+  if (raw !== null && raw !== undefined) initial = parse(raw);
   const store = writable<T>(initial);
   store.subscribe((v) => {
-    try { localStorage.setItem(key, String(v)); } catch { /* ignore */ }
+    try { areaOf(area)?.setItem(key, String(v)); } catch { /* quota, private mode */ }
   });
   return store;
 }
+
+function persisted<T>(key: string, fallback: T, parse: (raw: string) => T): Writable<T> {
+  return persistedIn('local', key, fallback, parse);
+}
+
+/**
+ * A remembered on/off switch.
+ *
+ * Exported because `stores/mirror.ts` needs one too, and every store in this
+ * folder that wanted a persisted boolean has so far written its own
+ * `try { localStorage… } catch` pair. Naming the one in this file rather than
+ * adding a fourth copy elsewhere; a shared `stores/persisted.ts` would be the
+ * tidier home if a fifth consumer ever turns up.
+ */
+export function persistedFlag(key: string, fallback: boolean): Writable<boolean> {
+  return persisted(key, fallback, (v) => v === 'true');
+}
+
+/**
+ * Whether this window draws the canvas at all (UI-098).
+ *
+ * The canvas used to be the one thing that could not be closed — it was what
+ * the panes flanked, and closing it left a window with nothing in the middle.
+ * Two windows changed that: one can hold the graph while the other holds the
+ * panes that read it, and the second one has no use for a 640px floor it
+ * cannot fill. Closing it is also what makes all five panes reachable at once
+ * across the pair, which no single window under 1640px could manage.
+ *
+ * **Per-tab, unlike every other flag here.** `localStorage` is shared by every
+ * window of the browser, so a pane window closing its canvas would leave the
+ * canvas window opening without one after a reload — losing the graph, in the
+ * window whose whole job is the graph. `sessionStorage` is scoped to the tab
+ * and survives its reloads, which is exactly the reach this switch wants.
+ */
+export const canvasPaneOpen = persistedIn('session', 'nao-canvas-pane-open', true, (v) => v === 'true');
 
 /** Whether the Details column is expanded. Default open: it is where a click
  *  on a node lands, and one click hides it. */
@@ -72,43 +135,41 @@ export const splitViewOpen = persisted('nao-split-view-open', false, (v) => v ==
  */
 export const followAnalysisScope = persisted('nao-spec-follow-scope', false, (v) => v === 'true');
 
-/** Spec-pane width. Wider floor than Details: the pane draws a graph rather
- *  than reading prose, and below ~260px the tier labels collide with the
- *  nodes. */
-export const SPEC_MIN_WIDTH = 260;
-export const SPEC_MAX_WIDTH = 720;
-
-export const specWidth = persisted('nao-spec-width', 400, (v) => {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return 400;
-  return Math.min(SPEC_MAX_WIDTH, Math.max(SPEC_MIN_WIDTH, n));
-});
-
-/** Narrow, deliberately: it is what the pane shrinks to at 1280×800 rather
- *  than vanishing, and a cramped Details column beats no Details column when
- *  promoting it out of the sidebar was the whole point. */
-export const DETAILS_MIN_WIDTH = 220;
-export const DETAILS_MAX_WIDTH = 560;
-
-export const detailsWidth = persisted('nao-details-width', 340, (v) => {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return 340;
-  return Math.min(DETAILS_MAX_WIDTH, Math.max(DETAILS_MIN_WIDTH, n));
-});
-
-/** The Description column is a fixed-width reading pane — its content is one
- *  chain of prose, so there is nothing for extra width to buy. */
-export const DESCRIPTION_WIDTH = 300;
-
-/** Below this the canvas stops being the thing you are looking at, so the
- *  right-hand panes give way rather than squeezing it further.
+/**
+ * What each column remembers being dragged to.
  *
- *  Set so the canvas stays wider than every side column put together at
- *  1280×800, the narrowest window the layout is checked at (UI-020): that
- *  window less the sidebar's 360 and the three 20px toggle strips leaves
- *  Details its 220px minimum, and 640 > 360 + 220.
+ * Only a floor is enforced on the way in. There is no stored maximum any more
+ * (UI-093): a width is a preference, and the window it is being read on is
+ * what decides how much of it can be honoured — `layoutPanes` clamps what is
+ * *shown* without touching what is *stored*, so a pane dragged wide on a
+ * monitor survives a trip through a laptop.
+ */
+function width(key: string, fallback: number, min: number): Writable<number> {
+  return persisted(key, fallback, (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, n);
+  });
+}
+
+export const specWidth = width('nao-spec-width', 400, SPEC_MIN_WIDTH);
+export const detailsWidth = width('nao-details-width', 340, DETAILS_MIN_WIDTH);
+
+/** The Description column was a fixed 300px with no handle at all — the pane
+ *  holding the most prose was the one you could not widen (UI-093). The key is
+ *  new because there was never a stored value to inherit. */
+export const describeWidth = width('nao-describe-width', 300, DESCRIPTION_MIN_WIDTH);
+
+/** The sidebar was a plain `let` in `App.svelte`, so it forgot its width on
+ *  every reload while the two panes beside it remembered theirs. */
+export const sidebarWidth = width('nao-sidebar-width', 360, SIDEBAR_MIN_WIDTH);
+
+/**
+ * Whether the focused pane grows into the slack (UI-094).
  *
- *  With the sidebar open, all three columns fit from ~1700px, Details alone
- *  from 1280, and below that the right-hand side is empty. Collapsing the
- *  sidebar moves each of those thresholds down by its width. */
-export const MIN_CANVAS_WIDTH = 640;
+ * Off by default: it moves columns in response to a keystroke that used to
+ * move only a focus ring, and a layout that rearranges itself is something to
+ * opt into rather than to discover. What it does to the arithmetic is in
+ * `viewmodels/paneLayout.ts`; all that lives here is whether it is on.
+ */
+export const focusExpand = persisted('nao-focus-expand', false, (v) => v === 'true');

@@ -26,6 +26,28 @@ function moduleOf(node: D3Node): string {
 }
 
 /**
+ * UI-090 — does every file in this graph hold exactly one entity?
+ *
+ * When it does, collapsing entities into files removes nothing: Entity level
+ * and File level are the same picture, and a reader who presses Entity and
+ * watches the canvas not move has learned only that a control looks broken.
+ * That is the normal case for a document graph — the Markdown parser emits
+ * one Note per file, because a link addresses a whole document — but nothing
+ * here asks what language anything is written in. A future language with the
+ * same shape inherits the answer, and a Rust file that happens to hold one
+ * struct does not, because the question is about the graph on screen.
+ *
+ * Takes the *entity-level* nodes. Asking a collapsed graph is meaningless:
+ * every file already holds one node there by construction.
+ */
+export function everyFileIsOneEntity(nodes: readonly D3Node[]): boolean {
+  if (nodes.length === 0) return false;
+  const files = new Set<string>();
+  for (const n of nodes) files.add(n.file_path);
+  return files.size === nodes.length;
+}
+
+/**
  * The scope a node collapses into — or the node itself, when its scope has
  * been expanded (UI-057).
  *

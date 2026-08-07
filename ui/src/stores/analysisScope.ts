@@ -16,6 +16,8 @@
 
 import { writable, derived, get } from 'svelte/store';
 import { apiUrl } from '../vscodeAdapter';
+import { isServeMode } from './serveMode';
+import { settingsReport, type SettingsReport } from './settingsReport';
 import { nextStagedLanguages, allOrNoneStaged } from '../utils/languageScope';
 
 /** The language lists and the staging rules live in
@@ -43,6 +45,17 @@ export const stagedAnalysisLanguages = writable<Set<string> | null>(null);
 export const appliedIncludeDocs = writable<boolean>(false);
 export const stagedIncludeDocs = writable<boolean>(false);
 
+/** Where the Elevator spec lives, when it isn't "every `.elv` under the
+ *  root" — the default, written here as the empty string because this is a
+ *  text field and `null` would need special-casing at every use.
+ *
+ *  A session override, not a saved setting: the durable answer is `spec_dir`
+ *  in the repo's `.nao/settings.json`, and this field is seeded from it. The
+ *  browser deliberately does not write that file back — a page should not be
+ *  able to edit the file that decides which directories nao reads. */
+export const appliedSpecDir = writable<string>('');
+export const stagedSpecDir = writable<string>('');
+
 /** Seed both from the server. Without this the panel assumes "no filter,
  *  no docs" — and against a server started with `--include-docs` the first
  *  Apply would send `include_docs: false` and turn docs off for real. */
@@ -53,12 +66,15 @@ export async function loadAnalysisScope(): Promise<void> {
     const data = (await resp.json()) as {
       languages: string[] | null;
       include_docs: boolean;
+      spec_dir?: string | null;
     };
     const langs = data.languages === null ? null : new Set(data.languages);
     appliedAnalysisLanguages.set(langs);
     stagedAnalysisLanguages.set(langs);
     appliedIncludeDocs.set(!!data.include_docs);
     stagedIncludeDocs.set(!!data.include_docs);
+    appliedSpecDir.set(data.spec_dir ?? '');
+    stagedSpecDir.set(data.spec_dir ?? '');
   } catch {
     // A server too old to answer leaves the defaults in place. Nothing to
     // report — the panel is still usable, it just starts from an assumption.
@@ -81,9 +97,18 @@ export const analysisScopeError = writable<string | null>(null);
 /** True when the staged set differs from the applied set. The Apply
  *  button is enabled iff this is true. */
 export const analysisScopeDirty = derived(
-  [stagedAnalysisLanguages, appliedAnalysisLanguages, stagedIncludeDocs, appliedIncludeDocs],
-  ([$staged, $applied, $stagedDocs, $appliedDocs]) =>
-    !setsEqual($staged, $applied) || $stagedDocs !== $appliedDocs,
+  [
+    stagedAnalysisLanguages,
+    appliedAnalysisLanguages,
+    stagedIncludeDocs,
+    appliedIncludeDocs,
+    stagedSpecDir,
+    appliedSpecDir,
+  ],
+  ([$staged, $applied, $stagedDocs, $appliedDocs, $stagedSpec, $appliedSpec]) =>
+    !setsEqual($staged, $applied) ||
+    $stagedDocs !== $appliedDocs ||
+    $stagedSpec.trim() !== $appliedSpec.trim(),
 );
 
 function setsEqual(a: Set<string> | null, b: Set<string> | null): boolean {
@@ -126,19 +151,70 @@ export const stagedScopeEmpty = derived(
 export function resetStaged(): void {
   stagedAnalysisLanguages.set(get(appliedAnalysisLanguages));
   stagedIncludeDocs.set(get(appliedIncludeDocs));
+  stagedSpecDir.set(get(appliedSpecDir));
   analysisScopeError.set(null);
+}
+
+/** True while a save-as-default is in flight. */
+export const analysisScopeSaving = writable<boolean>(false);
+
+/** Set after a successful save, cleared as soon as the scope is staged
+ *  differently again — a "saved" badge that outlives the thing it describes
+ *  is worse than none. */
+export const analysisScopeSaved = writable<boolean>(false);
+
+/**
+ * Promote the *applied* scope to this repo's default, by writing the
+ * analysis keys into `<root>/.nao/settings.json` (CFG-010).
+ *
+ * The applied scope, not the staged one: saving something the reader has not
+ * yet seen the graph for would make the button a second, quieter Apply. It
+ * also means saving never re-analyzes — there is nothing to recompute.
+ *
+ * Not offered in serve mode. `nao serve` never reads a submitted repo's
+ * settings file, so a file written there would be one nothing will ever read
+ * (ADR-0008); the route does not exist there either.
+ */
+export async function saveScopeAsRepoDefault(): Promise<boolean> {
+  if (isServeMode()) return false;
+  analysisScopeSaving.set(true);
+  analysisScopeError.set(null);
+  try {
+    const resp = await fetch(apiUrl('/api/settings/analysis'), { method: 'POST' });
+    if (!resp.ok) {
+      // The server refuses rather than overwrites when the existing file
+      // cannot be parsed, and rather than writing a spec_dir the loader
+      // would reject on the next start. Both send prose worth showing.
+      throw new Error((await resp.text()) || `HTTP ${resp.status}`);
+    }
+    settingsReport.set((await resp.json()) as SettingsReport);
+    analysisScopeSaved.set(true);
+    return true;
+  } catch (e) {
+    analysisScopeError.set(`Could not save: ${e instanceof Error ? e.message : e}`);
+    return false;
+  } finally {
+    analysisScopeSaving.set(false);
+  }
 }
 
 /** Apply staged changes: POST to the backend. Returns true on success. */
 export async function applyAnalysisScope(): Promise<boolean> {
   const staged = get(stagedAnalysisLanguages);
   const stagedDocs = get(stagedIncludeDocs);
+  // The empty string is not "unchanged" but "clear it" — the backend reads
+  // it that way (see `AnalysisScopeRequest::spec_dir`), which is how the
+  // field can be emptied to get back to every `.elv` under the root.
+  const stagedSpec = get(stagedSpecDir).trim();
   analysisScopeApplying.set(true);
   analysisScopeError.set(null);
+  // A newly applied scope is not the saved one, whatever was saved before.
+  analysisScopeSaved.set(false);
   try {
     const body = JSON.stringify({
       languages: staged === null ? null : [...staged],
       include_docs: stagedDocs,
+      spec_dir: stagedSpec,
     });
     const resp = await fetch(apiUrl('/api/analysis/scope'), {
       method: 'POST',
@@ -161,6 +237,8 @@ export async function applyAnalysisScope(): Promise<boolean> {
     // the applied state here so the UI can stop showing "dirty".
     appliedAnalysisLanguages.set(staged);
     appliedIncludeDocs.set(stagedDocs);
+    appliedSpecDir.set(stagedSpec);
+    stagedSpecDir.set(stagedSpec);
     return true;
   } catch (e) {
     analysisScopeError.set(`Failed to apply: ${e}`);

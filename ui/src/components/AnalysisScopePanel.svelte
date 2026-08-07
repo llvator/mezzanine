@@ -29,7 +29,13 @@
     stagedScopeEmpty,
     resetStaged,
     applyAnalysisScope,
+    stagedSpecDir,
+    appliedSpecDir,
+    analysisScopeSaving,
+    analysisScopeSaved,
+    saveScopeAsRepoDefault,
   } from '../stores/analysisScope';
+  import { serveMode } from '../stores/serveMode';
   import { LANGUAGE_COLORS } from '../types/graph';
 
   // A language is "checked" when either no filter is active (null =
@@ -61,6 +67,13 @@
   $: appliedSummary = $appliedAnalysisLanguages === null
     ? 'All languages'
     : [...$appliedAnalysisLanguages].sort().join(', ') || 'None';
+
+  // Shown whether or not it is set, unlike the language summary above it.
+  // The setting was invisible while unset — a reader with no spec folder saw
+  // no line, so the field inside the collapsed section was findable only by
+  // opening a section whose heading did not mention it. Naming the default
+  // out loud is what says "there is a control here".
+  $: specSummary = $appliedSpecDir.trim() || 'every .elv under the root';
   /** Collapsed by default in the sidebar: nineteen checkboxes that are all
    *  ticked and almost never changed were consuming ~175px above the scope
    *  tree (UI-011). The summary line stays visible either way, so the
@@ -83,6 +96,9 @@
 <div class="analysis-scope">
   <div class="summary">
     Analyzing: <span class="summary-value">{appliedSummary}</span>
+  </div>
+  <div class="summary">
+    Spec from: <span class="summary-value">{specSummary}</span>
   </div>
 
   {#if open}
@@ -129,6 +145,25 @@
     {/each}
   </div>
 
+  <label class="spec-dir" for="spec-dir-input">Spec folder</label>
+  <input
+    id="spec-dir-input"
+    class="spec-dir-input"
+    type="text"
+    spellcheck="false"
+    autocomplete="off"
+    placeholder="every .elv under the root"
+    disabled={$analysisScopeApplying}
+    bind:value={$stagedSpecDir}
+  />
+  <p class="layer-note">
+    Where this repo's Elevator spec lives — relative to the analyzed root, or
+    an absolute path when the spec sits outside it. Set it and only `.elv`
+    files under that folder are the spec; leave it empty and every `.elv` in
+    the tree is. Applies to this session; the durable answer is
+    <code>spec_dir</code> in <code>.nao/settings.json</code>.
+  </p>
+
   <div class="actions">
     <button
       type="button"
@@ -154,6 +189,30 @@
     >
       Reset
     </button>
+    <!-- Saves what is *applied*, so it is disabled while the panel is dirty:
+         a button that quietly saved something the reader had not yet seen
+         drawn would be a second Apply. Absent in serve mode, where a repo
+         arrived from a URL a stranger pasted and its settings file is never
+         read (ADR-0008). -->
+    {#if !$serveMode}
+      <button
+        type="button"
+        class="save-btn"
+        disabled={$analysisScopeDirty || $analysisScopeApplying || $analysisScopeSaving}
+        on:click={saveScopeAsRepoDefault}
+        title={$analysisScopeDirty
+          ? 'Apply the staged scope first — this saves what is currently drawn'
+          : "Write this scope into .nao/settings.json so it survives a restart"}
+      >
+        {#if $analysisScopeSaving}
+          Saving…
+        {:else if $analysisScopeSaved && !$analysisScopeDirty}
+          Saved ✓
+        {:else}
+          Save as this repo's default
+        {/if}
+      </button>
+    {/if}
   </div>
 
   {#if $analysisScopeError}
@@ -212,6 +271,39 @@
     line-height: 1.35;
     color: var(--text-muted, #888);
   }
+  .layer-note code {
+    font-size: 0.95em;
+    color: var(--text-secondary);
+  }
+
+  /* A path, not a toggle: the one control here that needs typing, so it gets
+     a label of its own rather than sitting inline with the checkboxes. */
+  .spec-dir {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .spec-dir-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.3rem 0.4rem;
+    font-family: inherit;
+    font-size: 0.75rem;
+    color: var(--text);
+    background: var(--bg-body);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+  }
+  .spec-dir-input::placeholder { color: var(--text-dim); }
+  .spec-dir-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .spec-dir-input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
 
   /* Ticked because the docs switch says so, not because the user picked it.
      Dimmed so "on but not yours to change here" is visible rather than
@@ -237,12 +329,31 @@
   }
 
   .apply-btn,
-  .cancel-btn {
+  .cancel-btn,
+  .save-btn {
     padding: 0.3rem 0.6rem;
     border-radius: 3px;
     cursor: pointer;
     font-size: 0.8rem;
     border: 1px solid var(--border);
+  }
+
+  /* Quieter than Apply: this one writes a file rather than changing what is
+     on screen, and it is the rarer of the two actions. Full width on its own
+     row because the label is a sentence. */
+  .save-btn {
+    background: var(--bg-surface-alt);
+    color: var(--text-secondary);
+    flex-basis: 100%;
+  }
+  .save-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  .save-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .apply-btn {

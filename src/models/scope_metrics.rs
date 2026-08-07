@@ -38,6 +38,25 @@ pub struct ScopeMetrics {
     /// `None` when both are 0.
     pub instability: Option<f32>,
 
+    // --- Reference edges, counted apart from coupling (UI-091) ---
+    //
+    // Every field above is computed over dependency edges only, so a scope
+    // whose relationships are all `References` — a Markdown link, an
+    // Elevator or Impex reference, a folded SQL foreign key — scores a
+    // fan-out of `0` while the canvas plainly draws arrows leaving it. Zero
+    // is the *good* end of that scale, so an unmeasured scope reads as a
+    // perfectly decoupled one.
+    //
+    // These two say how much was passed over. They deliberately feed no
+    // ratio, no cycle detection and no composite score: this is a claim
+    // about what the numbers above cover, not a second opinion on coupling.
+    /// Distinct other scopes referencing this one, over `References` edges.
+    #[serde(default)]
+    pub ref_fan_in: u32,
+    /// Distinct other scopes this one references, over `References` edges.
+    #[serde(default)]
+    pub ref_fan_out: u32,
+
     // --- Aggregated entity-quality rollup ---
     /// Mean composite score of all entities in this scope.
     pub avg_quality: f32,

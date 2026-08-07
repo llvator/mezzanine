@@ -14,8 +14,12 @@
     tierMethodCount,
     tierPublicFieldRatio,
   } from '../stores/quality';
-  import { diffActive, diffStatusMap, diffDeltaMap, diffSourceChangedMap, diffBaseIdMap, baseDetailsCache, DIFF_COLORS, normalizeEntityId, type ChangeStatus, type MetricDelta } from '../stores/diff';
-  import { computeLineDiff, type DiffLine } from '../utils/lineDiff';
+  import { diffActive, diffStatusMap, diffDeltaMap, diffSourceChangedMap, diffBaseIdMap, diffRelDeltaMap, diffScopeChanges, diffScopeCounts, baseDetailsCache, DIFF_COLORS, normalizeEntityId, type ChangeStatus, type MetricDelta } from '../stores/diff';
+  import { normalizeScopePath } from '../viewmodels/diffRollup';
+  import { exceedsLcsBudget } from '../utils/lineDiff';
+  import SourceDiff from './SourceDiff.svelte';
+  import RelationshipChanges from './RelationshipChanges.svelte';
+  import { couplingCell } from '../viewmodels/scopeCoupling';
 
   export let entity: D3Node | null;
   export let showSource: boolean = true;
@@ -132,11 +136,47 @@
   $: diffDeltas = entity && $diffDeltaMap ? $diffDeltaMap.get(normalizeEntityId(entity.original_id)) : undefined;
   $: diffIsCore = entity && $diffSourceChangedMap ? $diffSourceChangedMap.get(normalizeEntityId(entity.original_id)) : undefined;
 
-  // Diff: look up base source code for side-by-side comparison
+  // ─── UI-097 — a file or folder node is a rollup, not an entity ──────
+  //
+  // `compute_diff` walks entities, and a file is not one, so a collapsed
+  // node has no row in the diff: no status, no base id, no metric deltas.
+  // Every lookup above misses and the pane falls back to printing source —
+  // which is what the canvas shows most of the time, since anything above a
+  // small scope opens at File level. The canvas already solved this for
+  // colour (UI-064) with a rollup keyed by scope path; these read the same
+  // rollup, and the before-source from the sidecar, whose file entries are
+  // keyed by that identical repo-relative path.
+  $: scopePath = entity ? normalizeScopePath(entity.original_id) : '';
+  $: isScopeNode = entity?.kind_raw === 'File' || entity?.kind_raw === 'Module';
+  $: scopeChange = isScopeNode && $diffScopeChanges ? $diffScopeChanges.get(scopePath) : undefined;
+  $: scopeTally = isScopeNode && $diffScopeCounts ? $diffScopeCounts.get(scopePath) : undefined;
+  /** The entity's own status, or the rolled-up one for a scope node. */
+  $: effectiveStatus = diffStatus ?? scopeChange?.status;
+  $: effectiveIsCore = diffStatus ? diffIsCore : scopeChange?.sourceChanged;
+  $: scopeChangedCount = scopeTally
+    ? scopeTally.added + scopeTally.removed + scopeTally.modified
+    : 0;
+
+  // Diff: the before-source, and the relationships this entity gained or lost.
   $: baseEntityId = entity && $diffBaseIdMap ? $diffBaseIdMap.get(normalizeEntityId(entity.original_id)) : undefined;
-  $: baseSource = baseEntityId && $baseDetailsCache ? $baseDetailsCache[baseEntityId]?.source_code : undefined;
-  $: showSplit = $diffActive && diffStatus === 'modified' && baseSource && detail?.source_code;
-  $: diffLines = showSplit ? computeLineDiff(baseSource!, detail!.source_code!) : [];
+  $: baseSource = baseEntityId && $baseDetailsCache
+    ? $baseDetailsCache[baseEntityId]?.source_code
+    : isScopeNode && $baseDetailsCache
+      ? $baseDetailsCache[scopePath]?.source_code
+      : undefined;
+  $: relDeltas = entity && $diffRelDeltaMap ? $diffRelDeltaMap.get(normalizeEntityId(entity.original_id)) ?? [] : [];
+  /** Anything the diff has something to say about gets the diff renderer:
+   *  modified with both sides, and added/removed where only one side exists.
+   *  Everything else is just source. */
+  $: showDiff = $diffActive
+    && !!effectiveStatus
+    && effectiveStatus !== 'unchanged'
+    && (!!baseSource || !!detail?.source_code);
+  /** A whole file can be too dissimilar to align line by line. Saying so
+   *  beats presenting the fallback — one block replaced by another — as
+   *  though it were the alignment. */
+  $: diffDegraded = showDiff && !!baseSource && !!detail?.source_code
+    && exceedsLcsBudget(baseSource, detail.source_code);
 
   $: isCallable = !!entity && (entity.kind_raw === 'Function' || entity.kind_raw === 'Method');
   $: isContainer = !!entity && !isCallable;
@@ -250,6 +290,15 @@
   $: showPfr = isContainer && metrics?.public_field_ratio != null;
   $: pfrScored = showPfr && (metrics?.method_count ?? 0) > 3;
 
+  /** UI-091. On a File or Module node these two cells are rollups over
+   *  dependency edges, and a scope whose relationships are all references
+   *  scores `0` on both while the canvas draws arrows out of it. `scope_metrics`
+   *  now carries what was passed over, so the cell can say "not measured"
+   *  rather than flatter the scope with a zero. Entity nodes have no reference
+   *  tally and fall through to the plain number. */
+  $: fanIn = couplingCell(metrics?.fan_in ?? 0, entity?.scope_metrics?.ref_fan_in ?? 0, 'in');
+  $: fanOut = couplingCell(metrics?.fan_out ?? 0, entity?.scope_metrics?.ref_fan_out ?? 0, 'out');
+
   function explain(key: keyof typeof METRIC_EXPLANATIONS): string {
     const e = METRIC_EXPLANATIONS[key];
     return `${e.title} — ${e.body}`;
@@ -346,7 +395,7 @@
     {/if}
     <div class="detail-row">
       <div class="detail-label">Name</div>
-      <div class="detail-value code">{entity.name}</div>
+      <div class="detail-value code" data-probe="entity-name">{entity.name}</div>
     </div>
     {#if entity.tags?.includes('ghost')}
       <div class="detail-row">
@@ -378,15 +427,33 @@
     </div>
 
     <!-- Diff mode: change status badge + metric deltas -->
-    {#if $diffActive && diffStatus}
+    {#if $diffActive && effectiveStatus}
       <div class="detail-row">
-        <span class="diff-badge diff-{diffStatus}">{diffStatus}</span>
-        {#if diffStatus === 'modified'}
-          <span class="diff-type-badge" class:core={diffIsCore} class:impact={!diffIsCore}>
-            {diffIsCore ? 'core' : 'impact'}
+        <span class="diff-badge diff-{effectiveStatus}">{effectiveStatus}</span>
+        {#if effectiveStatus === 'modified'}
+          <span class="diff-type-badge" class:core={effectiveIsCore} class:impact={!effectiveIsCore}>
+            {effectiveIsCore ? 'core' : 'impact'}
           </span>
         {/if}
       </div>
+      <!-- A scope node's own "metrics" are its contents: it has no metric
+           deltas of its own, and the count is what the reader is deciding
+           whether to open it on. -->
+      {#if scopeTally && scopeChangedCount > 0}
+        <div class="detail-row">
+          <div class="detail-label">
+            What changed in here ({scopeChangedCount} of {scopeChangedCount + scopeTally.unchanged})
+          </div>
+          <div class="scope-tally" data-probe="scope-tally">
+            {#if scopeTally.added > 0}<span class="tally added">+{scopeTally.added} added</span>{/if}
+            {#if scopeTally.removed > 0}<span class="tally removed">−{scopeTally.removed} removed</span>{/if}
+            {#if scopeTally.modified > 0}<span class="tally modified">~{scopeTally.modified} modified</span>{/if}
+            <span class="tally core-note" title="Entities whose own source or intrinsic metrics moved, rather than only their fan-in/fan-out">
+              {scopeTally.core} edited
+            </span>
+          </div>
+        </div>
+      {/if}
       {#if diffDeltas && diffDeltas.length > 0}
         <div class="detail-row">
           <div class="detail-label">Changes</div>
@@ -443,13 +510,26 @@
               <span class="metric-value">{metrics.param_count}</span>
             </div>
           {/if}
-          <div class="metric metric-ok help" data-tip={explain('fan_in')} aria-label={explain('fan_in')}>
+          <!-- `metric-na` is the existing grey for "no tier applies", which
+               is exactly what an unmeasured count is. Reusing it keeps the
+               panel's vocabulary at four states instead of five. -->
+          <div
+            class="metric metric-{fanIn.unmeasured ? 'na' : 'ok'} help"
+            data-probe="fan-in"
+            data-tip={fanIn.tip || explain('fan_in')}
+            aria-label={fanIn.tip || explain('fan_in')}
+          >
             <span class="metric-label">Fan-in</span>
-            <span class="metric-value">{metrics.fan_in}</span>
+            <span class="metric-value">{fanIn.text}</span>
           </div>
-          <div class="metric metric-{tierFanOut(metrics.fan_out)} help" data-tip={explain('fan_out')} aria-label={explain('fan_out')}>
+          <div
+            class="metric metric-{fanOut.unmeasured ? 'na' : tierFanOut(metrics.fan_out)} help"
+            data-probe="fan-out"
+            data-tip={fanOut.tip || explain('fan_out')}
+            aria-label={fanOut.tip || explain('fan_out')}
+          >
             <span class="metric-label">Fan-out</span>
-            <span class="metric-value">{metrics.fan_out}</span>
+            <span class="metric-value">{fanOut.text}</span>
           </div>
           {#if metrics.in_cycle}
             <div class="metric metric-bad help" data-tip={explain('cycle')} aria-label={explain('cycle')}>
@@ -649,37 +729,30 @@
       </div>
     {/if}
 
-    <!-- Source code (loaded from detail sidecar) -->
-    {#if showSource && detail?.source_code}
+    <!-- Source code (loaded from detail sidecar). Under a loaded diff this
+         is a diff of the entity's own source, not a printout of its head
+         state: what changed is the question the pane is being asked. -->
+    {#if showSource && (detail?.source_code || (showDiff && baseSource))}
       <div class="detail-row">
-        <div class="detail-label">{entity.kind_raw === 'File' ? 'Source' : 'Definition'}</div>
-        {#if showSplit}
-          <div class="diff-view" class:compact>
-            <div class="diff-header">
-              <span class="diff-header-label split-label-removed">Base</span>
-              <span class="diff-header-label split-label-added">Head</span>
-            </div>
-            <div class="diff-lines">
-              {#each diffLines as line}
-                <div class="diff-line diff-line-{line.kind}">
-                  <span class="diff-gutter diff-gutter-base">{line.baseLine ?? ''}</span>
-                  <span class="diff-gutter diff-gutter-head">{line.headLine ?? ''}</span>
-                  <span class="diff-marker">{line.kind === 'added' ? '+' : line.kind === 'removed' ? '-' : ' '}</span>
-                  <pre class="diff-text">{line.text}</pre>
-                </div>
-              {/each}
-            </div>
+        <div class="detail-label">
+          {entity.kind_raw === 'File' ? 'Source' : 'Definition'}
+          {#if showDiff}<span class="src-diff-note">{effectiveStatus}</span>{/if}
+        </div>
+        {#if diffDegraded}
+          <div class="diff-degraded" data-probe="diff-degraded">
+            Too dissimilar to line up — the whole body is shown as replaced.
           </div>
-        {:else if $diffActive && diffStatus === 'removed' && baseSource}
-          <div class="source-code-block" class:compact><pre>{baseSource}</pre></div>
-        {:else}
-          <div class="source-code-block" class:compact><pre>{detail.source_code}</pre></div>
         {/if}
-      </div>
-    {:else if showSource && $diffActive && diffStatus === 'removed' && baseSource}
-      <div class="detail-row">
-        <div class="detail-label">Definition (removed)</div>
-        <div class="source-code-block" class:compact><pre>{baseSource}</pre></div>
+        {#if showDiff}
+          <SourceDiff
+            base={effectiveStatus === 'added' ? undefined : baseSource}
+            head={effectiveStatus === 'removed' ? undefined : detail?.source_code}
+            status={effectiveStatus}
+            {compact}
+          />
+        {:else}
+          <div class="source-code-block" class:compact><pre>{detail?.source_code}</pre></div>
+        {/if}
       </div>
     {/if}
 
@@ -692,6 +765,12 @@
           <div class="source-code-block" class:compact><pre>{block}</pre></div>
         </div>
       {/each}
+    {/if}
+
+    <!-- What the diff did to this entity's edges. Above the Relationships
+         list, which draws the head graph and so cannot show a loss. -->
+    {#if showRelationships && $diffActive}
+      <RelationshipChanges deltas={relDeltas} />
     {/if}
 
     <!-- Relationships -->
@@ -949,103 +1028,38 @@
     tab-size: 4;
   }
 
-  /* Unified diff view */
-  .diff-view {
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    margin-top: 8px;
-    overflow-x: auto;
-  }
-
-  .diff-view.compact {
-    max-height: 300px;
-    overflow-y: auto;
-  }
-
-  .diff-header {
-    display: flex;
-    gap: 0;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .diff-header-label {
-    flex: 1;
-    font-size: 0.65rem;
-    font-weight: 600;
-    text-transform: uppercase;
+  /* The diff renderer lives in SourceDiff.svelte, which owns its own
+     styles; what stays here is the one-word status note beside the
+     Definition label. */
+  .src-diff-note {
+    font-size: 0.62rem;
     letter-spacing: 0.04em;
-    padding: 4px 8px;
-    text-align: center;
+    color: var(--text-muted);
   }
 
-  .split-label-removed {
-    background: rgba(244, 67, 54, 0.15);
-    color: #EF9A9A;
+  .diff-degraded {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    background: var(--bg-surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    margin-top: 6px;
   }
 
-  .split-label-added {
-    background: rgba(76, 175, 80, 0.15);
-    color: #A5D6A7;
-  }
-
-  .diff-lines {
-    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
-    font-size: 0.75rem;
-    line-height: 1.5;
-  }
-
-  .diff-line {
+  /* A scope node's rolled-up contents. Add/remove hues are identity, not
+     theme (see CONTRIBUTING) — the same three the diff badge uses. */
+  .scope-tally {
     display: flex;
-    align-items: stretch;
-    min-height: 1.5em;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    font-family: 'Monaco', 'Menlo', monospace;
+    font-size: 0.72rem;
   }
-
-  .diff-line-equal {
-    color: var(--text-dim);
-  }
-
-  .diff-line-added {
-    background: rgba(76, 175, 80, 0.1);
-    color: #A5D6A7;
-  }
-
-  .diff-line-removed {
-    background: rgba(244, 67, 54, 0.1);
-    color: #EF9A9A;
-  }
-
-  .diff-gutter {
-    flex-shrink: 0;
-    width: 32px;
-    text-align: right;
-    padding: 0 4px;
-    color: var(--text-dim);
-    font-size: 0.65rem;
-    opacity: 0.5;
-    border-right: 1px solid var(--border-subtle);
-    user-select: none;
-  }
-
-  .diff-marker {
-    flex-shrink: 0;
-    width: 16px;
-    text-align: center;
-    user-select: none;
-    font-weight: 700;
-  }
-
-  .diff-line-added .diff-marker { color: #4CAF50; }
-  .diff-line-removed .diff-marker { color: #F44336; }
-
-  .diff-text {
-    margin: 0;
-    padding: 0 8px 0 4px;
-    white-space: pre;
-    tab-size: 4;
-    flex: 1;
-    min-width: 0;
-  }
+  .scope-tally .added { color: #A5D6A7; }
+  .scope-tally .removed { color: #EF9A9A; }
+  .scope-tally .modified { color: #FFCC80; }
+  .scope-tally .core-note { color: var(--text-dim); }
 
   .fields-table {
     width: 100%;

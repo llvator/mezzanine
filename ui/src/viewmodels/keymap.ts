@@ -32,28 +32,41 @@ export interface PaneDef {
 }
 
 /**
- * Digits, not letters, and in layout order left-to-right: the number is a
- * position on screen, which is the one mapping nobody has to memorise.
+ * Digits, not letters, and near enough to layout order to be guessable: the
+ * number is a position on screen, which is the one mapping nobody has to
+ * memorise.
+ *
+ * The one pane not at its screen position is the canvas. `1` is the graph
+ * because it is what the app opens onto and what every other pane is read
+ * *against* — geometry would hand that digit to the spec pane, which a project
+ * without `.elv` files never draws at all. So the canvas keeps `1`, the spec
+ * pane takes `2` as the column beside it, and the rest run left to right from
+ * there. Appending Spec at `5` (its first home, when the pane was new) put the
+ * two canvases at opposite ends of the row for no reason a reader could see.
  */
 export const PANES: readonly PaneDef[] = [
   { id: 'sidebar', digit: '0', label: 'Sidebar', hint: 'Filters, Quality and Settings' },
   { id: 'graph', digit: '1', label: 'Graph', hint: 'The canvas itself' },
-  { id: 'view', digit: '2', label: 'View', hint: 'The view controls above the canvas' },
-  { id: 'details', digit: '3', label: 'Details', hint: 'The hovered or pinned entity' },
-  { id: 'description', digit: '4', label: 'Description', hint: 'The graph as prose' },
-  // Out of layout order, breaking this list's own rule, and the alternative is
-  // worse: the spec pane sits between the sidebar and the canvas, so placing
-  // it by position would renumber four panes that people already have in
-  // their hands. It is also the only optional pane — a project with no `.elv`
-  // files never shows it — so a digit that moves with its presence would be
-  // the least memorable number of all.
-  { id: 'spec', digit: '5', label: 'Spec', hint: 'The Elevator spec, and the code filter it drives' },
+  { id: 'spec', digit: '2', label: 'Spec', hint: 'The Elevator spec, and the code filter it drives' },
+  { id: 'view', digit: '3', label: 'View', hint: 'The view controls above the canvas' },
+  { id: 'details', digit: '4', label: 'Details', hint: 'The hovered or pinned entity' },
+  { id: 'description', digit: '5', label: 'Description', hint: 'The graph as prose' },
 ];
 
 export const PANE_LABEL: Record<PaneId, string> = {
   sidebar: 'Sidebar', graph: 'Graph', view: 'View', details: 'Details',
   description: 'Description', spec: 'Spec',
 };
+
+/**
+ * The key that focuses each pane, by id.
+ *
+ * Derived rather than written out, because the collapsed strips print it: a
+ * second hand-kept copy of the digits is exactly the kind of thing that ends
+ * up telling the reader to press a key that moves them somewhere else.
+ */
+export const PANE_DIGIT: Record<PaneId, string> =
+  Object.fromEntries(PANES.map((p) => [p.id, p.digit])) as Record<PaneId, string>;
 
 /**
  * Every command the layer can issue. A closed union rather than free strings
@@ -64,7 +77,8 @@ export type Command =
   // global
   | 'pane.focus.sidebar' | 'pane.focus.graph' | 'pane.focus.view'
   | 'pane.focus.details' | 'pane.focus.description' | 'pane.focus.spec'
-  | 'help.toggle' | 'help.close' | 'hover.lock' | 'search.focus'
+  | 'help.toggle' | 'ui.dismiss' | 'hover.lock' | 'search.focus'
+  | 'history.back' | 'history.forward' | 'pane.expand'
   // any pane that can be collapsed
   | 'pane.collapse'
   // sidebar
@@ -112,9 +126,29 @@ export const BINDINGS: readonly Binding[] = [
     label: p.label,
   })),
   { keys: '?', scope: 'global', command: 'help.toggle', label: 'Keys' },
-  { keys: 'Escape', scope: 'global', command: 'help.close', label: 'Close help' },
+  // Escape backs out of whatever is in front of the reader: the help overlay
+  // while it is up, otherwise the pane holding focus. Global rather than one
+  // binding per pane, and not because it means the same thing everywhere — it
+  // does not — but because the overlay covers every pane, so a pane-scoped
+  // Escape would win the resolution order and leave `?` with no way out.
+  // The per-pane `c` stays: it is the one that reads as "collapse" rather than
+  // as "get me out of here", and the bar can only advertise a pane's own keys.
+  { keys: 'Escape', scope: 'global', command: 'ui.dismiss', label: 'Close / collapse' },
   { keys: 'l', scope: 'global', command: 'hover.lock', label: 'Freeze hover' },
   { keys: 'mod+k', scope: 'global', command: 'search.focus', label: 'Search' },
+  // Global rather than canvas-scoped, and the reason is where the gestures
+  // are: a scope is committed from the sidebar, a region focused from the
+  // canvas, a view restored from the sidebar again. A key that only worked
+  // in the pane the last navigation happened to come from would be a key
+  // nobody could rely on. `[` and `]` are the two brackets no other binding
+  // wants, and they read as directions on every keyboard layout that has
+  // them together.
+  { keys: '[', scope: 'global', command: 'history.back', label: 'Back' },
+  { keys: ']', scope: 'global', command: 'history.forward', label: 'Forward' },
+  // Global for the same reason the digits are: it changes what focus *means*
+  // for every pane at once, so binding it inside one of them would make the
+  // mode reachable only from wherever you happened to be standing (UI-094).
+  { keys: 'z', scope: 'global', command: 'pane.expand', label: 'Expand focused' },
 
   // --- sidebar ---
   { keys: 'f', scope: 'sidebar', command: 'sidebar.tab.filters', label: 'Filters' },

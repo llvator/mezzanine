@@ -36,7 +36,7 @@ import { derived, get, writable } from 'svelte/store';
 import type { Readable } from 'svelte/store';
 import type { D3Node } from '../types/graph';
 import { fullGraphDataStore } from './scope';
-import { rawEntityGraph, selectedNode } from './graph';
+import { focusNode, rawEntityGraph, selectedNode } from './graph';
 import { followAnalysisScope, splitViewOpen } from './panes';
 import { buildPathUniverse } from '../utils/refPaths';
 import {
@@ -284,7 +284,13 @@ export function focusSpecEntity(node: D3Node): void {
   // Closing a level clears the filter with it; the entity you just closed is
   // no longer the thing you are asking about.
   specSelection.set(wasOpen ? new Set() : new Set([node.id]));
-  selectedNode.set(node);
+  // `focusNode`, not `selectedNode.set`: this is a click on a *panel*, and the
+  // pane the reader clicked is not the canvas, so whatever the graph still
+  // thinks is hovered is a leftover. Details prefers the selection and the
+  // Description pane prefers the hover, so setting only the selection moved one
+  // column and left the other narrating the code entity you navigated away
+  // from. Every other panel-driven selection already goes through here.
+  focusNode(node);
 }
 
 /** The Filters pane's checkbox: select without moving the pane. */

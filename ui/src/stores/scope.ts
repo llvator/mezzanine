@@ -431,8 +431,79 @@ export async function applySelection(): Promise<void> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Navigation recording — the hook the wayback hangs on (UI-092)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Called once, *before* a gesture replaces the picture, so the history can
+ * bank what the reader was looking at.
+ *
+ * A registered callback rather than an import, and that is the whole design
+ * decision here: the history has to read every store a view captures, which
+ * means it depends on `stores/savedViews.ts`, which already depends on this
+ * module. Importing it back would close the cycle on a file whose top level
+ * builds a `derived` over `scopeRules` — the kind of cycle that does not
+ * warn, it just hands the other module `undefined` at import time. So the
+ * dependency points one way and the history reaches in.
+ *
+ * One subscriber, replaced rather than appended: there is exactly one history
+ * and a second would be a bug rather than a feature. Until it registers this
+ * is a no-op, which is the correct degradation — navigation still works, it
+ * just is not remembered.
+ */
+let beforeNavigate: (() => void) | null = null;
+let recording = true;
+let navDepth = 0;
+
+export function onBeforeNavigate(fn: () => void): void {
+  beforeNavigate = fn;
+}
+
+/** Record the current picture, unless we are already inside a navigation or
+ *  the caller has suspended recording. */
+function markNavigation(): void {
+  if (navDepth === 0 && recording) beforeNavigate?.();
+}
+
+/**
+ * Run `fn` as one navigation step.
+ *
+ * The depth guard is what keeps `drillIn` — which sets `autoLevel` and *then*
+ * calls `setScopes`, itself a navigation — from banking two frames, the
+ * second of which would have the level flag already mutated. The outermost
+ * gesture is the one the reader made, so it is the one that records.
+ */
+export async function asNavigation<T>(fn: () => Promise<T>): Promise<T> {
+  markNavigation();
+  navDepth++;
+  try {
+    return await fn();
+  } finally {
+    navDepth--;
+  }
+}
+
+/** Run `fn` with recording off — for the history's own back and forward,
+ *  which restore a frame through the same stores every gesture writes and
+ *  would otherwise record the step they are undoing. */
+export async function withoutNavigation<T>(fn: () => Promise<T>): Promise<T> {
+  const was = recording;
+  recording = false;
+  try {
+    return await fn();
+  } finally {
+    recording = was;
+  }
+}
+
 /**
  * Flip one path in or out of scope and re-render.
+ *
+ * Deliberately *not* a navigation: this is the scope tree's checkbox, and a
+ * reader who ticks five folders and then drills wants one step back to the
+ * five-folder reading, not five steps back through the building of it
+ * (UI-092). The commit gestures below record; the adjustments do not.
  *
  * One appended rule, whichever direction the click goes. The set-based
  * version had to `materializeExclusion` here — drop the covering ancestor and
@@ -447,14 +518,28 @@ export function toggleScope(path: string): void {
 
 /** Clear all selections. */
 export function clearScope(): void {
+  markNavigation();
   scopeRules.set([]);
   publishGraph({ nodes: [], links: [] });
 }
 
-/** Widen the scope: replace each selected path with its own parent folder
- *  (root stays root), collapsing overlaps to the minimal covering set.
- *  Pairs with "Visualize Current File" — start from a single file and grow
- *  the scope one level per click. */
+/**
+ * Widen the scope: replace each selected path with its own parent folder
+ * (root stays root), collapsing overlaps to the minimal covering set.
+ * Pairs with "Visualize Current File" — start from a single file and grow
+ * the scope one level per click.
+ *
+ * **Up, not back.** This climbs the folder tree; the wayback (UI-092)
+ * returns to the previous picture. After `drillIntoMarks` — six files from
+ * three folders — the parent folder is an answer to a question nobody asked
+ * and "where was I" is exact, so the two controls both exist and neither
+ * substitutes for the other.
+ *
+ * `autoLevel` goes back on for the same reason `drillIn` sets it: a wider
+ * scope holds more entities than the narrow one did, and keeping the level
+ * the narrow scope picked draws the parent folder at a detail it cannot
+ * afford. Widening always means "as much as fits", never "this exact level".
+ */
 export function extendScopeToParents(): void {
   const sel = get(selectedScopes);
   if (sel.size === 0) return;
@@ -463,12 +548,15 @@ export function extendScopeToParents(): void {
     const idx = p.lastIndexOf('/');
     parents.add(idx >= 0 ? p.slice(0, idx) : '');
   }
+  markNavigation();
+  autoLevel.set(true);
   scopeRules.set(compactRules(includeAll(parents)));
   applySelection();
 }
 
 /** Select every path in the index (equivalent to selecting the root scope). */
 export function selectAllScope(): void {
+  markNavigation();
   scopeRules.set(includeAll(['']));
   applySelection();
 }
@@ -493,8 +581,10 @@ export async function setScopes(paths: string[]): Promise<void> {
     }
     if (!get(indexData)) return;
   }
-  scopeRules.set(compactRules(includeAll(paths)));
-  await applySelection();
+  await asNavigation(async () => {
+    scopeRules.set(compactRules(includeAll(paths)));
+    await applySelection();
+  });
 }
 
 /**
@@ -505,8 +595,10 @@ export async function setScopes(paths: string[]): Promise<void> {
  * what "add this to what I'm looking at" has to mean once exclusions exist.
  */
 export async function addScopes(paths: string[]): Promise<void> {
-  scopeRules.update((rules) => compactRules([...rules, ...includeAll(paths)]));
-  await applySelection();
+  await asNavigation(async () => {
+    scopeRules.update((rules) => compactRules([...rules, ...includeAll(paths)]));
+    await applySelection();
+  });
 }
 
 /** Drill into a scope: narrow selection AND re-enable auto-level so the
@@ -516,8 +608,13 @@ export async function addScopes(paths: string[]): Promise<void> {
  *  level pin. */
 export async function drillIn(path: string): Promise<void> {
   console.log(`[drill] drillIn() called path=${path} — resetting autoLevel=true and calling setScopes([${path}])`);
-  autoLevel.set(true);
-  await setScopes([path]);
+  // The wrapper, not `setScopes`'s, is the one that records: the frame has to
+  // be captured before `autoLevel` moves, or back would restore the picture
+  // with the flag the drill set (UI-092).
+  await asNavigation(async () => {
+    autoLevel.set(true);
+    await setScopes([path]);
+  });
   console.log(`[drill] drillIn() completed path=${path}`);
 }
 
@@ -547,8 +644,10 @@ export async function drillIntoMarks(): Promise<void> {
   const paths = [...get(markedPaths)];
   if (paths.length === 0) return;
   console.log(`[drill] drillIntoMarks() called with ${paths.length} marked path(s)`);
-  autoLevel.set(true);
-  await setScopes(paths);
+  await asNavigation(async () => {
+    autoLevel.set(true);
+    await setScopes(paths);
+  });
   clearMarks();
 }
 
@@ -565,8 +664,13 @@ export async function focusScope(path: string, timeoutMs = 5000): Promise<boolea
   while (Date.now() < deadline) {
     const idx = get(indexData);
     if (idx && idx.nodes[path]) {
-      scopeRules.set(includeAll([path]));
-      await applySelection();
+      // Recorded here rather than around the whole call: a path that never
+      // arrives leaves the picture alone, and a frame banked for a navigation
+      // that did not happen is a back press that does nothing (UI-092).
+      await asNavigation(async () => {
+        scopeRules.set(includeAll([path]));
+        await applySelection();
+      });
       return true;
     }
     // Index not ready or path not present yet — wait briefly and retry

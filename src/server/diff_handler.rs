@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,40 +42,92 @@ fn working_head_config(mut config: Config, repo_root: &Path) -> Config {
     config
 }
 
-/// The cached base analysis for `sha`, or `None` when the cache holds a
-/// different ref (or nothing).
+/// The cached base analysis for `sha` under `scope`, or `None` when the cache
+/// holds a different ref, a different scope, or nothing.
 ///
 /// Clones rather than moves: a refresh that fails partway must not have
 /// consumed the cache, or the next save pays for the analysis again.
 fn take_cached_base(
     cache: &Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
     sha: &str,
-) -> Option<(DependencyGraph, Config)> {
+    scope: &str,
+) -> Option<(DependencyGraph, Config, String)> {
     let guard = cache.as_ref()?.read().ok()?;
     let cached = guard.as_ref()?;
-    if cached.sha != sha {
+    if cache_key(cached) != (sha, scope) {
         return None;
     }
-    Some((cached.graph.clone(), cached.config.clone()))
+    Some((cached.graph.clone(), cached.config.clone(), cached.details.clone()))
+}
+
+/// What identifies a cached base. Both halves, always: the ref says which
+/// tree was analyzed and the scope says what was looked at in it, and an
+/// answer produced under the wrong half of that pair is the wrong answer.
+fn cache_key(cached: &CachedBase) -> (&str, &str) {
+    (&cached.sha, &cached.scope)
 }
 
 fn store_cached_base(
     cache: &Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
     sha: &str,
+    scope: &str,
     graph: &DependencyGraph,
     config: &Config,
+    details: &str,
 ) {
     let Some(cache) = cache else { return };
     if let Ok(mut slot) = cache.write() {
-        let already = slot.as_ref().is_some_and(|c| c.sha == sha);
+        let already = slot.as_ref().is_some_and(|c| cache_key(c) == (sha, scope));
         if !already {
             *slot = Some(CachedBase {
                 sha: sha.to_string(),
+                scope: scope.to_string(),
                 graph: graph.clone(),
                 config: config.clone(),
+                details: details.to_string(),
             });
         }
     }
+}
+
+/// The base side of a diff: its graph, its config, and its detail sidecar —
+/// plus whether this call is the one that created the worktree, which decides
+/// who cleans it up.
+///
+/// The sidecar is rendered *here*, next to the analysis, while the worktree it
+/// reads its file sources from still exists. Deferring it to the write, or
+/// re-deriving it on a later refresh from the cached graph, renders against a
+/// directory that has been removed: `render_details` then finds no files, and
+/// the before-side quietly loses every file's text — which left the details
+/// pane with nothing to diff at file level from the second refresh onward
+/// (UI-097).
+///
+/// `base_config` is the live config re-rooted at the checkout, not a config
+/// rebuilt from the startup flags. The base has to be looked at through the
+/// same lens as the head or the diff reports the two lenses disagreeing:
+/// `include_docs` on one side alone turns every doc into an addition, and a
+/// settings-file `exclude_patterns` entry turns everything it excludes into a
+/// removal, on a working tree where nothing was touched.
+#[allow(clippy::type_complexity)]
+fn acquire_base(
+    repo_root: &Path,
+    base_dir: &Path,
+    from_ref: &str,
+    from_sha: &str,
+    scope: &str,
+    base_config: Config,
+    base_cache: &Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
+) -> Result<((DependencyGraph, Config, String), bool), String> {
+    if let Some((graph, config, details)) = take_cached_base(base_cache, from_sha, scope) {
+        eprintln!("  Reusing base ({}) analysis", from_sha);
+        return Ok(((graph, config, details), false));
+    }
+    let e2s = |e: anyhow::Error| e.to_string();
+    diff::create_worktree(repo_root, base_dir, from_ref).map_err(e2s)?;
+    let (graph, config) =
+        diff::analyze_with(base_config, &format!("base ({})", from_sha)).map_err(e2s)?;
+    let details = diff::render_base_details(&graph, &config).map_err(e2s)?;
+    Ok(((graph, config, details), true))
 }
 
 // ------------------------------------------------------------------
@@ -82,15 +135,17 @@ fn store_cached_base(
 // ------------------------------------------------------------------
 
 /// Blocking helper that performs the actual diff computation.
+///
+/// `live_config` is the scope both sides are analyzed under, whichever refs
+/// they name. It is read once, here, so that a scope change landing mid-diff
+/// cannot reach one side and not the other.
 fn compute_diff_blocking(
     repo_root: &Path,
     output_dir: &Path,
-    include_tests: bool,
-    languages: &Option<Vec<String>>,
+    live_config: &Arc<std::sync::RwLock<Config>>,
     from_ref: &str,
     to_ref: &str,
     current_graph: Option<Arc<std::sync::RwLock<DependencyGraph>>>,
-    current_config: Option<Arc<std::sync::RwLock<Config>>>,
     base_cache: Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
 ) -> Result<(DiffResponse, DependencyGraph, Config, String, String), String> {
     let is_working = to_ref == WORKING_REF;
@@ -99,6 +154,9 @@ fn compute_diff_blocking(
     eprintln!("🔄 Starting diff: {} → {}", from_ref, to_label);
 
     let e2s = |e: anyhow::Error| e.to_string();
+
+    let live = live_config.read().map_err(|e| format!("Config lock: {}", e))?.clone();
+    let scope = diff::analysis_fingerprint(&live, repo_root);
 
     // Resolve refs
     let from_sha = diff::resolve_git_ref(repo_root, from_ref)
@@ -114,27 +172,18 @@ fn compute_diff_blocking(
     let tmp = std::env::temp_dir();
     let base_dir = tmp.join(format!("nao-diff-base-{}", from_sha));
     let worktree_start = Instant::now();
-    let cached = take_cached_base(&base_cache, &from_sha);
-    let base_is_ours = cached.is_none();
-    let (base_graph, base_config) = match cached {
-        Some((graph, config)) => {
-            eprintln!("  Reusing base ({}) analysis", from_sha);
-            (graph, config)
-        }
-        None => {
-            diff::create_worktree(repo_root, &base_dir, from_ref).map_err(e2s)?;
-            diff::analyze_at(&base_dir, include_tests, languages, &format!("base ({})", from_sha)).map_err(e2s)?
-        }
-    };
+    let (base, base_is_ours) = acquire_base(
+        repo_root, &base_dir, from_ref, &from_sha,
+        &scope, diff::rooted_at(&live, &base_dir), &base_cache,
+    )?;
+    let (base_graph, base_config, base_details_str) = base;
 
     // Acquire head graph: from in-memory state (WORKING) or a new worktree
     let (head_graph, head_config, head_dir_for_diff) = if is_working {
         eprintln!("   Using current working directory as head...");
         let g = current_graph.unwrap();
-        let c = current_config.unwrap();
         let graph = g.read().map_err(|e| format!("Graph lock: {}", e))?.clone();
-        let config = c.read().map_err(|e| format!("Config lock: {}", e))?.clone();
-        let config = working_head_config(config, repo_root);
+        let config = working_head_config(live, repo_root);
         let dir = config.root_path.clone();
         (graph, config, dir)
     } else {
@@ -146,7 +195,8 @@ fn compute_diff_blocking(
             return Err(e.to_string());
         }
         let (graph, config) =
-            diff::analyze_at(&hdir, include_tests, languages, &format!("head ({})", to_sha)).map_err(e2s)?;
+            diff::analyze_with(diff::rooted_at(&live, &hdir), &format!("head ({})", to_sha))
+                .map_err(e2s)?;
         (graph, config, hdir)
     };
 
@@ -170,8 +220,9 @@ fn compute_diff_blocking(
     );
 
     // Write output files
-    let (diff_json, base_details_str) =
-        diff::write_diff_outputs(output_dir, &head_graph, &head_config, &base_graph, &base_config, &diff_result).map_err(e2s)?;
+    let diff_json =
+        diff::write_diff_outputs(output_dir, &head_graph, &head_config, &base_details_str, &diff_result)
+            .map_err(e2s)?;
 
     // Cleanup worktrees. Only the ones this call created — a reused base
     // was removed by whichever call analyzed it, and asking git to remove it
@@ -190,7 +241,7 @@ fn compute_diff_blocking(
     // Keep the base for the next refresh. Its worktree is gone either way —
     // the graph is what the next diff needs, and re-deriving it from a
     // checkout that has not moved is the cost this avoids.
-    store_cached_base(&base_cache, &from_sha, &base_graph, &base_config);
+    store_cached_base(&base_cache, &from_sha, &scope, &base_graph, &base_config, &base_details_str);
 
     eprintln!("✅ Diff complete in {:.1}s total", total_start.elapsed().as_secs_f32());
 
@@ -254,6 +305,49 @@ pub(crate) async fn diff_handler(
     }
 }
 
+/// DELETE /api/diff — leave diff mode.
+///
+/// Two things have to go, and dropping either one alone is what left the
+/// working-tree diff with no way out (UI-100). `live_diff` is the
+/// subscription: while it is set, every file save recomputes the comparison
+/// and announces it, so a client that cleared its own overlay gets it back on
+/// the next keystroke it saves. `diff_result` is the answer still being
+/// served: while it is set, any page that reloads asks `GET /api/diff`, is
+/// handed the last comparison, and comes up in diff mode again.
+///
+/// `base_cache` is deliberately kept. It holds an analysis keyed by the base
+/// sha and nothing reads it except a later diff against that same base, which
+/// it saves a worktree checkout — dropping it would only make starting over
+/// slower.
+///
+/// Always succeeds. "Stop showing me this" has no failure the caller could
+/// act on, and leaving diff mode when there is no diff is what the caller
+/// asked for either way.
+pub(crate) async fn stop_diff_handler(State(state): State<AppState>) -> StatusCode {
+    // Before the clears, so a diff that is mid-flight sees the new epoch when
+    // it goes to publish rather than racing the writes below.
+    state.diff_epoch.fetch_add(1, Ordering::SeqCst);
+
+    if let Ok(mut live) = state.live_diff.write() {
+        *live = None;
+    }
+    if let Ok(mut d) = state.diff_result.write() {
+        *d = None;
+    }
+    if let Ok(mut b) = state.base_details.write() {
+        *b = None;
+    }
+
+    // Tell every connected client, not just the one that asked. The overlay
+    // is server state, so a mirrored window (UI-095) that kept drawing it
+    // would be drawing a comparison that no longer exists. `Diff` rather than
+    // `Graph`: the code has not moved, only the overlay on it.
+    let _ = state.tx.send(ReloadKind::Diff);
+
+    eprintln!("🔀 Diff mode left — no longer following the working tree");
+    StatusCode::NO_CONTENT
+}
+
 /// Re-run the live working-tree diff, if there is one, against the graph the
 /// watcher just published (UI-067).
 ///
@@ -303,14 +397,16 @@ pub(crate) async fn refresh_live_diff(state: &AppState) {
 /// Compute a diff and publish it, without touching the in-progress lock or
 /// the live-diff bookkeeping — both callers own those differently.
 async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, String> {
+    // Whose diff mode this result belongs to. Checked again before publishing:
+    // a stop that arrives while this runs must win (UI-100).
+    let epoch = state.diff_epoch.load(Ordering::SeqCst);
+
     // Read repo_root before spawning blocking task
     let repo_root = state.repo_root.read().await.clone();
 
     // Run diff in a blocking task since it's CPU-intensive
     let result = tokio::task::spawn_blocking({
         let output_dir = state.output_dir.clone();
-        let include_tests = state.include_tests;
-        let languages = state.languages.clone();
         let from_ref = req.from_ref.clone();
         let to_ref = req.to_ref.clone();
         let is_working = to_ref == WORKING_REF;
@@ -319,23 +415,21 @@ async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, S
         } else {
             None
         };
-        let current_config = if is_working {
-            Some(state.config.clone())
-        } else {
-            None
-        };
+        // Handed over whatever the head is. Only a working-tree head *reads*
+        // its graph from here; both kinds take their analysis scope from it,
+        // which is what keeps a commit-to-commit diff looking at the same
+        // languages, docs and patterns as the tree it was asked for from.
+        let live_config = state.config.clone();
         let base_cache = Some(state.base_cache.clone());
 
         move || {
             compute_diff_blocking(
                 &repo_root,
                 &output_dir,
-                include_tests,
-                &languages,
+                &live_config,
                 &from_ref,
                 &to_ref,
                 current_graph,
-                current_config,
                 base_cache,
             )
         }
@@ -346,6 +440,18 @@ async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, S
     // Store results in memory and signal reload
     match result {
         Ok((resp, head_graph, head_config, diff_json, base_details_str)) => {
+            if resp.success && state.diff_epoch.load(Ordering::SeqCst) != epoch {
+                // Diff mode was left while this ran. Publishing now would put
+                // the overlay back a second after the user dismissed it, and
+                // adopting the head graph would move the canvas for a
+                // comparison nobody is looking at any more.
+                eprintln!("   ⚠ Diff discarded: diff mode was left while it ran");
+                return Ok(DiffResponse {
+                    success: false,
+                    message: "Diff discarded: diff mode was left while it ran".to_string(),
+                    summary: None,
+                });
+            }
             if resp.success {
                 // Adopt the head graph only when the head *is* what this
                 // server watches — i.e. the working tree.
@@ -437,11 +543,13 @@ pub(crate) async fn set_root_handler(
         let include_tests = state.include_tests;
         let include_docs = state.include_docs;
         let languages = state.languages.clone();
+        let spec_dir = state.spec_dir.clone();
         let settings = state.settings.clone();
         let path = canonical_path.clone();
 
         move || -> Result<(usize, usize, DependencyGraph, Config), String> {
-            let config = build_config(&path, include_tests, include_docs, &languages, &settings);
+            let config =
+                build_config(&path, include_tests, include_docs, &languages, spec_dir, &settings);
 
             // Run analysis
             let mut analyzer = Analyzer::new(config.clone());
@@ -589,6 +697,42 @@ mod tests {
                 "root '{poisoned}' should have been replaced by the watched root",
             );
         }
+    }
+
+    /// The cache half of keeping the two sides to one scope. Narrowing the
+    /// analysis from the browser leaves the base *ref* untouched, so a cache
+    /// keyed on the sha alone hands the next refresh a base analyzed under
+    /// the scope that was in force before — and the diff then reports the
+    /// difference between two scopes as a change to the code.
+    #[test]
+    fn a_base_cached_under_another_scope_is_not_reused() {
+        let cache = Some(Arc::new(std::sync::RwLock::new(Some(CachedBase {
+            sha: "c0ff33".to_string(),
+            scope: "wide".to_string(),
+            graph: DependencyGraph::default(),
+            config: Config::default(),
+            details: "{}".to_string(),
+        }))));
+
+        assert!(take_cached_base(&cache, "c0ff33", "wide").is_some());
+        assert!(
+            take_cached_base(&cache, "c0ff33", "narrow").is_none(),
+            "same ref, different scope — the analysis behind it is not the one being asked for",
+        );
+        assert!(take_cached_base(&cache, "0the12", "wide").is_none());
+    }
+
+    /// And storing has to replace the entry when only the scope moved, or the
+    /// first scope wins for the rest of the session.
+    #[test]
+    fn storing_under_a_new_scope_replaces_the_cached_base() {
+        let cache = Some(Arc::new(std::sync::RwLock::new(None)));
+        let graph = DependencyGraph::default();
+        store_cached_base(&cache, "c0ff33", "wide", &graph, &Config::default(), "{}");
+        store_cached_base(&cache, "c0ff33", "narrow", &graph, &Config::default(), "{}");
+
+        assert!(take_cached_base(&cache, "c0ff33", "narrow").is_some());
+        assert!(take_cached_base(&cache, "c0ff33", "wide").is_none());
     }
 
     #[test]

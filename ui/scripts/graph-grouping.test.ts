@@ -29,7 +29,8 @@ import {
   COHESION_STRENGTH, COHESION_LEVELS,
 } from '../src/utils/forceCohesion.ts';
 import { makeSeeder, wedgeKeyOf } from '../src/utils/layoutSeed.ts';
-import { computeFolderHulls, MIN_HULL_MEMBERS } from '../src/viewmodels/folderHulls.ts';
+import { computeFolderHulls, labelBoxOf, MIN_HULL_MEMBERS } from '../src/viewmodels/folderHulls.ts';
+import { regionsAtPoint, tightestRegion, sameRegions } from '../src/viewmodels/regionsAtPoint.ts';
 import { groupMemberIds } from '../src/viewmodels/hoverHighlight.ts';
 import { rankHubs, hubNames } from '../src/viewmodels/hubs.ts';
 import { collapseGraph } from '../src/viewmodels/collapseGraph.ts';
@@ -707,6 +708,71 @@ test('the label sits above the outline, not inside it', () => {
   assert.ok(hull.labelY <= topY, `label ${hull.labelY} below hull top ${topY}`);
 });
 
+/** Every pair of region names that share space on the canvas. */
+function collidingNames(hulls: ReturnType<typeof computeFolderHulls>): string[] {
+  const boxes = hulls.map((h) => ({ path: h.path, ...labelBoxOf(h) }));
+  const hits: string[] = [];
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const a = boxes[i], b = boxes[j];
+      if (a.x1 <= b.x0 || a.x0 >= b.x1) continue;
+      if (a.y1 <= b.y0 || a.y0 >= b.y1) continue;
+      hits.push(`${a.path} × ${b.path}`);
+    }
+  }
+  return hits;
+}
+
+test('two region names are never drawn on top of each other', () => {
+  // The nesting case, which is the structural one: `src/server` holds the
+  // topmost node of `src`, so both outlines pass through the same ring point
+  // and both names were anchored on the same line.
+  const hulls = computeFolderHulls(
+    [...folder('src/server', 5), ...folder('src/output', 5, 0, 400)], nestedOpts(2));
+  assert.ok(hulls.length >= 2, 'expected a parent and a child to compare');
+  assert.deepEqual(collidingNames(hulls), []);
+});
+
+test('sibling regions whose tops line up keep their names apart', () => {
+  // Side by side and level, close enough that the names would run together
+  // horizontally. Nothing encloses anything here, so this is the same rule
+  // applied without any ancestry to lean on.
+  const hulls = computeFolderHulls(
+    [...folder('averylongfoldername', 3), ...folder('anotherlongfoldername', 3, 60)], hullOpts());
+  assert.equal(hulls.length, 2);
+  assert.deepEqual(collidingNames(hulls), []);
+});
+
+test('the enclosing region\'s name is the one that moves, and it moves up', () => {
+  const hulls = computeFolderHulls(
+    [...folder('src/server', 5), ...folder('src/output', 5, 0, 400)], nestedOpts(2));
+  const parent = hulls.find((h) => h.path === 'src')!;
+  const child = hulls.find((h) => h.path === 'src/server')!;
+  // A parent's name is the heading over the regions inside it, so it has to
+  // end up above them rather than below.
+  assert.ok(parent.labelY < child.labelY,
+    `parent name at ${parent.labelY} is not above the child's at ${child.labelY}`);
+});
+
+test('a name pushed clear of another still sits outside its own outline', () => {
+  // The UI-055 promise, retested after the lift: only ever upward, so a name
+  // can never end up over the nodes it is describing.
+  const hulls = computeFolderHulls(
+    [...folder('src/server', 5), ...folder('src/output', 5, 0, 400)], nestedOpts(2));
+  for (const h of hulls) {
+    const topY = Math.min(...h.points.map((p) => p[1]));
+    assert.ok(h.labelY <= topY, `${h.path}: label ${h.labelY} below hull top ${topY}`);
+  }
+});
+
+test('a name far from every other is left where its outline puts it', () => {
+  // Separation must not become a layout of its own: a region with room keeps
+  // the anchor that ties its name to its shape.
+  const [alone] = computeFolderHulls(folder('pkg', 5), hullOpts());
+  const topY = Math.min(...alone.points.map((p) => p[1]));
+  assert.equal(alone.labelY, topY - 6);
+});
+
 test('bigger regions come first, so a small one is never buried', () => {
   const hulls = computeFolderHulls(
     [...folder('small', 3), ...folder('big', 9, 500), ...folder('mid', 5, 1200)], hullOpts());
@@ -922,6 +988,86 @@ test('a deeper tier than the tree has does not invent a region', () => {
 test('ghosts are in no region at any tier', () => {
   const ghosts = [node('println', '', 0, 0), node('Vec', '', 10, 10), node('len', '', 20, 20)];
   assert.equal(computeFolderHulls(ghosts, nestedOpts(3)).length, 0);
+});
+
+// ── which region the pointer is in (UI-071) ─────────────────────────────
+
+/** The centroid of a hull's own members — a point that is unambiguously
+ *  inside it, without hand-picking coordinates that could drift with the
+ *  padding. */
+function centroidOf(nodes: D3Node[]): [number, number] {
+  const n = nodes.length;
+  return [
+    nodes.reduce((s, d) => s + d.x!, 0) / n,
+    nodes.reduce((s, d) => s + d.y!, 0) / n,
+  ];
+}
+
+test('a point in one region reports that region', () => {
+  const inside = folder('ui/src/stores', 4);
+  const hulls = computeFolderHulls([...inside, ...folder('ui/src/utils', 4, 3000)], hullOpts());
+  const trail = regionsAtPoint(hulls, ...centroidOf(inside));
+  assert.deepEqual(trail.map((h) => h.path), ['ui/src/stores']);
+});
+
+test('empty canvas is in no region, rather than in the nearest one', () => {
+  const hulls = computeFolderHulls(folder('pkg', 5), hullOpts());
+  assert.deepEqual(regionsAtPoint(hulls, 9000, 9000), []);
+});
+
+test('nested regions come back parent first', () => {
+  // The whole point of the trail: standing in `F1/SF11` you are also in `F1`,
+  // and "you are in SF11" hides the more useful half of the sentence.
+  const leaf = folder('F1/SF11', 4, 0, 0);
+  const hulls = computeFolderHulls([...leaf, ...folder('F1/SF12', 4, 0, 400),
+    ...folder('F2/SF21', 4, 3000, 0), ...folder('F2/SF22', 4, 3000, 400)], nestedOpts(2));
+  const trail = regionsAtPoint(hulls, ...centroidOf(leaf));
+  assert.deepEqual(trail.map((h) => h.path), ['F1', 'F1/SF11']);
+});
+
+test('the tightest region is the last one, and is what a focus acts on', () => {
+  const leaf = folder('F1/SF11', 4, 0, 0);
+  const hulls = computeFolderHulls([...leaf, ...folder('F1/SF12', 4, 0, 400),
+    ...folder('F2/SF21', 4, 3000, 0), ...folder('F2/SF22', 4, 3000, 400)], nestedOpts(2));
+  const trail = regionsAtPoint(hulls, ...centroidOf(leaf));
+  assert.equal(tightestRegion(trail)!.path, 'F1/SF11');
+  assert.equal(tightestRegion([]), null);
+});
+
+test('the part of a parent no child covers reports the parent alone', () => {
+  // This is how an ancestor stays reachable at all once its middle is taken
+  // by the regions inside it. `p` holds loose files as well as `p/sub`, so
+  // there is such a place; it is where those loose files sit.
+  const loose = folder('p', 4, 0, 0);
+  const hulls = computeFolderHulls([...loose, ...folder('p/sub', 4, 0, 600)], nestedOpts(1));
+  const trail = regionsAtPoint(hulls, ...centroidOf(loose));
+  assert.deepEqual(trail.map((h) => h.path), ['p']);
+});
+
+test('the trail is ordered by the regions, not by the array it arrives in', () => {
+  // The caller hands over its paint-order array today. A hover trail that
+  // silently depended on that would break the day the drawing order changes
+  // for a drawing reason.
+  const leaf = folder('F1/SF11', 4, 0, 0);
+  const hulls = computeFolderHulls([...leaf, ...folder('F1/SF12', 4, 0, 400),
+    ...folder('F2/SF21', 4, 3000, 0), ...folder('F2/SF22', 4, 3000, 400)], nestedOpts(2));
+  const trail = regionsAtPoint([...hulls].reverse(), ...centroidOf(leaf));
+  assert.deepEqual(trail.map((h) => h.path), ['F1', 'F1/SF11']);
+});
+
+test('a non-finite point is in no region', () => {
+  // `d3.pointer` returns NaN when the canvas has no layout box yet, and a
+  // point-in-polygon test on NaN answers false for every edge crossing —
+  // which is an accident, not a decision.
+  const hulls = computeFolderHulls(folder('pkg', 5), hullOpts());
+  assert.deepEqual(regionsAtPoint(hulls, NaN, 0), []);
+});
+
+test('two trails naming the same regions compare equal', () => {
+  // What keeps a pointer move that changed nothing from re-rendering.
+  const hulls = computeFolderHulls(folder('pkg', 5), hullOpts());
+  assert.ok(sameRegions(hulls, [...hulls]));
+  assert.ok(!sameRegions(hulls, []));
 });
 
 // ── mixed-level expansion (UI-057) and edge fidelity (UI-058) ───────────

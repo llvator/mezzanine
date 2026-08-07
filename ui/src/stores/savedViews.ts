@@ -38,7 +38,7 @@ import {
   showTemplateVars,
   searchHidesNonMatches,
 } from './graph';
-import { autoLevel, applySelection, fullGraphDataStore, scopeRules } from './scope';
+import { asNavigation, autoLevel, applySelection, fullGraphDataStore, scopeRules } from './scope';
 import { searchTerm, committedSearchIds } from '../viewmodels/filterViewModel';
 import { specSelection, setSpecSelection, specGraph } from './crossFilter';
 import {
@@ -146,7 +146,7 @@ function mergeOverrides(saved: Record<number, LevelOverrides>): Record<number, L
 }
 
 /**
- * Put the canvas back into `view`.
+ * Put the canvas back into the picture `s` describes.
  *
  * The order is the whole subtlety. `applySelection` republishes the dataset,
  * and publishing re-seeds the entity-kind, relationship-kind and per-level
@@ -157,48 +157,81 @@ function mergeOverrides(saved: Record<number, LevelOverrides>): Record<number, L
  * looks like it works and is silently undone one microtask later.
  *
  * Returns what had to be dropped, for the caller to report.
+ *
+ * Taken as a bare `ViewState` rather than a `SavedView` because the wayback
+ * (UI-092) restores frames nobody named, and the only thing a name adds to a
+ * restore is a label in a toast. `restoreView` below is the named door.
+ *
+ * The whole thing is one navigation step, so pressing Back after restoring a
+ * view returns to the picture the reader restored it *from*. The history's
+ * own steps come through `withoutNavigation`, which is what stops a back
+ * press from recording the step it is undoing.
  */
-export async function restoreView(view: SavedView): Promise<Dropped> {
-  const s = view.state;
+export async function restoreState(s: ViewState): Promise<Dropped> {
+  return asNavigation(async () => {
+    // Before the republish: the level (which `applySelection` recomputes only
+    // when `autoLevel` is on, which is exactly what "auto" means), the
+    // exclusions the seed does not touch, and the display toggles.
+    autoLevel.set(s.autoLevel);
+    graphLevel.set(s.level);
+    hiddenLanguages.set(new Set(s.hiddenLanguages));
+    showGhostNodes.set(s.showGhosts);
+    showBuiltinGhosts.set(s.showBuiltinGhosts);
+    showTemplateVars.set(s.showTemplateVars);
+    searchHidesNonMatches.set(s.searchHides);
 
-  // Before the republish: the level (which `applySelection` recomputes only
-  // when `autoLevel` is on, which is exactly what "auto" means), the
-  // exclusions the seed does not touch, and the display toggles.
-  autoLevel.set(s.autoLevel);
-  graphLevel.set(s.level);
-  hiddenLanguages.set(new Set(s.hiddenLanguages));
-  showGhostNodes.set(s.showGhosts);
-  showBuiltinGhosts.set(s.showBuiltinGhosts);
-  showTemplateVars.set(s.showTemplateVars);
-  searchHidesNonMatches.set(s.searchHides);
+    // Clear the outgoing search before the scope moves: its committed ids are
+    // about the graph being replaced, and leaving them set would filter the
+    // new one to nothing for as long as the fetch takes.
+    searchTerm.set('');
 
-  // Clear the outgoing search before the scope moves: its committed ids are
-  // about the graph being replaced, and leaving them set would filter the new
-  // one to nothing for as long as the fetch takes.
-  searchTerm.set('');
+    scopeRules.set(s.scope.map((r) => ({ ...r })));
+    await applySelection();
 
-  scopeRules.set(s.scope.map((r) => ({ ...r })));
-  await applySelection();
+    // After the republish, once the dataset — and the level — have settled.
+    const { state: live, dropped } = pruneState(s, present());
+    hiddenFiles.set(new Set(live.hiddenFiles));
+    generalEntityTypes.set(new Set(live.entityTypes));
+    generalRelTypes.set(new Set(live.relTypes));
+    generalOutgoing.set(live.outgoing);
+    generalIncoming.set(live.incoming);
+    levelOverrides.set(mergeOverrides(live.levelOverrides));
+    setSpecSelection(live.spec);
 
-  // After the republish, once the dataset — and the level — have settled.
-  const { state: live, dropped } = pruneState(s, present());
-  hiddenFiles.set(new Set(live.hiddenFiles));
-  generalEntityTypes.set(new Set(live.entityTypes));
-  generalRelTypes.set(new Set(live.relTypes));
-  generalOutgoing.set(live.outgoing);
-  generalIncoming.set(live.incoming);
-  levelOverrides.set(mergeOverrides(live.levelOverrides));
-  setSpecSelection(live.spec);
+    // Term first: clearing it clears the commit, by subscription in
+    // `filterViewModel`, so the two have to be written in this order.
+    if (live.searchTerm.trim() !== '') {
+      searchTerm.set(live.searchTerm);
+      committedSearchIds.set(new Set(live.searchIds));
+    }
 
-  // Term first: clearing it clears the commit, by subscription in
-  // `filterViewModel`, so the two have to be written in this order.
-  if (live.searchTerm.trim() !== '') {
-    searchTerm.set(live.searchTerm);
-    committedSearchIds.set(new Set(live.searchIds));
-  }
-
-  return dropped;
+    return dropped;
+  });
 }
+
+/** Put the canvas back into a *named* view. The list's click. */
+export function restoreView(view: SavedView): Promise<Dropped> {
+  return restoreState(view.state);
+}
+
+/**
+ * The picture on screen, as a store rather than a call.
+ *
+ * `captureState()` answers "what is it now"; this answers "tell me whenever it
+ * changes", which is a different question and one that two features now ask.
+ * The dependency list is the whole point: it is every store a `ViewState` is
+ * made of, in one place, so a store added to the codec cannot be forgotten by
+ * one consumer and remembered by the other.
+ */
+export const currentState: Readable<ViewState> = derived(
+  [
+    scopeRules, graphLevel, autoLevel, generalEntityTypes, generalRelTypes,
+    generalOutgoing, generalIncoming, levelOverrides, hiddenLanguages, hiddenFiles,
+    showGhostNodes, showBuiltinGhosts, showTemplateVars, specSelection, searchTerm,
+    committedSearchIds, searchHidesNonMatches,
+  ],
+  () => captureState(),
+);
 
 /**
  * The saved view the canvas is currently showing, or `null`.
@@ -210,16 +243,8 @@ export async function restoreView(view: SavedView): Promise<Dropped> {
  * picture had drifted from it.
  */
 export const activeViewId: Readable<string | null> = derived(
-  [
-    savedViews, scopeRules, graphLevel, autoLevel, generalEntityTypes, generalRelTypes,
-    generalOutgoing, generalIncoming, levelOverrides, hiddenLanguages, hiddenFiles,
-    showGhostNodes, showBuiltinGhosts, showTemplateVars, specSelection, searchTerm,
-    committedSearchIds, searchHidesNonMatches,
-  ],
-  ([$views]) => {
-    const now = captureState();
-    return ($views as SavedView[]).find((v) => sameState(v.state, now))?.id ?? null;
-  },
+  [savedViews, currentState],
+  ([$views, $now]) => $views.find((v) => sameState(v.state, $now))?.id ?? null,
 );
 
 // ─────────────────────────────────────────────────────────────────────────────

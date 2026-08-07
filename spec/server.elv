@@ -13,7 +13,7 @@ c server {
 }
 
 f local_serve {
-    d: "`nao serve` / `nao watch`: analyze one root, hold it in AppState, serve the UI and stream changes over SSE. spawn_file_watcher re-analyzes on save, gated by is_source_extension and has_source_change so editor noise and non-source writes do not trigger a pass. build_router wires the routes; write_json_with_cancel lets an in-flight response abandon work when a newer analysis supersedes it. resolve_startup checks the flags that can fail before any analysis begins, so a typo costs a second rather than a full parse."
+    d: "`nao serve` / `nao watch`: analyze one root, hold it in AppState, serve the UI and stream changes over SSE. spawn_file_watcher re-analyzes on save, gated by is_source_extension and has_source_change so editor noise and non-source writes do not trigger a pass; it takes a second watched root when spec_dir sits outside the first, a spec being something people edit. handle_reanalysis publishes the watched root's config but reads the analysis scope back from the shared one, or the next keystroke would silently undo a narrowing the reader made from the browser. build_router wires the routes; write_json_with_cancel lets an in-flight response abandon work when a newer analysis supersedes it. resolve_startup checks the flags that can fail before any analysis begins, so a typo costs a second rather than a full parse."
     cr: "src/server/mod.rs", "src/server/state.rs"
 }
 
@@ -28,7 +28,7 @@ f hosted_repos {
 }
 
 f graph_api {
-    d: "The endpoints the canvas reads: graph_handler for nodes and edges, index_handler and details_handler for lazy per-entity detail, commits_handler over git_commits, and the diff endpoints (diff_handler, set_root_handler, base_details_handler) that drive comparison against a ref. Educator hits the same router through position_handler, scan_handler and diagnostics_handler."
+    d: "The endpoints the canvas reads: graph_handler for nodes and edges, index_handler and details_handler for lazy per-entity detail, commits_handler over git_commits, and the diff endpoints (diff_handler, set_root_handler, base_details_handler) that drive comparison against a ref. /api/analysis/scope re-runs the analyzer under a new language set, docs switch or spec directory; build_config_with_scope validates before anything expensive, since the walker's fallback lands on a stderr the browser never shows. Its spec_dir is tri-state — absent leaves it, empty clears it, a path sets it — and may name a directory outside the root, which the settings file's key may not: this request came from a page the operator opened, not from a file that arrived with a clone. Educator hits the same router through position_handler, scan_handler and diagnostics_handler."
     cr: "src/server/handlers.rs", "src/server/diff_handler.rs", "src/server/analysis_handler.rs", "src/server/educator_handler.rs", "src/server/types.rs"
 }
 

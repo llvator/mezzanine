@@ -197,6 +197,12 @@ export interface ScopeMetrics {
   in_cycle: boolean;
   /** Instability index at scope level. */
   instability?: number;
+  /** UI-091 — distinct scopes referencing this one over `References` edges,
+   *  counted apart from `fan_in` because references are not coupling. Lets a
+   *  scope that was never measured be told apart from a decoupled one. */
+  ref_fan_in?: number;
+  /** Distinct scopes this one references. See `ref_fan_in`. */
+  ref_fan_out?: number;
   /** Mean composite score of entities in this scope. */
   avg_quality?: number;
   /** Worst composite score in this scope. */

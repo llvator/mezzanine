@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use anyhow::Result;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -56,8 +56,37 @@ pub(crate) struct LiveDiff {
 /// enough to accumulate copies of speculatively.
 pub(crate) struct CachedBase {
     pub sha: String,
+    /// The analysis scope this base was produced under, from
+    /// [`crate::diff::scope_fingerprint`]. Part of the key, not decoration:
+    /// narrowing the scope from the browser leaves the git ref untouched, so
+    /// a cache keyed on `sha` alone answers the next refresh with a base
+    /// analyzed under the *old* scope — and the difference between the two
+    /// scopes is then reported as a change to the code.
+    pub scope: String,
     pub graph: DependencyGraph,
     pub config: Config,
+    /// The before-side detail sidecar, rendered while the base worktree was
+    /// still on disk. Carried rather than re-derived: its file entries are
+    /// read off disk, and the worktree is gone by the time the next diff
+    /// reuses this (UI-097).
+    pub details: String,
+}
+
+/// Everything `/api/settings` needs that the rest of the state does not
+/// already carry (CFG-006, CFG-008).
+///
+/// The merged `Settings` on `AppState` cannot answer "which file did this
+/// come from" — merging is where that is discarded — so the two scopes are
+/// kept here unmerged. `loaded` is behind a lock because saving the analysis
+/// scope rewrites the repo file and the report has to follow it without a
+/// restart.
+pub(crate) struct SettingsView {
+    pub loaded: std::sync::RwLock<crate::settings::Loaded>,
+    /// The settings keys this process was given on its command line.
+    pub flags: std::collections::BTreeSet<String>,
+    /// The startup values that live nowhere else — `port` and friends were
+    /// consumed as the server came up.
+    pub effective: crate::settings::report::Effective,
 }
 
 #[derive(Clone)]
@@ -69,9 +98,15 @@ pub(crate) struct AppState {
     /// Analyze Markdown alongside the code (see `AnalysisConfig::include_docs`).
     pub include_docs: bool,
     pub languages: Option<Vec<String>>,
+    /// `--spec-dir` as the process was started, for handlers that rebuild a
+    /// config from scratch. The *live* value is on `config` — this one is
+    /// the startup flag, the same way `languages` is.
+    pub spec_dir: Option<std::path::PathBuf>,
     /// The merged settings file, so handlers that rebuild a config from
     /// scratch honour it exactly as the initial analysis did.
     pub settings: Arc<Settings>,
+    /// The same file, kept unmerged and attributable. See [`SettingsView`].
+    pub settings_view: Arc<SettingsView>,
     pub diff_in_progress: Arc<Mutex<bool>>,
     pub analysis_in_progress: Arc<Mutex<bool>>,
     pub graph: Arc<std::sync::RwLock<DependencyGraph>>,
@@ -84,6 +119,14 @@ pub(crate) struct AppState {
     pub live_diff: Arc<std::sync::RwLock<Option<LiveDiff>>>,
     /// Base analysis reused across refreshes. See `CachedBase`.
     pub base_cache: Arc<std::sync::RwLock<Option<CachedBase>>>,
+    /// Bumped every time diff mode is left (`DELETE /api/diff`).
+    ///
+    /// A diff takes seconds, and the moment a user is most likely to press
+    /// "stop" is while one is running. Without this the run finishes after
+    /// the stop, publishes its result and broadcasts a `diff` event, and the
+    /// overlay everyone just dismissed comes back. `run_diff` snapshots this
+    /// before starting and declines to publish if it moved (UI-100).
+    pub diff_epoch: Arc<AtomicU64>,
     /// False when `--pin-diff` asked for the diff to stay where it was put.
     pub follow_diff: bool,
     /// Flipped to `true` to ask the active analyzer to abort. The
@@ -149,11 +192,13 @@ pub(crate) fn build_config(
     include_tests: bool,
     include_docs: bool,
     languages: &Option<Vec<String>>,
+    spec_dir: Option<std::path::PathBuf>,
     settings: &Settings,
 ) -> Config {
     let mut config = Config::for_path(root).with_output_format(OutputFormat::Json);
     config.analysis.include_tests = include_tests;
     config.analysis.include_docs = include_docs;
+    config.analysis.spec_dir = spec_dir;
     if let Some(langs) = languages {
         for lang in langs {
             if let Some(language) = Language::from_name(lang) {

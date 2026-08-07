@@ -18,12 +18,15 @@ import {
   showLabels, showKindLabels, showLinkLabels, cycleTreeDensity,
 } from '../stores/graph';
 import { autoLevel, drillIntoMarks } from '../stores/scope';
+// Also the import that registers the history's `onBeforeNavigate` hook — see
+// the module comment there for why that matters.
+import { goBack, goForward } from '../stores/viewHistory';
 import { clearMarks, toggleMark } from '../stores/marks';
 import { autoFitView } from '../stores/settings';
 import { describeOnHover } from '../stores/description';
 import {
   sidebarPaneOpen, sidebarTab, toolbarCollapsed, detailsPaneOpen, describePaneOpen,
-  splitViewOpen,
+  splitViewOpen, focusExpand, canvasPaneOpen,
 } from '../stores/panes';
 import { clearSpecFocus } from '../stores/crossFilter';
 import { focusedPane, focusPane, shortcutHelpOpen, requestSearchFocus } from '../stores/keymap';
@@ -66,7 +69,13 @@ function runGlobal(command: Command): boolean {
     case 'pane.focus.description': focusPane('description'); return true;
     case 'pane.focus.spec': focusPane('spec'); return true;
     case 'help.toggle': shortcutHelpOpen.update((v) => !v); return true;
-    case 'help.close': shortcutHelpOpen.set(false); return true;
+    // Escape, with a queue behind it. The overlay first: it is drawn over the
+    // pane the collapse would apply to, so folding that pane away underneath
+    // it would be a change the reader cannot see happening.
+    case 'ui.dismiss':
+      if (get(shortcutHelpOpen)) shortcutHelpOpen.set(false);
+      else collapseFocusedPane();
+      return true;
     case 'hover.lock': hoverLocked.update((v) => !v); return true;
     case 'search.focus':
       // The box lives in the sidebar's Filters tab, so getting there is part
@@ -77,12 +86,26 @@ function runGlobal(command: Command): boolean {
       requestSearchFocus();
       return true;
     case 'pane.collapse': collapseFocusedPane(); return true;
+    // Handled whether or not there is a step that way: the key is bound, and
+    // reporting it unhandled would let it fall through to the browser, where
+    // `[` means nothing and the reader would learn only that nothing happened.
+    case 'history.back': void goBack(); return true;
+    case 'history.forward': void goForward(); return true;
+    case 'pane.expand': focusExpand.update((v) => !v); return true;
     default: return false;
   }
 }
 
-/** `c` in whichever pane has focus. The canvas has no collapsed state — it is
- *  what the panes flank — so there it does nothing. */
+/**
+ * `c` — or `Escape` — in whichever pane has focus.
+ *
+ * The canvas folds like the rest now (UI-098): a window that exists to hold
+ * panes beside a mirrored one has no use for a graph, and the floor it stops
+ * reserving is what lets the columns fit. `1` or the Graph chip brings it back.
+ * Escape reaches the canvas where `c` never did, which is the one arm of this
+ * switch the keyboard could not previously get to; the digit on the collapsed
+ * strip is what makes that an affordance rather than a disappearance.
+ */
 function collapseFocusedPane(): void {
   const pane: PaneId = get(focusedPane);
   switch (pane) {
@@ -91,10 +114,31 @@ function collapseFocusedPane(): void {
     case 'details': detailsPaneOpen.set(false); break;
     case 'description': describePaneOpen.set(false); break;
     case 'spec': splitViewOpen.set(false); break;
-    case 'graph': break;
+    case 'graph': canvasPaneOpen.set(false); break;
   }
   // Focus follows the reader, not the pane that just went away.
-  if (pane !== 'graph') focusedPane.set('graph');
+  focusedPane.set(refugeFrom(pane));
+}
+
+/**
+ * Where the keyboard goes when the pane it was in folds away.
+ *
+ * The canvas, while there is one: it is what the panes flank, and it is the
+ * one place focus can land without landing on something that might itself be
+ * closed. With the canvas closed too the keyboard falls to the leftmost column
+ * still drawn — and stays where it is when a window has nothing open at all,
+ * which is recoverable rather than trapped: every pane chip is still in the
+ * shortcut bar, and focusing one opens it.
+ */
+function refugeFrom(collapsed: PaneId): PaneId {
+  if (get(canvasPaneOpen)) return 'graph';
+  const columns: [PaneId, boolean][] = [
+    ['sidebar', get(sidebarPaneOpen)],
+    ['spec', get(splitViewOpen)],
+    ['details', get(detailsPaneOpen)],
+    ['description', get(describePaneOpen)],
+  ];
+  return columns.find(([, open]) => open)?.[0] ?? collapsed;
 }
 
 function runSidebar(command: Command): boolean {

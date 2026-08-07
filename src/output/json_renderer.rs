@@ -119,6 +119,12 @@ struct JsonOutput {
     thresholds: crate::models::Thresholds,
 }
 
+/// Serde predicate: leave a count out of the payload when it has nothing
+/// to say.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 /// File- or module-level rollup for JSON. Path is project-root-relative.
 #[derive(Serialize)]
 struct JsonScopeMetrics {
@@ -136,6 +142,14 @@ struct JsonScopeMetrics {
     in_cycle: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     instability: Option<f32>,
+    // UI-091. What the two counts above passed over: reference edges are not
+    // coupling, so a scope whose links are all references scores `0` on both
+    // and reads as decoupled rather than as unmeasured. Omitted when zero, so
+    // a code graph's payload is byte-identical to what it was.
+    #[serde(skip_serializing_if = "is_zero")]
+    ref_fan_in: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    ref_fan_out: u32,
     avg_quality: f32,
     max_quality: f32,
     quality_ok: u32,
@@ -163,6 +177,8 @@ impl JsonScopeMetrics {
             fan_out: m.fan_out,
             in_cycle: m.in_cycle,
             instability: m.instability,
+            ref_fan_in: m.ref_fan_in,
+            ref_fan_out: m.ref_fan_out,
             avg_quality: m.avg_quality,
             max_quality: m.max_quality,
             quality_ok: m.quality_ok,
@@ -797,4 +813,68 @@ fn chrono_lite_timestamp() -> String {
         .unwrap_or_default();
     
     format!("{}", duration.as_secs())
+}
+
+#[cfg(test)]
+mod scope_metrics_payload_tests {
+    //! UI-091: the reference counts have to survive the trip to the UI.
+    //!
+    //! The rollup was correct in the graph and absent from the payload for
+    //! one round of this work — the browser reads this struct, not
+    //! `ScopeMetrics`, so a field the renderer forgets is a field the reader
+    //! never sees.
+
+    use super::*;
+    use crate::analyzer::AnalysisResult;
+    use crate::config::Config;
+    use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, Span};
+
+    fn note(path: &str, name: &str) -> CodeEntity {
+        let mut span = Span::default();
+        span.start.line = 1;
+        CodeEntity::new(name, EntityKind::Note, path, span)
+    }
+
+    fn rendered(kind: RelationshipKind) -> serde_json::Value {
+        let a = note("docs/a.md", "A");
+        let b = note("guide/b.md", "B");
+        let rel = Relationship::new(a.id.clone(), b.id.clone(), kind);
+        let graph = DependencyGraph::from_analysis(&AnalysisResult {
+            entities: vec![a, b],
+            relationships: vec![rel],
+            files: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let json = JsonRenderer.render(&graph, &Config::default()).expect("render");
+        serde_json::from_str(&json).expect("valid json")
+    }
+
+    fn module<'a>(v: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        v["modules"]
+            .as_array()
+            .expect("modules")
+            .iter()
+            .find(|m| m["path"] == path)
+            .expect("the module")
+    }
+
+    #[test]
+    fn a_referencing_folder_ships_its_reference_counts() {
+        let v = rendered(RelationshipKind::References);
+        let docs = module(&v, "docs");
+        assert_eq!(docs["fan_out"], 0);
+        assert_eq!(docs["ref_fan_out"], 1);
+        assert_eq!(module(&v, "guide")["ref_fan_in"], 1);
+    }
+
+    #[test]
+    fn a_code_graphs_payload_is_unchanged() {
+        // Omitted when zero, so nothing new appears in a graph that has no
+        // references to report.
+        let v = rendered(RelationshipKind::Calls);
+        let docs = module(&v, "docs");
+        assert_eq!(docs["fan_out"], 1);
+        assert!(docs.get("ref_fan_out").is_none());
+        assert!(docs.get("ref_fan_in").is_none());
+    }
 }

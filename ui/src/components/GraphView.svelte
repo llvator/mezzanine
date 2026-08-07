@@ -22,7 +22,18 @@
   } from '../utils/arrivals';
   import { liveReloading } from '../stores/liveReload';
   import { computeFolderHulls, type FolderHull } from '../viewmodels/folderHulls';
+  import { regionsAtPoint, sameRegions } from '../viewmodels/regionsAtPoint';
+  import {
+    regionSpecClaim, clampDescription, documentationLookup, hasSpecLayer,
+    type RegionSpecClaim,
+  } from '../viewmodels/regionSpec';
+  import { specGraph } from '../stores/crossFilter';
+  import { ensureDetailsLoaded, type EntityDetails } from '../stores/details';
   import { groupMemberIds } from '../viewmodels/hoverHighlight';
+  import {
+    regionTraffic, membershipText, membershipTitle, trafficSentence,
+    type RegionTraffic,
+  } from '../viewmodels/regionTraffic';
   import { canvasChrome, type CanvasChrome } from '../utils/canvasChrome';
   import { drillIn, refreshing } from '../stores/scope';
   import { isMarked, markedPaths, toggleMark } from '../stores/marks';
@@ -454,6 +465,182 @@
     .y((p) => p[1])
     .curve(d3.curveCatmullRomClosed.alpha(0.5));
 
+  /** The regions as last drawn, kept for the hover hit test (UI-071).
+   *
+   *  The geometry is already computed once per draw; hit-testing against this
+   *  costs a point-in-polygon per region per pointer move and nothing else.
+   *  Re-deriving it from the DOM would mean parsing the `d` attribute back
+   *  into points, and re-running `computeFolderHulls` on a pointer move would
+   *  put a full pass over every drawn node behind the cursor. */
+  let regionHulls: FolderHull[] = [];
+  /** The regions under the pointer, widest first — what the card lists. */
+  let hoveredRegions: FolderHull[] = [];
+  /** What each region holds and what its relationships do (UI-071), by path.
+   *
+   *  Rebuilt with the drawn set rather than with the hulls: none of it
+   *  depends on where the simulation put anything, and `drawHulls` runs on a
+   *  throttle during ticks. Counting links sixty times a second to get the
+   *  same answer would be the one expensive thing on this canvas that buys
+   *  nothing. */
+  let regionTrafficByPath = new Map<string, RegionTraffic>();
+  /** Card position in canvas pixels, and its measured box so the card can be
+   *  flipped rather than clipped at the right and bottom edges. */
+  let regionCardX = 0;
+  let regionCardY = 0;
+  let regionCardW = 0;
+  let regionCardH = 0;
+  /** Distance from the cursor to the card. Far enough that the card does not
+   *  sit under the hotspot the reader is aiming with. */
+  const REGION_CARD_GAP = 14;
+
+  function clearRegionHover(): void {
+    if (hoveredRegions.length > 0) hoveredRegions = [];
+  }
+
+  /**
+   * The `/api/details` sidecar, which is where a description actually lives.
+   *
+   * Not in the graph payload — `documentation` is deliberately absent there —
+   * so the card reads it from the same repo-wide cache `descriptionChain`
+   * uses. Held as a plain field and re-read on every graph publish: the
+   * promise is already resolved after the first call, so this costs nothing
+   * except on the reload that reset the cache.
+   */
+  let specDocs: Record<string, EntityDetails> | null = null;
+
+  function refreshSpecDocs(): void {
+    void ensureDetailsLoaded().then((docs) => { specDocs = docs; });
+  }
+
+  /**
+   * What the spec says about the region under the pointer, if anything.
+   *
+   * Asked of the *tightest* region only, and one call is enough for the whole
+   * trail: `cr:` claims are prefix-based, so a ref on `ui/` is already found
+   * when the innermost region is `ui/src/stores` — and comes back marked as
+   * inherited rather than as a description of `stores`.
+   *
+   * Written as a function of its three inputs so Svelte re-runs it when the
+   * spec graph arrives or the sidecar finishes loading, not only when the
+   * pointer moves.
+   */
+  function claimFor(
+    regions: FolderHull[],
+    graph: import('../viewmodels/specGraph').SpecGraph,
+    docs: Record<string, EntityDetails> | null,
+  ): RegionSpecClaim | null {
+    if (regions.length === 0) return null;
+    return regionSpecClaim(graph, regions[regions.length - 1].path, documentationLookup(docs));
+  }
+
+  $: regionClaim = claimFor(hoveredRegions, $specGraph, specDocs);
+  /** The tightest hovered region's traffic — the one the sentence is about,
+   *  and the one the double-click acts on. */
+  $: regionTraffic0 = hoveredRegions.length === 0
+    ? undefined
+    : regionTrafficByPath.get(hoveredRegions[hoveredRegions.length - 1].path);
+  $: regionClaimText = clampDescription(regionClaim?.description ?? null);
+  /** Only worth saying in a project that has a spec at all. */
+  $: regionUnclaimed = hoveredRegions.length > 0 && !regionClaim && hasSpecLayer($specGraph);
+
+  /**
+   * Which regions the pointer is in, and where to put the card saying so.
+   *
+   * Runs off the raw pointer move rather than d3's hover events because the
+   * question is about a *stack* of regions and the DOM only ever delivers the
+   * topmost one. It stays cheap by having nothing to recompute: the polygons
+   * are the ones already drawn.
+   *
+   * The card is placed in canvas pixels, not world ones, so it holds still
+   * relative to the cursor while the graph zooms underneath it.
+   */
+  function onCanvasPointerMove(event: PointerEvent): void {
+    if (regionHulls.length === 0) { clearRegionHover(); return; }
+    const [px, py] = d3.pointer(event, svgEl);
+    const [wx, wy] = d3.zoomTransform(svgEl).invert([px, py]);
+    const hits = regionsAtPoint(regionHulls, wx, wy);
+    if (hits.length === 0) { clearRegionHover(); return; }
+
+    const w = container?.clientWidth ?? 0;
+    const h = container?.clientHeight ?? 0;
+    // Flip left / lift up near an edge. The measurements are last frame's,
+    // which is exactly right while the trail is unchanged and one frame stale
+    // when it grows a row — visible only as a card that settles, never as one
+    // that is cut off.
+    regionCardX = px + REGION_CARD_GAP + regionCardW > w
+      ? Math.max(4, px - REGION_CARD_GAP - regionCardW)
+      : px + REGION_CARD_GAP;
+    regionCardY = Math.max(4, Math.min(py + REGION_CARD_GAP, h - regionCardH - 4));
+
+    if (!sameRegions(hits, hoveredRegions)) hoveredRegions = hits;
+  }
+
+  /**
+   * Double-click a region: make it the whole view (UI-089).
+   *
+   * The same gesture and the same verb as double-clicking a collapsed node —
+   * `drillIn` narrows the scope and re-enables auto-level, so the view opens
+   * to the finest detail the smaller subset affords. A region is the one thing
+   * on the canvas that names a folder without being a node, and it was the
+   * only one you could not drill into.
+   *
+   * Double-click rather than click for two reasons: a single click inside a
+   * region has to keep meaning "deselect", and a gesture that replaces the
+   * entire view should not be one stray click away.
+   *
+   * `stopPropagation` keeps d3's own dblclick-to-zoom from firing on the same
+   * gesture — the same guard `onNodeDoubleClick` uses.
+   */
+  function onRegionDoubleClick(event: MouseEvent, h: FolderHull): void {
+    event.stopPropagation();
+    event.preventDefault();
+    clearRegionHover();
+    void drillIn(h.path);
+  }
+
+  /**
+   * Double-click anywhere inside the canvas content: focus the region under
+   * the pointer, if there is one.
+   *
+   * Hit-tested rather than delivered by the DOM, and bound to the zoomed root
+   * group rather than to the outline itself. The outline is the *backmost*
+   * layer, so anything drawn over it — an edge crossing the region, a link
+   * label, an order badge — takes the event instead, and the gesture then
+   * bubbled to d3's `dblclick.zoom` and zoomed in where the reader had asked
+   * to focus. It failed about one double-click in ten on a dense graph, which
+   * is exactly often enough to read as "sometimes it just zooms".
+   *
+   * Binding here is what makes stopping the zoom possible at all: `zoom`
+   * registers `dblclick.zoom` on the `<svg>`, so a handler on the svg would
+   * run *after* it and could not prevent it. This runs while the event is
+   * still bubbling through the content group. Nodes never reach it — their
+   * own handler stops propagation first — and a double-click on genuinely
+   * empty canvas is not inside this group at all, so zoom keeps it.
+   */
+  function onContentDoubleClick(event: MouseEvent): void {
+    if (regionHulls.length === 0) return;
+    const [px, py] = d3.pointer(event, svgEl);
+    const [wx, wy] = d3.zoomTransform(svgEl).invert([px, py]);
+    const hits = regionsAtPoint(regionHulls, wx, wy);
+    if (hits.length === 0) return;
+    onRegionDoubleClick(event, hits[hits.length - 1]);
+  }
+
+  /**
+   * Is this click on nothing?
+   *
+   * A hull is background. UI-055 made the outline `pointer-events: none`
+   * precisely because this test used to be `event.target === svgEl`, and a
+   * region covering most of the canvas would then have swallowed
+   * click-to-deselect everywhere it reached. The regions are hittable now, so
+   * the fix moves here: a click that lands on a region and not on a node is
+   * still a click on nothing, and still deselects.
+   */
+  function isCanvasBackground(target: EventTarget | null): boolean {
+    if (target === svgEl) return true;
+    return target instanceof Element && target.closest('.folder-hull') !== null;
+  }
+
   function hullsEnabled(): boolean {
     if (!get(showFolderHulls)) return false;
     // Tree mode draws no hulls, as before. The layout is a strict hierarchy
@@ -466,9 +653,53 @@
     return true;
   }
 
+  /**
+   * Recount what each region holds and what its relationships do (UI-071).
+   *
+   * The candidate set is every node bound to the canvas, not the visible
+   * ones: `drawn` and `total` have to be in the same units for their
+   * difference to mean "hidden by a filter", which is the reading that tells
+   * a filtered region apart from a genuinely sparse one.
+   *
+   * Membership comes from the same chain `drawHulls` passes to
+   * `computeFolderHulls`, so the numbers and the outline can never disagree
+   * about who is in a region.
+   */
+  function computeRegionTraffic(plan: DisplayPlan): void {
+    if (!nodeSel || !linkSel) { regionTrafficByPath = new Map(); return; }
+    const chains = new Map<string, readonly string[]>();
+    const candidates: { id: string }[] = [];
+    nodeSel.each((d: D3Node) => {
+      candidates.push({ id: d.id });
+      const key = folderKeyOf(d);
+      chains.set(d.id, key === null ? [] : ancestorChainOf(key, Infinity));
+    });
+    const links: { source: string; target: string }[] = [];
+    linkSel.each((l: D3Link) => {
+      if (!plan.visibleLinkKeys.has(linkKeyFor(l))) return;
+      const from = typeof l.source === 'string' ? l.source : (l.source as D3Node).id;
+      const to = typeof l.target === 'string' ? l.target : (l.target as D3Node).id;
+      links.push({ source: from, target: to });
+    });
+    regionTrafficByPath = regionTraffic({
+      candidates,
+      isDrawn: (id) => hullNodeIds.has(id),
+      links,
+      keysOf: (id) => chains.get(id) ?? [],
+    });
+  }
+
   function drawHulls(immediate = false): void {
     if (!fileHullGroup || !nodeSel) return;
-    if (!hullsEnabled()) { fileHullGroup.selectAll('*').remove(); return; }
+    if (!hullsEnabled()) {
+      fileHullGroup.selectAll('*').remove();
+      // The card answers "which region am I in"; with no regions drawn there
+      // is no such thing to be in, and a card left standing would be naming a
+      // grouping the canvas has stopped making.
+      regionHulls = [];
+      clearRegionHover();
+      return;
+    }
     const now = performance.now();
     if (!immediate && now - lastHullDraw < HULL_INTERVAL_MS) return;
     lastHullDraw = now;
@@ -488,6 +719,7 @@
       },
       tiers: get(hullDepth),
     });
+    regionHulls = hulls;
 
     const sel = fileHullGroup.selectAll<SVGGElement, FolderHull>('g.folder-hull')
       .data(hulls, (h) => (h as FolderHull).path)
@@ -495,12 +727,28 @@
         (enter) => {
           const grp = enter.append('g').attr('class', 'folder-hull');
           grp.append('path').attr('class', 'hull-shape');
-          grp.append('text').attr('class', 'hull-label').attr('text-anchor', 'middle');
+          grp.append('text').attr('class', 'hull-label').attr('text-anchor', 'middle')
+            // The name carries its own handler where the shape does not: a
+            // label sits *outside* the outline it names, so the hit test in
+            // `onContentDoubleClick` finds no region under it. That makes it
+            // the one way to focus an ancestor whose middle is entirely
+            // covered by the regions inside it.
+            .on('dblclick', function (event: MouseEvent) {
+              onRegionDoubleClick(event, d3.select<SVGTextElement, FolderHull>(this).datum());
+            });
           return grp;
         },
         (update) => update,
         (exit) => exit.remove(),
       );
+
+    // Painter's algorithm again, and now it is load-bearing twice over. A
+    // keyed join leaves surviving elements where they were, so a region that
+    // grew past a neighbour between frames would keep the old stacking — and
+    // stacking is what decides which region takes a double-click. Without
+    // this, a parent could drift on top of its child and swallow the gesture
+    // meant for the tighter, more specific region under the cursor.
+    sel.order();
 
     // `data-path` and the parent class are read by the probe, which cannot
     // tell a region's ancestry from a label that carries only the last
@@ -845,6 +1093,7 @@
     hullNodeIds = new Set<string>();
     for (const id of plan.visibleNodeIds) hullNodeIds.add(id);
     if (dimOpacity > 0) for (const id of plan.dimmedNodeIds) hullNodeIds.add(id);
+    computeRegionTraffic(plan);
     drawHulls(true);
 
     // Immediate for the same reason, and it is the *only* publish tree mode
@@ -1141,6 +1390,11 @@
     // the canvas down over the draw ceiling would leave the panel showing the
     // graph that is no longer there — the one picture guaranteed to be wrong.
     overviewDots.set([]);
+    // Same reason the overview is emptied: the regions are gone, so a hover
+    // card computed from the last frame's polygons would name a grouping that
+    // is no longer on screen.
+    regionHulls = [];
+    clearRegionHover();
     nodeSel = null as any;
     linkSel = null as any;
     linkLabelSel = null as any;
@@ -1176,6 +1430,11 @@
 
     svg = d3.select(svgEl).attr('width', w).attr('height', h);
     g = svg.append('g');
+    // Focus-a-region (UI-089) listens here, on the content group, so it sees
+    // the double-click before `dblclick.zoom` on the <svg> does — and
+    // whatever the event landed on, since an edge or a label drawn over a
+    // region would otherwise take it. See `onContentDoubleClick`.
+    g.on('dblclick', (event) => onContentDoubleClick(event));
     fileHullGroup = g.append('g').attr('class', 'file-hulls');
 
     zoom = d3.zoom<SVGSVGElement, unknown>()
@@ -1188,7 +1447,7 @@
     svg.call(zoom.transform, d3.zoomIdentity);
 
     svg.on('click', (event) => {
-      if (event.target === svgEl) selectedNode.set(null);
+      if (isCanvasBackground(event.target)) selectedNode.set(null);
     });
 
     // `markerUnits: userSpaceOnUse` is the load-bearing attribute: without it
@@ -1576,6 +1835,13 @@
     //    previous theme's chrome until the next rebuild (UI-009).
     unsubscribers.push(activeTheme.subscribe(() => restyleCanvasChrome()));
 
+    // 0a. The description sidecar, for the region card's spec claim (UI-090).
+    //     Subscribed to the graph rather than fetched once: a live reload
+    //     resets the cache, and a card that kept the old map would attribute
+    //     the previous analysis's words to a folder. Cached after the first
+    //     call, so every later publish is a resolved promise.
+    unsubscribers.push(graphData.subscribe(() => refreshSpecDocs()));
+
     // 0b. Encoding (UI-014). Changing what size or fill *means* is a restyle,
     //     not a re-layout — the graph is the same graph, so switching channel
     //     must not re-settle the force simulation and throw away the reading
@@ -1743,7 +2009,94 @@
 
 <div class="graph-container" class:pane-focused={$focusedPane === 'graph'}
   data-pane="graph" bind:this={container}>
-  <svg bind:this={svgEl}></svg>
+  <!-- The handlers are hover-only: they place a card that says which region
+       the pointer is in. Nothing here is reachable only by pointer — the same
+       regions are named on the canvas, and focusing one has a keyboard path
+       through the scope tree. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <svg
+    bind:this={svgEl}
+    on:pointermove={onCanvasPointerMove}
+    on:pointerleave={clearRegionHover}
+  ></svg>
+  <!-- Where you are (UI-071). Widest region first, so the card reads the way
+       a path does, and the tightest one last because that is what the double
+       click acts on. `pointer-events: none` in the stylesheet: the card
+       tracks the cursor, so anything it could intercept is something the
+       reader was reaching for underneath it. -->
+  {#if hoveredRegions.length > 0}
+    <div
+      class="region-card"
+      data-probe="region-card"
+      style="left: {regionCardX}px; top: {regionCardY}px"
+      bind:clientWidth={regionCardW}
+      bind:clientHeight={regionCardH}
+    >
+      {#each hoveredRegions as region, i (region.path)}
+        <div
+          class="region-row"
+          class:tightest={i === hoveredRegions.length - 1}
+          data-probe="region-row"
+          data-region-path={region.path}
+          style="padding-left: {i * 9}px"
+        >
+          <span class="region-name">{region.label}</span>
+          <!-- `12 of 19` only when the two differ (UI-071). A ratio on every
+               row of a three-deep trail is noise that hides the one row where
+               it matters — and that row is the whole point: a region half
+               hidden by a filter reads identically to a small one. -->
+          <span
+            class="region-count"
+            class:partial={regionTrafficByPath.get(region.path)?.drawn !== regionTrafficByPath.get(region.path)?.total}
+            data-probe="region-count"
+            title={membershipTitle(regionTrafficByPath.get(region.path))}
+          >{membershipText(regionTrafficByPath.get(region.path), region.size)}</span>
+        </div>
+      {/each}
+      <div class="region-path" data-probe="region-path">
+        {hoveredRegions[hoveredRegions.length - 1].path || '(repo root)'}
+      </div>
+      <!-- Is this a subsystem, or a directory someone filed things in? The
+           graph knows, and this is the sentence that says it (UI-071).
+           Counts, never a percentage: the Quality panel's cohesion is
+           measured over every dependency edge in the repo, this is measured
+           over what is drawn, and two numbers under one name would be worse
+           than one. It describes the tightest region — the one the trail
+           emphasises and the one a double-click acts on. -->
+      {#if regionTraffic0}
+        <div class="region-traffic" data-probe="region-traffic"
+          title="Counted over the relationships currently drawn — not the repo-wide cohesion in the Quality panel">
+          {trafficSentence(hoveredRegions[hoveredRegions.length - 1].label, regionTraffic0)}
+        </div>
+      {/if}
+      <!-- What the spec says about this folder (UI-090). The description is
+           an author's sentence about a concept, so it is attributed: the
+           entity's kind and name carry it, and an inherited claim says which
+           path it actually describes rather than passing it off as this
+           folder's own. -->
+      {#if regionClaim}
+        <div class="region-spec" data-probe="region-spec" data-spec-id={regionClaim.id}>
+          <div class="region-spec-head">
+            <span class="region-spec-kind">{regionClaim.kind}</span>
+            <span class="region-spec-name">{regionClaim.name}</span>
+          </div>
+          {#if !regionClaim.exact}
+            <div class="region-spec-via" data-probe="region-spec-via">claims {regionClaim.claimPath}</div>
+          {/if}
+          {#if regionClaimText}
+            <div class="region-spec-desc" data-probe="region-spec-desc">{regionClaimText}</div>
+          {/if}
+        </div>
+      {:else if regionUnclaimed}
+        <!-- Silence is a finding: a folder no declared entity claims. Said
+             quietly, and only where there is a spec to be missing from. -->
+        <div class="region-spec-none" data-probe="region-spec-none">No spec entity claims this folder</div>
+      {/if}
+      <div class="region-hint" data-probe="region-hint">
+        Double-click to focus {hoveredRegions[hoveredRegions.length - 1].label}
+      </div>
+    </div>
+  {/if}
   <slot />
 </div>
 
@@ -1772,17 +2125,165 @@
     background: var(--bg-body);
   }
 
-  /* Folder hulls (UI-055). `pointer-events: none` on the whole group is
-     load-bearing, not tidiness: the background-click handler deselects only
-     when `event.target === svgEl`, and a hull covers most of the canvas, so
-     a hittable outline would silently break click-to-deselect everywhere it
-     reaches. It also costs the outline a <title> tooltip — the label carries
-     the name instead. */
+  /* Folder hulls (UI-055, hittable since UI-071). The group stays
+     `pointer-events: none` and the two drawn parts opt back in, so the gap
+     between a region's outline and the next one over is still empty canvas.
+
+     UI-055 made the whole thing inert for a reason worth keeping in view: the
+     background-click handler deselected only when `event.target === svgEl`,
+     and a hull covers most of the canvas, so a hittable outline silently
+     broke click-to-deselect everywhere it reached. That test is now
+     `isCanvasBackground`, which counts a hull as background — the fix that
+     had to land before the shape could take an event at all.
+
+     `fill` rather than `visibleFill`: a parent region is drawn with
+     `fill-opacity: 0` so its children's colours read true, and it still has
+     to be as hoverable as any other region. */
   :global(.folder-hull) { pointer-events: none; }
+  :global(.hull-shape) { pointer-events: fill; }
   :global(.hull-label) {
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.12em;
+    /* The name is the one part of a region small enough to point at
+       precisely, which is what makes it the way to focus an *ancestor* whose
+       middle is covered by its children. */
+    pointer-events: auto;
+    cursor: pointer;
+  }
+  :global(.hull-label:hover) { text-decoration: underline; }
+
+  /* The "where am I" card (UI-071). Cursor-anchored rather than parked in a
+     corner: the question is about the point being aimed at, and a reader
+     tracking a stack of nested regions should not have to look away from it
+     to read the answer.
+
+     Inert on purpose. It follows the pointer, so any event it caught would be
+     one aimed at the node or region underneath — including the double-click
+     that focuses a region. */
+  .region-card {
+    position: absolute;
+    z-index: 6;
+    pointer-events: none;
+    /* 300, not 260, since the card gained the traffic sentence (UI-071). The
+       budget that matters on a hover surface is *height* — a card as tall as
+       a panel stops reading as a pointer annotation — and the tallest thing
+       in here is a spec description wrapping. Forty more pixels of width buys
+       a line back and reads better as prose. */
+    max-width: 300px;
+    padding: 5px 8px 6px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  /* One row per enclosing region, widest first and each one indented under
+     the last, so the stack reads as the containment it is. */
+  .region-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .region-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* The tightest region is both the most specific answer and the one the
+     double-click acts on, so it carries the emphasis the hint line names. */
+  .region-row.tightest .region-name {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .region-count {
+    margin-left: auto;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Only the tightest region's full path, and only once. Every row's path is
+     implied by the trail above it, and four of them would turn a hover card
+     into a column of directories. */
+  .region-path {
+    margin-top: 3px;
+    padding-top: 3px;
+    border-top: 1px solid var(--border-subtle);
+    color: var(--text-dim);
+    font-size: 10px;
+    word-break: break-all;
+  }
+  /* The claim the card exists to make (UI-071), so it reads as prose at the
+     card's own text colour rather than as another dim annotation. */
+  .region-traffic {
+    margin-top: 3px;
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+  /* A count that is hiding something has to look different from one that is
+     not, or the reader has to hover every row to find out which is which. */
+  .region-count.partial { color: var(--text); font-weight: 600; }
+  /* The spec claim (UI-090). Set off from the folder trail above it, because
+     the two answer different questions: the trail is where you are, this is
+     what someone wrote down about it. */
+  .region-spec {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .region-spec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+  }
+  /* The kind, not just the name: "Feature grouping" and "Concept grouping"
+     are very different claims and the name alone hides which. */
+  .region-spec-kind {
+    color: var(--text-dim);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .region-spec-name {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .region-spec-via {
+    color: var(--text-dim);
+    font-size: 10px;
+  }
+  /* Two lines, hard. `d:` is one string by grammar but not a short one — real
+     specs run to paragraphs, and this repo's longest is past 300 words. The
+     clamp in `clampDescription` cuts the text; this stops a long unbroken
+     path or identifier from stretching the card anyway. */
+  .region-spec-desc {
+    margin-top: 2px;
+    color: var(--text-secondary);
+    font-size: 10px;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+  }
+  .region-spec-none {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid var(--border-subtle);
+    color: var(--text-dim);
+    font-size: 10px;
+    font-style: italic;
+  }
+
+  .region-hint {
+    margin-top: 2px;
+    color: var(--text-muted);
+    font-size: 10px;
   }
   /* A parent region's name is the heading over the regions inside it
      (UI-070). Wider tracking as well as more size: two nested outlines cross,
