@@ -12,17 +12,100 @@ use crate::graph::DependencyGraph;
 use crate::output::{self, JsonRenderer};
 
 use super::state::{build_config, AppState, CachedBase, LiveDiff, ReloadKind};
-use super::types::{DiffRequest, DiffResponse, DiffSummaryResponse, RootPathRequest, RootPathResponse};
+use super::types::{
+    DiffRequest, DiffResponse, DiffSummaryResponse, RootPathRequest, RootPathResponse,
+};
 
 /// The one `to_ref` that means "the tree this server is watching" rather
 /// than a git ref that has to be checked out into a temp worktree first.
 const WORKING_REF: &str = "WORKING";
 
+/// The `to_ref` that means the git index. A sentinel rather than a sha because
+/// the index is not a ref: the commit that names it is manufactured *inside*
+/// this call and is unreferenced, so a client that held one would be holding a
+/// commit that means whatever the index happened to be when it was made — the
+/// `stash@{N}` mistake with the failure moved to the other end (UI-111).
+const STAGED_REF: &str = "STAGED";
+
+/// What `diff.json` calls a staged head. The literal is the discriminator the
+/// UI reads to know which tree the comparison looked at, the same channel
+/// `working` already uses.
+const STAGED_LABEL: &str = "staged";
+
 /// Whether this request's head is the live working tree. The answer decides
 /// whether the result may be adopted as live state — see the swap at the end
 /// of `diff_handler` (SRV-019).
+///
+/// `STAGED` is *not* a working head, deliberately: the index is checked out
+/// into a temp worktree like any commit, so adopting its graph would re-root
+/// the server at a directory this call deletes before it returns.
 fn is_working_head(req: &DiffRequest) -> bool {
     req.to_ref == WORKING_REF
+}
+
+/// The head side of a diff once the sentinels are resolved.
+#[derive(Debug)]
+struct Head {
+    /// The ref to check out, or `None` for the working tree the server already
+    /// holds a graph of.
+    git_ref: Option<String>,
+    /// What the result is reported and keyed under: a literal for either
+    /// sentinel, the resolved short sha for an ordinary ref.
+    label: String,
+}
+
+/// What the reader is told when there is nothing in the index. Not an error:
+/// nothing staged is the ordinary state of a repository, and it is the one
+/// answer an empty overlay would state as "nothing changed" about the wrong
+/// thing.
+const NOTHING_STAGED: &str = "Nothing is staged. `git add` the changes you want to look at first.";
+
+/// Sort a head-resolution failure into the two kinds a caller answers
+/// differently: a comparison the server *declines*, and one it could not make.
+///
+/// Nothing staged is the only declined one, and the distinction is whose
+/// problem it is. A 500 tells the reader something broke and gives them
+/// nothing to do about it; `success: false` with a message tells them to
+/// `git add` something. Every other failure here — a ref that does not
+/// resolve, git absent — is the server failing to answer.
+fn declined(e: String) -> Result<DiffResponse, String> {
+    if e == NOTHING_STAGED {
+        Ok(DiffResponse {
+            success: false,
+            message: e,
+            summary: None,
+        })
+    } else {
+        Err(e)
+    }
+}
+
+/// Turn a request's `to_ref` into the head to analyze.
+///
+/// Resolved on the async side, before the blocking task starts, because the
+/// staged case has an answer that is not a diff at all — and finding that out
+/// after a worktree checkout and a full analysis would be paying for it twice.
+fn resolve_head(repo_root: &Path, to_ref: &str) -> Result<Head, String> {
+    match to_ref {
+        WORKING_REF => Ok(Head {
+            git_ref: None,
+            label: "working".to_string(),
+        }),
+        STAGED_REF => diff::staged_commit(repo_root)
+            .map_err(|e| e.to_string())?
+            .map(|sha| Head {
+                git_ref: Some(sha),
+                label: STAGED_LABEL.to_string(),
+            })
+            .ok_or_else(|| NOTHING_STAGED.to_string()),
+        r => Ok(Head {
+            label: diff::resolve_git_ref(repo_root, r)
+                .map_err(|e| format!("Invalid to_ref: {}", e))?,
+            // The ref as asked for, not its sha: a checkout of either is the
+            // same tree, and the name is what the log line reads as.
+            git_ref: Some(r.to_string()),
+        }),
+    }
 }
 
 /// The config to diff the working tree with: the live one, re-rooted at the
@@ -57,7 +140,11 @@ fn take_cached_base(
     if cache_key(cached) != (sha, scope) {
         return None;
     }
-    Some((cached.graph.clone(), cached.config.clone(), cached.details.clone()))
+    Some((
+        cached.graph.clone(),
+        cached.config.clone(),
+        cached.details.clone(),
+    ))
 }
 
 /// What identifies a cached base. Both halves, always: the ref says which
@@ -144,51 +231,48 @@ fn compute_diff_blocking(
     output_dir: &Path,
     live_config: &Arc<std::sync::RwLock<Config>>,
     from_ref: &str,
-    to_ref: &str,
+    head: &Head,
     current_graph: Option<Arc<std::sync::RwLock<DependencyGraph>>>,
     base_cache: Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
 ) -> Result<(DiffResponse, DependencyGraph, Config, String, String), String> {
-    let is_working = to_ref == WORKING_REF;
+    let is_working = head.git_ref.is_none();
+    let to_sha = head.label.clone();
     let total_start = Instant::now();
-    let to_label = if is_working { "Working Tree" } else { to_ref };
+    let to_label = if is_working { "Working Tree" } else { &to_sha };
     eprintln!("🔄 Starting diff: {} → {}", from_ref, to_label);
 
     let e2s = |e: anyhow::Error| e.to_string();
 
-    let live = live_config.read().map_err(|e| format!("Config lock: {}", e))?.clone();
+    let live = live_config
+        .read()
+        .map_err(|e| format!("Config lock: {}", e))?
+        .clone();
     let scope = diff::analysis_fingerprint(&live, repo_root);
 
-    // Resolve refs
     let from_sha = diff::resolve_git_ref(repo_root, from_ref)
         .map_err(|e| format!("Invalid from_ref: {}", e))?;
-    let to_sha = if is_working {
-        "working".to_string()
-    } else {
-        diff::resolve_git_ref(repo_root, to_ref)
-            .map_err(|e| format!("Invalid to_ref: {}", e))?
-    };
 
     // Create + analyze base worktree, unless the last diff already did.
     let tmp = std::env::temp_dir();
     let base_dir = tmp.join(format!("nao-diff-base-{}", from_sha));
     let worktree_start = Instant::now();
     let (base, base_is_ours) = acquire_base(
-        repo_root, &base_dir, from_ref, &from_sha,
-        &scope, diff::rooted_at(&live, &base_dir), &base_cache,
+        repo_root,
+        &base_dir,
+        from_ref,
+        &from_sha,
+        &scope,
+        diff::rooted_at(&live, &base_dir),
+        &base_cache,
     )?;
     let (base_graph, base_config, base_details_str) = base;
 
-    // Acquire head graph: from in-memory state (WORKING) or a new worktree
-    let (head_graph, head_config, head_dir_for_diff) = if is_working {
-        eprintln!("   Using current working directory as head...");
-        let g = current_graph.unwrap();
-        let graph = g.read().map_err(|e| format!("Graph lock: {}", e))?.clone();
-        let config = working_head_config(live, repo_root);
-        let dir = config.root_path.clone();
-        (graph, config, dir)
-    } else {
+    // Acquire head graph: from in-memory state (WORKING) or a new worktree.
+    // The staged head goes down the worktree path like any commit — the
+    // manufactured commit it checks out is an ordinary ref by then.
+    let (head_graph, head_config, head_dir_for_diff) = if let Some(head_ref) = &head.git_ref {
         let hdir = tmp.join(format!("nao-diff-head-{}", to_sha));
-        if let Err(e) = diff::create_worktree(repo_root, &hdir, to_ref) {
+        if let Err(e) = diff::create_worktree(repo_root, &hdir, head_ref) {
             if base_is_ours {
                 diff::remove_worktree(repo_root, &base_dir);
             }
@@ -198,6 +282,13 @@ fn compute_diff_blocking(
             diff::analyze_with(diff::rooted_at(&live, &hdir), &format!("head ({})", to_sha))
                 .map_err(e2s)?;
         (graph, config, hdir)
+    } else {
+        eprintln!("   Using current working directory as head...");
+        let g = current_graph.unwrap();
+        let graph = g.read().map_err(|e| format!("Graph lock: {}", e))?.clone();
+        let config = working_head_config(live, repo_root);
+        let dir = config.root_path.clone();
+        (graph, config, dir)
     };
 
     eprintln!(
@@ -209,20 +300,30 @@ fn compute_diff_blocking(
     eprintln!("   Computing structural diff...");
     let diff_start = Instant::now();
     let diff_result = diff::compute_diff(
-        &base_graph, &head_graph,
-        &base_dir, &head_dir_for_diff,
-        &from_sha, &to_sha,
+        &base_graph,
+        &head_graph,
+        &base_dir,
+        &head_dir_for_diff,
+        &from_sha,
+        &to_sha,
     );
     eprintln!(
         "   Diff computed in {:.1}s: +{} -{} ~{}",
         diff_start.elapsed().as_secs_f32(),
-        diff_result.summary.added, diff_result.summary.removed, diff_result.summary.modified
+        diff_result.summary.added,
+        diff_result.summary.removed,
+        diff_result.summary.modified
     );
 
     // Write output files
-    let diff_json =
-        diff::write_diff_outputs(output_dir, &head_graph, &head_config, &base_details_str, &diff_result)
-            .map_err(e2s)?;
+    let diff_json = diff::write_diff_outputs(
+        output_dir,
+        &head_graph,
+        &head_config,
+        &base_details_str,
+        &diff_result,
+    )
+    .map_err(e2s)?;
 
     // Cleanup worktrees. Only the ones this call created — a reused base
     // was removed by whichever call analyzed it, and asking git to remove it
@@ -241,9 +342,19 @@ fn compute_diff_blocking(
     // Keep the base for the next refresh. Its worktree is gone either way —
     // the graph is what the next diff needs, and re-deriving it from a
     // checkout that has not moved is the cost this avoids.
-    store_cached_base(&base_cache, &from_sha, &scope, &base_graph, &base_config, &base_details_str);
+    store_cached_base(
+        &base_cache,
+        &from_sha,
+        &scope,
+        &base_graph,
+        &base_config,
+        &base_details_str,
+    );
 
-    eprintln!("✅ Diff complete in {:.1}s total", total_start.elapsed().as_secs_f32());
+    eprintln!(
+        "✅ Diff complete in {:.1}s total",
+        total_start.elapsed().as_secs_f32()
+    );
 
     let resp = DiffResponse {
         success: true,
@@ -293,7 +404,9 @@ pub(crate) async fn diff_handler(
             if resp.success {
                 if let Ok(mut live) = state.live_diff.write() {
                     *live = if state.follow_diff && is_working_head(&req) {
-                        Some(LiveDiff { from_ref: req.from_ref.clone() })
+                        Some(LiveDiff {
+                            from_ref: req.from_ref.clone(),
+                        })
                     } else {
                         None
                     };
@@ -404,13 +517,20 @@ async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, S
     // Read repo_root before spawning blocking task
     let repo_root = state.repo_root.read().await.clone();
 
+    // Resolve the head before paying for anything. The staged case can answer
+    // "there is nothing to compare", and that is a message rather than a
+    // failure — discovering it after a checkout and a full analysis would be
+    // charging the reader for the answer.
+    let head = match resolve_head(&repo_root, &req.to_ref) {
+        Ok(head) => head,
+        Err(e) => return declined(e),
+    };
+
     // Run diff in a blocking task since it's CPU-intensive
     let result = tokio::task::spawn_blocking({
         let output_dir = state.output_dir.clone();
         let from_ref = req.from_ref.clone();
-        let to_ref = req.to_ref.clone();
-        let is_working = to_ref == WORKING_REF;
-        let current_graph = if is_working {
+        let current_graph = if head.git_ref.is_none() {
             Some(state.graph.clone())
         } else {
             None
@@ -428,7 +548,7 @@ async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, S
                 &output_dir,
                 &live_config,
                 &from_ref,
-                &to_ref,
+                &head,
                 current_graph,
                 base_cache,
             )
@@ -548,8 +668,14 @@ pub(crate) async fn set_root_handler(
         let path = canonical_path.clone();
 
         move || -> Result<(usize, usize, DependencyGraph, Config), String> {
-            let config =
-                build_config(&path, include_tests, include_docs, &languages, spec_dir, &settings);
+            let config = build_config(
+                &path,
+                include_tests,
+                include_docs,
+                &languages,
+                spec_dir,
+                &settings,
+            );
 
             // Run analysis
             let mut analyzer = Analyzer::new(config.clone());
@@ -561,12 +687,11 @@ pub(crate) async fn set_root_handler(
             // Write output files
             std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
             let data_path = output_dir.join("data.json");
-            let output_str =
-                crate::output::render(&graph, &config).map_err(|e| e.to_string())?;
+            let output_str = crate::output::render(&graph, &config).map_err(|e| e.to_string())?;
             std::fs::write(&data_path, &output_str).map_err(|e| e.to_string())?;
 
-            let details_str = JsonRenderer::render_details(&graph, &config)
-                .map_err(|e| e.to_string())?;
+            let details_str =
+                JsonRenderer::render_details(&graph, &config).map_err(|e| e.to_string())?;
             std::fs::write(data_path.with_extension("details.json"), &details_str)
                 .map_err(|e| e.to_string())?;
 
@@ -656,7 +781,10 @@ mod tests {
     use super::*;
 
     fn req(to_ref: &str) -> DiffRequest {
-        DiffRequest { from_ref: "HEAD".to_string(), to_ref: to_ref.to_string() }
+        DiffRequest {
+            from_ref: "HEAD".to_string(),
+            to_ref: to_ref.to_string(),
+        }
     }
 
     #[test]
@@ -669,9 +797,107 @@ mod tests {
         // Each of these analyzes into a temp worktree that is deleted before
         // the response is written. Adopting one leaves the server rendering
         // its graph against a root that no longer exists (SRV-019).
-        for r in ["HEAD", "HEAD~1", "main", "c0ff6d2", "v1.2.3", "working"] {
-            assert!(!is_working_head(&req(r)), "'{r}' must not be adopted as live state");
+        // `STAGED` is in this list and not the one above: the index is checked
+        // out into a temp worktree exactly like a commit, however much it reads
+        // as uncommitted work (UI-111).
+        for r in [
+            "HEAD", "HEAD~1", "main", "c0ff6d2", "v1.2.3", "working", "STAGED", "staged",
+        ] {
+            assert!(
+                !is_working_head(&req(r)),
+                "'{r}' must not be adopted as live state"
+            );
         }
+    }
+
+    /// A repository with one commit, at a path unique to this test.
+    fn repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nao-head-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "--initial-branch=main", "."],
+            vec!["config", "user.email", "t@t.t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-qm", "base"]] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        dir
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+
+    #[test]
+    fn the_working_sentinel_resolves_to_no_ref_at_all() {
+        let head = resolve_head(Path::new("/nonexistent"), WORKING_REF).unwrap();
+        assert!(head.git_ref.is_none(), "nothing is checked out for WORKING");
+        assert_eq!(head.label, "working");
+    }
+
+    /// The label is what reaches `diff.json`, and it has to stay the literal:
+    /// a sha there would name a commit nothing references, and the UI would
+    /// read a staged comparison as an ordinary commit-to-commit one.
+    #[test]
+    fn a_staged_head_is_a_sha_to_check_out_and_a_literal_to_report() {
+        let dir = repo("staged");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git_in(&dir, &["add", "."]);
+
+        let head = resolve_head(&dir, STAGED_REF).unwrap();
+        assert_eq!(head.label, STAGED_LABEL);
+        let sha = head.git_ref.expect("the index resolves to a commit");
+        assert_ne!(sha, STAGED_REF, "the sentinel must not reach git");
+        assert_eq!(sha.len(), 40, "a full commit sha: {}", sha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing staged has to come back as this exact message, because that is
+    /// what `run_diff` matches on to answer with a declined diff rather than a
+    /// 500 — the reader has nothing to fix.
+    #[test]
+    fn nothing_staged_is_the_declined_message() {
+        let dir = repo("empty");
+        // An unstaged edit is not a staged one.
+        std::fs::write(dir.join("a.txt"), "working only\n").unwrap();
+
+        assert_eq!(resolve_head(&dir, STAGED_REF).unwrap_err(), NOTHING_STAGED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary ref keeps its name for the checkout and reports the sha, so
+    /// `nao-diff-head-<label>` stays one directory per tree rather than one per
+    /// spelling of it.
+    #[test]
+    fn an_ordinary_ref_is_checked_out_by_name_and_reported_by_sha() {
+        let dir = repo("named");
+        let head = resolve_head(&dir, "main").unwrap();
+        assert_eq!(head.git_ref.as_deref(), Some("main"));
+        assert!(!head.label.is_empty() && head.label != "main");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -688,7 +914,12 @@ mod tests {
         // and the *next* working diff inherited it. Re-rooting on every call
         // is what makes the second call independent of the first, so this
         // holds however badly the config arrives.
-        for poisoned in ["/tmp/nao-diff-head-abc", "/tmp/nao-diff-base-def", "relative/nonsense", "/"] {
+        for poisoned in [
+            "/tmp/nao-diff-head-abc",
+            "/tmp/nao-diff-base-def",
+            "relative/nonsense",
+            "/",
+        ] {
             let mut live = Config::default();
             live.root_path = PathBuf::from(poisoned);
             assert_eq!(

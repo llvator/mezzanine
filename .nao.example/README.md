@@ -61,6 +61,28 @@ defaults, which already skip `node_modules`, `target`, `.git`, `vendor`,
 `__pycache__`, `dist` and `build`. Listing one extra rule will not silently
 re-enable scanning `node_modules`.
 
+## What a pattern is matched against
+
+The path **relative to the repo root** — the directory this file lives under.
+Write what you would read off your editor:
+
+```json
+{ "exclude_patterns": ["src/contracts.d.ts", "src/generated/**"] }
+```
+
+Both work identically for `nao analyze .`, `nao analyze src` and
+`nao analyze /path/to/repo/src`. Point nao at a directory that is not in a
+checkout and that directory stands in for the repo root.
+
+Two things worth knowing:
+
+- **`*` crosses `/`.** `*.d.ts` matches `src/a.d.ts`, not just `a.d.ts`, which
+  makes the leading `**/` in the defaults decorative. Surprising, and kept:
+  every pattern written against nao so far relies on it.
+- **A pattern that matched nothing says so**, on stderr, naming the key and
+  the spelling — which is how you tell a rule that is working from a typo,
+  since both produce the same graph.
+
 ## Four keys a settings file may never set
 
 `allow_agent_spawn`, `no_token`, `allow_origin`, `allow_unsafe_passes`.

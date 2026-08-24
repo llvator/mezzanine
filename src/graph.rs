@@ -1,7 +1,10 @@
 //! Graph representation and manipulation using petgraph.
 
 use crate::analyzer::AnalysisResult;
-use crate::models::{CodeEntity, FileMetrics, ModuleMetrics, Relationship, RelationshipKind, EntityKind, ScopeMetrics};
+use crate::models::{
+    CodeEntity, EntityKind, FileMetrics, FolderPicture, ImportSite, ModuleMetrics, Relationship,
+    RelationshipKind, ScopeMetrics,
+};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
@@ -25,6 +28,14 @@ pub struct DependencyGraph {
     /// Prose rather than a rollup, so it sits beside the metrics instead of
     /// inside them, and only files that carry a header appear.
     file_docs: HashMap<String, String>,
+    /// Where each cross-file import was written (AN-024), carried through
+    /// from the analysis rather than derived here.
+    ///
+    /// Beside the graph for the reason [`ImportSite`] gives: an import
+    /// resolves to a file, and files are only nodes for a Groovy script —
+    /// so the resolver's `Imports` edges exist for that one case and no
+    /// other. Sorted, so anything printed from it is stable across runs.
+    import_sites: Vec<ImportSite>,
 }
 
 /// Per-file entity counts and composite scores collected during a single
@@ -39,6 +50,10 @@ struct FileTally {
     /// Composite scores and LOC of every entity per file (for quality rollup).
     /// Each entry is `(composite_score, loc)` so we can compute LOC-weighted averages.
     scores: HashMap<String, Vec<(f32, u32)>>,
+    /// Files holding nothing but module declarations — a `mod.rs` that names
+    /// its siblings and says nothing else. Folder shape draws these as the
+    /// folder rather than as a child of it.
+    declaration_only: HashSet<String>,
 }
 
 /// Per-file tallies for one *family* of edges. The shape is the same
@@ -63,8 +78,14 @@ impl EdgeBuckets {
             *self.internal.entry(sf.to_string()).or_insert(0) += 1;
             return;
         }
-        self.fan_out.entry(sf.to_string()).or_default().insert(tf.to_string());
-        self.fan_in.entry(tf.to_string()).or_default().insert(sf.to_string());
+        self.fan_out
+            .entry(sf.to_string())
+            .or_default()
+            .insert(tf.to_string());
+        self.fan_in
+            .entry(tf.to_string())
+            .or_default()
+            .insert(sf.to_string());
         self.pairs.push((sf.to_string(), tf.to_string()));
     }
 
@@ -75,6 +96,31 @@ impl EdgeBuckets {
     fn fan_out_of(&self, path: &str) -> u32 {
         self.fan_out.get(path).map(|s| s.len() as u32).unwrap_or(0)
     }
+}
+
+/// The file-level dependency graph — what a folder's drawing is made of.
+///
+/// The same four inputs every folder score is computed from, handed out
+/// whole so a caller asking a question about the tree asks it over the
+/// edges the shape scores were drawn over rather than over a second
+/// derivation that agrees most of the time.
+pub struct FileGraph {
+    /// Every analysed file, by the one path spelling this graph uses.
+    pub files: Vec<String>,
+    /// Every cross-file dependency edge, as `(source file, target file)`.
+    /// Duplicates are expected — several entity edges between one pair of
+    /// files are several entries — and every consumer dedupes.
+    pub pairs: Vec<(String, String)>,
+    /// Every folder holding an analysed file, up to their common root.
+    pub folders: HashSet<String>,
+    /// Files holding nothing but module declarations — the folder
+    /// speaking rather than a child of it (ADR 0022).
+    pub declaration_only: HashSet<String>,
+    /// Every cross-file import statement, in the same path spelling. The
+    /// only part of the model that knows the build erases an edge, and
+    /// what lets a folder's scores be taken over the graph that ships
+    /// (ADR 0026).
+    pub imports: Vec<ImportSite>,
 }
 
 /// Per-file edge data, split by what the edges *mean*.
@@ -104,6 +150,7 @@ impl DependencyGraph {
             file_metrics: Vec::new(),
             module_metrics: Vec::new(),
             file_docs: HashMap::new(),
+            import_sites: Vec::new(),
         }
     }
 
@@ -125,16 +172,65 @@ impl DependencyGraph {
     pub fn module_metrics(&self) -> &[ModuleMetrics] {
         &self.module_metrics
     }
-    
+
+    /// Where the analysis saw each cross-file import written (AN-024).
+    /// Empty until `from_analysis` runs, and empty for a language whose
+    /// imports name packages rather than paths.
+    pub fn import_sites(&self) -> &[ImportSite] {
+        &self.import_sites
+    }
+
+    /// The graph one folder draws, with a verdict on every node and edge —
+    /// the evidence behind the `shape` its [`ModuleMetrics`] reports.
+    ///
+    /// Recomputed on demand from the same two scans `populate_scope_metrics`
+    /// runs, rather than kept from that pass: the scalars are four floats a
+    /// folder and free to hold, where a picture is the edge list again, and
+    /// only one folder is ever being looked at. Feeding it the identical
+    /// inputs is what makes it the picture the score was computed over
+    /// instead of one that usually agrees.
+    ///
+    /// `None` for a path that is not an analysed folder.
+    pub fn folder_picture(&self, folder: &str) -> Option<FolderPicture> {
+        let fg = self.file_graph();
+        crate::analyzer::folder_shape::picture(
+            &Self::normalize_path(std::path::Path::new(folder)),
+            fg.files.iter().map(String::as_str),
+            &fg.pairs,
+            &fg.imports,
+            &fg.folders,
+            &fg.declaration_only,
+        )
+    }
+
+    /// The file-level dependency graph, as the folder scores see it.
+    ///
+    /// Recomputed on demand from the same two scans `populate_scope_metrics`
+    /// runs. A caller wanting to count something over the tree — how many
+    /// files import one file, how many doors a folder has — starts here, so
+    /// its answer and the folder's score are claims about one graph.
+    pub fn file_graph(&self) -> FileGraph {
+        let tally = self.scan_entity_files();
+        let edges = self.scan_file_edges(&tally.entity_file);
+        let folders = Self::enumerate_module_paths(&tally);
+        FileGraph {
+            files: tally.entity_count.keys().cloned().collect(),
+            pairs: edges.deps.pairs,
+            folders,
+            declaration_only: tally.declaration_only,
+            imports: self.import_sites.clone(),
+        }
+    }
+
     /// Build a graph from analysis results
     pub fn from_analysis(result: &AnalysisResult) -> Self {
         let mut graph = Self::new();
-        
+
         // Add all entities as nodes
         for entity in &result.entities {
             graph.add_entity(entity.clone());
         }
-        
+
         // Build lookup maps for resolving relationships.
         // All passes are O(E); per-edge resolution stays O(1).
         // Bare names collide constantly — 23 entities are called `parse` in
@@ -152,13 +248,20 @@ impl DependencyGraph {
             std::collections::HashMap::new();
         // `TypeName::methodName` → method entity ID. Disambiguates common method
         // names like `new` when the callee was emitted qualified by the parser.
-        let mut typed_method_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut typed_method_to_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let id_to_entity: std::collections::HashMap<&str, &CodeEntity> =
             result.entities.iter().map(|e| (e.id.as_str(), e)).collect();
 
         for entity in &result.entities {
-            name_to_ids.entry(entity.name.clone()).or_default().push(entity.id.clone());
-            qualified_to_ids.entry(entity.qualified_name.clone()).or_default().push(entity.id.clone());
+            name_to_ids
+                .entry(entity.name.clone())
+                .or_default()
+                .push(entity.id.clone());
+            qualified_to_ids
+                .entry(entity.qualified_name.clone())
+                .or_default()
+                .push(entity.id.clone());
             if let Some(parent_id) = &entity.parent_id {
                 // `parent_id` is usually a real entity ID, but the Rust parser
                 // stores it as a bare type name for impl-block methods. Accept
@@ -170,9 +273,13 @@ impl DependencyGraph {
                 // Register under both `::` (Rust) and `.` (Java) separators so
                 // qualified callees from either parser resolve correctly.
                 let rust_key = format!("{}::{}", parent_name, entity.name);
-                typed_method_to_id.entry(rust_key).or_insert_with(|| entity.id.clone());
+                typed_method_to_id
+                    .entry(rust_key)
+                    .or_insert_with(|| entity.id.clone());
                 let java_key = format!("{}.{}", parent_name, entity.name);
-                typed_method_to_id.entry(java_key).or_insert_with(|| entity.id.clone());
+                typed_method_to_id
+                    .entry(java_key)
+                    .or_insert_with(|| entity.id.clone());
             }
         }
 
@@ -193,40 +300,44 @@ impl DependencyGraph {
         // `<module>::<name>` for Rust entities, where the module is the file
         // stem (or the directory name for `mod.rs`).
         //
-        // Ambiguity is declined, not guessed: two `calls.rs` files under
-        // different parser folders both claim `calls::extract_calls`, and
-        // picking one would trade this recall bug for a precision bug. A
-        // colliding key stores `None` and the lookup skips it, so this pass can
-        // only ever add exact matches.
-        let mut module_qualified: std::collections::HashMap<String, Option<String>> =
+        // Ambiguity is ranked, not declined. Two `calls.rs` files under
+        // different parser folders both claim `calls::extract_calls`, and this
+        // pass used to store `None` for such a key and skip it — trading the
+        // precision bug for a total loss of the edge. But the caller's own
+        // position already decides it: `declarations/mod.rs` calling
+        // `inference::collect_struct_fields` means the `inference.rs` beside it,
+        // not the one in an unrelated prototype folder. Every claimant is kept
+        // and `pick_nearest` chooses, which is the rule bare names have had
+        // since AN-011; when nothing is nearer than anything else it still
+        // answers, deterministically, rather than dropping the edge.
+        //
+        // AN-028 extends the same index to the web languages, where a value
+        // read through `import { LIMIT } from './settings'` is recorded as
+        // `settings::LIMIT`. The alternative there was a bare `LIMIT`, and
+        // measured over `ui/` that bound 57 of 449 reads to a same-named
+        // local in an unrelated file. Nothing already emitted can collide:
+        // every other web-language target is bare or dot-qualified, and this
+        // key is spelled with `::`.
+        let mut module_qualified: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for entity in &result.entities {
-            if entity.file_path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
             let Some(stem) = entity.file_path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            // `lib.rs` / `main.rs` are crate roots, not modules — nothing is
-            // referenced as `lib::foo`. `mod.rs` takes its directory's name.
-            let module = match stem {
-                "lib" | "main" => continue,
-                "mod" => match entity.file_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-                    Some(dir) => dir,
-                    None => continue,
-                },
-                other => other,
+            let Some(module) = module_segment(&entity.file_path, stem) else {
+                continue;
             };
-            let key = format!("{}::{}", module, entity.name);
-            match module_qualified.get(&key) {
-                None => {
-                    module_qualified.insert(key, Some(entity.id.clone()));
-                }
-                Some(Some(existing)) if existing != &entity.id => {
-                    module_qualified.insert(key, None);
-                }
-                Some(_) => {}
+            let ids = module_qualified.entry(format!("{}::{}", module, entity.name));
+            let ids = ids.or_default();
+            if !ids.contains(&entity.id) {
+                ids.push(entity.id.clone());
             }
+        }
+        // Same reason the maps above are sorted: candidates were pushed in
+        // entity order, and every fallback below has to be a function of the
+        // tree rather than of the walk (AN-002).
+        for ids in module_qualified.values_mut() {
+            ids.sort();
         }
 
         // `id_to_entity` covers the same key set as `graph.node_map` (every
@@ -254,10 +365,13 @@ impl DependencyGraph {
                 return Some(id);
             }
             // AN-006: `module::function`, and the `crate::`/`super::`-prefixed
-            // forms of it, resolved against the file-stem index above. Only
-            // unambiguous keys answer here — `Some(None)` means two modules
-            // claim the name and we decline rather than pick.
-            if let Some(id) = module_qualified.get(raw).and_then(|o| o.as_ref()).and_then(accept) {
+            // forms of it, resolved against the file-stem index above. Several
+            // modules may claim the name; the caller's position picks between
+            // them when it is nearer to one, and declines when it is not.
+            if let Some(id) = module_qualified
+                .get(raw)
+                .and_then(|c| pick_nearest_unambiguous(c, from_file, &id_to_entity))
+            {
                 return Some(id);
             }
             let segments: Vec<&str> = raw.split("::").collect();
@@ -267,7 +381,10 @@ impl DependencyGraph {
                     segments[segments.len() - 2],
                     segments[segments.len() - 1]
                 );
-                if let Some(id) = module_qualified.get(&key).and_then(|o| o.as_ref()).and_then(accept) {
+                if let Some(id) = module_qualified
+                    .get(&key)
+                    .and_then(|c| pick_nearest_unambiguous(c, from_file, &id_to_entity))
+                {
                     return Some(id);
                 }
             }
@@ -304,8 +421,12 @@ impl DependencyGraph {
                     // Create a ghost entity for the unresolved target
                     let ghost_id = ghosts.entry(rel.target_id.clone()).or_insert_with(|| {
                         let gid = format!("ghost:{}", rel.target_id);
-                        let name = rel.target_id.rsplit("::").next()
-                            .unwrap_or(&rel.target_id).to_string();
+                        let name = rel
+                            .target_id
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(&rel.target_id)
+                            .to_string();
                         // Force a type-ish kind for known built-in type
                         // names so `int`/`str`/`Vec` don't end up
                         // tagged as functions just because a Calls edge
@@ -335,8 +456,8 @@ impl DependencyGraph {
             };
 
             // Create a new relationship with resolved IDs, preserving metadata
-            let mut resolved_rel = Relationship::new(&source_id, &target_id, rel.kind)
-                .with_weight(rel.weight);
+            let mut resolved_rel =
+                Relationship::new(&source_id, &target_id, rel.kind).with_weight(rel.weight);
             resolved_rel.metadata = rel.metadata.clone();
             if let Some(ref label) = rel.label {
                 resolved_rel.label = Some(label.clone());
@@ -375,6 +496,12 @@ impl DependencyGraph {
 
         // Detect code smells (anti-pattern signals) from metric combinations.
         graph.detect_smells();
+
+        // Import sites are file-level and join here rather than falling
+        // out of the entity walk: no entity owns them. Before the rollups
+        // below, which is not incidental — folder shape reads them to
+        // decide which arrows the build erases (ADR 0026).
+        graph.import_sites = result.import_sites.clone();
 
         // Scope-level rollups: per-file and per-module. Independent of the
         // entity-level pass so entity metrics are finalized before we
@@ -504,7 +631,10 @@ impl DependencyGraph {
         }
 
         fn dfs_max_depth(
-            graph: &petgraph::graph::DiGraph<crate::models::CodeEntity, crate::models::Relationship>,
+            graph: &petgraph::graph::DiGraph<
+                crate::models::CodeEntity,
+                crate::models::Relationship,
+            >,
             node: NodeIndex,
             visited: &mut HashSet<NodeIndex>,
             current: u32,
@@ -646,16 +776,29 @@ impl DependencyGraph {
                 let loc = norm(m.loc as f32, t.loc_callable.bad);
                 let fo = norm(m.fan_out as f32, t.fan_out.bad);
                 let params = norm(m.param_count.unwrap_or(0) as f32, t.params.bad);
-                0.25 * cc + 0.15 * cog + 0.25 * fo + 0.15 * loc + 0.10 * params + 0.10 * nest + cycle
+                0.25 * cc
+                    + 0.15 * cog
+                    + 0.25 * fo
+                    + 0.15 * loc
+                    + 0.10 * params
+                    + 0.10 * nest
+                    + cycle
             } else {
                 let is_enum = e.kind == EntityKind::Enum;
-                let field_red = if is_enum { t.variants.bad } else { t.fields.bad };
+                let field_red = if is_enum {
+                    t.variants.bad
+                } else {
+                    t.fields.bad
+                };
                 let fields = norm(m.field_count.unwrap_or(0) as f32, field_red);
                 let methods = norm(m.method_count as f32, t.method_count.bad);
                 let loc = norm(m.loc as f32, t.loc_container.bad);
                 let fo = norm(m.fan_out as f32, t.fan_out.bad);
                 let encaps = if m.method_count > 3 {
-                    norm(m.public_field_ratio.unwrap_or(0.0), t.public_field_ratio.bad)
+                    norm(
+                        m.public_field_ratio.unwrap_or(0.0),
+                        t.public_field_ratio.bad,
+                    )
                 } else {
                     0.0
                 };
@@ -684,8 +827,12 @@ impl DependencyGraph {
             if !rel.kind.is_dependency() {
                 continue;
             }
-            let Some((src, tgt)) = self.graph.edge_endpoints(edge_idx) else { continue };
-            if src == tgt { continue; }
+            let Some((src, tgt)) = self.graph.edge_endpoints(edge_idx) else {
+                continue;
+            };
+            if src == tgt {
+                continue;
+            }
             let target_parent = self.graph[tgt].parent_id.clone();
             *outgoing_by_parent
                 .entry(src)
@@ -710,7 +857,8 @@ impl DependencyGraph {
             if e.kind.is_container() {
                 let fc = m.field_count.unwrap_or(0) as f32;
                 let mc = m.method_count as f32;
-                if fc > t.god_class_fields && mc > t.god_class_methods
+                if fc > t.god_class_fields
+                    && mc > t.god_class_methods
                     && m.fan_out as f32 > t.god_class_fan_out
                 {
                     smells.push(SmellKind::GodClass);
@@ -739,8 +887,12 @@ impl DependencyGraph {
                     if let Some(by_parent) = outgoing_by_parent.get(&idx) {
                         let own_parent = &e.parent_id;
                         for (target_parent, &count) in by_parent {
-                            if target_parent == own_parent { continue; }
-                            if target_parent.is_none() { continue; }
+                            if target_parent == own_parent {
+                                continue;
+                            }
+                            if target_parent.is_none() {
+                                continue;
+                            }
                             if (count as f32 / total as f32) >= t.feature_envy_ratio {
                                 smells.push(SmellKind::FeatureEnvy);
                                 break;
@@ -767,7 +919,7 @@ impl DependencyGraph {
         let edges = self.scan_file_edges(&tally.entity_file);
         let cycles = Self::compute_file_cycles(&tally, &edges);
         let files = Self::assemble_file_metrics(&tally, &edges, &cycles);
-        let modules = Self::compute_module_metrics(&tally, &edges, &cycles);
+        let modules = Self::compute_module_metrics(&tally, &edges, &cycles, &self.import_sites);
         self.file_metrics = files;
         self.module_metrics = modules;
     }
@@ -807,12 +959,22 @@ impl DependencyGraph {
             let w = loc.max(1);
             weighted_sum += s * w as f32;
             total_loc += w;
-            if s > max { max = s; }
-            if s <= 0.5 { ok += 1; }
-            else if s <= 1.0 { warn += 1; }
-            else { bad += 1; }
+            if s > max {
+                max = s;
+            }
+            if s <= 0.5 {
+                ok += 1;
+            } else if s <= 1.0 {
+                warn += 1;
+            } else {
+                bad += 1;
+            }
         }
-        let avg = if total_loc > 0 { weighted_sum / total_loc as f32 } else { 0.0 };
+        let avg = if total_loc > 0 {
+            weighted_sum / total_loc as f32
+        } else {
+            0.0
+        };
         (avg, max, ok, warn, bad)
     }
 
@@ -827,8 +989,10 @@ impl DependencyGraph {
             container_count: HashMap::new(),
             loc: HashMap::new(),
             scores: HashMap::new(),
+            declaration_only: HashSet::new(),
         };
         let mut max_end_line: HashMap<String, usize> = HashMap::new();
+        let mut substantive: HashSet<String> = HashSet::new();
 
         for idx in self.graph.node_indices() {
             let e = &self.graph[idx];
@@ -848,13 +1012,20 @@ impl DependencyGraph {
             }
             tally.entity_file.insert(idx, path.clone());
             *tally.entity_count.entry(path.clone()).or_insert(0) += 1;
+            if e.kind != EntityKind::Module {
+                substantive.insert(path.clone());
+            }
             if e.kind.is_callable() {
                 *tally.callable_count.entry(path.clone()).or_insert(0) += 1;
             }
             if e.kind.is_container() {
                 *tally.container_count.entry(path.clone()).or_insert(0) += 1;
             }
-            tally.scores.entry(path.clone()).or_default().push((e.metrics.composite_score, e.metrics.loc));
+            tally
+                .scores
+                .entry(path.clone())
+                .or_default()
+                .push((e.metrics.composite_score, e.metrics.loc));
             let slot = max_end_line.entry(path).or_insert(0);
             if e.span.end.line > *slot {
                 *slot = e.span.end.line;
@@ -863,12 +1034,21 @@ impl DependencyGraph {
         for (path, &max_line) in &max_end_line {
             tally.loc.insert(path.clone(), (max_line + 1) as u32);
         }
+        tally.declaration_only = tally
+            .entity_count
+            .keys()
+            .filter(|path| !substantive.contains(*path))
+            .cloned()
+            .collect();
         tally
     }
 
     /// Phase 2: scan dependency edges and bucket them per file.
     fn scan_file_edges(&self, entity_file: &HashMap<NodeIndex, String>) -> FileEdgeData {
-        let mut data = FileEdgeData { deps: EdgeBuckets::default(), refs: EdgeBuckets::default() };
+        let mut data = FileEdgeData {
+            deps: EdgeBuckets::default(),
+            refs: EdgeBuckets::default(),
+        };
         for edge_idx in self.graph.edge_indices() {
             let rel = &self.graph[edge_idx];
             // Only these two families are tallied. Structural kinds like
@@ -882,7 +1062,9 @@ impl DependencyGraph {
             } else {
                 continue;
             };
-            let Some((src, tgt)) = self.graph.edge_endpoints(edge_idx) else { continue };
+            let Some((src, tgt)) = self.graph.edge_endpoints(edge_idx) else {
+                continue;
+            };
             let (Some(sf), Some(tf)) = (entity_file.get(&src), entity_file.get(&tgt)) else {
                 continue;
             };
@@ -930,7 +1112,11 @@ impl DependencyGraph {
             let fo = edges.deps.fan_out_of(path);
             let external = fi + fo;
             let total = internal + external;
-            let cohesion = if total == 0 { None } else { Some(internal as f32 / total as f32) };
+            let cohesion = if total == 0 {
+                None
+            } else {
+                Some(internal as f32 / total as f32)
+            };
             let (avg_q, max_q, q_ok, q_warn, q_bad) =
                 Self::quality_rollup(tally.scores.get(path).map(|v| v.as_slice()).unwrap_or(&[]));
             let mut metrics = ScopeMetrics {
@@ -944,7 +1130,11 @@ impl DependencyGraph {
                 fan_in: fi,
                 fan_out: fo,
                 in_cycle: cycles.contains(path),
-                instability: if fi + fo > 0 { Some(fo as f32 / (fi + fo) as f32) } else { None },
+                instability: if fi + fo > 0 {
+                    Some(fo as f32 / (fi + fo) as f32)
+                } else {
+                    None
+                },
                 ref_fan_in: edges.refs.fan_in_of(path),
                 ref_fan_out: edges.refs.fan_out_of(path),
                 avg_quality: avg_q,
@@ -955,7 +1145,10 @@ impl DependencyGraph {
                 ..Default::default()
             };
             metrics.compute_composite_score(path, false);
-            files.push(FileMetrics { path: path.clone(), metrics });
+            files.push(FileMetrics {
+                path: path.clone(),
+                metrics,
+            });
         }
         files
     }
@@ -966,18 +1159,34 @@ impl DependencyGraph {
         tally: &FileTally,
         edges: &FileEdgeData,
         cycles: &HashSet<String>,
+        imports: &[ImportSite],
     ) -> Vec<ModuleMetrics> {
         let module_paths = Self::enumerate_module_paths(tally);
         if module_paths.is_empty() {
             return Vec::new();
         }
 
+        // Folder shape reads the same dependency pairs the coupling numbers
+        // above are built from, but asks a different question of them —
+        // whether the picture each folder draws can be followed. It is
+        // scored once for the whole tree because the measure is recursive:
+        // a folder's standing depends on its subfolders'.
+        let shapes = crate::analyzer::folder_shape::compute(
+            tally.entity_count.keys().map(String::as_str),
+            &edges.deps.pairs,
+            imports,
+            &module_paths,
+            &tally.declaration_only,
+        );
+
         let mut sorted: Vec<String> = module_paths.into_iter().collect();
         sorted.sort();
         let mut modules = Vec::with_capacity(sorted.len());
 
         for mp in &sorted {
-            let descendants: Vec<&String> = tally.entity_count.keys()
+            let descendants: Vec<&String> = tally
+                .entity_count
+                .keys()
                 .filter(|f| Self::is_descendant(mp, f))
                 .collect();
 
@@ -995,7 +1204,11 @@ impl DependencyGraph {
             m.internal_edges = internal;
             m.external_edges = external;
             let total = internal + external;
-            m.cohesion = if total == 0 { None } else { Some(internal as f32 / total as f32) };
+            m.cohesion = if total == 0 {
+                None
+            } else {
+                Some(internal as f32 / total as f32)
+            };
             m.fan_in = fan_in;
             m.fan_out = fan_out;
             m.instability = if fan_in + fan_out > 0 {
@@ -1003,9 +1216,8 @@ impl DependencyGraph {
             } else {
                 None
             };
-            m.in_cycle = descendants.iter().any(|f| cycles.contains(*f))
-                && m.fan_out > 0
-                && m.fan_in > 0;
+            m.in_cycle =
+                descendants.iter().any(|f| cycles.contains(*f)) && m.fan_out > 0 && m.fan_in > 0;
 
             let mut all_scores: Vec<(f32, u32)> = Vec::new();
             for f in &descendants {
@@ -1025,7 +1237,13 @@ impl DependencyGraph {
             m.quality_bad = q_bad;
 
             m.compute_composite_score(mp, true);
-            modules.push(ModuleMetrics { path: mp.clone(), metrics: m });
+            // Assigned after the composite score, and never read by it:
+            // organisation is not code quality (see `ScopeMetrics::shape`).
+            m.shape = shapes.get(mp).cloned();
+            modules.push(ModuleMetrics {
+                path: mp.clone(),
+                metrics: m,
+            });
         }
         modules
     }
@@ -1040,8 +1258,11 @@ impl DependencyGraph {
 
     /// Does `file_path` live under `module_path` (possibly in a subdirectory)?
     fn is_descendant(module_path: &str, file_path: &str) -> bool {
-        if module_path.is_empty() { return true; }
-        file_path.strip_prefix(module_path)
+        if module_path.is_empty() {
+            return true;
+        }
+        file_path
+            .strip_prefix(module_path)
             .map_or(false, |rest| rest.starts_with(std::path::MAIN_SEPARATOR))
     }
 
@@ -1067,13 +1288,17 @@ impl DependencyGraph {
                             .components()
                             .map(|c| c.as_os_str().to_owned())
                             .collect();
-                        let keep = prefix.iter().zip(comps.iter())
+                        let keep = prefix
+                            .iter()
+                            .zip(comps.iter())
                             .take_while(|(a, b)| a == b)
                             .count();
                         prefix.truncate(keep);
                     }
                     let mut buf = PathBuf::new();
-                    for c in &prefix { buf.push(c); }
+                    for c in &prefix {
+                        buf.push(c);
+                    }
                     buf.display().to_string()
                 }
             }
@@ -1085,7 +1310,9 @@ impl DependencyGraph {
             let mut cur = Self::parent_dir(file_path);
             loop {
                 paths.insert(cur.clone());
-                if cur == lcp || cur.is_empty() { break; }
+                if cur == lcp || cur.is_empty() {
+                    break;
+                }
                 cur = Self::parent_dir(&cur);
             }
         }
@@ -1108,10 +1335,7 @@ impl DependencyGraph {
     /// Classify cross-file edge pairs as internal or external to a module
     /// defined by `descendants`. Returns `(internal_edges, external_edges,
     /// fan_in_count, fan_out_count)`.
-    fn classify_module_edges(
-        edges: &EdgeBuckets,
-        descendants: &[&String],
-    ) -> (u32, u32, u32, u32) {
+    fn classify_module_edges(edges: &EdgeBuckets, descendants: &[&String]) -> (u32, u32, u32, u32) {
         // Intra-file edges are always internal to any ancestor module.
         let mut internal = 0u32;
         for f in descendants {
@@ -1135,7 +1359,12 @@ impl DependencyGraph {
                 _ => {}
             }
         }
-        (internal, external, fan_in_set.len() as u32, fan_out_set.len() as u32)
+        (
+            internal,
+            external,
+            fan_in_set.len() as u32,
+            fan_out_set.len() as u32,
+        )
     }
 
     /// Re-number call order metadata so they're sequential (1, 2, 3, ...)
@@ -1144,7 +1373,8 @@ impl DependencyGraph {
         use std::collections::HashMap;
 
         // Group edge indices by source node, collecting (original_order, edge_index)
-        let mut source_edges: HashMap<NodeIndex, Vec<(u32, petgraph::graph::EdgeIndex)>> = HashMap::new();
+        let mut source_edges: HashMap<NodeIndex, Vec<(u32, petgraph::graph::EdgeIndex)>> =
+            HashMap::new();
 
         for edge_idx in self.graph.edge_indices() {
             if let Some((src, _)) = self.graph.edge_endpoints(edge_idx) {
@@ -1167,14 +1397,16 @@ impl DependencyGraph {
             }
         }
     }
-    
+
     /// Infer the entity kind for a ghost node based on the relationship type.
     fn infer_ghost_kind(rel_kind: RelationshipKind) -> EntityKind {
         match rel_kind {
             RelationshipKind::Calls => EntityKind::Function,
             RelationshipKind::Implements => EntityKind::Trait,
             RelationshipKind::Inherits => EntityKind::Class,
-            RelationshipKind::UsesType | RelationshipKind::Returns | RelationshipKind::Instantiates => EntityKind::Struct,
+            RelationshipKind::UsesType
+            | RelationshipKind::Returns
+            | RelationshipKind::Instantiates => EntityKind::Struct,
             RelationshipKind::Imports => EntityKind::Module,
             _ => EntityKind::Unknown,
         }
@@ -1195,9 +1427,21 @@ impl DependencyGraph {
         // `int` / `str` / `list` are Classes, not Structs.
         if matches!(
             last,
-            "int" | "str" | "float" | "bool" | "bytes" | "bytearray"
-                | "list" | "dict" | "set" | "tuple" | "frozenset"
-                | "complex" | "type" | "object" | "None"
+            "int"
+                | "str"
+                | "float"
+                | "bool"
+                | "bytes"
+                | "bytearray"
+                | "list"
+                | "dict"
+                | "set"
+                | "tuple"
+                | "frozenset"
+                | "complex"
+                | "type"
+                | "object"
+                | "None"
         ) {
             return Some(EntityKind::Class);
         }
@@ -1205,11 +1449,31 @@ impl DependencyGraph {
         // types — all Structs in Rust's model.
         if matches!(
             last,
-            "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-                | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                | "f32" | "f64" | "char"
-                | "String" | "Vec" | "Option" | "Result" | "Box" | "Rc"
-                | "Arc" | "Cow" | "HashMap" | "HashSet" | "BTreeMap"
+            "u8" | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "f32"
+                | "f64"
+                | "char"
+                | "String"
+                | "Vec"
+                | "Option"
+                | "Result"
+                | "Box"
+                | "Rc"
+                | "Arc"
+                | "Cow"
+                | "HashMap"
+                | "HashSet"
+                | "BTreeMap"
                 | "BTreeSet"
         ) {
             return Some(EntityKind::Struct);
@@ -1227,24 +1491,81 @@ impl DependencyGraph {
         const BUILTINS: &[&str] = &[
             // Primitives — must include lowercase names now that
             // `extract_type_names` no longer drops them.
-            "str", "bool", "char",
-            "u8", "u16", "u32", "u64", "u128", "usize",
-            "i8", "i16", "i32", "i64", "i128", "isize",
-            "f32", "f64",
+            "str",
+            "bool",
+            "char",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "u128",
+            "usize",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "i128",
+            "isize",
+            "f32",
+            "f64",
             // Common owned / smart-pointer types
-            "String", "Vec", "Option", "Result", "Box", "Rc", "Arc", "Cow",
-            "HashMap", "HashSet", "BTreeMap", "BTreeSet", "PhantomData",
+            "String",
+            "Vec",
+            "Option",
+            "Result",
+            "Box",
+            "Rc",
+            "Arc",
+            "Cow",
+            "HashMap",
+            "HashSet",
+            "BTreeMap",
+            "BTreeSet",
+            "PhantomData",
             // Widespread traits
-            "Display", "Debug", "Clone", "Copy", "Default",
-            "Iterator", "IntoIterator",
-            "From", "Into", "TryFrom", "TryInto", "AsRef", "AsMut",
-            "Send", "Sync", "Sized", "Drop", "Fn", "FnMut", "FnOnce",
-            "Eq", "PartialEq", "Ord", "PartialOrd", "Hash",
-            "Read", "Write", "Seek", "BufRead",
-            "ToString", "ToOwned", "Borrow", "BorrowMut",
+            "Display",
+            "Debug",
+            "Clone",
+            "Copy",
+            "Default",
+            "Iterator",
+            "IntoIterator",
+            "From",
+            "Into",
+            "TryFrom",
+            "TryInto",
+            "AsRef",
+            "AsMut",
+            "Send",
+            "Sync",
+            "Sized",
+            "Drop",
+            "Fn",
+            "FnMut",
+            "FnOnce",
+            "Eq",
+            "PartialEq",
+            "Ord",
+            "PartialOrd",
+            "Hash",
+            "Read",
+            "Write",
+            "Seek",
+            "BufRead",
+            "ToString",
+            "ToOwned",
+            "Borrow",
+            "BorrowMut",
             // Bang-macros commonly called bare
-            "println", "eprintln", "format", "panic", "assert", "assert_eq",
-            "todo", "unimplemented", "unreachable",
+            "println",
+            "eprintln",
+            "format",
+            "panic",
+            "assert",
+            "assert_eq",
+            "todo",
+            "unimplemented",
+            "unreachable",
         ];
         let last_segment = name.rsplit("::").next().unwrap_or(name);
         if BUILTINS.contains(&last_segment) {
@@ -1253,42 +1574,169 @@ impl DependencyGraph {
         // Python builtins — keep in sync with python_parser::is_bare_builtin.
         const PY_BUILTINS: &[&str] = &[
             // Printing, I/O, introspection
-            "print", "input", "open", "format", "repr", "vars", "dir", "help",
-            "locals", "globals",
+            "print",
+            "input",
+            "open",
+            "format",
+            "repr",
+            "vars",
+            "dir",
+            "help",
+            "locals",
+            "globals",
             // Collection constructors / coercions
-            "len", "range", "str", "int", "float", "list", "dict", "set",
-            "tuple", "frozenset", "bool", "bytes", "bytearray", "complex",
+            "len",
+            "range",
+            "str",
+            "int",
+            "float",
+            "list",
+            "dict",
+            "set",
+            "tuple",
+            "frozenset",
+            "bool",
+            "bytes",
+            "bytearray",
+            "complex",
             // Iteration
-            "iter", "next", "map", "filter", "zip", "enumerate",
-            "sorted", "reversed", "any", "all",
+            "iter",
+            "next",
+            "map",
+            "filter",
+            "zip",
+            "enumerate",
+            "sorted",
+            "reversed",
+            "any",
+            "all",
             // Numeric
-            "abs", "round", "min", "max", "sum", "pow", "divmod",
-            "hex", "oct", "bin", "ord", "chr", "ascii", "hash", "id",
+            "abs",
+            "round",
+            "min",
+            "max",
+            "sum",
+            "pow",
+            "divmod",
+            "hex",
+            "oct",
+            "bin",
+            "ord",
+            "chr",
+            "ascii",
+            "hash",
+            "id",
             // Type system
-            "type", "super", "object", "callable",
-            "isinstance", "issubclass",
-            "hasattr", "getattr", "setattr", "delattr",
-            "staticmethod", "classmethod", "property",
+            "type",
+            "super",
+            "object",
+            "callable",
+            "isinstance",
+            "issubclass",
+            "hasattr",
+            "getattr",
+            "setattr",
+            "delattr",
+            "staticmethod",
+            "classmethod",
+            "property",
             // Metaprogramming
-            "compile", "eval", "exec", "breakpoint", "exit", "quit",
+            "compile",
+            "eval",
+            "exec",
+            "breakpoint",
+            "exit",
+            "quit",
             // Exceptions
-            "Exception", "BaseException", "ValueError", "TypeError",
-            "KeyError", "IndexError", "AttributeError", "RuntimeError",
-            "StopIteration", "StopAsyncIteration", "NotImplementedError",
-            "FileNotFoundError", "OSError", "IOError", "ZeroDivisionError",
-            "ArithmeticError", "AssertionError", "LookupError", "NameError",
-            "UnicodeError", "UnicodeDecodeError", "UnicodeEncodeError",
+            "Exception",
+            "BaseException",
+            "ValueError",
+            "TypeError",
+            "KeyError",
+            "IndexError",
+            "AttributeError",
+            "RuntimeError",
+            "StopIteration",
+            "StopAsyncIteration",
+            "NotImplementedError",
+            "FileNotFoundError",
+            "OSError",
+            "IOError",
+            "ZeroDivisionError",
+            "ArithmeticError",
+            "AssertionError",
+            "LookupError",
+            "NameError",
+            "UnicodeError",
+            "UnicodeDecodeError",
+            "UnicodeEncodeError",
             // Common stdlib module attributes that sometimes surface
-            "None", "True", "False", "NotImplemented", "Ellipsis",
+            "None",
+            "True",
+            "False",
+            "NotImplemented",
+            "Ellipsis",
         ];
         if PY_BUILTINS.contains(&last_segment) {
             return "ghost_stdlib";
         }
+        // Go predeclared types and built-in functions. `error`, `string`
+        // and `int` are as common in a Go graph as `str` is in a Python
+        // one, and without this they read as third-party.
+        const GO_BUILTINS: &[&str] = &[
+            "error",
+            "string",
+            "rune",
+            "byte",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "uintptr",
+            "float32",
+            "float64",
+            "complex64",
+            "complex128",
+            "any",
+            "comparable",
+            "append",
+            "make",
+            "len",
+            "cap",
+            "copy",
+            "delete",
+            "recover",
+        ];
+        if GO_BUILTINS.contains(&last_segment) {
+            return "ghost_stdlib";
+        }
         // JS/TS builtins
         const JS_BUILTINS: &[&str] = &[
-            "console", "Math", "JSON", "Promise", "Array", "Object", "Map", "Set",
-            "Date", "Error", "RegExp", "Symbol", "Number", "Boolean",
-            "setTimeout", "setInterval", "fetch", "parseInt", "parseFloat",
+            "console",
+            "Math",
+            "JSON",
+            "Promise",
+            "Array",
+            "Object",
+            "Map",
+            "Set",
+            "Date",
+            "Error",
+            "RegExp",
+            "Symbol",
+            "Number",
+            "Boolean",
+            "setTimeout",
+            "setInterval",
+            "fetch",
+            "parseInt",
+            "parseFloat",
         ];
         if JS_BUILTINS.contains(&last_segment) {
             return "ghost_stdlib";
@@ -1301,19 +1749,19 @@ impl DependencyGraph {
         if let Some(&idx) = self.node_map.get(&entity.id) {
             return idx;
         }
-        
+
         let id = entity.id.clone();
         let idx = self.graph.add_node(entity);
         self.node_map.insert(id.clone(), idx);
         self.reverse_map.insert(idx, id);
         idx
     }
-    
+
     /// Add a relationship to the graph
     pub fn add_relationship(&mut self, rel: Relationship) -> bool {
         let source_idx = self.node_map.get(&rel.source_id);
         let target_idx = self.node_map.get(&rel.target_id);
-        
+
         match (source_idx, target_idx) {
             (Some(&src), Some(&tgt)) => {
                 self.graph.add_edge(src, tgt, rel);
@@ -1322,87 +1770,115 @@ impl DependencyGraph {
             _ => false,
         }
     }
-    
+
     /// Get an entity by ID
     pub fn get_entity(&self, id: &str) -> Option<&CodeEntity> {
         self.node_map.get(id).map(|&idx| &self.graph[idx])
     }
-    
+
     /// Get all entities
     pub fn entities(&self) -> impl Iterator<Item = &CodeEntity> {
         self.graph.node_weights()
     }
-    
+
     /// Get all relationships
     pub fn relationships(&self) -> impl Iterator<Item = &Relationship> {
         self.graph.edge_weights()
     }
-    
+
     /// Get the number of nodes
     pub fn node_count(&self) -> usize {
         self.graph.node_count()
     }
-    
+
     /// Get the number of edges
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
     }
-    
+
     /// Get direct dependencies of an entity
     pub fn dependencies(&self, entity_id: &str) -> Vec<(&CodeEntity, &Relationship)> {
         let idx = match self.node_map.get(entity_id) {
             Some(&idx) => idx,
             None => return Vec::new(),
         };
-        
+
         self.graph
             .edges_directed(idx, Direction::Outgoing)
             .filter(|e| e.weight().kind.is_dependency())
             .map(|e| (&self.graph[e.target()], e.weight()))
             .collect()
     }
-    
+
     /// Get entities that depend on this entity
     pub fn dependents(&self, entity_id: &str) -> Vec<(&CodeEntity, &Relationship)> {
         let idx = match self.node_map.get(entity_id) {
             Some(&idx) => idx,
             None => return Vec::new(),
         };
-        
+
         self.graph
             .edges_directed(idx, Direction::Incoming)
             .filter(|e| e.weight().kind.is_dependency())
             .map(|e| (&self.graph[e.source()], e.weight()))
             .collect()
     }
-    
+
     /// Get children of an entity (containment relationship)
     pub fn children(&self, entity_id: &str) -> Vec<&CodeEntity> {
         let idx = match self.node_map.get(entity_id) {
             Some(&idx) => idx,
             None => return Vec::new(),
         };
-        
+
         self.graph
             .edges_directed(idx, Direction::Outgoing)
             .filter(|e| e.weight().kind == RelationshipKind::Contains)
             .map(|e| &self.graph[e.target()])
             .collect()
     }
-    
+
     /// Get the parent of an entity (if any)
     pub fn parent(&self, entity_id: &str) -> Option<&CodeEntity> {
         let idx = match self.node_map.get(entity_id) {
             Some(&idx) => idx,
             None => return None,
         };
-        
+
         self.graph
             .edges_directed(idx, Direction::Incoming)
             .find(|e| e.weight().kind == RelationshipKind::Contains)
             .map(|e| &self.graph[e.source()])
     }
-    
+
+    /// True when this entity declares a base type or interface the
+    /// analysis never saw. `resolve_inheritance` marks such an edge
+    /// `external` precisely because it could not find the declaration in
+    /// the tree; anything reaching the entity through that contract —
+    /// a framework calling a lifecycle hook it declared — is outside the
+    /// graph by construction.
+    pub fn has_external_supertype(&self, entity_id: &str) -> bool {
+        let idx = match self.node_map.get(entity_id) {
+            Some(&idx) => idx,
+            None => return false,
+        };
+
+        self.graph
+            .edges_directed(idx, Direction::Outgoing)
+            .filter(|e| {
+                matches!(
+                    e.weight().kind,
+                    RelationshipKind::Inherits | RelationshipKind::Implements
+                )
+            })
+            .any(|e| {
+                e.weight()
+                    .metadata
+                    .get("external")
+                    .is_some_and(|v| v == "true")
+            })
+    }
+
     /// Get related entities by relationship kind and direction.
     /// Returns (entity, relationship) pairs for all matching edges.
     pub fn related_by_kind(
@@ -1444,29 +1920,29 @@ impl DependencyGraph {
             .filter(|e| e.kind == kind)
             .collect()
     }
-    
+
     /// Filter the graph to create a subgraph
     pub fn filter<F>(&self, predicate: F) -> DependencyGraph
     where
         F: Fn(&CodeEntity) -> bool,
     {
         let mut new_graph = DependencyGraph::new();
-        
+
         // Add filtered nodes
         for entity in self.entities() {
             if predicate(entity) {
                 new_graph.add_entity(entity.clone());
             }
         }
-        
+
         // Add edges where both endpoints exist
         for rel in self.relationships() {
             new_graph.add_relationship(rel.clone());
         }
-        
+
         new_graph
     }
-    
+
     /// Get transitive dependencies up to a depth
     pub fn transitive_dependencies(
         &self,
@@ -1476,36 +1952,36 @@ impl DependencyGraph {
         let mut result: HashMap<usize, Vec<String>> = HashMap::new();
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut current_level = vec![entity_id.to_string()];
-        
+
         for depth in 1..=max_depth {
             let mut next_level = Vec::new();
-            
+
             for current_id in &current_level {
                 if visited.contains(current_id) {
                     continue;
                 }
                 visited.insert(current_id.clone());
-                
+
                 for (dep, _) in self.dependencies(current_id) {
                     if !visited.contains(&dep.id) {
                         next_level.push(dep.id.clone());
                     }
                 }
             }
-            
+
             if !next_level.is_empty() {
                 result.insert(depth, next_level.clone());
             }
             current_level = next_level;
-            
+
             if current_level.is_empty() {
                 break;
             }
         }
-        
+
         result
     }
-    
+
     /// Strongly-connected components of the *dependency* subgraph, each with
     /// two or more members. The single definition of "these entities form a
     /// cycle"; both `find_cycles` and per-entity `in_cycle` read it.
@@ -1553,14 +2029,15 @@ impl DependencyGraph {
         cycles.sort();
         cycles
     }
-    
+
     /// Calculate metrics for the graph
     pub fn metrics(&self) -> GraphMetrics {
         let node_count = self.node_count();
         let edge_count = self.edge_count();
 
         // Compute degree once per node, reuse for average + most connected
-        let mut connections: Vec<(String, usize)> = self.node_map
+        let mut connections: Vec<(String, usize)> = self
+            .node_map
             .iter()
             .map(|(id, &idx)| {
                 let degree = self.graph.edges_directed(idx, Direction::Outgoing).count()
@@ -1609,6 +2086,58 @@ fn pick_nearest(
     from_file: Option<&std::path::Path>,
     id_to_entity: &std::collections::HashMap<&str, &CodeEntity>,
 ) -> Option<String> {
+    nearest(candidates, from_file, id_to_entity).map(|(_, id)| id)
+}
+
+/// `pick_nearest`, but silent when nearness does not actually decide.
+///
+/// Used where a wrong answer is worse than none: a `<module>::<name>` key is
+/// built from a file *stem*, so two `calls.rs` under different parser folders
+/// collide on `calls::extract_calls`. When the caller sits beside one of them
+/// that is evidence and the edge should be drawn; when it is equidistant from
+/// both there is nothing to go on, and inventing an edge between two
+/// unrelated parsers is the precision bug AN-006 refused to trade for. The
+/// old index expressed that refusal by dropping the key entirely, which threw
+/// away the callers who *did* have a reason to prefer one.
+fn pick_nearest_unambiguous(
+    candidates: &[String],
+    from_file: Option<&std::path::Path>,
+    id_to_entity: &std::collections::HashMap<&str, &CodeEntity>,
+) -> Option<String> {
+    match nearest(candidates, from_file, id_to_entity) {
+        Some((true, id)) => Some(id),
+        _ => None,
+    }
+}
+
+/// The module name a `<module>::<name>` key uses for one file, or `None`
+/// when the file is not one a `::` path can name.
+///
+/// The two entry-point spellings resolve to their directory for the reason
+/// [`crate::analyzer::dependency_resolver`]'s `ENTRY_STEMS` gives: a Rust
+/// `mod.rs` and a TypeScript `index.ts` are the same thing, and neither is
+/// referred to by its stem. `lib.rs` and `main.rs` are crate roots rather
+/// than modules — nothing is referenced as `lib::foo`.
+fn module_segment<'a>(path: &'a std::path::Path, stem: &'a str) -> Option<&'a str> {
+    const QUALIFIED: [&str; 8] = ["rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "svelte"];
+    let extension = path.extension().and_then(|e| e.to_str())?;
+    if !QUALIFIED.contains(&extension) {
+        return None;
+    }
+    match stem {
+        "lib" | "main" if extension == "rs" => None,
+        "mod" | "index" => path.parent()?.file_name()?.to_str(),
+        other => Some(other),
+    }
+}
+
+/// The nearest candidate, and whether nearness actually chose it — `false`
+/// when the winner only won a tie, which the fallback settles arbitrarily.
+fn nearest(
+    candidates: &[String],
+    from_file: Option<&std::path::Path>,
+    id_to_entity: &std::collections::HashMap<&str, &CodeEntity>,
+) -> Option<(bool, String)> {
     let file_of = |id: &&String| id_to_entity.get(id.as_str()).map(|e| e.file_path.clone());
 
     // AN-014: a candidate in an unrelated language is not a candidate.
@@ -1616,41 +2145,37 @@ fn pick_nearest(
     // `SessionItem` from a Rust one, because path distance is all it sees.
     let candidates = interoperable_candidates(candidates, from_file, id_to_entity);
     if candidates.len() <= 1 {
-        return candidates.first().map(|id| (*id).clone());
+        return candidates.first().map(|id| (true, (*id).clone()));
     }
     let Some(from_file) = from_file else {
-        return candidates.first().map(|id| (*id).clone());
+        return candidates.first().map(|id| (false, (*id).clone()));
     };
-
-    if let Some(id) = candidates
-        .iter()
-        .find(|id| file_of(id).as_deref() == Some(from_file))
-    {
-        return Some((*id).clone());
-    }
-    if let Some(from_dir) = from_file.parent() {
-        if let Some(id) = candidates
-            .iter()
-            .find(|id| file_of(id).as_deref().and_then(|p| p.parent()) == Some(from_dir))
-        {
-            return Some((*id).clone());
-        }
-    }
     let from_components: Vec<_> = from_file.components().collect();
-    candidates
-        .iter()
-        .max_by_key(|id| {
-            file_of(id)
-                .map(|p| {
-                    p.components()
-                        .zip(from_components.iter())
-                        .take_while(|(a, b)| a == *b)
-                        .count()
-                })
-                .unwrap_or(0)
-        })
-        .or_else(|| candidates.first())
-        .map(|id| (*id).clone())
+
+    // The three passes as one comparable key, ordered the way they were asked:
+    // the caller's own file beats its directory beats the deepest shared path
+    // prefix. Ranking rather than short-circuiting is what lets the tie be
+    // *seen* — a pass that matches two candidates has not chosen between them,
+    // and the old `.find()` could not tell that from having chosen.
+    let rank = |id: &&String| match file_of(id) {
+        Some(p) => (
+            p == from_file,
+            p.parent() == from_file.parent(),
+            p.components()
+                .zip(from_components.iter())
+                .take_while(|(a, b)| a == *b)
+                .count(),
+        ),
+        None => (false, false, 0),
+    };
+    let best = candidates.iter().map(&rank).max()?;
+    let winners: Vec<_> = candidates.iter().filter(|id| rank(id) == best).collect();
+    // Last of equal bests, which is what `max_by_key` returned before this
+    // was factored out — the candidates are sorted, so it stays a function of
+    // the tree (AN-002) either way.
+    winners
+        .last()
+        .map(|id| (winners.len() == 1, (**id).clone()))
 }
 
 /// The candidates whose language can answer a name written in `from_file`
@@ -1742,6 +2267,7 @@ mod tests {
             entities,
             relationships,
             files: Vec::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         };
         DependencyGraph::from_analysis(&result)
@@ -1766,6 +2292,7 @@ mod tests {
                 content_hash: None,
                 documentation: Some("Scratch directories.".to_string()),
             }],
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         };
         let g = DependencyGraph::from_analysis(&result);
@@ -1780,7 +2307,10 @@ mod tests {
             g.file_documentation(std::path::Path::new("./src/tmp.rs")),
             Some("Scratch directories.")
         );
-        assert_eq!(g.file_documentation(std::path::Path::new("src/other.rs")), None);
+        assert_eq!(
+            g.file_documentation(std::path::Path::new("src/other.rs")),
+            None
+        );
     }
 
     #[test]
@@ -1896,7 +2426,14 @@ mod module_path_tests {
     }
 
     fn analysis(entities: Vec<CodeEntity>, callee: &str) -> AnalysisResult {
-        let caller = entity("run_diff", "src/main.rs", 10);
+        analysis_from("src/main.rs", entities, callee)
+    }
+
+    /// `analysis`, with the calling file named — locality is the whole
+    /// question in the ambiguity tests below, and `src/main.rs` is equidistant
+    /// from everything.
+    fn analysis_from(caller_path: &str, entities: Vec<CodeEntity>, callee: &str) -> AnalysisResult {
+        let caller = entity("run_diff", caller_path, 10);
         let mut entities = entities;
         let rel = Relationship::new(caller.id.clone(), callee, RelationshipKind::Calls);
         entities.push(caller);
@@ -1904,6 +2441,7 @@ mod module_path_tests {
             entities,
             relationships: vec![rel],
             files: Vec::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -1920,7 +2458,8 @@ mod module_path_tests {
     fn module_qualified_callee_resolves_to_the_free_function() {
         let target = entity("resolve_git_ref", "src/diff.rs", 306);
         let expected = target.id.clone();
-        let graph = DependencyGraph::from_analysis(&analysis(vec![target], "diff::resolve_git_ref"));
+        let graph =
+            DependencyGraph::from_analysis(&analysis(vec![target], "diff::resolve_git_ref"));
         assert_eq!(call_target(&graph), expected);
     }
 
@@ -1937,7 +2476,8 @@ mod module_path_tests {
     fn ambiguous_module_stem_is_declined_not_guessed() {
         // Two `calls.rs` files under different parser folders both claim
         // `calls::extract_calls`. Picking one would trade the recall bug this
-        // ticket fixes for a precision bug, so the lookup must decline.
+        // ticket fixes for a precision bug, so a caller with no reason to
+        // prefer either must decline.
         let a = entity("extract_calls", "src/parser/rust/calls.rs", 24);
         let b = entity("extract_calls", "src/parser/python/calls.rs", 20);
         let graph = DependencyGraph::from_analysis(&analysis(vec![a, b], "calls::extract_calls"));
@@ -1945,6 +2485,39 @@ mod module_path_tests {
             call_target(&graph).starts_with("ghost:"),
             "ambiguous stem must not resolve to an arbitrary candidate"
         );
+    }
+
+    #[test]
+    fn an_ambiguous_stem_resolves_for_a_caller_that_sits_beside_one() {
+        // The same collision, asked by someone with a stake in it. Declining
+        // here dropped a real edge: `declarations/mod.rs` calling
+        // `inference::collect_struct_fields` meant the `inference.rs` in its
+        // own parser, and the folder graph lost an entry point because of it.
+        let a = entity("extract_calls", "src/parser/rust/calls.rs", 24);
+        let expected = a.id.clone();
+        let b = entity("extract_calls", "src/parser/python/calls.rs", 20);
+        let graph = DependencyGraph::from_analysis(&analysis_from(
+            "src/parser/rust/declarations/mod.rs",
+            vec![a, b],
+            "calls::extract_calls",
+        ));
+        assert_eq!(call_target(&graph), expected);
+    }
+
+    #[test]
+    fn a_module_qualified_tie_still_declines_for_an_equidistant_caller() {
+        // The caller sits in neither parser, so nearness has nothing to say
+        // and the edge must not be invented. This is the half of AN-006's
+        // refusal that survives: decline when there is no evidence, not when
+        // there is.
+        let a = entity("extract_calls", "src/parser/rust/calls.rs", 24);
+        let b = entity("extract_calls", "src/parser/python/calls.rs", 20);
+        let graph = DependencyGraph::from_analysis(&analysis_from(
+            "src/output/json_renderer.rs",
+            vec![a, b],
+            "calls::extract_calls",
+        ));
+        assert!(call_target(&graph).starts_with("ghost:"));
     }
 
     #[test]
@@ -1988,6 +2561,7 @@ mod locality_tests {
             entities,
             relationships: vec![rel],
             files: Vec::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         });
         let target = graph
@@ -2145,7 +2719,9 @@ mod reference_edge_tests {
 
     use super::DependencyGraph;
     use crate::analyzer::AnalysisResult;
-    use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, ScopeMetrics, Span};
+    use crate::models::{
+        CodeEntity, EntityKind, Relationship, RelationshipKind, ScopeMetrics, Span,
+    };
 
     fn note(path: &str, name: &str) -> CodeEntity {
         let mut span = Span::default();
@@ -2153,31 +2729,49 @@ mod reference_edge_tests {
         CodeEntity::new(name, EntityKind::Note, path, span)
     }
 
-    fn graph_of(entities: Vec<CodeEntity>, edges: &[(usize, usize, RelationshipKind)]) -> DependencyGraph {
+    fn graph_of(
+        entities: Vec<CodeEntity>,
+        edges: &[(usize, usize, RelationshipKind)],
+    ) -> DependencyGraph {
         let relationships = edges
             .iter()
-            .map(|(a, b, k)| Relationship::new(entities[*a].id.clone(), entities[*b].id.clone(), *k))
+            .map(|(a, b, k)| {
+                Relationship::new(entities[*a].id.clone(), entities[*b].id.clone(), *k)
+            })
             .collect();
         DependencyGraph::from_analysis(&AnalysisResult {
             entities,
             relationships,
             files: Vec::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         })
     }
 
     fn file<'a>(g: &'a DependencyGraph, path: &str) -> &'a ScopeMetrics {
-        &g.file_metrics().iter().find(|f| f.path == path).expect("a file rollup").metrics
+        &g.file_metrics()
+            .iter()
+            .find(|f| f.path == path)
+            .expect("a file rollup")
+            .metrics
     }
 
     fn module<'a>(g: &'a DependencyGraph, path: &str) -> &'a ScopeMetrics {
-        &g.module_metrics().iter().find(|m| m.path == path).expect("a module rollup").metrics
+        &g.module_metrics()
+            .iter()
+            .find(|m| m.path == path)
+            .expect("a module rollup")
+            .metrics
     }
 
     /// `docs/a.md` links its neighbour and one note in another folder.
     fn note_graph() -> DependencyGraph {
         graph_of(
-            vec![note("docs/a.md", "A"), note("docs/b.md", "B"), note("guide/c.md", "C")],
+            vec![
+                note("docs/a.md", "A"),
+                note("docs/b.md", "B"),
+                note("guide/c.md", "C"),
+            ],
             &[
                 (0, 1, RelationshipKind::References),
                 (0, 2, RelationshipKind::References),

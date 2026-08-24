@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use crate::analyzer::Analyzer;
 use crate::config::Config;
 use crate::graph::DependencyGraph;
-use crate::models::{CodeEntity, EntityKind, EntityMetrics, RelationshipKind};
 use crate::models::file_info::Language;
+use crate::models::{CodeEntity, EntityKind, EntityMetrics, RelationshipKind};
 use crate::output::{self, JsonRenderer, OutputFormat};
 
 /// Stable key for matching entities across commits. Uses name + kind +
@@ -95,7 +95,10 @@ fn match_group<'a>(group: &mut Vec<&'a CodeEntity>, head: &CodeEntity) -> Option
 
 /// The same key with arity dropped — what the second matching pass runs on.
 fn loose_key(key: &EntityKey) -> EntityKey {
-    EntityKey { arity: None, ..key.clone() }
+    EntityKey {
+        arity: None,
+        ..key.clone()
+    }
 }
 
 /// Pair head entities with their base counterparts.
@@ -119,14 +122,20 @@ fn match_entities<'a>(
     head_graph: &'a DependencyGraph,
     base_root: &std::path::Path,
     head_root: &std::path::Path,
-) -> (Vec<EntityDiff>, HashMap<EntityKey, usize>, Vec<&'a CodeEntity>) {
+) -> (
+    Vec<EntityDiff>,
+    HashMap<EntityKey, usize>,
+    Vec<&'a CodeEntity>,
+) {
     // A key holds a *list*, not a single entity: overloads that survive the
     // arity split (same name, same arity, different types) still share one,
     // and a map that keeps only the last of them is what made unedited files
     // report edits.
     let mut exact: HashMap<EntityKey, Vec<&CodeEntity>> = HashMap::new();
     for e in base_graph.entities() {
-        if e.kind == EntityKind::Parameter { continue; }
+        if e.kind == EntityKind::Parameter {
+            continue;
+        }
         exact.entry(entity_key(e, base_root)).or_default().push(e);
     }
 
@@ -135,7 +144,9 @@ fn match_entities<'a>(
     let mut pending = Vec::new();
 
     for e in head_graph.entities() {
-        if e.kind == EntityKind::Parameter { continue; }
+        if e.kind == EntityKind::Parameter {
+            continue;
+        }
         let key = entity_key(e, head_root);
         let file_path = rel_path(e, head_root);
         match exact.get_mut(&key).and_then(|group| match_group(group, e)) {
@@ -152,7 +163,10 @@ fn match_entities<'a>(
         loose.entry(loose_key(&key)).or_default().extend(group);
     }
     for (e, key, file_path) in pending {
-        match loose.get_mut(&loose_key(&key)).and_then(|group| match_group(group, e)) {
+        match loose
+            .get_mut(&loose_key(&key))
+            .and_then(|group| match_group(group, e))
+        {
             Some(base_e) => {
                 survivors.insert(key, diffs.len());
                 diffs.push(diff_matched(e, base_e, file_path));
@@ -308,21 +322,57 @@ fn compare_metrics(base: &EntityMetrics, head: &EntityMetrics) -> (Vec<MetricDel
     };
 
     // Intrinsic metrics: change when the entity's own code changes
-    check("cyclomatic", base.cyclomatic.map(|v| v as f64), head.cyclomatic.map(|v| v as f64), true);
-    check("max_nesting", base.max_nesting.map(|v| v as f64), head.max_nesting.map(|v| v as f64), true);
+    check(
+        "cyclomatic",
+        base.cyclomatic.map(|v| v as f64),
+        head.cyclomatic.map(|v| v as f64),
+        true,
+    );
+    check(
+        "max_nesting",
+        base.max_nesting.map(|v| v as f64),
+        head.max_nesting.map(|v| v as f64),
+        true,
+    );
     check("loc", Some(base.loc as f64), Some(head.loc as f64), true);
-    check("param_count", base.param_count.map(|v| v as f64), head.param_count.map(|v| v as f64), true);
-    check("field_count", base.field_count.map(|v| v as f64), head.field_count.map(|v| v as f64), true);
-    check("method_count", Some(base.method_count as f64), Some(head.method_count as f64), true);
-    check("public_field_ratio",
+    check(
+        "param_count",
+        base.param_count.map(|v| v as f64),
+        head.param_count.map(|v| v as f64),
+        true,
+    );
+    check(
+        "field_count",
+        base.field_count.map(|v| v as f64),
+        head.field_count.map(|v| v as f64),
+        true,
+    );
+    check(
+        "method_count",
+        Some(base.method_count as f64),
+        Some(head.method_count as f64),
+        true,
+    );
+    check(
+        "public_field_ratio",
         base.public_field_ratio.map(|v| v as f64),
         head.public_field_ratio.map(|v| v as f64),
         true,
     );
 
     // Relational metrics: change when OTHER entities change their relationships
-    check("fan_in", Some(base.fan_in as f64), Some(head.fan_in as f64), false);
-    check("fan_out", Some(base.fan_out as f64), Some(head.fan_out as f64), false);
+    check(
+        "fan_in",
+        Some(base.fan_in as f64),
+        Some(head.fan_in as f64),
+        false,
+    );
+    check(
+        "fan_out",
+        Some(base.fan_out as f64),
+        Some(head.fan_out as f64),
+        false,
+    );
 
     (deltas, intrinsic_changed)
 }
@@ -359,15 +409,20 @@ fn index_endpoints(
     let mut key_of = HashMap::new();
     let mut endpoints = HashMap::new();
     for e in graph.entities() {
-        if e.kind == EntityKind::Parameter { continue; }
+        if e.kind == EntityKind::Parameter {
+            continue;
+        }
         let key = entity_key(e, root);
-        endpoints.insert(key.clone(), Endpoint {
-            name: e.name.clone(),
-            kind: e.kind.display_name().to_string(),
-            file_path: key.file_path.clone(),
-            head_id: in_head.then(|| e.id.clone()),
-            language: Language::from_path(&e.file_path),
-        });
+        endpoints.insert(
+            key.clone(),
+            Endpoint {
+                name: e.name.clone(),
+                kind: e.kind.display_name().to_string(),
+                file_path: key.file_path.clone(),
+                head_id: in_head.then(|| e.id.clone()),
+                language: Language::from_path(&e.file_path),
+            },
+        );
         key_of.insert(e.id.clone(), key);
     }
     (key_of, endpoints)
@@ -433,11 +488,23 @@ fn attach_edge(
     let lang = src_end.language;
     let mut landed = false;
     if let Some(&i) = survivors.get(src) {
-        diffs[i].rel_deltas.push(rel_delta(status, RelDirection::Outgoing, *kind, tgt_end, lang));
+        diffs[i].rel_deltas.push(rel_delta(
+            status,
+            RelDirection::Outgoing,
+            *kind,
+            tgt_end,
+            lang,
+        ));
         landed = true;
     }
     if let Some(&i) = survivors.get(tgt) {
-        diffs[i].rel_deltas.push(rel_delta(status, RelDirection::Incoming, *kind, src_end, lang));
+        diffs[i].rel_deltas.push(rel_delta(
+            status,
+            RelDirection::Incoming,
+            *kind,
+            src_end,
+            lang,
+        ));
         landed = true;
     }
     landed
@@ -603,7 +670,10 @@ pub fn compute_diff(
     // landed, so the relationship pass can hang its deltas off the right rows.
     let (mut diffs, survivors, unclaimed) =
         match_entities(base_graph, head_graph, base_root, head_root);
-    let total_base = base_graph.entities().filter(|e| e.kind != EntityKind::Parameter).count();
+    let total_base = base_graph
+        .entities()
+        .filter(|e| e.kind != EntityKind::Parameter)
+        .count();
 
     // Removed entities: whatever neither matching pass claimed.
     for base_e in unclaimed {
@@ -623,7 +693,10 @@ pub fn compute_diff(
         }
     }
 
-    let total_head = head_graph.entities().filter(|e| e.kind != EntityKind::Parameter).count();
+    let total_head = head_graph
+        .entities()
+        .filter(|e| e.kind != EntityKind::Parameter)
+        .count();
     let summary = summarize(&diffs, total_base, total_head, rel_added, rel_removed);
 
     DiffResult {
@@ -663,14 +736,132 @@ pub fn resolve_git_ref(repo_root: &Path, git_ref: &str) -> AnyhowResult<String> 
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The subject on the commit that names the index, so anything that comes
+/// across one loose in the object database can tell what wrote it and why.
+const STAGED_COMMIT_SUBJECT: &str = "nao: the staged tree";
+
+/// Name the git index as a commit, so the staged tree can be checked out like
+/// any other ref. `None` when nothing is staged.
+///
+/// The index is the one tree in a repository that no ref resolves to, and that
+/// is the whole of why this function exists: with it, a staged comparison is
+/// two refs and [`compute_diff`] needs no change at all — the same property
+/// that made a stash comparable for free.
+///
+/// Nothing is copied and nothing is hashed. Everything staged is *already* in
+/// the object database, because `git add` writes the blob at the moment it is
+/// run; this only writes the tree and commit objects that point at them.
+///
+/// Two decisions are load-bearing:
+///
+/// The index is copied and `GIT_INDEX_FILE` aimed at the copy rather than
+/// running `write-tree` in place. `git write-tree` updates the cache-tree
+/// extension of whichever index it reads, so in place it would write to the
+/// user's `.git/index`. The tree that comes out is identical either way — nao
+/// only ever reads the repository it watches, and racing a concurrent
+/// `git add` for the microsecond is not a trade worth making.
+///
+/// The commit is parented on `HEAD`, which is what makes `HEAD → this` the
+/// staged change and nothing besides. It is also *unreferenced*: nothing points
+/// at it, so `git worktree add --detach` resolves it but it is garbage the
+/// moment the index moves. It must therefore be produced and consumed by one
+/// call, never handed to a client to hold — the mirror of the `stash@{N}`
+/// problem, where the label outlives the thing but stops meaning it.
+pub fn staged_commit(repo_root: &Path) -> AnyhowResult<Option<String>> {
+    let Some(head_tree) = git_lines(repo_root, &["rev-parse", "HEAD^{tree}"]).pop() else {
+        anyhow::bail!("no HEAD to compare the index against — this repository has no commits");
+    };
+
+    // Unique per call, not per process. Two servers watching the same
+    // repository must not share a scratch index — and neither must two calls
+    // in one process, which is not hypothetical: a copy taken from another
+    // repository lands as `invalid object` from `write-tree`, since the blobs
+    // it names are in a different object database.
+    static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "nao-staged-index-{}-{}",
+        std::process::id(),
+        SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let index = index_path(repo_root);
+    std::fs::copy(&index, &scratch)
+        .map_err(|e| anyhow::anyhow!("could not read the git index at {:?}: {}", index, e))?;
+    let tree = Command::new("git")
+        .args(["write-tree"])
+        .env("GIT_INDEX_FILE", &scratch)
+        .current_dir(repo_root)
+        .output()?;
+    let _ = std::fs::remove_file(&scratch);
+    if !tree.status.success() {
+        anyhow::bail!(
+            "could not read the staged tree: {}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        );
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+
+    // Nothing staged is the ordinary state of a repository, and the index tree
+    // being HEAD's tree is exactly what that looks like. Answered here rather
+    // than left to the caller to derive: this is the only place that holds both
+    // trees, and an empty diff read as a comparison says "nothing changed"
+    // about the wrong thing.
+    if tree == head_tree {
+        return Ok(None);
+    }
+
+    let commit = Command::new("git")
+        .args([
+            "commit-tree",
+            &tree,
+            "-p",
+            "HEAD",
+            "-m",
+            STAGED_COMMIT_SUBJECT,
+        ])
+        .current_dir(repo_root)
+        .output()?;
+    if !commit.status.success() {
+        anyhow::bail!(
+            "could not name the staged tree: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&commit.stdout).trim().to_string(),
+    ))
+}
+
+/// Where this repository keeps its index.
+///
+/// Asked of git rather than assumed to be `.git/index`: in a linked worktree
+/// `.git` is a *file* and the index lives under the common directory's
+/// `worktrees/<name>/`, so the guess would read another checkout's staged
+/// state or nothing at all. `--git-path` answers relative to the cwd git ran
+/// in, which is `repo_root`.
+fn index_path(repo_root: &Path) -> std::path::PathBuf {
+    let rel = git_lines(repo_root, &["rev-parse", "--git-path", "index"])
+        .pop()
+        .unwrap_or_else(|| ".git/index".to_string());
+    let path = std::path::PathBuf::from(&rel);
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
 /// The non-empty output lines of a git command run in `repo_root`.
 ///
 /// Empty when git cannot answer at all — not a repository, no git on PATH, a
 /// ref that stopped resolving. Every caller here treats git's answer as
 /// advisory, so "it said nothing" and "it could not be asked" collapse into
 /// the same, safe result.
-fn git_lines(repo_root: &Path, args: &[&str]) -> Vec<String> {
-    let Ok(out) = Command::new("git").args(args).current_dir(repo_root).output() else {
+pub(crate) fn git_lines(repo_root: &Path, args: &[&str]) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+    else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -689,8 +880,13 @@ fn git_lines(repo_root: &Path, args: &[&str]) -> Vec<String> {
 /// changed set as advisory, never as a gate).
 pub fn changed_files(repo_root: &Path, base_ref: &str) -> Vec<String> {
     let mut files: std::collections::BTreeSet<String> =
-        git_lines(repo_root, &["diff", "--name-only", base_ref]).into_iter().collect();
-    files.extend(git_lines(repo_root, &["ls-files", "--others", "--exclude-standard"]));
+        git_lines(repo_root, &["diff", "--name-only", base_ref])
+            .into_iter()
+            .collect();
+    files.extend(git_lines(
+        repo_root,
+        &["ls-files", "--others", "--exclude-standard"],
+    ));
     files.into_iter().collect()
 }
 
@@ -736,10 +932,63 @@ pub fn create_worktree(repo_root: &Path, dir: &Path, git_ref: &str) -> AnyhowRes
         .current_dir(repo_root)
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("Failed to create worktree: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "Failed to create worktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
+    restore_stashed_untracked(repo_root, dir, git_ref);
     mirror_local_ignores(repo_root, dir);
     Ok(())
+}
+
+/// Git's own subject for the commit a `git stash -u` puts untracked files in.
+/// Matching on it is what separates a stash from an ordinary three-parent
+/// octopus merge, which must not be overlaid.
+const UNTRACKED_STASH_SUBJECT: &str = "untracked files on ";
+
+/// Overlay a stash's untracked files onto a checkout of it.
+///
+/// `git stash --include-untracked` does not put those files in the stash
+/// commit's own tree; it puts them in a *third parent*. So a
+/// `git worktree add --detach <dir> stash@{0}` reproduces the stash minus
+/// exactly the files a reader is most likely looking for — the new ones. A
+/// stashed module simply would not exist on the canvas, and the diff would
+/// report it as absent rather than as added (UI-107).
+///
+/// Best-effort in both directions. `git stash -u` writes a third parent even
+/// when nothing untracked was there to save, so a checkout that matches
+/// nothing is the ordinary case and not a failure; and a diff is still worth
+/// computing without the overlay, so no outcome here fails the worktree.
+///
+/// A no-op for every ref that is not a stash — the third parent has to exist
+/// *and* carry git's untracked-stash subject.
+fn restore_stashed_untracked(repo_root: &Path, dir: &Path, git_ref: &str) {
+    let Some(sha) = stashed_untracked_tree(repo_root, git_ref) else {
+        return;
+    };
+    // Run inside the new worktree: it shares the object database, so the
+    // stash's untracked tree resolves there, and `-- .` lands the files at
+    // the checkout's root without disturbing what is already there.
+    let _ = Command::new("git")
+        .args(["checkout", &sha, "--", "."])
+        .current_dir(dir)
+        .output();
+}
+
+/// The commit holding `git_ref`'s stashed untracked files, if it is a stash
+/// that has one.
+///
+/// Both halves of the test matter. A third parent alone is an ordinary
+/// octopus merge, whose sides are already merged into the commit's own tree —
+/// overlaying one would write files into a checkout that never held them. The
+/// subject is git's own marker for the other shape, and it is the only thing
+/// that tells the two apart from the outside.
+fn stashed_untracked_tree(repo_root: &Path, git_ref: &str) -> Option<String> {
+    let third = format!("{}^3", git_ref);
+    let sha = git_lines(repo_root, &["rev-parse", "--verify", "--quiet", &third]).pop()?;
+    let subject = git_lines(repo_root, &["log", "-1", "--format=%s", &sha]).pop()?;
+    subject.starts_with(UNTRACKED_STASH_SUBJECT).then_some(sha)
 }
 
 /// The ignore files whose absence from a checkout changes what a walk sees.
@@ -771,7 +1020,10 @@ pub fn mirror_local_ignores(repo_root: &Path, dir: &Path) -> usize {
         .filter(|rel| copy_into(repo_root, dir, rel))
         .count();
     if copied > 0 {
-        eprintln!("    Applied {} local ignore file(s) to the checkout", copied);
+        eprintln!(
+            "    Applied {} local ignore file(s) to the checkout",
+            copied
+        );
     }
     copied
 }
@@ -781,7 +1033,8 @@ pub fn mirror_local_ignores(repo_root: &Path, dir: &Path) -> usize {
 /// ignore file is worth failing a diff over.
 fn copy_into(from_root: &Path, to_root: &Path, rel: &str) -> bool {
     let to = to_root.join(rel);
-    to.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok())
+    to.parent()
+        .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
         && std::fs::copy(from_root.join(rel), &to).is_ok()
 }
 
@@ -789,9 +1042,14 @@ fn copy_into(from_root: &Path, to_root: &Path, rel: &str) -> bool {
 /// untracked ones, and tracked ones with uncommitted edits.
 fn local_ignore_files(repo_root: &Path) -> Vec<String> {
     let mut paths: std::collections::BTreeSet<String> =
-        git_lines(repo_root, &["ls-files", "--others", "--exclude-standard"]).into_iter().collect();
+        git_lines(repo_root, &["ls-files", "--others", "--exclude-standard"])
+            .into_iter()
+            .collect();
     paths.extend(git_lines(repo_root, &["diff", "--name-only"]));
-    paths.into_iter().filter(|p| names_ignore_file(Path::new(p))).collect()
+    paths
+        .into_iter()
+        .filter(|p| names_ignore_file(Path::new(p)))
+        .collect()
 }
 
 /// Whether a path names an ignore file, at any depth. Public because the
@@ -825,7 +1083,9 @@ pub fn ignore_fingerprint(repo_root: &Path) -> String {
         .chain([".git/info/exclude"])
     {
         rel.hash(&mut hasher);
-        std::fs::read_to_string(repo_root.join(rel)).unwrap_or_default().hash(&mut hasher);
+        std::fs::read_to_string(repo_root.join(rel))
+            .unwrap_or_default()
+            .hash(&mut hasher);
     }
     format!("{:x}", hasher.finish())
 }
@@ -833,7 +1093,11 @@ pub fn ignore_fingerprint(repo_root: &Path) -> String {
 /// The whole of what a cached analysis has to be keyed on besides its git
 /// ref: the scope the config asks for, and the ignore rules in force.
 pub fn analysis_fingerprint(config: &Config, repo_root: &Path) -> String {
-    format!("{}|{}", scope_fingerprint(config), ignore_fingerprint(repo_root))
+    format!(
+        "{}|{}",
+        scope_fingerprint(config),
+        ignore_fingerprint(repo_root)
+    )
 }
 
 /// Remove a git worktree (best-effort, ignores errors).
@@ -845,6 +1109,27 @@ pub fn remove_worktree(repo_root: &Path, dir: &Path) {
 }
 
 /// Build a Config for analyzing a directory.
+///
+/// The command line first, `root`'s settings file last, which is the order
+/// [`apply_to_config`](crate::settings::Settings::apply_to_config) is built
+/// for: it extends the pattern lists and fills only the scalars nothing has
+/// chosen, so an `--include-tests` or `--language` typed on the command line
+/// still outranks the file (ADR-0008).
+///
+/// Reading the file here rather than at each call site is what CFG-011 was:
+/// this was the one config builder that never called `settings::load`, and
+/// `nao mcp` is its only entry point — so an agent, the caller with no flags
+/// to pass and therefore the one most dependent on the file, got the single
+/// code path where the file was inert. `exclude_patterns` named in a repo's
+/// `.nao/settings.json` were honoured by every CLI command and by nothing
+/// served over MCP.
+///
+/// The file is read from `root`'s *checkout* rather than from `root` itself
+/// (CFG-012), so a subdirectory gets the same settings the whole repo would —
+/// which is most of what makes CFG-011 worth having, since `map` and
+/// `reshape` are routinely called on a subfolder. What a subdirectory call
+/// does not preserve is the entity keys a diff matches on: both sides of a
+/// diff still take one config and [`rooted_at`] it, never a second call.
 pub fn build_analysis_config(
     root: &Path,
     include_tests: bool,
@@ -859,6 +1144,7 @@ pub fn build_analysis_config(
             }
         }
     }
+    crate::settings::load(root).apply_to_config(&mut config);
     config
 }
 
@@ -898,22 +1184,34 @@ pub fn analyze_with(config: Config, label: &str) -> AnyhowResult<(DependencyGrap
     let mut analyzer = Analyzer::new(config.clone());
     let result = analyzer.analyze()?;
     let graph = DependencyGraph::from_analysis(&result);
-    eprintln!("    {} entities, {} relationships", result.entities.len(), result.relationships.len());
+    eprintln!(
+        "    {} entities, {} relationships",
+        result.entities.len(),
+        result.relationships.len()
+    );
     Ok((graph, config))
 }
 
-/// Analyze code at `root_dir` and return graph + config.
+/// Analyze code at `root_dir`, under `root_dir`'s own settings, and return
+/// graph + config.
 ///
-/// For callers that build both sides of their comparison this way, and so
-/// cannot skew one against the other. A caller holding a live config should
-/// use [`rooted_at`] with [`analyze_with`] instead.
+/// For a directory that stands alone. **Not for the base side of a diff:**
+/// since [`build_analysis_config`] reads `.nao/settings.json` from the root
+/// it is handed, calling this once per worktree gives each side the settings
+/// committed at its own ref, and a scope the two sides disagree about reads
+/// as every excluded file being added or removed. Both sides of a diff take
+/// one config from the repo root and [`rooted_at`] it into each checkout,
+/// then go through [`analyze_with`].
 pub fn analyze_at(
     root_dir: &Path,
     include_tests: bool,
     languages: &Option<Vec<String>>,
     label: &str,
 ) -> AnyhowResult<(DependencyGraph, Config)> {
-    analyze_with(build_analysis_config(root_dir, include_tests, languages), label)
+    analyze_with(
+        build_analysis_config(root_dir, include_tests, languages),
+        label,
+    )
 }
 
 /// Render the before-side detail sidecar: per-entity source, and per-file
@@ -988,6 +1286,7 @@ mod tests {
             entities,
             relationships,
             files: Vec::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         })
     }
@@ -998,7 +1297,10 @@ mod tests {
     }
 
     fn row<'a>(d: &'a DiffResult, name: &str) -> &'a EntityDiff {
-        d.entities.iter().find(|e| e.name == name).expect("entity in diff")
+        d.entities
+            .iter()
+            .find(|e| e.name == name)
+            .expect("entity in diff")
     }
 
     fn fns(names: &[&str]) -> Vec<CodeEntity> {
@@ -1015,8 +1317,8 @@ mod tests {
     /// honours `include_tests: false` by path, so a fixture under a `…-test-…`
     /// directory is skipped entirely and the analysis comes back empty.
     fn temp_checkout(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("nao-diff-details-{}-{}", std::process::id(), tag));
+        let root =
+            std::env::temp_dir().join(format!("nao-diff-details-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
@@ -1030,21 +1332,79 @@ mod tests {
     /// A repo with one commit, for the worktree tests. Same naming rule as
     /// `temp_checkout`: no "test" in the directory name.
     fn git_repo(tag: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("nao-diff-repo-{}-{}", std::process::id(), tag));
+        let root =
+            std::env::temp_dir().join(format!("nao-diff-repo-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn hello() -> u32 { 1 }\n").unwrap();
         let git = |args: &[&str]| {
-            Command::new("git").args(args).current_dir(&root).output().unwrap();
+            Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
         };
         git(&["init", "-q", "."]);
         git(&["add", "-A"]);
         git(&[
-            "-c", "user.email=nao@example.com", "-c", "user.name=Nao",
-            "commit", "-qm", "init",
+            "-c",
+            "user.email=nao@example.com",
+            "-c",
+            "user.name=Nao",
+            "commit",
+            "-qm",
+            "init",
         ]);
         root
+    }
+
+    /// A root carrying a repo-scope settings file, for the CFG-011 tests.
+    /// Same naming rule as `temp_checkout`: no "test" in the directory name.
+    fn root_with_settings(tag: &str, json: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("nao-diff-cfg-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".nao")).unwrap();
+        std::fs::write(root.join(".nao/settings.json"), json).unwrap();
+        root
+    }
+
+    /// CFG-011. Every other entry point settles its config through
+    /// `settings::load`; this builder did not, and `nao mcp` is its only
+    /// caller — so the audience with no flags to pass got the one code path
+    /// where the repo's file was inert.
+    #[test]
+    fn a_built_config_carries_the_repo_settings_file() {
+        let root = root_with_settings(
+            "excludes",
+            r#"{"exclude_patterns": ["**/generated/**"], "min_weight": 4}"#,
+        );
+        let config = build_analysis_config(&root, false, &None);
+        assert!(
+            config
+                .analysis
+                .exclude_patterns
+                .contains(&"**/generated/**".to_string()),
+            "the file's excludes never reached the config: {:?}",
+            config.analysis.exclude_patterns
+        );
+        assert_eq!(config.filters.min_weight, 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The order the file is applied in, not just the fact of it: a
+    /// `--language` on the `nao mcp` command line is a narrowing the caller
+    /// typed, and the file underneath it must not widen it back.
+    #[test]
+    fn a_language_on_the_command_line_outranks_the_file() {
+        let root = root_with_settings("language", r#"{"language": ["python"]}"#);
+        let config = build_analysis_config(&root, false, &Some(vec!["rust".to_string()]));
+        assert!(config.analysis.languages.contains(&Language::Rust));
+        assert!(
+            !config.analysis.languages.contains(&Language::Python),
+            "the file widened a filter the command line had narrowed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The scope a diff is computed under has to reach both sides. Only the
@@ -1056,15 +1416,26 @@ mod tests {
         live.analysis.include_docs = true;
         live.analysis.include_tests = true;
         live.analysis.spec_dir = Some(std::path::PathBuf::from("spec"));
-        live.analysis.exclude_patterns.push("**/generated/**".to_string());
+        live.analysis
+            .exclude_patterns
+            .push("**/generated/**".to_string());
 
         let base = rooted_at(&live, Path::new("/tmp/nao-diff-base-abc"));
 
-        assert_eq!(base.root_path, std::path::PathBuf::from("/tmp/nao-diff-base-abc"));
-        assert!(base.analysis.include_docs, "docs were on for the head and must be on for the base");
+        assert_eq!(
+            base.root_path,
+            std::path::PathBuf::from("/tmp/nao-diff-base-abc")
+        );
+        assert!(
+            base.analysis.include_docs,
+            "docs were on for the head and must be on for the base"
+        );
         assert!(base.analysis.include_tests);
         assert_eq!(base.analysis.spec_dir, live.analysis.spec_dir);
-        assert!(base.analysis.exclude_patterns.contains(&"**/generated/**".to_string()));
+        assert!(base
+            .analysis
+            .exclude_patterns
+            .contains(&"**/generated/**".to_string()));
     }
 
     /// A relative `spec_dir` has to follow the config into the checkout, or
@@ -1077,7 +1448,9 @@ mod tests {
         let base = rooted_at(&live, Path::new("/tmp/nao-diff-base-abc"));
         assert_eq!(
             base.spec_root(),
-            Some(std::path::PathBuf::from("/tmp/nao-diff-base-abc/docs/domain")),
+            Some(std::path::PathBuf::from(
+                "/tmp/nao-diff-base-abc/docs/domain"
+            )),
         );
     }
 
@@ -1098,7 +1471,9 @@ mod tests {
             |c: &mut Config| c.analysis.include_docs = true,
             |c: &mut Config| c.analysis.include_tests = true,
             |c: &mut Config| c.analysis.exclude_patterns.push("**/gen/**".to_string()),
-            |c: &mut Config| { c.analysis.languages.insert(Language::Rust); },
+            |c: &mut Config| {
+                c.analysis.languages.insert(Language::Rust);
+            },
             |c: &mut Config| c.filters.min_weight = 3,
         ] {
             let mut changed = live.clone();
@@ -1113,11 +1488,28 @@ mod tests {
 
     #[test]
     fn an_ignore_file_is_recognised_at_any_depth() {
-        for yes in [".gitignore", "src/.gitignore", "a/b/c/.ignore", "/abs/path/.ignore"] {
-            assert!(names_ignore_file(Path::new(yes)), "{yes} names an ignore file");
+        for yes in [
+            ".gitignore",
+            "src/.gitignore",
+            "a/b/c/.ignore",
+            "/abs/path/.ignore",
+        ] {
+            assert!(
+                names_ignore_file(Path::new(yes)),
+                "{yes} names an ignore file"
+            );
         }
-        for no in ["src/lib.rs", "gitignore", "src/.gitignore.bak", ".gitattributes", ""] {
-            assert!(!names_ignore_file(Path::new(no)), "{no} does not name an ignore file");
+        for no in [
+            "src/lib.rs",
+            "gitignore",
+            "src/.gitignore.bak",
+            ".gitattributes",
+            "",
+        ] {
+            assert!(
+                !names_ignore_file(Path::new(no)),
+                "{no} does not name an ignore file"
+            );
         }
     }
 
@@ -1133,14 +1525,24 @@ mod tests {
 
         std::fs::write(repo.join(".gitignore"), "gen/\n").unwrap();
         let with_ignore = analysis_fingerprint(&config, &repo);
-        assert_ne!(before, with_ignore, "a new ignore file changes what is analyzed");
+        assert_ne!(
+            before, with_ignore,
+            "a new ignore file changes what is analyzed"
+        );
 
         std::fs::write(repo.join(".gitignore"), "gen/\nvendor/\n").unwrap();
-        assert_ne!(with_ignore, analysis_fingerprint(&config, &repo), "so does editing one");
+        assert_ne!(
+            with_ignore,
+            analysis_fingerprint(&config, &repo),
+            "so does editing one"
+        );
 
         std::fs::write(repo.join(".git/info/exclude"), "build/\n").unwrap();
         let with_exclude = analysis_fingerprint(&config, &repo);
-        assert_ne!(with_ignore, with_exclude, "and so does the repo-local exclude file");
+        assert_ne!(
+            with_ignore, with_exclude,
+            "and so does the repo-local exclude file"
+        );
 
         // Stable when nothing moved — or every save pays for a base checkout.
         assert_eq!(with_exclude, analysis_fingerprint(&config, &repo));
@@ -1162,11 +1564,14 @@ mod tests {
         std::fs::create_dir_all(repo.join("src/vendor")).unwrap();
         std::fs::write(repo.join("src/vendor/.ignore"), "*.min.js\n").unwrap();
 
-        let work = std::env::temp_dir()
-            .join(format!("nao-diff-wt-{}-uncommitted", std::process::id()));
+        let work =
+            std::env::temp_dir().join(format!("nao-diff-wt-{}-uncommitted", std::process::id()));
         create_worktree(&repo, &work, "HEAD").unwrap();
 
-        assert_eq!(std::fs::read_to_string(work.join(".gitignore")).unwrap(), "gen/\n");
+        assert_eq!(
+            std::fs::read_to_string(work.join(".gitignore")).unwrap(),
+            "gen/\n"
+        );
         assert_eq!(
             std::fs::read_to_string(work.join("src/vendor/.ignore")).unwrap(),
             "*.min.js\n",
@@ -1184,17 +1589,31 @@ mod tests {
         let repo = git_repo("edited-ignore");
         std::fs::write(repo.join(".gitignore"), "committed/\n").unwrap();
         let git = |args: &[&str]| {
-            Command::new("git").args(args).current_dir(&repo).output().unwrap();
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
         };
         git(&["add", "-A"]);
-        git(&["-c", "user.email=nao@example.com", "-c", "user.name=Nao", "commit", "-qm", "ignore"]);
+        git(&[
+            "-c",
+            "user.email=nao@example.com",
+            "-c",
+            "user.name=Nao",
+            "commit",
+            "-qm",
+            "ignore",
+        ]);
         std::fs::write(repo.join(".gitignore"), "edited/\n").unwrap();
 
-        let work = std::env::temp_dir()
-            .join(format!("nao-diff-wt-{}-edited", std::process::id()));
+        let work = std::env::temp_dir().join(format!("nao-diff-wt-{}-edited", std::process::id()));
         create_worktree(&repo, &work, "HEAD").unwrap();
 
-        assert_eq!(std::fs::read_to_string(work.join(".gitignore")).unwrap(), "edited/\n");
+        assert_eq!(
+            std::fs::read_to_string(work.join(".gitignore")).unwrap(),
+            "edited/\n"
+        );
 
         remove_worktree(&repo, &work);
         let _ = std::fs::remove_dir_all(&repo);
@@ -1240,13 +1659,22 @@ mod tests {
         // `caller` drops its call to `old` and calls `new` instead. Same
         // fan_out, same source hash (both are None here), same everything the
         // metric comparison looks at — the edges are the only witness.
-        let base = graph_of(fns(&["caller", "old", "new"]), &[(0, 1, RelationshipKind::Calls)]);
-        let head = graph_of(fns(&["caller", "old", "new"]), &[(0, 2, RelationshipKind::Calls)]);
+        let base = graph_of(
+            fns(&["caller", "old", "new"]),
+            &[(0, 1, RelationshipKind::Calls)],
+        );
+        let head = graph_of(
+            fns(&["caller", "old", "new"]),
+            &[(0, 2, RelationshipKind::Calls)],
+        );
         let d = diff_of(&base, &head);
 
         let caller = row(&d, "caller");
         assert_eq!(caller.status, ChangeStatus::Modified);
-        assert!(!caller.source_changed, "rewiring is an impact, not a core change");
+        assert!(
+            !caller.source_changed,
+            "rewiring is an impact, not a core change"
+        );
         assert!(caller.metric_deltas.is_empty(), "no metric moved");
 
         let out: Vec<_> = caller
@@ -1269,8 +1697,14 @@ mod tests {
 
     #[test]
     fn the_callee_learns_who_stopped_calling_it() {
-        let base = graph_of(fns(&["caller", "old", "new"]), &[(0, 1, RelationshipKind::Calls)]);
-        let head = graph_of(fns(&["caller", "old", "new"]), &[(0, 2, RelationshipKind::Calls)]);
+        let base = graph_of(
+            fns(&["caller", "old", "new"]),
+            &[(0, 1, RelationshipKind::Calls)],
+        );
+        let head = graph_of(
+            fns(&["caller", "old", "new"]),
+            &[(0, 2, RelationshipKind::Calls)],
+        );
         let d = diff_of(&base, &head);
 
         let old = row(&d, "old");
@@ -1291,7 +1725,10 @@ mod tests {
         // bury the one delta that carries information: that `caller` reaches
         // it now.
         let base = graph_of(fns(&["caller"]), &[]);
-        let head = graph_of(fns(&["caller", "helper"]), &[(0, 1, RelationshipKind::Calls)]);
+        let head = graph_of(
+            fns(&["caller", "helper"]),
+            &[(0, 1, RelationshipKind::Calls)],
+        );
         let d = diff_of(&base, &head);
 
         let helper = row(&d, "helper");
@@ -1398,7 +1835,10 @@ mod tests {
         assert_eq!(d.summary.modified, 0);
         assert_eq!(d.summary.added, 0);
         assert_eq!(d.summary.removed, 0);
-        assert_eq!(d.summary.total_base, 3, "counts entities, not distinct keys");
+        assert_eq!(
+            d.summary.total_base, 3,
+            "counts entities, not distinct keys"
+        );
     }
 
     /// Same arity, so the key alone cannot separate them — the parameter
@@ -1406,11 +1846,17 @@ mod tests {
     #[test]
     fn same_arity_overloads_match_by_parameter_type() {
         let base = graph_of(
-            vec![overload(10, "get", &["Product"]), overload(20, "get", &["Variant"])],
+            vec![
+                overload(10, "get", &["Product"]),
+                overload(20, "get", &["Variant"]),
+            ],
             &[],
         );
         let head = graph_of(
-            vec![overload(10, "get", &["Variant"]), overload(20, "get", &["Product"])],
+            vec![
+                overload(10, "get", &["Variant"]),
+                overload(20, "get", &["Product"]),
+            ],
             &[],
         );
         let d = diff_of(&base, &head);
@@ -1418,14 +1864,21 @@ mod tests {
         let get = rows(&d, "get");
         assert_eq!(get.len(), 2);
         for r in &get {
-            assert_eq!(r.status, ChangeStatus::Unchanged, "swapped order is not an edit");
+            assert_eq!(
+                r.status,
+                ChangeStatus::Unchanged,
+                "swapped order is not an edit"
+            );
         }
     }
 
     #[test]
     fn editing_one_overload_leaves_its_siblings_alone() {
         let base = graph_of(
-            vec![overload(10, "set", &["Product"]), overload(20, "set", &["Product", "Status"])],
+            vec![
+                overload(10, "set", &["Product"]),
+                overload(20, "set", &["Product", "Status"]),
+            ],
             &[],
         );
         let mut edited = vec![
@@ -1438,10 +1891,17 @@ mod tests {
         let set = rows(&d, "set");
         let by_arity = |n: usize| {
             *set.iter()
-                .find(|r| r.entity_id.ends_with(&format!("{}:set", if n == 1 { 10 } else { 20 })))
+                .find(|r| {
+                    r.entity_id
+                        .ends_with(&format!("{}:set", if n == 1 { 10 } else { 20 }))
+                })
                 .expect("row")
         };
-        assert_eq!(by_arity(1).status, ChangeStatus::Unchanged, "untouched sibling");
+        assert_eq!(
+            by_arity(1).status,
+            ChangeStatus::Unchanged,
+            "untouched sibling"
+        );
         assert_eq!(by_arity(2).status, ChangeStatus::Modified);
         assert!(by_arity(2).source_changed);
     }
@@ -1452,11 +1912,17 @@ mod tests {
     #[test]
     fn an_overload_group_that_moved_down_the_file_is_unchanged() {
         let base = graph_of(
-            vec![overload(10, "run", &["A"]), overload(20, "run", &["A", "B"])],
+            vec![
+                overload(10, "run", &["A"]),
+                overload(20, "run", &["A", "B"]),
+            ],
             &[],
         );
         let head = graph_of(
-            vec![overload(80, "run", &["A"]), overload(90, "run", &["A", "B"])],
+            vec![
+                overload(80, "run", &["A"]),
+                overload(90, "run", &["A", "B"]),
+            ],
             &[],
         );
         let d = diff_of(&base, &head);
@@ -1472,7 +1938,10 @@ mod tests {
     #[test]
     fn dropping_one_overload_removes_only_that_one() {
         let base = graph_of(
-            vec![overload(10, "log", &["String"]), overload(20, "log", &["String", "Level"])],
+            vec![
+                overload(10, "log", &["String"]),
+                overload(20, "log", &["String", "Level"]),
+            ],
             &[],
         );
         let head = graph_of(vec![overload(10, "log", &["String"])], &[]);
@@ -1501,10 +1970,16 @@ mod tests {
         assert_eq!(save[0].status, ChangeStatus::Modified);
         assert!(save[0].source_changed);
         assert!(
-            save[0].metric_deltas.iter().any(|m| m.name == "param_count" && m.delta == 1.0),
+            save[0]
+                .metric_deltas
+                .iter()
+                .any(|m| m.name == "param_count" && m.delta == 1.0),
             "the signature change is reported as the delta it is",
         );
-        assert!(save[0].base_entity_id.is_some(), "the before-source is reachable");
+        assert!(
+            save[0].base_entity_id.is_some(),
+            "the before-source is reachable"
+        );
     }
 
     /// The second pass only sees entities that failed the first on *both*
@@ -1513,7 +1988,10 @@ mod tests {
     #[test]
     fn the_loose_pass_does_not_rematch_an_intact_overload_group() {
         let group = || {
-            vec![overload(10, "put", &["A"]), overload(20, "put", &["A", "B"])]
+            vec![
+                overload(10, "put", &["A"]),
+                overload(20, "put", &["A", "B"]),
+            ]
         };
         let mut head = group();
         head.push(overload(30, "put", &["A", "B", "C"]));
@@ -1521,10 +1999,15 @@ mod tests {
 
         let put = rows(&d, "put");
         assert_eq!(put.len(), 3);
-        let added: Vec<_> = put.iter().filter(|r| r.status == ChangeStatus::Added).collect();
+        let added: Vec<_> = put
+            .iter()
+            .filter(|r| r.status == ChangeStatus::Added)
+            .collect();
         assert_eq!(added.len(), 1, "the new overload is an addition");
         assert_eq!(
-            put.iter().filter(|r| r.status == ChangeStatus::Unchanged).count(),
+            put.iter()
+                .filter(|r| r.status == ChangeStatus::Unchanged)
+                .count(),
             2,
             "its siblings are untouched, not dragged into a loose match",
         );
@@ -1550,5 +2033,231 @@ mod tests {
         assert_eq!(d.summary.relationships_added, 1);
         assert_eq!(d.summary.relationships_removed, 1);
         assert_eq!(row(&d, "caller").status, ChangeStatus::Modified);
+    }
+
+    // --------------------------------------------------------------
+    //  Worktrees over real git repositories (UI-107)
+    // --------------------------------------------------------------
+
+    /// Run a git command in `dir`, asserting it succeeded — a test whose
+    /// setup half-failed would otherwise assert against an unknown tree.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    /// A fresh repository with one commit, at a path unique to this test.
+    fn repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nao-stash-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "--initial-branch=main", "."]);
+        git(&dir, &["config", "user.email", "t@t.t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        write(&dir, "tracked.txt", "one\n");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "base"]);
+        dir
+    }
+
+    fn cleanup(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The files `-u` saves live in the stash's *third parent*, not in its own
+    /// tree, so a plain checkout of the stash is missing exactly the new code
+    /// a reader opened the diff to look at.
+    #[test]
+    fn a_stash_checkout_carries_its_untracked_files() {
+        let dir = repo("untracked");
+        write(&dir, "tracked.txt", "two\n");
+        write(&dir, "brand_new.rs", "fn added() {}\n");
+        git(&dir, &["stash", "-q", "--include-untracked"]);
+
+        let wt = dir.join("wt");
+        create_worktree(&dir, &wt, "stash@{0}").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
+            "two\n"
+        );
+        assert!(
+            wt.join("brand_new.rs").exists(),
+            "an untracked file in the stash must reach the checkout"
+        );
+        remove_worktree(&dir, &wt);
+        cleanup(&dir);
+    }
+
+    /// `git stash -u` writes a third parent even with nothing untracked to
+    /// save, so the overlay runs against an empty tree on ordinary stashes and
+    /// must not turn that into a failed worktree.
+    #[test]
+    fn a_stash_with_nothing_untracked_still_checks_out() {
+        let dir = repo("empty-untracked");
+        write(&dir, "tracked.txt", "two\n");
+        git(&dir, &["stash", "-q", "--include-untracked"]);
+
+        let wt = dir.join("wt");
+        create_worktree(&dir, &wt, "stash@{0}").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
+            "two\n"
+        );
+        remove_worktree(&dir, &wt);
+        cleanup(&dir);
+    }
+
+    /// A three-parent commit is not by itself a stash. An octopus merge's
+    /// sides are already merged into its own tree, so overlaying one would
+    /// write files into a checkout that never held them.
+    ///
+    /// Asserted on the decision rather than on the resulting files: the
+    /// merge's tree contains every side already, so an overlay that wrongly
+    /// ran would leave the checkout looking correct.
+    #[test]
+    fn an_octopus_merge_is_not_a_stash() {
+        let dir = repo("octopus");
+        let base = git(&dir, &["rev-parse", "HEAD"]);
+        for branch in ["b1", "b2"] {
+            git(&dir, &["checkout", "-q", "-b", branch, &base]);
+            write(&dir, &format!("{}.txt", branch), "x\n");
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-qm", branch]);
+        }
+        // Move main off `base` first, or git fast-forwards to b1 and the
+        // merge lands with two parents instead of three.
+        git(&dir, &["checkout", "-q", "main"]);
+        write(&dir, "main.txt", "x\n");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "main moves"]);
+        git(&dir, &["merge", "-q", "--no-edit", "b1", "b2"]);
+
+        let parents = git(&dir, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(
+            parents.split(' ').count(),
+            4,
+            "three parents plus the commit itself"
+        );
+        assert!(
+            stashed_untracked_tree(&dir, "HEAD").is_none(),
+            "a third parent alone must not be read as stashed untracked files"
+        );
+        cleanup(&dir);
+    }
+
+    // --------------------------------------------------------------
+    //  The index as a ref (UI-111)
+    // --------------------------------------------------------------
+
+    /// The point of the whole thing: what was `git add`ed reaches a checkout,
+    /// and what was only saved to disk does not.
+    #[test]
+    fn a_staged_commit_checks_out_the_index_and_not_the_working_tree() {
+        let dir = repo("staged");
+        write(&dir, "tracked.txt", "staged\n");
+        write(&dir, "added.rs", "fn staged() {}\n");
+        git(&dir, &["add", "."]);
+        // Both files move again *after* staging, and one more appears that was
+        // never staged at all. None of it may reach the checkout.
+        write(&dir, "tracked.txt", "working\n");
+        write(&dir, "added.rs", "fn working() {}\n");
+        write(&dir, "unstaged.rs", "fn never() {}\n");
+
+        let sha = staged_commit(&dir).unwrap().expect("something is staged");
+        let wt = dir.join("wt");
+        create_worktree(&dir, &wt, &sha).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
+            "staged\n",
+            "the checkout must be the index, not the working tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("added.rs")).unwrap(),
+            "fn staged() {}\n"
+        );
+        assert!(
+            !wt.join("unstaged.rs").exists(),
+            "a file that was never staged is not part of the staged tree"
+        );
+        remove_worktree(&dir, &wt);
+        cleanup(&dir);
+    }
+
+    /// `HEAD → staged` has to be the staged change alone, which is what the
+    /// first parent buys. Paired against anything else, every commit in between
+    /// would read as something the index did.
+    #[test]
+    fn a_staged_commit_is_parented_on_head() {
+        let dir = repo("staged-parent");
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        write(&dir, "tracked.txt", "staged\n");
+        git(&dir, &["add", "."]);
+
+        let sha = staged_commit(&dir).unwrap().unwrap();
+        assert_eq!(git(&dir, &["rev-parse", &format!("{}^1", sha)]), head);
+        cleanup(&dir);
+    }
+
+    /// Nothing staged is the ordinary state of a repository. It has to be
+    /// distinguishable from a comparison that ran and found nothing, or the
+    /// reader is shown an empty overlay and told the code did not change.
+    #[test]
+    fn nothing_staged_is_no_commit_rather_than_an_empty_one() {
+        let dir = repo("staged-empty");
+        // A working-tree edit is not a staged one, so this must still be None.
+        write(&dir, "tracked.txt", "working only\n");
+
+        assert!(staged_commit(&dir).unwrap().is_none());
+        cleanup(&dir);
+    }
+
+    /// nao reads the repository it watches and does not write to it. `git
+    /// write-tree` updates the cache-tree extension of the index it is given,
+    /// so it is given a copy — asserted on the bytes, because the tree that
+    /// comes out is the same either way and would not show the difference.
+    #[test]
+    fn naming_the_index_does_not_write_to_it() {
+        let dir = repo("staged-readonly");
+        write(&dir, "tracked.txt", "staged\n");
+        git(&dir, &["add", "."]);
+
+        let index = index_path(&dir);
+        let before = std::fs::read(&index).unwrap();
+        staged_commit(&dir).unwrap().unwrap();
+        assert_eq!(
+            before,
+            std::fs::read(&index).unwrap(),
+            "the working repository's index must come out byte-identical"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_stash_third_parent_is_recognised() {
+        let dir = repo("recognised");
+        write(&dir, "brand_new.rs", "fn added() {}\n");
+        git(&dir, &["stash", "-q", "--include-untracked"]);
+
+        assert!(stashed_untracked_tree(&dir, "stash@{0}").is_some());
+        // The ordinary case: no third parent at all.
+        assert!(stashed_untracked_tree(&dir, "HEAD").is_none());
+        cleanup(&dir);
     }
 }

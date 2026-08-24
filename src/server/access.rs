@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Request, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -229,11 +229,7 @@ pub fn hello_route(
 /// same-origin browser requests or non-browser clients, and neither is what
 /// this gate is about. A page cannot forge the header, which is the whole
 /// reason it can be trusted to select who gets asked.
-async fn require_token(
-    State(policy): State<AccessPolicy>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn require_token(State(policy): State<AccessPolicy>, req: Request, next: Next) -> Response {
     let Some(expected) = policy.token() else {
         return next.run(req).await;
     };
@@ -445,7 +441,7 @@ fn normalize_origin(raw: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request, routing::get};
+    use axum::{body::Body, http::Request, routing::get, Router};
     use tower::ServiceExt;
 
     fn policy(origins: &[&str]) -> AccessPolicy {
@@ -621,8 +617,7 @@ mod tests {
             status_for(&p, "/api/graph", "https://example.com", Some("Bearer nope")).await;
         assert_eq!(header_form, 401);
 
-        let query_form =
-            status_for(&p, "/api/graph?token=nope", "https://example.com", None).await;
+        let query_form = status_for(&p, "/api/graph?token=nope", "https://example.com", None).await;
         assert_eq!(query_form, 401);
     }
 

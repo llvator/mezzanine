@@ -1,5 +1,6 @@
 <script lang="ts">
   import { selectedNode, graphData, rawEntityGraph, hiddenFiles } from '../stores/graph';
+  import { openShape } from '../stores/shape';
   import {
     qualityRows,
     qualitySummary,
@@ -9,6 +10,8 @@
     scopeHolds,
     METRIC_EXPLANATIONS,
     SMELL_META,
+    SHAPE_HINTS,
+    shapeBlockerLabel,
     SCORE_SCALE_LABEL,
     SUMMARY_METRIC_THRESHOLDS,
     thresholdStore,
@@ -26,7 +29,7 @@
   import { fetchRefactorPrompt, spawnAgentTerminal } from '../viewmodels/contextScope';
   import { connection } from '../stores/connection';
   import { copyToClipboard } from '../utils/clipboard';
-  import type { D3Node } from '../types/graph';
+  import type { D3Node, ScopeMetrics, ShapePattern } from '../types/graph';
   import Scatter from './Scatter.svelte';
 
   // Look up a parent entity's display name by its parent_id. The parent_id
@@ -61,13 +64,13 @@
     | 'score' | 'name' | 'cc' | 'cognitive' | 'nest' | 'loc' | 'params'
     | 'fan_in' | 'fan_out' | 'fields' | 'methods' | 'pub_ratio'
     | 'path' | 'entity_count' | 'callable_count' | 'scope_loc' | 'cohesion'
-    | 'scope_fan_in' | 'scope_fan_out';
+    | 'scope_fan_in' | 'scope_fan_out' | 'shape';
   let sortKey: SortKey = 'score';
   let sortDir: 'asc' | 'desc' = 'desc';
 
   // Filters
   let kindFilter: 'all' | 'callable' | 'container' = 'all';
-  let severityFilter: 'all' | 'bad' | 'warnbad' | 'cycle' | 'smell' = 'all';
+  let severityFilter: 'all' | 'bad' | 'warnbad' | 'cycle' | 'smell' | 'shape' = 'all';
   let limit = 100;
 
   function toggleSort(key: SortKey) {
@@ -112,6 +115,8 @@
     if (severityFilter === 'all') return true;
     if (severityFilter === 'cycle') return !!r.node.metrics?.in_cycle;
     if (severityFilter === 'smell') return (r.node.metrics?.smells?.length ?? 0) > 0;
+    // Shape is a folder property; entities have none to be filtered on.
+    if (severityFilter === 'shape') return true;
     const tiers: Tier[] = [
       r.tiers.cc, r.tiers.cognitive, r.tiers.nest, r.tiers.loc, r.tiers.params, r.tiers.fanOut,
       r.tiers.fieldCount, r.tiers.methodCount, r.tiers.publicFieldRatio,
@@ -316,15 +321,74 @@
       case 'cohesion': return s.cohesion ?? -1;
       case 'scope_fan_in': return s.fan_in;
       case 'scope_fan_out': return s.fan_out;
+      case 'shape': return shapeOrder(s);
       default: return 0;
     }
   }
 
+  // --- Folder shape ---
+  // Higher is better here, the reverse of every other column, so the
+  // ordering is spelled out rather than inferred from a raw number.
+  const SHAPE_RANK: Record<ShapePattern, number> = {
+    cyclic: 0, tangled: 1, hierarchical: 2, fractal: 3,
+  };
+  const SHAPE_GLYPH: Record<ShapePattern, string> = {
+    cyclic: '↺', tangled: '⤫', hierarchical: '⌄', fractal: '❖',
+  };
+  /** Sort position: tier first, compliance as the tie-break inside it. */
+  function shapeOrder(s: ScopeMetrics): number {
+    if (!s.shape) return -1;
+    return SHAPE_RANK[s.shape.pattern] * 2 + s.shape.compliance;
+  }
+  /** A folder short of hierarchical is the one with something to fix. */
+  function shapeIsPoor(s: ScopeMetrics): boolean {
+    return !!s.shape && SHAPE_RANK[s.shape.pattern] < SHAPE_RANK.hierarchical;
+  }
+  function pct(v: number | undefined): string {
+    return v == null ? '—' : `${Math.round(v * 100)}%`;
+  }
+  function shapeCell(s: ScopeMetrics): { text: string; why: string; cls: string; tip: string } {
+    const shape = s.shape;
+    if (!shape) return { text: '—', why: '', cls: '', tip: 'No shape measured for this scope.' };
+    const cls = { cyclic: 'tier-bad', tangled: 'tier-warn', hierarchical: 'tier-ok', fractal: 'tier-ok' }[shape.pattern];
+    // The failing gate rather than `compliance`, which is a weighted blend
+    // of four terms: two folders at 72% can need opposite fixes, so the
+    // blend cannot be acted on where the binding constraint can. The blend
+    // stays in the tooltip for anyone ranking rather than fixing.
+    const why = shapeBlockerLabel(shape.blocker, pct) ?? '';
+    const tip =
+      `${shape.pattern}${why ? ` — held back by ${why}` : ''}\n` +
+      `${SHAPE_HINTS[shape.pattern]}\n\n` +
+      `compliance ${pct(shape.compliance)} · acyclic ${pct(shape.acyclicity)} · ` +
+      `layered ${pct(shape.layering)} · one door in ${pct(shape.entry_concentration)} · ` +
+      `children ${pct(shape.child_compliance)}\n` +
+      // Outside the blend on purpose (ADR 0013), and printed on its own line
+      // for that reason: listed among the four it would read as one of them,
+      // and a folder at compliance 95% held back by branching 40% is exactly
+      // the case the separation exists for.
+      `branching ${pct(shape.arborescence)} — gates fractal, not part of compliance\n` +
+      `${shape.child_count} immediate ${shape.child_count === 1 ? 'child' : 'children'} — ` +
+      `gates fractal, not part of compliance`;
+    return { text: `${SHAPE_GLYPH[shape.pattern]} ${shape.pattern}`, why, cls, tip };
+  }
+
   $: activeScopeRows = (mode as Mode) === 'files' ? $fileRows : $moduleRows;
+
+  $: shapeTally = activeScopeRows.reduce(
+    (acc, r) => {
+      const p = r.scope.shape?.pattern;
+      if (p) { acc[p] += 1; acc.measured += 1; }
+      return acc;
+    },
+    { cyclic: 0, tangled: 0, hierarchical: 0, fractal: 0, measured: 0 },
+  );
 
   $: scopeFiltered = activeScopeRows.filter((r) => {
     if (severityFilter === 'all') return true;
     if (severityFilter === 'cycle') return r.scope.in_cycle;
+    // Only modules carry a shape, so in Files mode this filter has nothing
+    // to say and hides nothing rather than emptying the table.
+    if (severityFilter === 'shape') return (mode as Mode) === 'files' || shapeIsPoor(r.scope);
     const tiers: Tier[] = Object.values(r.tiers);
     if (severityFilter === 'bad') return tiers.includes('bad');
     return tiers.includes('bad') || tiers.includes('warn');
@@ -333,7 +397,7 @@
   $: scopeSorted = [...scopeFiltered].sort((a, b) => {
     // Scope tables default to sorting by score if the sort key is an
     // entity-only one (e.g. after switching modes).
-    const key: SortKey = (['score','path','entity_count','callable_count','scope_loc','cohesion','scope_fan_in','scope_fan_out'].includes(sortKey)
+    const key: SortKey = (['score','path','entity_count','callable_count','scope_loc','cohesion','scope_fan_in','scope_fan_out','shape'].includes(sortKey)
       ? sortKey
       : 'score') as SortKey;
     const va = scopeValue(a, key);
@@ -350,6 +414,25 @@
     'Score', 'Path', 'Entities', 'Callables', 'Containers', 'LOC',
     'Internal', 'External', 'Cohesion', 'Fan-in', 'Fan-out', 'Cycle',
   ];
+  // Shape is folder-only, so the modules table exports six more columns
+  // than the files one rather than six empty cells.
+  const SHAPE_COPY_HEADER = [
+    'Shape', 'Held back by', 'Compliance', 'Layered', 'Branching', 'One door in',
+  ];
+  $: scopeCopyHeader = (mode as Mode) === 'modules'
+    ? [...SCOPE_COPY_HEADER, ...SHAPE_COPY_HEADER]
+    : SCOPE_COPY_HEADER;
+  function shapeRowValues(s: ScopeMetrics): string[] {
+    if (!s.shape) return SHAPE_COPY_HEADER.map(() => '—');
+    return [
+      s.shape.pattern,
+      shapeBlockerLabel(s.shape.blocker, pct) ?? 'nothing',
+      pct(s.shape.compliance),
+      pct(s.shape.layering),
+      pct(s.shape.arborescence),
+      pct(s.shape.entry_concentration),
+    ];
+  }
   function scopeRowValues(r: ScopeRow): string[] {
     const s = r.scope;
     return [
@@ -374,9 +457,13 @@
   let scopeCopiedTimer: ReturnType<typeof setTimeout> | null = null;
   async function copyScopeRow(e: Event, r: ScopeRow) {
     e.stopPropagation();
-    const header = `| ${SCOPE_COPY_HEADER.join(' | ')} |`;
-    const sep = `| ${SCOPE_COPY_HEADER.map(() => '---').join(' | ')} |`;
-    const row = `| ${scopeRowValues(r).join(' | ')} |`;
+    const cols = scopeCopyHeader;
+    const header = `| ${cols.join(' | ')} |`;
+    const sep = `| ${cols.map(() => '---').join(' | ')} |`;
+    const values = cols === SCOPE_COPY_HEADER
+      ? scopeRowValues(r)
+      : [...scopeRowValues(r), ...shapeRowValues(r.scope)];
+    const row = `| ${values.join(' | ')} |`;
     const text = `${header}\n${sep}\n${row}\n`;
     try { await navigator.clipboard.writeText(text); } catch { /* ignore */ }
     scopeCopiedId = r.scope.path;
@@ -892,6 +979,17 @@
       <div class="qr-head">
       <section class="summary">
         <h3>{mode === 'files' ? 'Files' : 'Modules'} ({activeScopeRows.length})</h3>
+        {#if mode === 'modules' && shapeTally.measured > 0}
+          <!-- Reads as a ladder, worst first, so the two tiers with
+               something to fix sit at the front where they are read. -->
+          <p class="shape-tally" data-probe="folder-shape-tally">
+            Shape:
+            <span class="tier-bad">{shapeTally.cyclic} cyclic</span> ·
+            <span class="tier-warn">{shapeTally.tangled} tangled</span> ·
+            {shapeTally.hierarchical} hierarchical ·
+            <span class="tier-ok">{shapeTally.fractal} fractal</span>
+          </p>
+        {/if}
       </section>
 
       {#if mode === 'files'}
@@ -917,6 +1015,9 @@
             <option value="warnbad">amber + red</option>
             <option value="bad">red only</option>
             <option value="cycle">in cycle</option>
+            {#if mode === 'modules'}
+              <option value="shape">shape below hierarchical</option>
+            {/if}
           </select>
         </label>
         <label>
@@ -956,6 +1057,9 @@
               <th class="sortable num help" data-tip={explain('scope_fan_in')} aria-label={explain('scope_fan_in')} on:click={() => toggleSort('scope_fan_in')}>Fin</th>
               <th class="sortable num help" data-tip={explain('scope_fan_out')} aria-label={explain('scope_fan_out')} on:click={() => toggleSort('scope_fan_out')}>Fout</th>
               <th class="help" data-tip={explain('scope_cycle')} aria-label={explain('scope_cycle')}>Cyc</th>
+              {#if mode === 'modules'}
+                <th class="sortable help" data-tip={explain('folder_shape')} aria-label={explain('folder_shape')} on:click={() => toggleSort('shape')}>Shape {sortKey === 'shape' ? (sortDir === 'desc' ? '▼' : '▲') : ''}</th>
+              {/if}
               <th aria-label="Copy row"></th>
             </tr>
           </thead>
@@ -989,6 +1093,26 @@
                 <td class="num" title={fin.tip}>{fin.text}</td>
                 <td class="num {fout.unmeasured ? '' : tierClass(r.tiers.fanOut)}" title={fout.tip}>{fout.text}</td>
                 <td class="num">{r.scope.in_cycle ? '●' : ''}</td>
+                {#if mode === 'modules'}
+                  {@const shape = shapeCell(r.scope)}
+                  <!-- UI-108 — the cell is the door from the number to the
+                       picture. ADR 0012's premise is that the score is a
+                       claim about a drawing somebody looks at, and until
+                       this there was no way to look at it: a reader told
+                       "tangled, layered 0.61" could not find the edges that
+                       did it. The verdict is the obvious thing to click. -->
+                  <td class="shape-cell {shape.cls}" title={shape.tip} data-probe="folder-shape-cell">
+                    <button
+                      type="button"
+                      class="shape-open"
+                      title="Draw this folder's own graph — its children by level, with every edge's verdict marked"
+                      on:click={() => openShape(r.scope.path)}
+                    >
+                      {shape.text}
+                      {#if shape.why}<span class="shape-why">{shape.why}</span>{/if}
+                    </button>
+                  </td>
+                {/if}
                 <td class="copy-cell">
                   <button
                     type="button"
@@ -1401,6 +1525,47 @@
     position: relative;
     z-index: 1;
     font-weight: 700;
+  }
+
+  /* Folder shape. Left-aligned and worded rather than numeric, because the
+     tier is the reading and the percentages behind it live in the tooltip. */
+  .shape-cell {
+    font-size: 0.68rem;
+    text-align: left;
+    white-space: nowrap;
+  }
+  /* The failing gate reads as an annotation on the verdict, not as a
+     second verdict: muted and unbolded so it never competes with the tier
+     word, which is still what the eye should land on first. */
+  .shape-why {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .shape-why::before {
+    content: '· ';
+  }
+  /* The cell is a button but must not look like one: a row of tier words
+     that suddenly rendered as chrome would bury the tally beneath them.
+     It inherits everything and earns an underline on hover instead. */
+  .shape-open {
+    all: unset;
+    cursor: pointer;
+    display: block;
+    width: 100%;
+  }
+  .shape-open:hover,
+  .shape-open:focus-visible {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .shape-open:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .shape-tally {
+    margin: 2px 0 0;
+    font-size: 0.68rem;
+    color: var(--text-muted);
   }
 
   .tier-ok { color: var(--tier-ok-fg); }

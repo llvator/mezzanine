@@ -148,6 +148,11 @@ export interface DiffState {
    *  leaving out rather than implying full coverage. */
   undrawableEdges: number;
   dimOpacity: number;
+  /** How strongly the entities a rung recruited are drawn against the edits
+   *  it grew from (UI-112). Optional: a webview built before this existed
+   *  sends no such field, and the view reads its absence as "full strength",
+   *  which is what that build draws. */
+  contextOpacity?: number;
   computing: boolean;
   error?: string | null;
   /** Whether any scope is currently selected. Without one, the graph is

@@ -57,7 +57,9 @@ def f():
     assert_eq!(arms.len(), 5, "try + 2x except + else + finally");
     assert!(arms.iter().any(|e| e.tags.contains("try_body_arm")));
     assert_eq!(
-        arms.iter().filter(|e| e.tags.contains("except_arm")).count(),
+        arms.iter()
+            .filter(|e| e.tags.contains("except_arm"))
+            .count(),
         2
     );
     assert!(arms.iter().any(|e| e.tags.contains("else_arm")));
@@ -130,7 +132,10 @@ def f():
         .iter()
         .find(|r| r.target_id.ends_with("inside_except"))
         .expect("inside_except call recorded");
-    assert_eq!(inside.metadata.get("branch").map(|s| s.as_str()), Some(except_path));
+    assert_eq!(
+        inside.metadata.get("branch").map(|s| s.as_str()),
+        Some(except_path)
+    );
 }
 
 #[test]
@@ -154,11 +159,7 @@ def f():
     let inner_except = arms
         .iter()
         .filter(|e| e.tags.contains("except_arm"))
-        .find(|e| {
-            e.attributes
-                .iter()
-                .any(|a| a == "caught:KeyError")
-        })
+        .find(|e| e.attributes.iter().any(|a| a == "caught:KeyError"))
         .expect("inner KeyError arm");
     // Outer except is the second arm at module scope (c2); the
     // inner try's body and except live inside it.
@@ -361,8 +362,16 @@ def f(x):
         .into_iter()
         .map(|e| e.id.rsplit("::branch::").next().unwrap_or(""))
         .collect();
-    assert!(case_paths.contains(&"c2"), "expected c2 in {:?}", case_paths);
-    assert!(case_paths.contains(&"c3"), "expected c3 in {:?}", case_paths);
+    assert!(
+        case_paths.contains(&"c2"),
+        "expected c2 in {:?}",
+        case_paths
+    );
+    assert!(
+        case_paths.contains(&"c3"),
+        "expected c3 in {:?}",
+        case_paths
+    );
 }
 
 #[test]
@@ -402,18 +411,9 @@ def f(x):
     let result = parse(src);
     let zero_arm = case_arms(&result)
         .into_iter()
-        .find(|e| {
-            e.attributes
-                .iter()
-                .any(|a| a == "pattern:0")
-        })
+        .find(|e| e.attributes.iter().any(|a| a == "pattern:0"))
         .expect("zero-pattern arm");
-    let zero_path = zero_arm
-        .id
-        .rsplit("::branch::")
-        .next()
-        .unwrap()
-        .to_string();
+    let zero_path = zero_arm.id.rsplit("::branch::").next().unwrap().to_string();
     let inside = result
         .relationships
         .iter()
@@ -546,7 +546,10 @@ async def f(p):
 "#;
     let result = parse(src);
     let arm = with_arms(&result).into_iter().next().expect("with arm");
-    assert!(arm.tags.contains("async"), "async with should set async tag");
+    assert!(
+        arm.tags.contains("async"),
+        "async with should set async tag"
+    );
     assert!(arm.attributes.iter().any(|a| a == "async"));
 }
 
@@ -710,7 +713,11 @@ def f(xs):
         lam.name
     );
     let parent = lam.parent_id.as_deref().unwrap_or("");
-    assert!(parent.ends_with(":f"), "lambda should be parented to f, got {}", parent);
+    assert!(
+        parent.ends_with(":f"),
+        "lambda should be parented to f, got {}",
+        parent
+    );
 }
 
 #[test]
@@ -842,7 +849,10 @@ def outer():
 "#;
     let result = parse(src);
     let outer = entity_named(&result, "outer");
-    assert!(!outer.tags.contains("generator"), "outer should not be a generator");
+    assert!(
+        !outer.tags.contains("generator"),
+        "outer should not be a generator"
+    );
     let inner = entity_named(&result, "inner");
     assert!(inner.tags.contains("generator"));
 }
@@ -977,11 +987,7 @@ def f():
 "#;
     let result = parse(src);
     for n in ["a", "b", "c"] {
-        assert!(
-            local_var(&result, n).is_some(),
-            "{} should be a local",
-            n
-        );
+        assert!(local_var(&result, n).is_some(), "{} should be a local", n);
     }
 }
 
@@ -1013,8 +1019,14 @@ def f():
         .iter()
         .filter(|r| r.kind == RelationshipKind::WritesTo)
         .collect();
-    let x_writes = writes.iter().filter(|r| r.target_id.ends_with("::x")).count();
-    let y_writes = writes.iter().filter(|r| r.target_id.ends_with("::y")).count();
+    let x_writes = writes
+        .iter()
+        .filter(|r| r.target_id.ends_with("::x"))
+        .count();
+    let y_writes = writes
+        .iter()
+        .filter(|r| r.target_id.ends_with("::y"))
+        .count();
     assert_eq!(x_writes, 1, "x should have exactly one WritesTo edge");
     assert_eq!(y_writes, 1, "y should have exactly one WritesTo edge");
 }
@@ -1028,11 +1040,7 @@ def f():
 "#;
     let result = parse(src);
     for n in ["a", "b", "c"] {
-        assert!(
-            local_var(&result, n).is_some(),
-            "{} should be a local",
-            n
-        );
+        assert!(local_var(&result, n).is_some(), "{} should be a local", n);
     }
 }
 
@@ -1042,9 +1050,7 @@ fn uses_type_targets(result: &ParseResult, source_suffix: &str) -> Vec<String> {
     let mut targets: Vec<String> = result
         .relationships
         .iter()
-        .filter(|r| {
-            r.kind == RelationshipKind::UsesType && r.source_id.ends_with(source_suffix)
-        })
+        .filter(|r| r.kind == RelationshipKind::UsesType && r.source_id.ends_with(source_suffix))
         .map(|r| r.target_id.clone())
         .collect();
     targets.sort();
@@ -1130,7 +1136,11 @@ class Order:
         .filter(|r| r.kind == RelationshipKind::UsesType)
         .map(|r| r.target_id.clone())
         .collect();
-    assert_eq!(targets, vec!["Receipt"], "owning-class mentions carry no signal");
+    assert_eq!(
+        targets,
+        vec!["Receipt"],
+        "owning-class mentions carry no signal"
+    );
 }
 
 #[test]
@@ -1308,8 +1318,7 @@ def f(p):
 #[test]
 fn async_loops_score_as_their_sync_forms() {
     let sync = parse("def f(xs):\n    for x in xs:\n        use(x)\n");
-    let asynchronous =
-        parse("async def f(xs):\n    async for x in xs:\n        use(x)\n");
+    let asynchronous = parse("async def f(xs):\n    async for x in xs:\n        use(x)\n");
     assert_eq!(metrics_of(&sync, "f"), metrics_of(&asynchronous, "f"));
 }
 
@@ -1391,7 +1400,6 @@ def single() -> int:
     assert_eq!(rc("single"), None);
 }
 
-
 // ---------------------------------------------------------------------
 // PY-026 — call-chain callee names
 // ---------------------------------------------------------------------
@@ -1412,9 +1420,21 @@ def make():
     return builder.set_size("medium").set_dough("thin").build()
 "#;
     let targets = call_targets(&parse(src));
-    assert!(targets.contains(&"builder.set_size".to_string()), "{:?}", targets);
-    assert!(targets.contains(&"set_size.set_dough".to_string()), "{:?}", targets);
-    assert!(targets.contains(&"set_dough.build".to_string()), "{:?}", targets);
+    assert!(
+        targets.contains(&"builder.set_size".to_string()),
+        "{:?}",
+        targets
+    );
+    assert!(
+        targets.contains(&"set_size.set_dough".to_string()),
+        "{:?}",
+        targets
+    );
+    assert!(
+        targets.contains(&"set_dough.build".to_string()),
+        "{:?}",
+        targets
+    );
 }
 
 /// The case that fails today: a chain broken across lines used to carry
@@ -1423,9 +1443,21 @@ def make():
 fn multi_line_chain_reduces_to_the_same_names() {
     let src = "def make():\n    return (\n        builder\n        .set_size(\"medium\")\n        .set_dough(\"thin\")\n        .build()\n    )\n";
     let targets = call_targets(&parse(src));
-    assert!(targets.contains(&"builder.set_size".to_string()), "{:?}", targets);
-    assert!(targets.contains(&"set_size.set_dough".to_string()), "{:?}", targets);
-    assert!(targets.contains(&"set_dough.build".to_string()), "{:?}", targets);
+    assert!(
+        targets.contains(&"builder.set_size".to_string()),
+        "{:?}",
+        targets
+    );
+    assert!(
+        targets.contains(&"set_size.set_dough".to_string()),
+        "{:?}",
+        targets
+    );
+    assert!(
+        targets.contains(&"set_dough.build".to_string()),
+        "{:?}",
+        targets
+    );
 }
 
 /// A dot inside a string literal must never reach a name. The receiver is
@@ -1466,8 +1498,16 @@ class Child(Base):
 "#;
     let targets = call_targets(&parse(src));
     assert!(targets.contains(&"repo.find".to_string()), "{:?}", targets);
-    assert!(targets.contains(&"Child.helper".to_string()), "{:?}", targets);
-    assert!(targets.contains(&"Child.run_base".to_string()), "{:?}", targets);
+    assert!(
+        targets.contains(&"Child.helper".to_string()),
+        "{:?}",
+        targets
+    );
+    assert!(
+        targets.contains(&"Child.run_base".to_string()),
+        "{:?}",
+        targets
+    );
 }
 
 /// Whole-graph guard for the acceptance criterion: nothing the parser
@@ -1523,7 +1563,10 @@ class Plain:
     assert_eq!(config.kind, crate::models::EntityKind::Dataclass);
     assert!(config.tags.contains("typeddict"), "{:?}", config.tags);
 
-    assert_eq!(class_named(&result, "Plain").kind, crate::models::EntityKind::Class);
+    assert_eq!(
+        class_named(&result, "Plain").kind,
+        crate::models::EntityKind::Class
+    );
 }
 
 /// Abstract still outranks the record kinds.
@@ -1571,7 +1614,9 @@ class Repository:
             name
         );
     }
-    assert!(!class_named(&result, "Repository").tags.contains("exception"));
+    assert!(!class_named(&result, "Repository")
+        .tags
+        .contains("exception"));
 }
 
 /// PY-016: the base of `class Foo(Bag[int])` is `Bag`, not `Bag[int]` — the
@@ -1623,20 +1668,32 @@ class Account:
 fn slots_accept_every_literal_form() {
     let list_form = parse("class A:\n    __slots__ = [\"a\", \"b\"]\n");
     assert_eq!(
-        class_named(&list_form, "A").fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        class_named(&list_form, "A")
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["a", "b"]
     );
 
     let single = parse("class B:\n    __slots__ = \"only\"\n");
     assert_eq!(
-        class_named(&single, "B").fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        class_named(&single, "B")
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["only"]
     );
 
     // A dict's keys are the slots; the values are per-slot docstrings.
     let dict_form = parse("class C:\n    __slots__ = {\"a\": \"the a\", \"b\": \"the b\"}\n");
     assert_eq!(
-        class_named(&dict_form, "C").fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        class_named(&dict_form, "C")
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["a", "b"]
     );
 
@@ -1687,7 +1744,10 @@ registry = {}
 #[test]
 fn an_upper_case_alias_is_still_an_alias() {
     let result = parse("from typing import Dict, Any\n\nJSON = Dict[str, Any]\n");
-    assert_eq!(kind_of(&result, "JSON"), crate::models::EntityKind::TypeAlias);
+    assert_eq!(
+        kind_of(&result, "JSON"),
+        crate::models::EntityKind::TypeAlias
+    );
 }
 
 /// PEP 695 `type X = …` is its own statement kind and reached no arm before.
@@ -1700,21 +1760,31 @@ fn pep695_type_statement_becomes_a_type_alias() {
         .find(|e| e.name == "Vec3")
         .expect("Vec3");
     assert_eq!(alias.kind, crate::models::EntityKind::TypeAlias);
-    assert_eq!(alias.return_type.as_deref(), Some("tuple[float, float, float]"));
+    assert_eq!(
+        alias.return_type.as_deref(),
+        Some("tuple[float, float, float]")
+    );
 }
 
 /// PY-019: a module maintained only with `+=` used to look stateless.
 #[test]
 fn module_augmented_assignment_declares_state() {
     let result = parse("COUNTER += 1\n");
-    assert_eq!(kind_of(&result, "COUNTER"), crate::models::EntityKind::Constant);
+    assert_eq!(
+        kind_of(&result, "COUNTER"),
+        crate::models::EntityKind::Constant
+    );
 }
 
 /// Rebinding is not redeclaring — first write wins, as it does for locals.
 #[test]
 fn a_rebound_module_name_yields_one_entity() {
     let result = parse("COUNTER = 0\nCOUNTER += 1\nCOUNTER = 5\n");
-    let hits = result.entities.iter().filter(|e| e.name == "COUNTER").count();
+    let hits = result
+        .entities
+        .iter()
+        .filter(|e| e.name == "COUNTER")
+        .count();
     assert_eq!(hits, 1, "module rebinding produced duplicate entities");
 }
 
@@ -1750,7 +1820,8 @@ counter = int("3")
 /// PEP 695 bracket groups on classes and functions.
 #[test]
 fn pep695_type_parameters_are_recorded_as_generics() {
-    let result = parse("class Box[T]:\n    pass\n\ndef first[T](xs: list[T]) -> T:\n    return xs[0]\n");
+    let result =
+        parse("class Box[T]:\n    pass\n\ndef first[T](xs: list[T]) -> T:\n    return xs[0]\n");
     let generics = |name: &str| {
         result
             .entities
@@ -1773,11 +1844,19 @@ fn pep695_type_parameters_are_recorded_as_generics() {
 #[test]
 fn star_imports_are_flagged() {
     let result = parse("from foo.bar import *\nfrom baz import thing\n");
-    let star = result.imports.iter().find(|i| i.path == "foo.bar").expect("foo.bar");
+    let star = result
+        .imports
+        .iter()
+        .find(|i| i.path == "foo.bar")
+        .expect("foo.bar");
     assert!(star.is_wildcard);
     assert!(star.items.is_empty());
 
-    let named = result.imports.iter().find(|i| i.path == "baz").expect("baz");
+    let named = result
+        .imports
+        .iter()
+        .find(|i| i.path == "baz")
+        .expect("baz");
     assert!(!named.is_wildcard);
     assert_eq!(named.items, vec!["thing"]);
 }
@@ -1827,7 +1906,12 @@ if sys.version_info >= (3, 11):
     let result = parse(src);
     use crate::parser::language_parser::ImportCondition;
     let condition = |path: &str| {
-        result.imports.iter().find(|i| i.path == path).unwrap().condition
+        result
+            .imports
+            .iter()
+            .find(|i| i.path == path)
+            .unwrap()
+            .condition
     };
     assert_eq!(condition("tomllib"), Some(ImportCondition::Fallback));
     assert_eq!(condition("typing"), Some(ImportCondition::Guarded));
@@ -2064,7 +2148,11 @@ def f(x):
     };
     assert_eq!(branch_of("cond"), "l1", "condition call groups under loop");
     assert_eq!(branch_of("body"), "l1", "body call groups under loop");
-    assert_eq!(branch_of("done"), branch.name, "else call groups under its arm");
+    assert_eq!(
+        branch_of("done"),
+        branch.name,
+        "else call groups under its arm"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -2084,7 +2172,10 @@ def bump():
 "#;
     let result = parse(src);
     assert!(
-        !result.entities.iter().any(|e| e.id.contains("::local::COUNTER")),
+        !result
+            .entities
+            .iter()
+            .any(|e| e.id.contains("::local::COUNTER")),
         "global write still minted a synthetic local"
     );
     let write = result
@@ -2092,7 +2183,10 @@ def bump():
         .iter()
         .find(|r| r.kind == RelationshipKind::WritesTo && r.target_id == "COUNTER")
         .expect("WritesTo COUNTER");
-    assert_eq!(write.metadata.get("scope").map(String::as_str), Some("global"));
+    assert_eq!(
+        write.metadata.get("scope").map(String::as_str),
+        Some("global")
+    );
 }
 
 #[test]
@@ -2118,7 +2212,10 @@ def outer():
         Some("nonlocal")
     );
     // The enclosing function's own `total = 0` is still a real local.
-    assert!(result.entities.iter().any(|e| e.id.ends_with("::local::total")));
+    assert!(result
+        .entities
+        .iter()
+        .any(|e| e.id.ends_with("::local::total")));
 }
 
 /// The declaration can sit anywhere in the function, including inside an
@@ -2132,7 +2229,10 @@ def bump(flag):
     COUNTER = 1
 "#;
     let result = parse(src);
-    assert!(!result.entities.iter().any(|e| e.id.contains("::local::COUNTER")));
+    assert!(!result
+        .entities
+        .iter()
+        .any(|e| e.id.contains("::local::COUNTER")));
 }
 
 /// An inner function's `global` is its own business — it must not silence
@@ -2152,7 +2252,10 @@ def outer():
         .entities
         .iter()
         .find(|e| e.id.ends_with("::local::value") && e.id.contains("outer"));
-    assert!(outer_local.is_some(), "outer's own local write was suppressed");
+    assert!(
+        outer_local.is_some(),
+        "outer's own local write was suppressed"
+    );
 }
 
 /// Writes with no `global`/`nonlocal` declaration are untouched.
@@ -2206,7 +2309,10 @@ def pick(flag):
 fn a_value_only_ternary_emits_no_branches() {
     let result = parse("def f(x):\n    return x if x else 0\n");
     assert!(
-        !result.entities.iter().any(|e| e.tags.contains("branch_node")),
+        !result
+            .entities
+            .iter()
+            .any(|e| e.tags.contains("branch_node")),
         "value-only ternary polluted the graph with empty arms"
     );
 }
@@ -2270,7 +2376,11 @@ fn every_comprehension_form_emits_a_loop() {
     ] {
         let result = parse(src);
         assert_eq!(
-            result.entities.iter().filter(|e| e.tags.contains("loop_node")).count(),
+            result
+                .entities
+                .iter()
+                .filter(|e| e.tags.contains("loop_node"))
+                .count(),
             1,
             "no loop for {}",
             src.trim()
@@ -2307,5 +2417,103 @@ fn an_async_comprehension_is_tagged() {
         .iter()
         .find(|e| e.tags.contains("loop_node"))
         .expect("loop");
-    assert!(loop_node.tags.contains("async_loop"), "{:?}", loop_node.tags);
+    assert!(
+        loop_node.tags.contains("async_loop"),
+        "{:?}",
+        loop_node.tags
+    );
+}
+
+// ------------------------------------------------------------------
+//  Type-checking imports (AN-022)
+// ------------------------------------------------------------------
+
+/// The Python half of "the build erases this edge". `if TYPE_CHECKING:` is
+/// the one guard whose body never runs, so its imports are the same
+/// category as TypeScript's `import type`.
+#[test]
+fn a_type_checking_guard_marks_its_imports_erased() {
+    let src = r#"
+import os
+
+if TYPE_CHECKING:
+    from models import User
+
+if typing.TYPE_CHECKING:
+    from other import Thing
+"#;
+    let result = parse(src);
+    let type_only = |path: &str| {
+        result
+            .imports
+            .iter()
+            .find(|i| i.path == path)
+            .unwrap_or_else(|| panic!("no import of {}", path))
+            .is_type_only
+    };
+    assert!(!type_only("os"));
+    assert!(type_only("models"));
+    assert!(type_only("other"), "a qualified TYPE_CHECKING is the same gate");
+}
+
+/// `Guarded` is broader than this ticket. A platform or version gate is
+/// just as conditional and very much executed, so marking every `if` as
+/// erased would be the same lie the mark exists to end.
+#[test]
+fn an_ordinary_guard_is_conditional_without_being_erased() {
+    let src = r#"
+if sys.version_info >= (3, 11):
+    import tomllib
+
+try:
+    import ujson
+except ImportError:
+    pass
+"#;
+    let result = parse(src);
+    use crate::parser::language_parser::ImportCondition;
+    let import = |path: &str| {
+        result
+            .imports
+            .iter()
+            .find(|i| i.path == path)
+            .unwrap_or_else(|| panic!("no import of {}", path))
+    };
+    assert_eq!(import("tomllib").condition, Some(ImportCondition::Guarded));
+    assert!(!import("tomllib").is_type_only);
+    assert!(!import("ujson").is_type_only);
+}
+
+/// A `try` written inside the gate is still inside it. The wrapper is
+/// replaced on the way down; being erased is not.
+#[test]
+fn a_try_inside_the_type_checking_gate_is_still_erased() {
+    let src = r#"
+if TYPE_CHECKING:
+    try:
+        from models import User
+    except ImportError:
+        from fallback import User
+    from other import Thing
+"#;
+    let result = parse(src);
+    assert!(
+        result.imports.iter().all(|i| i.is_type_only),
+        "{:?}",
+        result.imports
+    );
+}
+
+/// And the gate does not leak past its own block.
+#[test]
+fn imports_after_the_type_checking_gate_are_not_erased() {
+    let src = r#"
+if TYPE_CHECKING:
+    from models import User
+
+import os
+"#;
+    let result = parse(src);
+    let os = result.imports.iter().find(|i| i.path == "os").unwrap();
+    assert!(!os.is_type_only);
 }

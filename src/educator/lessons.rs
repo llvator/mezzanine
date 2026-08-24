@@ -15,7 +15,8 @@
 //!     doesn't have to parse the body to find a sidebar label).
 //!   - `level` is required: `beginner | intermediate | advanced`.
 
-use super::rules::{LoadIssue, LoadIssueSeverity};
+use super::content_files::{split_frontmatter, walk_markdown_files};
+use super::issues::{LoadIssue, LoadIssueSeverity};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -46,9 +47,9 @@ pub struct Lesson {
 }
 
 fn parse_one(path: &Path) -> Result<Lesson> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let (frontmatter_str, body) = super::rules::split_frontmatter(&raw)
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let (frontmatter_str, body) = split_frontmatter(&raw)
         .with_context(|| format!("splitting frontmatter in {}", path.display()))?;
     let fm: Frontmatter = serde_yaml::from_str(frontmatter_str)
         .with_context(|| format!("parsing frontmatter YAML in {}", path.display()))?;
@@ -83,7 +84,7 @@ pub(super) fn load_all(content_root: &Path) -> Result<(Vec<Lesson>, Vec<LoadIssu
         }
         // Recurses into subdirectories so lessons can be organised into
         // semantic folders (`lessons/control-flow/`, `lessons/oop/`, …).
-        let lesson_files = super::scan::walk_markdown_files(&lessons_dir)
+        let lesson_files = walk_markdown_files(&lessons_dir)
             .with_context(|| format!("walking lessons dir {}", lessons_dir.display()))?;
         for path in lesson_files {
             match parse_one(&path) {

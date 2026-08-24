@@ -1,6 +1,10 @@
 import { writable } from 'svelte/store';
-import { COHESION_LEVELS, type CohesionLevel } from '../utils/forceCohesion';
+import { COHESION_LEVELS, GROUP_GRAINS, type CohesionLevel, type GroupGrain } from '../utils/forceCohesion';
 import { HUB_COUNTS, DEFAULT_HUB_COUNT } from '../viewmodels/hubs';
+import {
+  SIZE_CURVE_IDS, SIZE_BOOST_DEFAULT, SIZE_BINS_OFF, clampBoost, clampBins,
+  type SizeCurveId,
+} from '../viewmodels/sizeCurve';
 
 export type ThemeId = 'llvator' | 'obsidian' | 'nord' | 'light' | 'midnight';
 
@@ -233,7 +237,7 @@ function loadChannel<T extends string>(key: string, valid: readonly T[], fallbac
   return fallback;
 }
 
-const SIZE_CHANNEL_IDS = ['loc', 'degree', 'coupling', 'methodCount', 'wmc', 'cyclomatic', 'pagerank', 'kind'] as const;
+const SIZE_CHANNEL_IDS = ['loc', 'churn', 'degree', 'coupling', 'methodCount', 'wmc', 'cyclomatic', 'pagerank', 'kind'] as const;
 const COLOR_CHANNEL_IDS = ['severity', 'kind'] as const;
 
 export type SizeChannelId = typeof SIZE_CHANNEL_IDS[number];
@@ -251,6 +255,70 @@ sizeChannel.subscribe((v) => {
 });
 colorChannel.subscribe((v) => {
   try { localStorage.setItem(COLOR_CHANNEL_KEY, v); } catch { /* ignore */ }
+});
+
+// ── Node size shape and scale (UI-106) ──────────────────────────────────
+//
+// Two more knobs on the same channel: `sizeCurve` decides how the value range
+// is distributed over the radius range, `sizeBoost` decides how wide that
+// radius range is. Both were constants — √ over 7–34px — and both were the
+// reason a skewed repo drew nine hundred near-identical circles.
+//
+// Defaults reproduce the pre-UI-106 picture exactly (`area`, ×1): the old
+// behaviour was a reasonable default and a bad ceiling, so it stays the
+// starting point and stops being the only point.
+const SIZE_CURVE_KEY = 'nao-size-curve';
+const SIZE_BOOST_KEY = 'nao-size-boost';
+
+export const sizeCurve = writable<SizeCurveId>(
+  loadChannel(SIZE_CURVE_KEY, SIZE_CURVE_IDS, 'area'),
+);
+
+function loadBoost(): number {
+  try {
+    const v = localStorage.getItem(SIZE_BOOST_KEY);
+    // `clampBoost` also absorbs the NaN a hand-edited or half-written value
+    // would produce, so a corrupt entry falls back to ×1 rather than sizing
+    // every node NaN and drawing an empty canvas.
+    if (v !== null) return clampBoost(Number(v));
+  } catch { /* SSR / blocked storage */ }
+  return SIZE_BOOST_DEFAULT;
+}
+
+export const sizeBoost = writable<number>(loadBoost());
+
+sizeCurve.subscribe((v) => {
+  try { localStorage.setItem(SIZE_CURVE_KEY, v); } catch { /* ignore */ }
+});
+sizeBoost.subscribe((v) => {
+  try { localStorage.setItem(SIZE_BOOST_KEY, String(v)); } catch { /* ignore */ }
+});
+
+// ── Size groups (UI-110) ────────────────────────────────────────────────
+//
+// How many size classes the canvas draws, or `SIZE_BINS_OFF` for the
+// continuous scale the curve and the scale both assume.
+//
+// Continuous is the default and stays the default: it is what every earlier
+// measurement and screenshot is of, it discards nothing, and grouping is a
+// deliberate trade — within-group differences for an answerable "which group
+// is this in". A reader who wants classes asks for them.
+const SIZE_BINS_KEY = 'nao-size-bins';
+
+function loadBins(): number {
+  try {
+    const v = localStorage.getItem(SIZE_BINS_KEY);
+    // Same shape as `loadBoost`: `clampBins` absorbs NaN and out-of-range,
+    // and lands on continuous — the mode that cannot mislead.
+    if (v !== null) return clampBins(Number(v));
+  } catch { /* SSR / blocked storage */ }
+  return SIZE_BINS_OFF;
+}
+
+export const sizeBins = writable<number>(loadBins());
+
+sizeBins.subscribe((v) => {
+  try { localStorage.setItem(SIZE_BINS_KEY, String(v)); } catch { /* ignore */ }
 });
 
 // ── Folder cohesion (UI-052) ────────────────────────────────────────────
@@ -296,6 +364,32 @@ showFolderHulls.subscribe((v) => {
   try { localStorage.setItem(HULLS_KEY, String(v)); } catch { /* ignore */ }
 });
 
+// ── Group grain (UI-103) ────────────────────────────────────────────────
+//
+// Which level of the declared tree is the innermost group: the folder, or
+// the file inside it. Not a filter and not an aggregation level — the same
+// nodes are drawn either way, grouped differently.
+//
+// Default `folder`, unlike cohesion's non-off default. The argument there
+// was that the first graph anyone sees should not be the hairball the force
+// exists to break up; here the folder grain *is* the established reading of
+// every screenshot and every measurement, and the file grain answers a
+// narrower question a reader has to be looking for.
+//
+// Deliberately not part of `ViewState`: a saved view holds what decides
+// which entities reach the canvas, and cohesion and hull depth are both
+// absent for the same reason. See `f.window_mirror` on why layout stays
+// local.
+const GROUP_GRAIN_KEY = 'nao-group-grain';
+
+export const groupGrain = writable<GroupGrain>(
+  loadChannel(GROUP_GRAIN_KEY, GROUP_GRAINS, 'folder'),
+);
+
+groupGrain.subscribe((v) => {
+  try { localStorage.setItem(GROUP_GRAIN_KEY, v); } catch { /* ignore */ }
+});
+
 // ── Region tiers (UI-070) ───────────────────────────────────────────────
 //
 // How many levels of the folder tree get an outline. 1 is the UI-055
@@ -312,11 +406,20 @@ const HULL_DEPTH_KEY = 'nao-hull-depth';
 
 export const HULL_DEPTHS: readonly number[] = [1, 2, 3];
 
-export const HULL_DEPTH_LABELS: Record<number, string> = {
-  1: 'Folders',
-  2: '+ Parent',
-  3: '+ Grandparent',
-};
+/**
+ * What each tier setting is called, which depends on the grain (UI-103).
+ *
+ * `tiers` counts upward from the *innermost* region, so the same number means
+ * a different thing once the file is the innermost one. Labelling depth 1
+ * "Folders" at file grain would name the tier above the one it draws — and
+ * that mislabelling is the reason grain is a second control rather than a
+ * fourth value in `HULL_DEPTHS`.
+ */
+export function hullDepthLabels(grain: GroupGrain): Record<number, string> {
+  return grain === 'file'
+    ? { 1: 'Files', 2: '+ Folder', 3: '+ Parent' }
+    : { 1: 'Folders', 2: '+ Parent', 3: '+ Grandparent' };
+}
 
 function loadHullDepth(): number {
   try {

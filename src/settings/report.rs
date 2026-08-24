@@ -121,6 +121,12 @@ pub struct SettingsReport {
     pub warnings: Vec<Warning>,
     pub user_path: Option<PathBuf>,
     pub user_exists: bool,
+    /// Where the repo-scope file was looked for — the `.nao` of the checkout
+    /// the analyzed path lies in, which is not the analyzed path itself when
+    /// nao was pointed at a subfolder (CFG-012). Reporting the resolved path
+    /// rather than the root it was derived from is what makes that resolution
+    /// something a reader can check instead of infer.
+    ///
     /// `None` under `serve`, which analyzes many repos and reads no repo's
     /// file — there is no single path to name.
     pub repo_path: Option<PathBuf>,
@@ -199,7 +205,14 @@ fn scalar(
     present: impl Fn(&Settings) -> bool,
 ) -> Row {
     let origin = inputs.origin(key, false, present(inputs.repo()), present(inputs.user()));
-    Row { key, tier, value, sources: vec![origin], note: None, entries: Vec::new() }
+    Row {
+        key,
+        tier,
+        value,
+        sources: vec![origin],
+        note: None,
+        entries: Vec::new(),
+    }
 }
 
 /// A key an environment variable can also supply.
@@ -250,7 +263,14 @@ fn widened(
     if sources.is_empty() {
         sources.push(Origin::Default);
     }
-    Row { key, tier: Tier::Analysis, value: json!(on), sources, note, entries: Vec::new() }
+    Row {
+        key,
+        tier: Tier::Analysis,
+        value: json!(on),
+        sources,
+        note,
+        entries: Vec::new(),
+    }
 }
 
 /// One of the two glob lists.
@@ -271,7 +291,10 @@ fn patterns(
         .map(|p| (p, Origin::Default))
         .chain(of(inputs.user()).iter().map(|p| (p, Origin::UserFile)))
         .chain(of(inputs.repo()).iter().map(|p| (p, Origin::RepoFile)))
-        .map(|(value, source)| Entry { value: value.clone(), source })
+        .map(|(value, source)| Entry {
+            value: value.clone(),
+            source,
+        })
         .collect();
     let mut sources: Vec<Origin> = Vec::new();
     for e in &entries {
@@ -282,12 +305,23 @@ fn patterns(
     let value = json!(entries.iter().map(|e| e.value.clone()).collect::<Vec<_>>());
     let note = (sources.len() > 1)
         .then_some("Extends rather than replaces — every source's patterns all apply.");
-    Row { key, tier: Tier::View, value, sources, note, entries }
+    Row {
+        key,
+        tier: Tier::View,
+        value,
+        sources,
+        note,
+        entries,
+    }
 }
 
 fn analysis_rows(inputs: &Inputs) -> Vec<Row> {
     let a = &inputs.config.analysis;
-    let mut languages: Vec<String> = a.languages.iter().map(|l| l.filter_name().to_string()).collect();
+    let mut languages: Vec<String> = a
+        .languages
+        .iter()
+        .map(|l| l.filter_name().to_string())
+        .collect();
     languages.sort();
     vec![
         scalar(
@@ -296,16 +330,32 @@ fn analysis_rows(inputs: &Inputs) -> Vec<Row> {
             Tier::Analysis,
             // Empty is "no filter", which the wire spells `null` — the same
             // convention `/api/analysis/scope` already uses.
-            if languages.is_empty() { Value::Null } else { json!(languages) },
+            if languages.is_empty() {
+                Value::Null
+            } else {
+                json!(languages)
+            },
             |s| s.language.is_some(),
         ),
-        widened(inputs, "include_tests", a.include_tests, |s| s.include_tests == Some(true)),
-        widened(inputs, "include_docs", a.include_docs, |s| s.include_docs == Some(true)),
-        widened(inputs, "include_locals", a.include_locals, |s| s.include_locals == Some(true)),
+        widened(inputs, "include_tests", a.include_tests, |s| {
+            s.include_tests == Some(true)
+        }),
+        widened(inputs, "include_docs", a.include_docs, |s| {
+            s.include_docs == Some(true)
+        }),
+        widened(inputs, "include_locals", a.include_locals, |s| {
+            s.include_locals == Some(true)
+        }),
         widened(inputs, "include_external", a.include_external, |s| {
             s.include_external == Some(true)
         }),
-        scalar(inputs, "max_depth", Tier::Analysis, json!(a.max_depth), |s| s.max_depth.is_some()),
+        scalar(
+            inputs,
+            "max_depth",
+            Tier::Analysis,
+            json!(a.max_depth),
+            |s| s.max_depth.is_some(),
+        ),
         scalar(
             inputs,
             "spec_dir",
@@ -338,27 +388,51 @@ fn view_rows(inputs: &Inputs) -> Vec<Row> {
             inputs,
             "kind",
             Tier::View,
-            if kinds.is_empty() { Value::Null } else { json!(kinds) },
+            if kinds.is_empty() {
+                Value::Null
+            } else {
+                json!(kinds)
+            },
             |s| s.kind.is_some(),
         ),
-        patterns(inputs, "exclude_patterns", &defaults.analysis.exclude_patterns, |s| {
-            &s.exclude_patterns
-        }),
-        patterns(inputs, "include_patterns", &defaults.analysis.include_patterns, |s| {
-            &s.include_patterns
-        }),
+        patterns(
+            inputs,
+            "exclude_patterns",
+            &defaults.analysis.exclude_patterns,
+            |s| &s.exclude_patterns,
+        ),
+        patterns(
+            inputs,
+            "include_patterns",
+            &defaults.analysis.include_patterns,
+            |s| &s.include_patterns,
+        ),
     ]
 }
 
 fn process_rows(inputs: &Inputs) -> Vec<Row> {
     let e = inputs.effective;
     vec![
-        scalar(inputs, "port", Tier::Process, json!(e.port), |s| s.port.is_some()),
-        scalar(inputs, "debounce_ms", Tier::Process, json!(e.debounce_ms), |s| {
-            s.debounce_ms.is_some()
+        scalar(inputs, "port", Tier::Process, json!(e.port), |s| {
+            s.port.is_some()
         }),
-        scalar(inputs, "output_dir", Tier::Process, path(&e.output_dir), |s| s.output_dir.is_some()),
-        from_env(inputs, "ui_dir", "NAO_UI_DIR", path(&e.ui_dir), |s| s.ui_dir.is_some()),
+        scalar(
+            inputs,
+            "debounce_ms",
+            Tier::Process,
+            json!(e.debounce_ms),
+            |s| s.debounce_ms.is_some(),
+        ),
+        scalar(
+            inputs,
+            "output_dir",
+            Tier::Process,
+            path(&e.output_dir),
+            |s| s.output_dir.is_some(),
+        ),
+        from_env(inputs, "ui_dir", "NAO_UI_DIR", path(&e.ui_dir), |s| {
+            s.ui_dir.is_some()
+        }),
         from_env(
             inputs,
             "content_fallback",
@@ -377,8 +451,19 @@ fn path(p: &Option<PathBuf>) -> Value {
 mod tests {
     use super::*;
 
-    fn inputs<'a>(loaded: &'a Loaded, flags: &'a BTreeSet<String>, config: &'a Config, eff: &'a Effective) -> Inputs<'a> {
-        Inputs { loaded, flags, config, effective: eff, repo_scope_read: true }
+    fn inputs<'a>(
+        loaded: &'a Loaded,
+        flags: &'a BTreeSet<String>,
+        config: &'a Config,
+        eff: &'a Effective,
+    ) -> Inputs<'a> {
+        Inputs {
+            loaded,
+            flags,
+            config,
+            effective: eff,
+            repo_scope_read: true,
+        }
     }
 
     fn row<'a>(rows: &'a [Row], key: &str) -> &'a Row {
@@ -392,6 +477,31 @@ mod tests {
         SettingsReport::build(Some(root), &inputs(&loaded, &flags, &config, &eff))
     }
 
+    /// CFG-012: the report is where a reader checks *which* file was read,
+    /// so it has to name the one the loader actually opened — the checkout's,
+    /// not the subdirectory's.
+    #[test]
+    fn the_repo_file_is_named_where_the_loader_looked_for_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "nao-report-root-{}-{}",
+            std::process::id(),
+            "cfg012"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let sub = dir.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let loaded = Loaded::default();
+        let flags = named(&[]);
+        let config = Config::default();
+        let eff = Effective::default();
+        let r = SettingsReport::build(Some(&sub), &inputs(&loaded, &flags, &config, &eff));
+
+        assert_eq!(r.repo_path, Some(dir.join(".nao").join("settings.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The distinction the whole module exists for: the same 3 means
     /// different things depending on who chose it.
     #[test]
@@ -403,8 +513,14 @@ mod tests {
     #[test]
     fn the_repo_file_outranks_the_user_file() {
         let loaded = Loaded {
-            repo: Settings { max_depth: Some(5), ..Default::default() },
-            user: Settings { max_depth: Some(9), ..Default::default() },
+            repo: Settings {
+                max_depth: Some(5),
+                ..Default::default()
+            },
+            user: Settings {
+                max_depth: Some(9),
+                ..Default::default()
+            },
             warnings: Vec::new(),
         };
         let r = report(loaded, &[], Config::default());
@@ -414,7 +530,10 @@ mod tests {
     #[test]
     fn a_flag_outranks_both_files() {
         let loaded = Loaded {
-            repo: Settings { max_depth: Some(5), ..Default::default() },
+            repo: Settings {
+                max_depth: Some(5),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let r = report(loaded, &["max_depth"], Config::default());
@@ -426,8 +545,14 @@ mod tests {
     #[test]
     fn a_widened_switch_names_every_contributor() {
         let loaded = Loaded {
-            repo: Settings { include_docs: Some(true), ..Default::default() },
-            user: Settings { include_docs: Some(true), ..Default::default() },
+            repo: Settings {
+                include_docs: Some(true),
+                ..Default::default()
+            },
+            user: Settings {
+                include_docs: Some(true),
+                ..Default::default()
+            },
             warnings: Vec::new(),
         };
         let mut config = Config::default();
@@ -435,7 +560,10 @@ mod tests {
         let r = report(loaded, &[], config);
         let docs = row(&r.rows, "include_docs");
         assert_eq!(docs.sources, vec![Origin::RepoFile, Origin::UserFile]);
-        assert!(docs.note.is_some(), "a two-source merge needs its explanation");
+        assert!(
+            docs.note.is_some(),
+            "a two-source merge needs its explanation"
+        );
     }
 
     #[test]
@@ -459,7 +587,11 @@ mod tests {
         };
         let r = report(loaded, &[], Config::default());
         let ex = row(&r.rows, "exclude_patterns");
-        let mine = ex.entries.iter().find(|e| e.value == "**/from-repo/**").unwrap();
+        let mine = ex
+            .entries
+            .iter()
+            .find(|e| e.value == "**/from-repo/**")
+            .unwrap();
         assert_eq!(mine.source, Origin::RepoFile);
         assert!(
             ex.entries.iter().any(|e| e.source == Origin::Default),
@@ -473,12 +605,27 @@ mod tests {
     fn every_settable_key_is_reported() {
         let r = report(Loaded::default(), &[], Config::default());
         for key in [
-            "language", "kind", "include_tests", "include_docs", "include_locals",
-            "include_external", "max_depth", "min_weight", "port", "debounce_ms",
-            "exclude_patterns", "include_patterns", "output_dir", "spec_dir",
-            "ui_dir", "content_fallback",
+            "language",
+            "kind",
+            "include_tests",
+            "include_docs",
+            "include_locals",
+            "include_external",
+            "max_depth",
+            "min_weight",
+            "port",
+            "debounce_ms",
+            "exclude_patterns",
+            "include_patterns",
+            "output_dir",
+            "spec_dir",
+            "ui_dir",
+            "content_fallback",
         ] {
-            assert!(r.rows.iter().any(|row| row.key == key), "{key} is not reported");
+            assert!(
+                r.rows.iter().any(|row| row.key == key),
+                "{key} is not reported"
+            );
         }
     }
 

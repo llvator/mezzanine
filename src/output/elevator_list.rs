@@ -42,12 +42,14 @@ pub fn render_list(
         .iter()
         .filter(|e| e.tags.contains("elevator"))
         .collect();
-    let by_id: HashMap<String, &CodeEntity> =
-        entities.iter().map(|e| (e.id.clone(), *e)).collect();
+    let by_id: HashMap<String, &CodeEntity> = entities.iter().map(|e| (e.id.clone(), *e)).collect();
 
     let mut out = String::new();
     let total = entities.len();
-    let unresolved = entities.iter().filter(|e| e.tags.contains("unresolved")).count();
+    let unresolved = entities
+        .iter()
+        .filter(|e| e.tags.contains("unresolved"))
+        .count();
 
     let _ = writeln!(out, "# Elevator entity list");
     let header = if kind_filter == "all" || kind_filter.is_empty() {
@@ -106,8 +108,8 @@ pub fn render_list(
         // Categories, Concepts, and UI Pages render the same way
         // either way; Features and Functionalities are where
         // `--grouped` adds value.
-        let should_group = grouped
-            && matches!(kind, EntityKind::Feature | EntityKind::Functionality);
+        let should_group =
+            grouped && matches!(kind, EntityKind::Feature | EntityKind::Functionality);
         if should_group {
             render_grouped_section(label, kind, &group, &by_id, &mut out);
         } else {
@@ -121,17 +123,18 @@ pub fn render_list(
 /// Flat alphabetic listing — the original behaviour. Used for
 /// Categories, Concepts, UI Pages, and for everything when
 /// `--grouped` is off.
-fn render_flat_section(
-    label: &str,
-    kind: EntityKind,
-    group: &[&&CodeEntity],
-    out: &mut String,
-) {
+fn render_flat_section(label: &str, kind: EntityKind, group: &[&&CodeEntity], out: &mut String) {
     let mut sorted: Vec<&&CodeEntity> = group.iter().copied().collect();
     sorted.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
     let _ = writeln!(out, "## {} ({})", label, sorted.len());
     for e in sorted {
-        let _ = writeln!(out, "  {} {}{}", kind_marker(kind), e.qualified_name, unresolved_tag(e));
+        let _ = writeln!(
+            out,
+            "  {} {}{}",
+            kind_marker(kind),
+            e.qualified_name,
+            unresolved_tag(e)
+        );
     }
     let _ = writeln!(out);
 }
@@ -178,7 +181,13 @@ fn render_grouped_section(
         let _ = writeln!(out, "{}", header);
         entries.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
         for e in entries {
-            let _ = writeln!(out, "  {} {}{}", kind_marker(kind), e.qualified_name, unresolved_tag(e));
+            let _ = writeln!(
+                out,
+                "  {} {}{}",
+                kind_marker(kind),
+                e.qualified_name,
+                unresolved_tag(e)
+            );
         }
     }
     if !orphans.is_empty() {
@@ -186,7 +195,13 @@ fn render_grouped_section(
         let mut sorted_orphans: Vec<&&CodeEntity> = orphans.iter().copied().collect();
         sorted_orphans.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
         for e in sorted_orphans {
-            let _ = writeln!(out, "  {} {}{}", kind_marker(kind), e.qualified_name, unresolved_tag(e));
+            let _ = writeln!(
+                out,
+                "  {} {}{}",
+                kind_marker(kind),
+                e.qualified_name,
+                unresolved_tag(e)
+            );
         }
     }
     let _ = writeln!(out);
@@ -200,7 +215,10 @@ fn parent_chain<'a>(
 ) -> Vec<&'a CodeEntity> {
     let mut chain: Vec<&CodeEntity> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cursor = entity.parent_id.as_ref().and_then(|p| by_id.get(p).copied());
+    let mut cursor = entity
+        .parent_id
+        .as_ref()
+        .and_then(|p| by_id.get(p).copied());
     while let Some(p) = cursor {
         if !seen.insert(p.id.clone()) {
             break; // cycle guard — shouldn't happen but be safe
@@ -265,7 +283,10 @@ pub fn render_stats(result: &AnalysisResult) -> String {
 
     let mut out = String::new();
     let total = entities.len();
-    let unresolved = entities.iter().filter(|e| e.tags.contains("unresolved")).count();
+    let unresolved = entities
+        .iter()
+        .filter(|e| e.tags.contains("unresolved"))
+        .count();
     let rel_count = result.relationships.len();
 
     let _ = writeln!(out, "# Elevator stats");

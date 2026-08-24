@@ -53,7 +53,14 @@ pub(super) fn emit_case_arm_entity(
     pattern: Option<&str>,
     result: &mut ParseResult,
 ) {
-    emit_branch_entity(caller_id, parent_branch, branch_path, body_node, path, result);
+    emit_branch_entity(
+        caller_id,
+        parent_branch,
+        branch_path,
+        body_node,
+        path,
+        result,
+    );
     if let Some(entity) = result.entities.last_mut() {
         entity.tags.insert("case_arm".to_string());
         if let Some(p) = pattern {
@@ -113,7 +120,14 @@ pub(super) fn emit_try_arm_entity(
     caught: Option<&str>,
     result: &mut ParseResult,
 ) {
-    emit_branch_entity(caller_id, parent_branch, branch_path, body_node, path, result);
+    emit_branch_entity(
+        caller_id,
+        parent_branch,
+        branch_path,
+        body_node,
+        path,
+        result,
+    );
     if let Some(entity) = result.entities.last_mut() {
         entity.tags.insert("try_arm".to_string());
         entity.tags.insert(format!("{}_arm", arm_kind));

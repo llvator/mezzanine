@@ -418,7 +418,10 @@ fn scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
 /// Truncate to `max` chars with an ellipsis (char-safe).
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     } else {
         s.to_string()
     }
@@ -703,8 +706,7 @@ fn set_attr(res: &mut K8sResourceInfo, key: &str, value: &str) {
 fn unquote(s: &str) -> &str {
     let b = s.as_bytes();
     if b.len() >= 2
-        && ((b[0] == b'"' && b[b.len() - 1] == b'"')
-            || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
     {
         &s[1..s.len() - 1]
     } else {
@@ -854,7 +856,10 @@ fn parse_playbook(path: &Path, content: &str, rel: &str, result: &mut ParseResul
     let doc: serde_yaml::Value = match serde_yaml::from_str(content) {
         Ok(v) => v,
         Err(e) => {
-            result.add_warning(format!("ansible: YAML parse error in playbook {}: {}", rel, e));
+            result.add_warning(format!(
+                "ansible: YAML parse error in playbook {}: {}",
+                rel, e
+            ));
             return;
         }
     };
@@ -906,7 +911,11 @@ fn include_role_name(task: &serde_yaml::Value) -> Option<&str> {
         "ansible.builtin.include_role",
         "ansible.builtin.import_role",
     ] {
-        if let Some(name) = task.get(key).and_then(|v| v.get("name")).and_then(|v| v.as_str()) {
+        if let Some(name) = task
+            .get(key)
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+        {
             return Some(name);
         }
     }
@@ -1033,9 +1042,11 @@ fn ensure_entity(id: &str, name: &str, kind: EntityKind, path: &Path, result: &m
 /// Add a relationship unless an identical (source, target, kind) edge is
 /// already present — role usages repeat across plays.
 fn add_unique_rel(rel: Relationship, result: &mut ParseResult) {
-    if result.relationships.iter().any(|r| {
-        r.source_id == rel.source_id && r.target_id == rel.target_id && r.kind == rel.kind
-    }) {
+    if result
+        .relationships
+        .iter()
+        .any(|r| r.source_id == rel.source_id && r.target_id == rel.target_id && r.kind == rel.kind)
+    {
         return;
     }
     result.add_relationship(rel);

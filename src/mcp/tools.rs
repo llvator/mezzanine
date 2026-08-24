@@ -13,7 +13,10 @@ use serde_json::Value;
 
 use crate::diff;
 use crate::graph::DependencyGraph;
-use crate::models::{CodeEntity, EntityKind, Precision, Relationship, RelationshipKind, SmellKind};
+use crate::models::{
+    CodeEntity, EntityKind, FolderShape, Precision, Relationship, RelationshipKind,
+    ShapePattern, SmellKind,
+};
 use crate::Analyzer;
 
 use super::McpServer;
@@ -73,7 +76,11 @@ fn resolve_path(server: &McpServer, args: &Value) -> Result<PathBuf> {
         server.root.clone()
     } else {
         let p = PathBuf::from(raw);
-        if p.is_absolute() { p } else { server.root.join(p) }
+        if p.is_absolute() {
+            p
+        } else {
+            server.root.join(p)
+        }
     };
     candidate
         .canonicalize()
@@ -97,20 +104,34 @@ fn analyze_with_tests(
     include_tests: bool,
 ) -> Result<Arc<DependencyGraph>> {
     let key = (path.to_path_buf(), include_tests);
-    let gen_at_start = server.generation.load(std::sync::atomic::Ordering::Acquire);
-    if let Some(hit) = server.graph_cache.lock().unwrap().get(&key) {
-        if hit.gen == gen_at_start {
-            eprintln!("⚡ graph cache hit for {}", path.display());
-            return Ok(hit.graph.clone());
-        }
-    }
-
     let (dir, single_file) = if path.is_file() {
         (path.parent().unwrap_or(path).to_path_buf(), Some(path))
     } else {
         (path.to_path_buf(), None)
     };
-    let config = diff::build_analysis_config(&dir, include_tests, &server.languages);
+    // The settings file is the *repo's*, so it is read at `server.root` and
+    // the result re-rooted at whatever subdirectory this call asked for.
+    // Building it at `dir` instead would leave `map path="src"` — the
+    // ordinary way an agent narrows — reading a `.nao/settings.json` that
+    // has to sit under `src/` to exist at all (CFG-011).
+    //
+    // Built before the cache is consulted rather than after, because the
+    // scope it resolves to is half the cache key: `rooted_at` moves
+    // `root_path` only, which `scope_fingerprint` does not read, so the
+    // digest is the server's scope for this `include_tests` either way.
+    let config = diff::rooted_at(
+        &diff::build_analysis_config(&server.root, include_tests, &server.languages),
+        &dir,
+    );
+    let scope = super::scope_id(&config);
+    let gen_at_start = server.generation.load(std::sync::atomic::Ordering::Acquire);
+    if let Some(hit) = server.graph_cache.lock().unwrap().get(&key) {
+        if hit.serves(gen_at_start, &scope) {
+            eprintln!("⚡ graph cache hit for {}", path.display());
+            return Ok(hit.graph.clone());
+        }
+    }
+
     let mut analyzer = Analyzer::new(config);
     let result = match single_file {
         Some(f) => analyzer.analyze_file(f)?,
@@ -123,12 +144,22 @@ fn analyze_with_tests(
         if cache.len() >= 8 {
             cache.clear();
         }
-        cache.insert(key, crate::mcp::CachedGraph { graph: graph.clone(), gen: gen_at_start });
+        cache.insert(
+            key,
+            crate::mcp::CachedGraph {
+                graph: graph.clone(),
+                gen: gen_at_start,
+                scope,
+            },
+        );
     }
     Ok(graph)
 }
 
-fn rel_path(file: &Path, base: &Path) -> String {
+/// `pub(super)` because the push-mode findings join two graphs by
+/// path and the base one lives in a throwaway worktree, so it has the
+/// same root-stripping problem this solves for the reports here.
+pub(super) fn rel_path(file: &Path, base: &Path) -> String {
     // When the analyzed target is itself a file, relativize against its
     // directory so the file keeps its name instead of becoming "".
     let base = if base.is_file() {
@@ -136,7 +167,10 @@ fn rel_path(file: &Path, base: &Path) -> String {
     } else {
         base
     };
-    file.strip_prefix(base).unwrap_or(file).display().to_string()
+    file.strip_prefix(base)
+        .unwrap_or(file)
+        .display()
+        .to_string()
 }
 
 /// Edge label carrying its AN-004 precision marker, e.g. `calls ·exact` /
@@ -153,13 +187,20 @@ fn edge_label(r: &Relationship) -> String {
 }
 
 fn smell_labels(smells: &[SmellKind]) -> String {
-    smells.iter().map(|s| s.label()).collect::<Vec<_>>().join(", ")
+    smells
+        .iter()
+        .map(|s| s.label())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Compact one-line metric annotation for an entity.
 fn metric_suffix(e: &CodeEntity) -> String {
     let m = &e.metrics;
-    let mut parts = vec![format!("L{}", e.span.start.line + 1), format!("loc {}", m.loc)];
+    let mut parts = vec![
+        format!("L{}", e.span.start.line + 1),
+        format!("loc {}", m.loc),
+    ];
     if let Some(c) = m.cyclomatic {
         parts.push(format!("cx {}", c));
     }
@@ -229,8 +270,7 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
         .clamp(1, 3);
 
     let graph = analyze(server, &path)?;
-    let by_id: HashMap<&str, &CodeEntity> =
-        graph.entities().map(|e| (e.id.as_str(), e)).collect();
+    let by_id: HashMap<&str, &CodeEntity> = graph.entities().map(|e| (e.id.as_str(), e)).collect();
 
     // Top-level entities grouped by file, ordered by path then line.
     let is_top_level = |e: &CodeEntity| match &e.parent_id {
@@ -246,7 +286,10 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
         if !is_listed(e) || !is_top_level(e) {
             continue;
         }
-        files.entry(rel_path(&e.file_path, &path)).or_default().push(e);
+        files
+            .entry(rel_path(&e.file_path, &path))
+            .or_default()
+            .push(e);
     }
     for entities in files.values_mut() {
         entities.sort_by_key(|e| e.span.start.line);
@@ -310,7 +353,11 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
 
 pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
     let path = resolve_path(server, args)?;
-    let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 50) as usize;
+    let top = args
+        .get("top")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
 
     let graph = analyze(server, &path)?;
     let entity_row = |e: &CodeEntity| {
@@ -331,7 +378,11 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
         .entities()
         .filter(|e| is_listed(e) && !e.metrics.smells.is_empty())
         .collect();
-    smelly.sort_by(|a, b| b.metrics.composite_score.total_cmp(&a.metrics.composite_score));
+    smelly.sort_by(|a, b| {
+        b.metrics
+            .composite_score
+            .total_cmp(&a.metrics.composite_score)
+    });
     body.push(format!("## Smells ({})", smelly.len()));
     let mut hints_used: HashSet<SmellKind> = HashSet::new();
     for e in smelly.iter().take(top) {
@@ -341,7 +392,10 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
         }
     }
     if smelly.len() > top {
-        body.push(format!("… and {} more smelly entities.", smelly.len() - top));
+        body.push(format!(
+            "… and {} more smelly entities.",
+            smelly.len() - top
+        ));
     }
     if !hints_used.is_empty() {
         body.push(String::new());
@@ -360,7 +414,11 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
         .entities()
         .filter(|e| is_listed(e) && e.metrics.composite_score > 0.0)
         .collect();
-    ranked.sort_by(|a, b| b.metrics.composite_score.total_cmp(&a.metrics.composite_score));
+    ranked.sort_by(|a, b| {
+        b.metrics
+            .composite_score
+            .total_cmp(&a.metrics.composite_score)
+    });
     for e in ranked.iter().take(top) {
         body.push(format!(
             "- [{:.2}] {} `{}` — {}:{} ({})",
@@ -392,13 +450,307 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
     for members in cycles.iter().take(5) {
         let names: Vec<&str> = members.iter().take(8).map(|e| e.name.as_str()).collect();
         let ellipsis = if members.len() > 8 { " → …" } else { "" };
-        body.push(format!("- {} → {}{}", names.join(" → "), names[0], ellipsis));
+        body.push(format!(
+            "- {} → {}{}",
+            names.join(" → "),
+            names[0],
+            ellipsis
+        ));
     }
     if cycles.len() > 5 {
         body.push(format!("… and {} more cycles.", cycles.len() - 5));
     }
 
+    body.extend(folder_shape_section(&graph, &path, top));
+
     Ok(cap_lines(body, "Call `quality` with a narrower `path`."))
+}
+
+/// Folders whose shape tier moved between the two graphs.
+///
+/// This is what closes the loop `reshape` opens: it proposes one rung, and
+/// the only honest confirmation that the rung was climbed is the tier
+/// moving when measured the same way. Silent when nothing moved, which is
+/// the normal case for a change that was not about organisation.
+///
+/// Regressions lead. A folder that fell a tier is news whether or not the
+/// change set out to touch its shape, and it is the half a reader would
+/// otherwise never look for.
+fn shape_moves(
+    base_graph: &DependencyGraph,
+    head_graph: &DependencyGraph,
+    roots: (&Path, &Path),
+) -> Vec<String> {
+    // Keyed on the path each side reports relative to its own root: the
+    // base lives in a worktree, so the raw paths never match.
+    let by_folder = |graph: &DependencyGraph, root: &Path| -> HashMap<String, ShapePattern> {
+        graph
+            .module_metrics()
+            .iter()
+            .filter_map(|m| {
+                let shape = m.metrics.shape.as_ref()?;
+                Some((rel_path(Path::new(&m.path), root), shape.pattern))
+            })
+            .collect()
+    };
+    let before = by_folder(base_graph, roots.0);
+    let after = by_folder(head_graph, roots.1);
+
+    let mut moves: Vec<(String, ShapePattern, ShapePattern)> = after
+        .iter()
+        .filter_map(|(path, now)| {
+            let was = *before.get(path)?;
+            (was != *now).then(|| (path.clone(), was, *now))
+        })
+        .collect();
+    if moves.is_empty() {
+        return Vec::new();
+    }
+    // Worse first, then by how far it fell, then by path so two identical
+    // runs print identically.
+    moves.sort_by(|a, b| {
+        let fell = |m: &(String, ShapePattern, ShapePattern)| m.2 < m.1;
+        fell(b)
+            .cmp(&fell(a))
+            .then(a.2.cmp(&b.2))
+            .then(a.0.cmp(&b.0))
+    });
+
+    let mut body = vec![
+        String::new(),
+        format!("## Folder shape moved ({})", moves.len()),
+    ];
+    for (path, was, now) in &moves {
+        let arrow = if now < was { "⚠ fell" } else { "improved" };
+        body.push(format!(
+            "- {} {}: {} → {}",
+            if path.is_empty() { "(root)" } else { path },
+            arrow,
+            was.label(),
+            now.label(),
+        ));
+    }
+    body.push(
+        "_Higher is better: cyclic < tangled < hierarchical < fractal. Call \
+         `reshape` on a folder to see the graph behind its verdict._"
+            .to_string(),
+    );
+    body
+}
+
+/// How readable a picture each folder in the assessed area draws, and
+/// which of them is worth sending anybody at.
+///
+/// Ranked lists of the folders short of `fractal`, because the ones
+/// already there need no action and listing them would bury the ones that
+/// do. The tally line above the list is what says how much was left out.
+///
+/// Split in two before it is ranked, which is the part that matters for
+/// planning. Worst-first alone answers "where is the organisation worst"
+/// — the question `quality` exists for — and it is the wrong order to
+/// *work* in. The ladder is recursive: a folder held back by a tangled
+/// subfolder cannot move until that subfolder does, so an agent sent at
+/// it spends the session against a gate that will not open however well
+/// it reads the parent's drawing. The folders whose blocker is in their
+/// own drawing go first, deepest-first, because clearing a deep one can
+/// clear a parent's child gate as well as its own.
+fn folder_shape_section(graph: &DependencyGraph, base: &Path, top: usize) -> Vec<String> {
+    let scored: Vec<(String, &FolderShape)> = graph
+        .module_metrics()
+        .iter()
+        .filter_map(|m| {
+            let shape = m.metrics.shape.as_ref()?;
+            Some((rel_path(Path::new(&m.path), base), shape))
+        })
+        .collect();
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    let mut body = shape_tally(&scored);
+    let short: Vec<(String, &FolderShape)> = scored
+        .into_iter()
+        .filter(|(_, s)| s.pattern < ShapePattern::Fractal)
+        .collect();
+    if short.is_empty() {
+        body.push("Every folder holds its shape.".to_string());
+        return body;
+    }
+
+    // A sub-fractal folder always carries a blocker — `folder_shape` has
+    // an invariant test for exactly that — so the `None` arm here is
+    // unreachable rather than a judgement. It falls to the second group,
+    // which is the harmless side: nothing is claimed to be actionable.
+    let (mut here, mut elsewhere): (Vec<_>, Vec<_>) = short
+        .into_iter()
+        .partition(|(_, s)| s.blocker.is_some_and(|b| b.is_own_drawing()));
+    here.sort_by(work_order);
+    elsewhere.sort_by(worst_first);
+
+    body.extend(start_here_group(&here, top));
+    body.extend(blocked_group(&elsewhere));
+    body.extend(verdict_hints(here.iter().chain(elsewhere.iter())));
+    body
+}
+
+/// How many "answered elsewhere" folders are worth naming. Well below
+/// `top`: they are not the work list, and the count plus the gates they
+/// are waiting on is the whole message.
+const SHAPE_BLOCKED_SHOWN: usize = 5;
+
+/// The distribution across the ladder, and the two clauses a reader needs
+/// before any number below it can be read the right way round.
+fn shape_tally(scored: &[(String, &FolderShape)]) -> Vec<String> {
+    let count = |p: ShapePattern| scored.iter().filter(|(_, s)| s.pattern == p).count();
+    vec![
+        String::new(),
+        format!("## Folder shape ({} folders)", scored.len()),
+        format!(
+            "{} cyclic · {} tangled · {} hierarchical · {} fractal — \
+             how readable the graph each folder draws is, over its immediate \
+             children with each subfolder as one node. Higher is better here, \
+             unlike the scores above. `branching` gates fractal but is not \
+             part of `compliance`, so a folder can blend well and still be \
+             held back by it.",
+            count(ShapePattern::Cyclic),
+            count(ShapePattern::Tangled),
+            count(ShapePattern::Hierarchical),
+            count(ShapePattern::Fractal),
+        ),
+    ]
+}
+
+/// Deepest first, then worst, then by path so two identical runs print
+/// identically (AN-002).
+///
+/// Depth leads because it is the only key that encodes the ladder's
+/// recursion: a folder's child gates are answered by work done below it,
+/// so the deep folders are the ones whose improvement can move more than
+/// themselves. Among folders at the same depth nothing links them, and
+/// worst-first is the ordinary reading.
+fn work_order(
+    a: &(String, &FolderShape),
+    b: &(String, &FolderShape),
+) -> std::cmp::Ordering {
+    depth(&b.0).cmp(&depth(&a.0)).then_with(|| worst_first(a, b))
+}
+
+fn worst_first(
+    a: &(String, &FolderShape),
+    b: &(String, &FolderShape),
+) -> std::cmp::Ordering {
+    a.1.pattern
+        .cmp(&b.1.pattern)
+        .then(a.1.compliance.total_cmp(&b.1.compliance))
+        .then(a.0.cmp(&b.0))
+}
+
+/// How many folders down from the assessed root, counted in path
+/// components so the assessed root itself is 0.
+fn depth(rel: &str) -> usize {
+    Path::new(rel).components().count()
+}
+
+fn start_here_group(here: &[(String, &FolderShape)], top: usize) -> Vec<String> {
+    if here.is_empty() {
+        return vec![
+            String::new(),
+            "### Start here — none".to_string(),
+            "Every folder short of fractal is waiting on something outside its own \
+             drawing. Work the deepest ones on the list below first: their gates are \
+             answered one level down."
+                .to_string(),
+        ];
+    }
+    let mut body = vec![
+        String::new(),
+        format!(
+            "### Start here — the blocker is in the folder's own drawing ({} of {} shown)",
+            here.len().min(top),
+            here.len()
+        ),
+        "Deepest first: clearing one of these can also clear a parent's child gate."
+            .to_string(),
+    ];
+    body.extend(here.iter().take(top).map(|(dir, s)| shape_line(dir, s)));
+    body
+}
+
+fn blocked_group(elsewhere: &[(String, &FolderShape)]) -> Vec<String> {
+    if elsewhere.is_empty() {
+        return Vec::new();
+    }
+    let mut body = vec![
+        String::new(),
+        format!(
+            "### Answered elsewhere — blocked on children, callers or the blend ({})",
+            elsewhere.len()
+        ),
+        "Nothing in these folders' own drawings is the thing holding them back. \
+         Re-measure them after the work above, not before."
+            .to_string(),
+    ];
+    body.extend(elsewhere.iter().take(SHAPE_BLOCKED_SHOWN).map(|(dir, s)| {
+        format!(
+            "- [{}] {} — held back by {}",
+            s.pattern.label(),
+            if dir.is_empty() { "(root)" } else { dir },
+            s.blocker
+                .map_or_else(|| "nothing".to_string(), |b| b.summary()),
+        )
+    }));
+    if elsewhere.len() > SHAPE_BLOCKED_SHOWN {
+        body.push(format!(
+            "… and {} more.",
+            elsewhere.len() - SHAPE_BLOCKED_SHOWN
+        ));
+    }
+    body
+}
+
+/// The blocker leads: it is the one part of the line that names something
+/// to go and change, where the five numbers behind it leave the reader to
+/// work out which gate failed.
+fn shape_line(dir: &str, shape: &FolderShape) -> String {
+    format!(
+        "- [{}] {} — held back by {}; compliance {:.2}, acyclic {:.2}, layered {}, \
+         branching {}, one-door-in {}, {} children",
+        shape.pattern.label(),
+        if dir.is_empty() { "(root)" } else { dir },
+        shape
+            .blocker
+            .map_or_else(|| "nothing".to_string(), |b| b.summary()),
+        shape.compliance,
+        shape.acyclicity,
+        ratio(shape.layering),
+        ratio(shape.arborescence),
+        ratio(shape.entry_concentration),
+        shape.child_count,
+    )
+}
+
+fn verdict_hints<'a>(
+    listed: impl Iterator<Item = &'a (String, &'a crate::models::FolderShape)>,
+) -> Vec<String> {
+    let mut hints: Vec<ShapePattern> = listed
+        .map(|(_, s)| s.pattern)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    hints.sort();
+    let mut body = vec![String::new(), "What each verdict means:".to_string()];
+    body.extend(
+        hints
+            .iter()
+            .map(|pattern| format!("- {}: {}", pattern.label(), pattern.hint())),
+    );
+    body
+}
+
+/// An unmeasured ratio prints as an em dash rather than a flattering
+/// zero — the same convention the coupling counts follow (UI-091).
+fn ratio(value: Option<f32>) -> String {
+    value.map_or_else(|| "—".to_string(), |v| format!("{v:.2}"))
 }
 
 // ------------------------------------------------------------------
@@ -431,7 +783,12 @@ fn signature(e: &CodeEntity) -> String {
         .unwrap_or_default();
     match e.kind {
         EntityKind::Function | EntityKind::Method => {
-            format!("{}({}){}", one_line(&e.name), cap_chars(&params, MAX_PARAMS_CHARS), ret)
+            format!(
+                "{}({}){}",
+                one_line(&e.name),
+                cap_chars(&params, MAX_PARAMS_CHARS),
+                ret
+            )
         }
         _ => one_line(&e.name),
     }
@@ -524,7 +881,10 @@ pub fn context(server: &McpServer, args: &Value) -> Result<String> {
         body.push(format!("… and {} more.", used_by.len() - 40));
     }
 
-    Ok(cap_lines(body, "Target a narrower entity, or use `impact` for positions only."))
+    Ok(cap_lines(
+        body,
+        "Target a narrower entity, or use `impact` for positions only.",
+    ))
 }
 
 // ------------------------------------------------------------------
@@ -665,17 +1025,15 @@ pub fn impact(server: &McpServer, args: &Value) -> Result<String> {
         .filter(|p| is_listed(p))
         .map(|p| format!(" (in {} `{}`)", p.kind.display_name(), p.name))
         .unwrap_or_default();
-    let mut body = vec![
-        format!(
-            "# Impact of {} `{}`{} — {}:{} ({})",
-            target.kind.display_name(),
-            target.name,
-            context,
-            rel_path(&target.file_path, root),
-            target.span.start.line + 1,
-            metric_suffix(target)
-        ),
-    ];
+    let mut body = vec![format!(
+        "# Impact of {} `{}`{} — {}:{} ({})",
+        target.kind.display_name(),
+        target.name,
+        context,
+        rel_path(&target.file_path, root),
+        target.span.start.line + 1,
+        metric_suffix(target)
+    )];
 
     // Outgoing: what the target relies on — its contract with the rest
     // of the code. Sorted by position for stable output.
@@ -797,7 +1155,10 @@ pub fn impact(server: &McpServer, args: &Value) -> Result<String> {
         }
     }
 
-    Ok(cap_lines(body, "Lower `depth` or target a narrower entity."))
+    Ok(cap_lines(
+        body,
+        "Lower `depth` or target a narrower entity.",
+    ))
 }
 
 /// BFS over incoming dependency edges. Level 0 holds direct dependents,
@@ -835,8 +1196,8 @@ fn transitive_dependents<'g>(
                 // A hop breaks confidence only when it's a heuristic call
                 // edge — the case AN-004 exists to flag. Structural/exact
                 // edges preserve it.
-                let hop_trusted =
-                    !(r.kind == RelationshipKind::Calls && r.precision == Some(Precision::Heuristic));
+                let hop_trusted = !(r.kind == RelationshipKind::Calls
+                    && r.precision == Some(Precision::Heuristic));
                 if visited.insert(&e.id) {
                     exact_path.insert(&e.id, src_exact && hop_trusted);
                     next.push(e);
@@ -967,8 +1328,16 @@ fn find_by_name<'g>(
 
 pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
     let path = resolve_path(server, args)?;
-    let days = args.get("days").and_then(|v| v.as_u64()).unwrap_or(180).clamp(1, 3650);
-    let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 50) as usize;
+    let days = args
+        .get("days")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(180)
+        .clamp(1, 3650);
+    let top = args
+        .get("top")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
 
     diff::verify_git_repo(&server.root)?;
 
@@ -1009,7 +1378,11 @@ pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
             .unwrap_or(abs)
             .display()
             .to_string();
-        let agg = files.entry(repo_rel).or_insert(FileAgg { weighted: 0.0, loc: 0, worst: e });
+        let agg = files.entry(repo_rel).or_insert(FileAgg {
+            weighted: 0.0,
+            loc: 0,
+            worst: e,
+        });
         agg.weighted += e.metrics.composite_score as f64 * e.metrics.loc.max(1) as f64;
         agg.loc += e.metrics.loc.max(1) as u64;
         if e.metrics.composite_score > agg.worst.metrics.composite_score {
@@ -1050,7 +1423,10 @@ pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
         ));
     }
     if ranked.len() > top {
-        body.push(format!("… and {} more files with non-zero risk.", ranked.len() - top));
+        body.push(format!(
+            "… and {} more files with non-zero risk.",
+            ranked.len() - top
+        ));
     }
 
     Ok(cap_lines(body, "Raise `top` or narrow `path`."))
@@ -1129,7 +1505,11 @@ pub fn tests_for(server: &McpServer, args: &Value) -> Result<String> {
         body.push(String::new());
         body.push(format!("{} ({} tests)", file, hits.len()));
         for (hops, e) in hits {
-            let directness = if hops == 1 { "direct".to_string() } else { format!("{} hops", hops) };
+            let directness = if hops == 1 {
+                "direct".to_string()
+            } else {
+                format!("{} hops", hops)
+            };
             // Flag tests reached only through a heuristic call edge — the
             // path may be a false positive (AN-004). Exact-path tests carry
             // no marker to keep the common case quiet.
@@ -1149,7 +1529,10 @@ pub fn tests_for(server: &McpServer, args: &Value) -> Result<String> {
         }
     }
 
-    Ok(cap_lines(body, "Lower `depth` to see only the closest tests."))
+    Ok(cap_lines(
+        body,
+        "Lower `depth` to see only the closest tests.",
+    ))
 }
 
 // ------------------------------------------------------------------
@@ -1214,10 +1597,18 @@ pub fn trace(server: &McpServer, args: &Value) -> Result<String> {
                         .find(|(e, _)| e.id == window[1])
                         .map(|(_, r)| edge_label(r))
                         .unwrap_or_else(|| "→".to_string());
-                    let node = graph.get_entity(&window[0]).map(render_node).unwrap_or_default();
+                    let node = graph
+                        .get_entity(&window[0])
+                        .map(render_node)
+                        .unwrap_or_default();
                     chain.push(format!("{} —{}→", node, label));
                 }
-                chain.push(graph.get_entity(path_ids.last().unwrap()).map(render_node).unwrap_or_default());
+                chain.push(
+                    graph
+                        .get_entity(path_ids.last().unwrap())
+                        .map(render_node)
+                        .unwrap_or_default(),
+                );
                 body.push(format!("- {}", chain.join(" ")));
             }
         }
@@ -1257,7 +1648,24 @@ pub fn trace(server: &McpServer, args: &Value) -> Result<String> {
         }
     }
 
-    Ok(cap_lines(body, "Raise `max_hops` if endpoints are far apart."))
+    Ok(cap_lines(
+        body,
+        "Raise `max_hops` if endpoints are far apart.",
+    ))
+}
+
+/// Record `pred` as a predecessor of a node, unless it is already one.
+///
+/// The dependency graph is a multigraph: a pair joined by both a `Calls` and
+/// a `UsesFn` edge is offered twice by `dependencies`. A predecessor stored
+/// twice reconstructs into two byte-identical chains, so `trace` spends its
+/// three-route budget printing one route repeatedly (MCP-019). Predecessor
+/// lists are a handful of entries, so the linear scan is cheaper than the
+/// wasted expansion it prevents.
+fn record_predecessor(preds: &mut Vec<String>, pred: &str) {
+    if !preds.iter().any(|p| p == pred) {
+        preds.push(pred.to_string());
+    }
 }
 
 /// BFS over outgoing dependency edges, reconstructing up to `max_paths`
@@ -1271,7 +1679,8 @@ fn shortest_paths(
     max_paths: usize,
 ) -> Vec<Vec<String>> {
     use std::collections::VecDeque;
-    // parents: for each visited node, all predecessors at minimal depth.
+    // parents: for each visited node, its distinct predecessors at minimal
+    // depth — see `record_predecessor` for why distinct.
     let mut parents: HashMap<String, Vec<String>> = HashMap::new();
     let mut depth_of: HashMap<String, usize> = HashMap::new();
     depth_of.insert(from.to_string(), 0);
@@ -1290,7 +1699,7 @@ fn shortest_paths(
                     queue.push_back(next.id.clone());
                 }
                 Some(&nd) if nd == d + 1 => {
-                    parents.get_mut(&next.id).unwrap().push(id.clone());
+                    record_predecessor(parents.entry(next.id.clone()).or_default(), &id);
                 }
                 _ => {}
             }
@@ -1389,7 +1798,11 @@ fn is_stopword(token: &str) -> bool {
 
 /// Weight one query token contributes to the score.
 fn token_weight(token: &str) -> f64 {
-    if is_stopword(token) { STOPWORD_WEIGHT } else { 1.0 }
+    if is_stopword(token) {
+        STOPWORD_WEIGHT
+    } else {
+        1.0
+    }
 }
 
 /// Total weight of a set of tokens.
@@ -1446,7 +1859,11 @@ pub fn similar(server: &McpServer, args: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("`query` is required"))?;
     let kind_filter = args.get("kind").and_then(|v| v.as_str());
-    let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 50) as usize;
+    let top = args
+        .get("top")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
 
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() {
@@ -1462,7 +1879,8 @@ pub fn similar(server: &McpServer, args: &Value) -> Result<String> {
         .filter(|e| is_listed(e))
         .filter(|e| kind_filter.is_none_or(|k| e.kind.display_name().eq_ignore_ascii_case(k)))
         .filter_map(|e| {
-            score_against(e, &query_tokens, query_weight).map(|(score, matched)| (score, matched, e))
+            score_against(e, &query_tokens, query_weight)
+                .map(|(score, matched)| (score, matched, e))
         })
         .filter(|(score, _, _)| *score >= SIMILARITY_FLOOR)
         .collect();
@@ -1487,7 +1905,10 @@ pub fn similar(server: &McpServer, args: &Value) -> Result<String> {
         ));
     }
 
-    Ok(cap_lines(body, "Refine the query with more specific words."))
+    Ok(cap_lines(
+        body,
+        "Refine the query with more specific words.",
+    ))
 }
 
 // ------------------------------------------------------------------
@@ -1521,7 +1942,7 @@ fn is_deletable(e: &CodeEntity) -> bool {
 }
 
 /// Languages whose parsers read visibility off an explicit source
-/// modifier (`pub`, `public`, Python's underscore convention), so `Public`
+/// modifier (`pub`, `public`, the Python/Dart underscore convention), so `Public`
 /// means "declared public" rather than "no information". Everywhere else —
 /// TypeScript's `export`, Go's capitalization — every entity is parsed as
 /// `Public`, and using that as a public-API filter would empty the report
@@ -1530,7 +1951,15 @@ fn records_visibility(lang: crate::models::file_info::Language) -> bool {
     use crate::models::file_info::Language as L;
     matches!(
         lang,
-        L::Rust | L::Java | L::Kotlin | L::CSharp | L::Scala | L::Swift | L::PHP | L::Python
+        L::Rust
+            | L::Java
+            | L::Kotlin
+            | L::Dart
+            | L::CSharp
+            | L::Scala
+            | L::Swift
+            | L::PHP
+            | L::Python
     )
 }
 
@@ -1573,11 +2002,38 @@ fn is_entry_point(graph: &DependencyGraph, e: &CodeEntity) -> bool {
         .any(|(_, r)| r.kind == RelationshipKind::Implements)
 }
 
+/// True when the entity's contract is declared against a type this graph
+/// does not hold — a TypeScript `class P extends Plugin` where `Plugin`
+/// comes from a package the analysis never walked. Whoever constructs `P`
+/// and calls `onload` lives on the other side of that declaration, so
+/// fan-in 0 is no more evidence of death here than it is for a Rust trait
+/// impl, which `is_entry_point` already spares for exactly this reason.
+///
+/// Scoped to the extending class and its members. A helper function
+/// sitting beside a plugin subclass is ordinary code, and so is a member
+/// the source declares `private`: it cannot be reached through the base
+/// type, so nothing outside the tree can be calling it and its fan-in
+/// still means what it says. (Unlike a bare `Public`, which TypeScript
+/// hands out by default — see `records_visibility` — an explicit
+/// `private` carries information.)
+fn declares_out_of_tree_contract(graph: &DependencyGraph, e: &CodeEntity) -> bool {
+    if graph.has_external_supertype(&e.id) {
+        return true;
+    }
+    if e.visibility == crate::models::Visibility::Private {
+        return false;
+    }
+    graph
+        .parent(&e.id)
+        .is_some_and(|p| graph.has_external_supertype(&p.id))
+}
+
 /// Why a fan-in-0 entity is *not* reported. Counted and stated in the
 /// header, so the report narrows visibly rather than silently.
 enum Excluded {
     Test,
     EntryPoint,
+    ExternalBase,
     PublicApi,
 }
 
@@ -1586,6 +2042,8 @@ fn exclusion_reason(graph: &DependencyGraph, e: &CodeEntity) -> Option<Excluded>
         Some(Excluded::Test)
     } else if is_entry_point(graph, e) {
         Some(Excluded::EntryPoint)
+    } else if declares_out_of_tree_contract(graph, e) {
+        Some(Excluded::ExternalBase)
     } else if is_public_api(e) {
         Some(Excluded::PublicApi)
     } else {
@@ -1597,6 +2055,7 @@ fn exclusion_reason(graph: &DependencyGraph, e: &CodeEntity) -> Option<Excluded>
 struct ExcludedCounts {
     tests: usize,
     entry_points: usize,
+    external_base: usize,
     public_api: usize,
     mentioned: usize,
 }
@@ -1611,7 +2070,9 @@ type OwnSpans<'a> = HashMap<&'a str, Vec<(&'a Path, usize, usize)>>;
 /// body of the entity it names: a function mentioning itself, not a use.
 fn in_own_definition(own: &OwnSpans, token: &str, file: &Path, line: usize) -> bool {
     own.get(token).is_some_and(|spans| {
-        spans.iter().any(|(p, from, to)| *p == file && line >= *from && line <= *to)
+        spans
+            .iter()
+            .any(|(p, from, to)| *p == file && line >= *from && line <= *to)
     })
 }
 
@@ -1646,7 +2107,10 @@ fn scan_mentions(
 /// It is deliberately one-directional — it only ever *suppresses* a
 /// candidate. A name in a comment or a same-named symbol elsewhere costs
 /// a true positive; nothing here can invent one.
-fn names_mentioned_elsewhere(candidates: &[&CodeEntity], files: &BTreeSet<&Path>) -> HashSet<String> {
+fn names_mentioned_elsewhere(
+    candidates: &[&CodeEntity],
+    files: &BTreeSet<&Path>,
+) -> HashSet<String> {
     let wanted: HashSet<&str> = candidates.iter().map(|e| e.name.as_str()).collect();
     if wanted.is_empty() {
         return HashSet::new();
@@ -1689,6 +2153,7 @@ fn collect_candidates<'g>(
         match exclusion_reason(graph, e) {
             Some(Excluded::Test) => counts.tests += 1,
             Some(Excluded::EntryPoint) => counts.entry_points += 1,
+            Some(Excluded::ExternalBase) => counts.external_base += 1,
             Some(Excluded::PublicApi) => {
                 counts.public_api += 1;
                 if include_public {
@@ -1703,8 +2168,9 @@ fn collect_candidates<'g>(
 
 /// `dead_code` — entities nothing in the project references, grouped by
 /// file. Fan-in 0 minus the populations for which "no dependent" is not
-/// evidence of death: tests, entry points, public API, and names the
-/// source mentions somewhere the graph cannot see.
+/// evidence of death: tests, entry points, members of a class whose base
+/// type is outside the tree, public API, and names the source mentions
+/// somewhere the graph cannot see.
 pub fn dead_code(server: &McpServer, args: &Value) -> Result<String> {
     let scope = resolve_path(server, args)?;
     let include_public = args
@@ -1738,11 +2204,20 @@ pub fn dead_code(server: &McpServer, args: &Value) -> Result<String> {
         if mentioned.contains(&e.name) {
             counts.mentioned += 1;
         } else {
-            by_file.entry(rel_path(&e.file_path, root)).or_default().push(e);
+            by_file
+                .entry(rel_path(&e.file_path, root))
+                .or_default()
+                .push(e);
         }
     }
 
-    Ok(render_dead_code(by_file, &counts, &scope, root, include_public))
+    Ok(render_dead_code(
+        by_file,
+        &counts,
+        &scope,
+        root,
+        include_public,
+    ))
 }
 
 /// Render the grouped report: files worst-first, each with its count.
@@ -1775,6 +2250,10 @@ fn render_dead_code(
     let mut excluded = vec![
         format!("{} test", counts.tests),
         format!("{} entry point", counts.entry_points),
+        format!(
+            "{} in a class extending a base outside the tree",
+            counts.external_base
+        ),
         format!(
             "{} public API{}",
             counts.public_api,
@@ -1871,10 +2350,15 @@ pub fn assess_change(server: &McpServer, args: &Value) -> Result<String> {
         None => {
             let base_dir = std::env::temp_dir().join(format!("nao-mcp-base-{}", from_sha));
             diff::create_worktree(repo_root, &base_dir, base_ref)?;
-            let analyzed = diff::analyze_at(
-                &base_dir,
-                server.include_tests,
-                &server.languages,
+            // The working tree's settings decide the scope of both sides.
+            // Analyzing the checkout on its own terms would read the
+            // `.nao/settings.json` committed at `base_ref`, and a base that
+            // excludes a different set of files than the head reports every
+            // file the two disagree about as added or removed.
+            let scope =
+                diff::build_analysis_config(repo_root, server.include_tests, &server.languages);
+            let analyzed = diff::analyze_with(
+                diff::rooted_at(&scope, &base_dir),
                 &format!("base ({})", from_sha),
             );
             diff::remove_worktree(repo_root, &base_dir);
@@ -1891,10 +2375,22 @@ pub fn assess_change(server: &McpServer, args: &Value) -> Result<String> {
     // Head side: the working tree — shares the warm root-graph cache.
     let head_graph = analyze(server, repo_root)?;
     let result = diff::compute_diff(
-        &base_graph, &head_graph, &base_dir, repo_root, &from_sha, "working",
+        &base_graph,
+        &head_graph,
+        &base_dir,
+        repo_root,
+        &from_sha,
+        "working",
     );
     let changed = diff::changed_files(repo_root, base_ref);
-    Ok(render_change_report(&result, &base_graph, &head_graph, base_ref, &changed))
+    Ok(render_change_report(
+        &result,
+        &base_graph,
+        &head_graph,
+        base_ref,
+        &changed,
+        (&base_dir, repo_root),
+    ))
 }
 
 /// `overview` — the project's domain-level shape from its Elevator
@@ -1924,7 +2420,11 @@ pub fn overview(server: &McpServer, args: &Value) -> Result<String> {
         _ => crate::output::elevator_text_renderer::render_elevator_text(&graph, None),
     };
 
-    let full = format!("{}\n{}", crate::output::elevator_text_renderer::LEGEND, body);
+    let full = format!(
+        "{}\n{}",
+        crate::output::elevator_text_renderer::LEGEND,
+        body
+    );
     let lines: Vec<String> = full.lines().map(String::from).collect();
     Ok(cap_lines(
         lines,
@@ -1961,7 +2461,10 @@ pub(super) fn path_under(cr: &str, changed: &str) -> bool {
 fn spec_claims(head_graph: &DependencyGraph, changed: &[String]) -> Vec<String> {
     use crate::output::elevator_code_map::{parse_cr_attr, short_ref};
     let mut lines: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for e in head_graph.entities().filter(|e| e.tags.contains("elevator")) {
+    for e in head_graph
+        .entities()
+        .filter(|e| e.tags.contains("elevator"))
+    {
         for attr in &e.attributes {
             let Some((_, cr_path)) = parse_cr_attr(attr) else {
                 continue;
@@ -1984,6 +2487,10 @@ pub(crate) fn render_change_report(
     head_graph: &DependencyGraph,
     base_ref: &str,
     changed_files: &[String],
+    // Where each side was analysed, base first. The base graph comes from a
+    // throwaway worktree, so joining the two by path means stripping each
+    // root before comparing.
+    roots: (&Path, &Path),
 ) -> String {
     let s = &result.summary;
     let base_by_id: HashMap<&str, &CodeEntity> =
@@ -1992,7 +2499,10 @@ pub(crate) fn render_change_report(
         head_graph.entities().map(|e| (e.id.as_str(), e)).collect();
 
     let mut body = vec![
-        format!("# Change assessment: {} ({}) → working tree", base_ref, result.from_ref),
+        format!(
+            "# Change assessment: {} ({}) → working tree",
+            base_ref, result.from_ref
+        ),
         format!(
             "{} added, {} removed, {} modified ({} source, {} coupling-only), {} unchanged",
             s.added, s.removed, s.modified, s.modified_source, s.modified_impact, s.unchanged
@@ -2005,7 +2515,11 @@ pub(crate) fn render_change_report(
     let skip_row = |d: &diff::EntityDiff| {
         head_by_id
             .get(d.entity_id.as_str())
-            .or_else(|| d.base_entity_id.as_deref().and_then(|id| base_by_id.get(id)))
+            .or_else(|| {
+                d.base_entity_id
+                    .as_deref()
+                    .and_then(|id| base_by_id.get(id))
+            })
             .map(|e| !is_listed(e))
             .unwrap_or(d.kind == "File")
     };
@@ -2029,12 +2543,19 @@ pub(crate) fn render_change_report(
             .map(|e| e.metrics.smells.iter().copied().collect())
             .unwrap_or_default();
         for smell in head_smells.difference(&base_smells) {
-            new_smells.push(format!("- {} on {} — {}", smell.label(), row_loc(d), smell.hint()));
+            new_smells.push(format!(
+                "- {} on {} — {}",
+                smell.label(),
+                row_loc(d),
+                smell.hint()
+            ));
         }
         for smell in base_smells.difference(&head_smells) {
             resolved_smells.push(format!("- {} on {}", smell.label(), row_loc(d)));
         }
     }
+    body.extend(shape_moves(base_graph, head_graph, roots));
+
     if !new_smells.is_empty() {
         body.push(String::new());
         body.push(format!("## ⚠ New smells ({})", new_smells.len()));
@@ -2079,11 +2600,18 @@ pub(crate) fn render_change_report(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let deltas = if deltas.is_empty() { "source changed, metrics stable".to_string() } else { deltas };
+        let deltas = if deltas.is_empty() {
+            "source changed, metrics stable".to_string()
+        } else {
+            deltas
+        };
         body.push(format!("- {}: {}", row_loc(d), deltas));
     }
     if modified.len() > 40 {
-        body.push(format!("… and {} more modified entities.", modified.len() - 40));
+        body.push(format!(
+            "… and {} more modified entities.",
+            modified.len() - 40
+        ));
     }
 
     // Added entities, with metrics so oversized newcomers stand out.
@@ -2116,7 +2644,10 @@ pub(crate) fn render_change_report(
         body.push(format!("- {}", row_loc(d)));
     }
     if removed.len() > 30 {
-        body.push(format!("… and {} more removed entities.", removed.len() - 30));
+        body.push(format!(
+            "… and {} more removed entities.",
+            removed.len() - 30
+        ));
     }
 
     // Coupling ripples: entities whose fan-in/out shifted without source edits.
@@ -2144,11 +2675,17 @@ pub(crate) fn render_change_report(
             body.push(line.clone());
         }
         if claims.len() > 25 {
-            body.push(format!("… and {} more claimed entities.", claims.len() - 25));
+            body.push(format!(
+                "… and {} more claimed entities.",
+                claims.len() - 25
+            ));
         }
     }
 
-    cap_lines(body, "Narrow the change or assess per-folder with `quality`.")
+    cap_lines(
+        body,
+        "Narrow the change or assess per-folder with `quality`.",
+    )
 }
 
 #[cfg(test)]
@@ -2206,7 +2743,87 @@ mod tests {
             graph_cache: std::sync::Mutex::new(HashMap::new()),
             base_cache: std::sync::Mutex::new(HashMap::new()),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            shape_baselines: Default::default(),
         }
+    }
+
+    fn shaped(pattern: ShapePattern, blocker: crate::models::ShapeBlocker) -> FolderShape {
+        FolderShape {
+            pattern,
+            compliance: 0.80,
+            acyclicity: 1.0,
+            layering: Some(0.80),
+            arborescence: Some(0.80),
+            entry_concentration: Some(0.80),
+            child_compliance: Some(0.90),
+            child_count: 4,
+            blocker: Some(blocker),
+        }
+    }
+
+    /// Depth beats severity, which is the whole reordering. A tangled
+    /// leaf leads a cyclic root because the root's child gates are
+    /// answered by work done below it, and an agent handed the root first
+    /// spends the session against a gate that will not open.
+    #[test]
+    fn the_work_list_leads_with_the_deepest_folder() {
+        let leaf = shaped(ShapePattern::Tangled, crate::models::ShapeBlocker::Layering(0.5));
+        let root = shaped(ShapePattern::Cyclic, crate::models::ShapeBlocker::Cycles(0.2));
+        let mut folders = [
+            (String::new(), &root),
+            ("src/parser/rust".to_string(), &leaf),
+            ("src".to_string(), &leaf),
+        ];
+        folders.sort_by(work_order);
+        let order: Vec<&str> = folders.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(order, vec!["src/parser/rust", "src", ""]);
+    }
+
+    /// Among folders nothing links, the ordinary reading returns.
+    #[test]
+    fn siblings_fall_back_to_worst_first() {
+        let cyclic = shaped(ShapePattern::Cyclic, crate::models::ShapeBlocker::Cycles(0.2));
+        let tangled = shaped(ShapePattern::Tangled, crate::models::ShapeBlocker::Layering(0.5));
+        let mut folders = [
+            ("src/b".to_string(), &tangled),
+            ("src/a".to_string(), &cyclic),
+        ];
+        folders.sort_by(work_order);
+        assert_eq!(folders[0].0, "src/a", "cyclic outranks tangled at equal depth");
+    }
+
+    /// The root is depth 0 and must not be mistaken for a leaf by a
+    /// component count that counts the empty string as one.
+    #[test]
+    fn the_assessed_root_is_depth_zero() {
+        assert_eq!(depth(""), 0);
+        assert_eq!(depth("src"), 1);
+        assert_eq!(depth("src/parser/rust"), 3);
+    }
+
+    /// An empty work list has to say so rather than print a heading over
+    /// nothing: "every remaining folder is waiting on something else" is
+    /// a different situation from "there is no work", and an agent that
+    /// cannot tell them apart invents work.
+    #[test]
+    fn an_empty_work_list_says_where_the_work_went() {
+        let out = start_here_group(&[], 10).join("\n");
+        assert!(out.contains("Start here — none"), "{out}");
+        assert!(out.contains("waiting on something outside"), "{out}");
+    }
+
+    /// The blocked group is a count and a sample, never the whole list —
+    /// it is not the work list and must not compete with it for lines.
+    #[test]
+    fn the_blocked_group_truncates_and_says_by_how_much() {
+        let blocked = shaped(ShapePattern::Hierarchical, crate::models::ShapeBlocker::Entry(0.5));
+        let folders: Vec<(String, &FolderShape)> = (0..SHAPE_BLOCKED_SHOWN + 3)
+            .map(|i| (format!("src/f{i}"), &blocked))
+            .collect();
+        let out = blocked_group(&folders).join("\n");
+        assert!(out.contains(&format!("({})", SHAPE_BLOCKED_SHOWN + 3)), "{out}");
+        assert!(out.contains("… and 3 more."), "{out}");
+        assert!(!out.contains("src/f7"), "past the cap must not print: {out}");
     }
 
     const LONG_DESC: &str = "Structured prompt with enforced step sequence and typed responses, callable mid-conversation by an author.";
@@ -2233,7 +2850,10 @@ fu f.protocol.creation {
         let dir = TmpDir::new("overview-map");
         dir.write("spec.elv", SPEC);
         let out = overview(&server_for(&dir), &json!({})).unwrap();
-        assert!(out.contains("# Elevator spec format"), "legend missing:\n{out}");
+        assert!(
+            out.contains("# Elevator spec format"),
+            "legend missing:\n{out}"
+        );
         assert!(out.contains("c library"), "category missing:\n{out}");
         assert!(out.contains("f protocol"), "feature missing:\n{out}");
     }
@@ -2244,8 +2864,14 @@ fu f.protocol.creation {
         dir.write("spec.elv", SPEC);
         let out = overview(&server_for(&dir), &json!({"focus": "f.protocol"})).unwrap();
         assert!(out.contains("← target"), "target marker missing:\n{out}");
-        assert!(out.contains(LONG_DESC), "focus must render `d:` unclipped:\n{out}");
-        assert!(out.contains("[cr: src/protocol/]"), "code reference missing:\n{out}");
+        assert!(
+            out.contains(LONG_DESC),
+            "focus must render `d:` unclipped:\n{out}"
+        );
+        assert!(
+            out.contains("[cr: src/protocol/]"),
+            "code reference missing:\n{out}"
+        );
     }
 
     #[test]
@@ -2253,7 +2879,10 @@ fu f.protocol.creation {
         let dir = TmpDir::new("overview-empty");
         dir.write("main.rs", "fn main() {}\n");
         let err = overview(&server_for(&dir), &json!({})).unwrap_err();
-        assert!(err.to_string().contains("No Elevator"), "unexpected error: {err:#}");
+        assert!(
+            err.to_string().contains("No Elevator"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
@@ -2306,9 +2935,66 @@ fu f.protocol.creation {
         // And a repo with no spec at all yields nothing.
         let bare = TmpDir::new("claims-nospec");
         bare.write("main.rs", "fn main() {}\n");
-        let bare_graph =
-            analyze(&server_for(&bare), &bare.0.canonicalize().unwrap()).unwrap();
+        let bare_graph = analyze(&server_for(&bare), &bare.0.canonicalize().unwrap()).unwrap();
         assert!(spec_claims(&bare_graph, &changed).is_empty());
+    }
+
+    // ---- settings (CFG-011) ---------------------------------------
+
+    /// CFG-011, end to end. `nao mcp` was the one entry point that never
+    /// opened `.nao/settings.json`, with no warning and no way to tell from
+    /// a response which configuration produced it — so a repo that had asked
+    /// nao to leave a directory out got a `map` listing it.
+    #[test]
+    fn map_leaves_out_what_the_repo_settings_file_excludes() {
+        let dir = TmpDir::new("settings-excludes");
+        dir.write("src/core/tree.rs", "pub fn kept_by_the_scope() {}\n");
+        dir.write(
+            "src/generated/schema.rs",
+            "pub fn excluded_by_the_file() {}\n",
+        );
+        dir.write(
+            ".nao/settings.json",
+            r#"{"exclude_patterns": ["**/generated/**"]}"#,
+        );
+
+        let out = map(&code_server_for(&dir), &json!({})).unwrap();
+        assert!(
+            out.contains("kept_by_the_scope"),
+            "the fixture never analyzed at all:\n{out}"
+        );
+        assert!(
+            !out.contains("excluded_by_the_file"),
+            "the settings file was ignored — the excluded file is in the map:\n{out}"
+        );
+    }
+
+    /// The same file, reached through a subdirectory `path` — the ordinary
+    /// way an agent narrows. The settings file is the repo's, so it is read
+    /// at the server root; looked for under the analyzed path instead, it
+    /// would have to sit inside `src/` to exist at all.
+    #[test]
+    fn a_subdirectory_map_is_held_to_the_same_scope() {
+        let dir = TmpDir::new("settings-excludes-subdir");
+        dir.write("src/core/tree.rs", "pub fn kept_by_the_scope() {}\n");
+        dir.write(
+            "src/generated/schema.rs",
+            "pub fn excluded_by_the_file() {}\n",
+        );
+        dir.write(
+            ".nao/settings.json",
+            r#"{"exclude_patterns": ["**/generated/**"]}"#,
+        );
+
+        let out = map(&code_server_for(&dir), &json!({"path": "src"})).unwrap();
+        assert!(
+            out.contains("kept_by_the_scope"),
+            "the subdirectory never analyzed at all:\n{out}"
+        );
+        assert!(
+            !out.contains("excluded_by_the_file"),
+            "narrowing to a subdirectory dropped the repo's scope:\n{out}"
+        );
     }
 
     // ---- similar (MCP-012) ----------------------------------------
@@ -2317,7 +3003,10 @@ fu f.protocol.creation {
     /// walker's test heuristic excludes wholesale. A fixture made of real
     /// source has to opt back in or the graph comes back empty.
     fn code_server_for(dir: &TmpDir) -> McpServer {
-        McpServer { include_tests: true, ..server_for(dir) }
+        McpServer {
+            include_tests: true,
+            ..server_for(dir)
+        }
     }
 
     /// The review fixture: one right answer, plus the `toRef`-class
@@ -2363,16 +3052,25 @@ export function reportDiff(state: {
             &json!({"query": "resolve git ref to sha", "top": 6}),
         )
         .unwrap();
-        assert!(out.contains("resolve_git_ref"), "lost the real match:\n{out}");
+        assert!(
+            out.contains("resolve_git_ref"),
+            "lost the real match:\n{out}"
+        );
         assert!(
             !out.contains("toRef"),
             "a hit carried by the word `to` survived:\n{out}"
         );
         // `top: 6` is a ceiling, not a quota — the tail is not padded.
         let hits = out.lines().filter(|l| l.starts_with("- [")).count();
-        assert!(hits <= 2, "expected the match and at most one other:\n{out}");
+        assert!(
+            hits <= 2,
+            "expected the match and at most one other:\n{out}"
+        );
         // The trace still names the tokens responsible.
-        assert!(out.contains("matched: git, ref, resolve"), "trace lost:\n{out}");
+        assert!(
+            out.contains("matched: git, ref, resolve"),
+            "trace lost:\n{out}"
+        );
     }
 
     #[test]
@@ -2439,12 +3137,24 @@ fn main() {
         let dir = dead_code_fixture("dead-code-basic");
         let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
 
-        assert!(out.contains("`orphan`"), "the one dead function is missing:\n{out}");
+        assert!(
+            out.contains("`orphan`"),
+            "the one dead function is missing:\n{out}"
+        );
         // A caller exists — the graph resolves it.
-        assert!(!out.contains("`live`"), "a called function was reported:\n{out}");
+        assert!(
+            !out.contains("`live`"),
+            "a called function was reported:\n{out}"
+        );
         // `main` is an entry point, `fmt` satisfies a trait contract.
-        assert!(!out.contains("`main`"), "the program entry was reported:\n{out}");
-        assert!(!out.contains("`fmt`"), "a trait impl method was reported:\n{out}");
+        assert!(
+            !out.contains("`main`"),
+            "the program entry was reported:\n{out}"
+        );
+        assert!(
+            !out.contains("`fmt`"),
+            "a trait impl method was reported:\n{out}"
+        );
         // `pub` means a caller can live outside this analysis entirely.
         assert!(
             !out.contains("`exported_but_unused`"),
@@ -2452,7 +3162,10 @@ fn main() {
         );
         // The header states each population it filtered rather than
         // shrinking the list silently.
-        assert!(out.contains("entry point"), "exclusion counts missing:\n{out}");
+        assert!(
+            out.contains("entry point"),
+            "exclusion counts missing:\n{out}"
+        );
     }
 
     #[test]
@@ -2472,6 +3185,67 @@ fn main() {
         );
     }
 
+    /// The Obsidian shape. `Plugin` is imported from a package that is
+    /// not in the tree, so the host calling `onload` is invisible to the
+    /// graph and every lifecycle method on the subclass has fan-in 0.
+    /// Five of five candidates on a real plugin were this.
+    #[test]
+    fn dead_code_spares_overrides_of_a_base_class_outside_the_tree() {
+        let dir = TmpDir::with_prefix("nao-mcp-fixture", "dead-code-external-base");
+        dir.write(
+            "main.ts",
+            r#"
+import { Plugin } from "obsidian";
+
+export default class MyPlugin extends Plugin {
+    async onload() {
+        this.wire();
+    }
+
+    async onunload() {}
+
+    private wire() {}
+
+    private neverCalled() {}
+}
+
+function looseHelper() {}
+"#,
+        );
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+
+        // The entry point of the whole plugin, and its teardown.
+        assert!(
+            !out.contains("`onload`"),
+            "the plugin entry point was reported dead:\n{out}"
+        );
+        assert!(
+            !out.contains("`onunload`"),
+            "a lifecycle hook was reported dead:\n{out}"
+        );
+        // The class itself is handed to the host by the same declaration.
+        assert!(
+            !out.contains("`MyPlugin`"),
+            "the subclass itself was reported dead:\n{out}"
+        );
+        // `private` cannot be reached through the base type, so fan-in 0
+        // still means what it says — the report must not go silent.
+        assert!(
+            out.contains("`neverCalled`"),
+            "a private method nothing calls was swallowed:\n{out}"
+        );
+        // The rule is scoped to the class, not to the file.
+        assert!(
+            out.contains("`looseHelper`"),
+            "a free function beside the subclass was swallowed:\n{out}"
+        );
+        // Narrowed visibly, like every other exclusion.
+        assert!(
+            out.contains("in a class extending a base outside the tree"),
+            "the exclusion is not stated in the header:\n{out}"
+        );
+    }
+
     #[test]
     fn dead_code_include_public_reveals_the_unused_export() {
         let dir = dead_code_fixture("dead-code-public");
@@ -2480,18 +3254,21 @@ fn main() {
             out.contains("`exported_but_unused`"),
             "include_public did not reveal public API:\n{out}"
         );
-        assert!(out.contains(", public"), "public rows are not marked:\n{out}");
+        assert!(
+            out.contains(", public"),
+            "public rows are not marked:\n{out}"
+        );
     }
 
     #[test]
     fn dead_code_groups_by_file_with_a_per_file_count() {
         let dir = dead_code_fixture("dead-code-grouping");
-        dir.write(
-            "extra.rs",
-            "fn first_orphan() {}\nfn second_orphan() {}\n",
-        );
+        dir.write("extra.rs", "fn first_orphan() {}\nfn second_orphan() {}\n");
         let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
-        assert!(out.contains("extra.rs (2)"), "per-file count missing:\n{out}");
+        assert!(
+            out.contains("extra.rs (2)"),
+            "per-file count missing:\n{out}"
+        );
         assert!(out.contains("app.rs (1)"), "per-file count missing:\n{out}");
         // Worst file first, so the heaviest cleanup target leads.
         let extra = out.find("extra.rs (2)").unwrap();
@@ -2502,7 +3279,10 @@ fn main() {
     #[test]
     fn dead_code_says_so_when_there_is_nothing_to_report() {
         let dir = TmpDir::with_prefix("nao-mcp-fixture", "dead-code-clean");
-        dir.write("app.rs", "fn live(x: i32) -> i32 { x }\n\nfn main() {\n    live(1);\n}\n");
+        dir.write(
+            "app.rs",
+            "fn live(x: i32) -> i32 { x }\n\nfn main() {\n    live(1);\n}\n",
+        );
         let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
         assert!(out.contains("None —"), "clean run is not stated:\n{out}");
     }
@@ -2562,7 +3342,10 @@ mod locality_tests {
         dir.write("app.rs", "pub fn lonely(x: i32) -> i32 { x }\n");
         let out = impact(&code_server_for(&dir), &json!({"entity": "lonely"})).unwrap();
 
-        assert!(out.contains("## Used by (0)"), "expected a zero count:\n{out}");
+        assert!(
+            out.contains("## Used by (0)"),
+            "expected a zero count:\n{out}"
+        );
         assert!(
             out.contains("not the same as none"),
             "a bare zero was reported with no caveat:\n{out}"
@@ -2578,7 +3361,10 @@ mod locality_tests {
             out.contains(POSSIBLE_HEADING),
             "the unresolved reference was not surfaced:\n{out}"
         );
-        assert!(out.contains("`bySide0`"), "the referring entity is missing:\n{out}");
+        assert!(
+            out.contains("`bySide0`"),
+            "the referring entity is missing:\n{out}"
+        );
         // Suggestive, never counted: the confirmed number stays honest.
         assert!(
             out.contains("## Used by (0)"),
@@ -2608,7 +3394,10 @@ mod locality_tests {
         );
         let out = impact(&code_server_for(&dir), &json!({"entity": "helper"})).unwrap();
 
-        assert!(out.contains("`caller`"), "the real dependent is missing:\n{out}");
+        assert!(
+            out.contains("`caller`"),
+            "the real dependent is missing:\n{out}"
+        );
         assert!(
             !out.contains("not the same as none"),
             "the zero-case note fired on a non-zero count:\n{out}"
@@ -2655,6 +3444,61 @@ mod locality_tests {
             visibility: None,
         });
         small.return_type = Some("String".to_string());
-        assert_eq!(signature(&small), "resolve_git_ref(git_ref: &str) -> String");
+        assert_eq!(
+            signature(&small),
+            "resolve_git_ref(git_ref: &str) -> String"
+        );
+    }
+
+    /// MCP-019: `shapes::widen` is both handed to a dispatcher (`UsesFn`)
+    /// and called (`Calls`) by `middle`, so the multigraph holds two edges
+    /// for one pair. The BFS recorded `middle` as a predecessor of `widen`
+    /// once per edge, and reconstruction expanded each independently — the
+    /// three-chain budget was spent printing one route twice.
+    #[test]
+    fn trace_does_not_repeat_a_chain_when_two_edges_join_a_pair() {
+        let dir = TmpDir::with_prefix("nao-mcp-fixture", "trace-parallel-edges");
+        dir.write(
+            "app.rs",
+            r#"
+pub mod shapes {
+    pub fn widen(x: i32) -> i32 { x + 1 }
+}
+
+pub fn dispatch(f: fn(i32) -> i32) -> i32 { f(1) }
+
+pub fn middle() -> i32 {
+    dispatch(shapes::widen) + shapes::widen(2)
+}
+
+pub fn other() -> i32 { shapes::widen(3) }
+
+pub fn entry() -> i32 { middle() + other() }
+"#,
+        );
+        let out = trace(
+            &code_server_for(&dir),
+            &json!({"from": "entry", "to": "widen"}),
+        )
+        .unwrap();
+
+        let chains: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("- ") && l.contains('\u{2192}'))
+            .collect();
+        let distinct: HashSet<&str> = chains.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            chains.len(),
+            "the same chain was printed more than once:\n{out}"
+        );
+        // And the dedup collapses repeats only: the two real routes through
+        // `middle` and through `other` are both still offered.
+        assert_eq!(chains.len(), 2, "a distinct route was lost:\n{out}");
+        assert!(
+            chains.iter().any(|c| c.contains("`middle`"))
+                && chains.iter().any(|c| c.contains("`other`")),
+            "both routes should be listed:\n{out}"
+        );
     }
 }

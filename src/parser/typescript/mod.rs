@@ -1,61 +1,39 @@
-//! TypeScript / TSX parser — entry point and entity-extraction dispatcher.
+//! TypeScript / TSX parser — the entry point, and the phases one file runs
+//! through.
 //!
-//! Submodules group the parsing logic by concern:
-//! - [`containers`] — class, interface, enum (plus heritage extraction)
-//! - [`functions`] — top-level function declarations
-//! - [`members`] — class/interface body members (methods, fields, signatures)
-//! - [`lexical`] — `const`/`let` declarations (arrow fns, function exprs, vars)
-//! - [`leaves`] — type aliases
-//! - [`imports`] — `import` statements
-//! - [`calls`] — call-site relationships and control-flow arm dispatch
-//! - [`flow`] — synthetic `Branch` / `Loop` entities (TS-002)
-//! - [`complexity`] — cyclomatic / cognitive / nesting metrics (TS-003)
-//! - [`inference`] — parameter, local and class-member type inference
-//! - [`types`] — `UsesType` edges from signature/member types (post-pass)
+//! The two halves of the walk each have a folder:
+//! - [`declarations`] — what the file declares, and the dispatcher over it
+//! - [`bodies`] — what a callable body yields once its declaration is placed
+//!
+//! What both of them read from a grammar node, and write their findings
+//! into, sits here beside them:
+//! - [`ctx`] — the context threaded through the walk
+//! - [`helpers`] — accessibility, parameters, generics, type-text trimming
 //! - [`tsdoc`] — `/** ... */` extraction
 //! - [`decorators`] — child + sibling decorator collection
-//! - [`helpers`] — accessibility, parameters, generics, type-text trimming
-//! - [`stdlib`] — built-in name table for call filtering
+//! - [`types`] — `UsesType` edges from signature/member types (post-pass)
+//! - [`values`] — `UsesValue` edges from imported names read as values
 
-mod calls;
-mod complexity;
-mod containers;
+mod bodies;
+mod ctx;
+mod declarations;
 mod decorators;
-mod flow;
-mod functions;
 mod helpers;
-mod imports;
-mod inference;
-mod leaves;
-mod lexical;
-mod members;
-mod stdlib;
 mod tsdoc;
 mod types;
+mod values;
 
 #[cfg(test)]
 mod tests;
 
 use super::language_parser::{LanguageParser, ParseResult};
 use crate::models::file_info::Language;
-use crate::models::CodeEntity;
 use anyhow::Result;
-use std::collections::HashMap;
 use std::path::Path;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Parser, Tree};
 
 pub struct TypeScriptParser {
     parser: Parser,
-}
-
-/// Shared context threaded through the entity-extraction walk.
-pub(super) struct ExtractCtx<'a> {
-    pub source: &'a str,
-    pub path: &'a Path,
-    /// Class/interface name → (member → declared type), collected once per
-    /// file so every method body can type `this.<field>` receivers.
-    pub members: &'a HashMap<String, HashMap<String, String>>,
-    pub result: &'a mut ParseResult,
 }
 
 impl TypeScriptParser {
@@ -93,87 +71,6 @@ impl TypeScriptParser {
     }
 }
 
-/// Walk a node's children and dispatch each to the appropriate extractor.
-/// `self_type` is the enclosing class/interface name, used to qualify
-/// `this.foo()` call targets inside its methods.
-fn extract_entities(
-    node: Node,
-    parent_id: Option<&str>,
-    self_type: Option<&str>,
-    ctx: &mut ExtractCtx<'_>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "class_declaration" | "abstract_class_declaration" => {
-                add_container(&child, parent_id, ctx, containers::parse_class);
-            }
-            "interface_declaration" => {
-                add_container(&child, parent_id, ctx, containers::parse_interface);
-            }
-            "enum_declaration" => add_leaf(&child, parent_id, ctx, containers::parse_enum),
-            "type_alias_declaration" => add_leaf(&child, parent_id, ctx, leaves::parse_type_alias),
-            "function_declaration" | "generator_function_declaration" => {
-                functions::handle_function(&child, parent_id, self_type, ctx);
-            }
-            "lexical_declaration" | "variable_declaration" => {
-                lexical::handle_lexical_declaration(&child, parent_id, self_type, ctx);
-            }
-            "export_statement" => {
-                extract_entities(child, parent_id, self_type, ctx);
-            }
-            "import_statement" => {
-                if let Some(import) = imports::parse_import(&child, ctx.source) {
-                    ctx.result.add_import(import);
-                }
-            }
-            "method_definition" => {
-                members::handle_method(&child, parent_id, self_type, ctx);
-            }
-            "abstract_method_signature" => {
-                add_leaf(&child, parent_id, ctx, members::parse_abstract_method)
-            }
-            "public_field_definition" => add_leaf(&child, parent_id, ctx, members::parse_field),
-            "property_signature" => {
-                add_leaf(&child, parent_id, ctx, members::parse_property_signature)
-            }
-            "method_signature" => {
-                add_leaf(&child, parent_id, ctx, members::parse_method_signature)
-            }
-            _ => {
-                extract_entities(child, parent_id, self_type, ctx);
-            }
-        }
-    }
-}
-
-fn add_leaf(
-    node: &Node,
-    parent_id: Option<&str>,
-    ctx: &mut ExtractCtx<'_>,
-    parse: fn(&Node, &str, &Path, Option<&str>) -> Option<CodeEntity>,
-) {
-    if let Some(entity) = parse(node, ctx.source, ctx.path, parent_id) {
-        ctx.result.add_entity(entity);
-    }
-}
-
-fn add_container(
-    node: &Node,
-    parent_id: Option<&str>,
-    ctx: &mut ExtractCtx<'_>,
-    parse: fn(&Node, &str, &Path, Option<&str>) -> Option<CodeEntity>,
-) {
-    if let Some(entity) = parse(node, ctx.source, ctx.path, parent_id) {
-        let entity_id = entity.id.clone();
-        let entity_name = entity.name.clone();
-        ctx.result.add_entity(entity);
-        if let Some(body) = node.child_by_field_name("body") {
-            extract_entities(body, Some(&entity_id), Some(&entity_name), ctx);
-        }
-    }
-}
-
 impl Default for TypeScriptParser {
     fn default() -> Self {
         Self::new()
@@ -190,19 +87,15 @@ impl LanguageParser for TypeScriptParser {
         let tree = parser.parse_tree(content)?;
 
         let mut result = ParseResult::new();
-        // Collected before the walk so a method body can type a receiver
-        // against a class declared later in the file.
-        let class_members = inference::collect_class_members(&tree.root_node(), content);
-        let mut ctx = ExtractCtx {
-            source: content,
-            path,
-            members: &class_members,
-            result: &mut result,
-        };
-        extract_entities(tree.root_node(), None, None, &mut ctx);
+        declarations::extract_file(&tree.root_node(), path, content, &mut result);
 
         // Emit UsesType edges from signature/member types (TS-001).
         types::emit_uses_type_edges(&mut result);
+
+        // Emit UsesValue edges for imported names read as values (AN-028).
+        // After the declaration walk because it sources each edge from the
+        // entity whose span encloses the read.
+        values::emit_uses_value_edges(&tree.root_node(), content, &mut result);
 
         Ok(result)
     }

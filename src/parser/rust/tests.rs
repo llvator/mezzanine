@@ -142,7 +142,10 @@ fn run(a: &'a mut crate::lsp::LspClient, b: Vec<Thing>, c: &dyn Renderer) {
 "#;
     let found = callees(&parse(src));
     for expected in ["LspClient::shutdown", "Vec::drain", "Renderer::render"] {
-        assert!(found.contains(&expected.to_string()), "missing {expected} in {found:?}");
+        assert!(
+            found.contains(&expected.to_string()),
+            "missing {expected} in {found:?}"
+        );
     }
 }
 
@@ -287,7 +290,9 @@ impl Counter {
     }
 }
 "#;
-    assert!(!callees(&parse(src)).iter().any(|c| c.starts_with("usize::")));
+    assert!(!callees(&parse(src))
+        .iter()
+        .any(|c| c.starts_with("usize::")));
 }
 
 #[test]
@@ -625,7 +630,10 @@ pub fn go() {}
         result.file_documentation.as_deref(),
         Some("What this file is for.\nSecond line.")
     );
-    assert_eq!(doc_of(&result, "go").as_deref(), Some("The function's own doc."));
+    assert_eq!(
+        doc_of(&result, "go").as_deref(),
+        Some("The function's own doc.")
+    );
 }
 
 #[test]
@@ -666,10 +674,99 @@ macro_rules! shout {
 }
 "#;
     let result = parse(src);
-    assert_eq!(doc_of(&result, "LIMIT").as_deref(), Some("How many at most."));
-    assert_eq!(doc_of(&result, "Row").as_deref(), Some("What we call a row."));
+    assert_eq!(
+        doc_of(&result, "LIMIT").as_deref(),
+        Some("How many at most.")
+    );
+    assert_eq!(
+        doc_of(&result, "Row").as_deref(),
+        Some("What we call a row.")
+    );
     assert_eq!(
         doc_of(&result, "shout").as_deref(),
         Some("Shorthand for the noisy call.")
+    );
+}
+
+/// The case that sent this looking: a dispatcher reaches its siblings only
+/// by handing their parsers to a helper. No call happens at that site, so
+/// call extraction saw nothing, and `declarations/mod.rs` drew as depending
+/// on neither `enums` nor `leaves` — both of which it plainly does.
+#[test]
+fn a_function_handed_to_a_dispatcher_is_a_dependency() {
+    let result = parse(
+        r#"
+fn extract(node: &Node, ctx: &mut Ctx) {
+    match node.kind() {
+        "enum_item" => add_leaf(&node, ctx, enums::parse_enum),
+        "type_item" => add_leaf(&node, ctx, leaves::parse_type_alias),
+        _ => {}
+    }
+}
+"#,
+    );
+    let named: Vec<&str> = result
+        .relationships
+        .iter()
+        .filter(|r| r.kind == RelationshipKind::UsesFn)
+        .map(|r| r.target_id.as_str())
+        .collect();
+
+    assert!(named.contains(&"enums::parse_enum"), "{named:?}");
+    assert!(named.contains(&"leaves::parse_type_alias"), "{named:?}");
+}
+
+/// The filter that made it usable. Path-qualified arguments are mostly not
+/// functions: measured over this repo, admitting all of them produced 626
+/// edges of which essentially none were function references — they were enum
+/// variants, which are values. Both halves of the path must read as a module
+/// and a free function.
+#[test]
+fn a_variant_or_a_type_associated_fn_is_not_a_function_reference() {
+    let result = parse(
+        r#"
+fn build(out: &mut Vec<String>) {
+    push(out, EntityKind::Function);
+    push(out, Ordering::Relaxed);
+    out.iter().map(String::from).collect()
+}
+"#,
+    );
+    let named: Vec<&str> = result
+        .relationships
+        .iter()
+        .filter(|r| r.kind == RelationshipKind::UsesFn)
+        .map(|r| r.target_id.as_str())
+        .collect();
+
+    assert!(named.is_empty(), "none of these name a function: {named:?}");
+}
+
+/// It is a dependency, not a call. Recording it as `Calls` would land it in
+/// the coupling tallies at the cost of claiming a call that never happens,
+/// which would put fiction into call ordering and call-site metadata.
+#[test]
+fn naming_a_function_is_not_recorded_as_calling_it() {
+    let result = parse(
+        r#"
+fn extract(node: &Node, ctx: &mut Ctx) {
+    add_leaf(&node, ctx, enums::parse_enum);
+}
+"#,
+    );
+    let called: Vec<&str> = result
+        .relationships
+        .iter()
+        .filter(|r| r.kind == RelationshipKind::Calls)
+        .map(|r| r.target_id.as_str())
+        .collect();
+
+    assert!(
+        !called.contains(&"enums::parse_enum"),
+        "named, never called: {called:?}"
+    );
+    assert!(
+        called.contains(&"add_leaf"),
+        "the real call is still there: {called:?}"
     );
 }

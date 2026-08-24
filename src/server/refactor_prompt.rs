@@ -106,11 +106,19 @@ impl Finding {
 
     fn render(&self) -> String {
         let past_red = self.value >= self.bad;
-        let (tier, line) = if past_red { ("red", self.bad) } else { ("warn", self.warn) };
+        let (tier, line) = if past_red {
+            ("red", self.bad)
+        } else {
+            ("warn", self.warn)
+        };
         // A value sitting exactly on its threshold is *at* the line, not over
         // it. Saying "over the red threshold of 5" when the value reads 5
         // makes the agent doubt every other number in the prompt.
-        let relation = if (self.value - line).abs() < f32::EPSILON { "at" } else { "over" };
+        let relation = if (self.value - line).abs() < f32::EPSILON {
+            "at"
+        } else {
+            "over"
+        };
         format!(
             "- {} = {} ({} the {} threshold of {}) — {}",
             self.label,
@@ -124,7 +132,13 @@ impl Finding {
 }
 
 fn finding(label: &'static str, gloss: &'static str, value: f32, t: &WarnBad) -> Finding {
-    Finding { label, gloss, value, warn: t.warn, bad: t.bad }
+    Finding {
+        label,
+        gloss,
+        value,
+        warn: t.warn,
+        bad: t.bad,
+    }
 }
 
 /// Metrics that drive `composite_score` for a callable.
@@ -176,7 +190,11 @@ fn container_findings(e: &CodeEntity, t: &Thresholds) -> Vec<Finding> {
     let is_enum = e.kind == EntityKind::Enum;
     let mut out = vec![
         finding(
-            if is_enum { "variant count" } else { "field count" },
+            if is_enum {
+                "variant count"
+            } else {
+                "field count"
+            },
             "declared members held by this type",
             m.field_count.unwrap_or(0) as f32,
             if is_enum { &t.variants } else { &t.fields },
@@ -187,7 +205,12 @@ fn container_findings(e: &CodeEntity, t: &Thresholds) -> Vec<Finding> {
             m.method_count as f32,
             &t.method_count,
         ),
-        finding("lines of code", "size of the entity body", m.loc as f32, &t.loc_container),
+        finding(
+            "lines of code",
+            "size of the entity body",
+            m.loc as f32,
+            &t.loc_container,
+        ),
         finding(
             "fan-out",
             "distinct entities this one depends on; high fan-out means it knows about too much",
@@ -386,8 +409,16 @@ mod tests {
     /// Entity spanning source lines 10–41 (the struct stores them 0-based).
     fn entity(kind: EntityKind, metrics: EntityMetrics) -> CodeEntity {
         let span = Span {
-            start: Position { line: 9, column: 0, offset: 0 },
-            end: Position { line: 40, column: 0, offset: 0 },
+            start: Position {
+                line: 9,
+                column: 0,
+                offset: 0,
+            },
+            end: Position {
+                line: 40,
+                column: 0,
+                offset: 0,
+            },
         };
         let mut e = CodeEntity::new("target", kind, "src/app.rs", span);
         e.qualified_name = "app::target".to_string();
@@ -410,12 +441,23 @@ mod tests {
             smells: vec![SmellKind::Dispatcher],
             ..Default::default()
         };
-        let p = build_header(&entity(EntityKind::Function, m), "src/app.rs", &Thresholds::default(), PromptContext::Full);
+        let p = build_header(
+            &entity(EntityKind::Function, m),
+            "src/app.rs",
+            &Thresholds::default(),
+            PromptContext::Full,
+        );
 
         assert!(p.contains("cyclomatic complexity = 31"), "{p}");
-        assert!(p.contains("threshold of 20"), "missing the cc red line:\n{p}");
+        assert!(
+            p.contains("threshold of 20"),
+            "missing the cc red line:\n{p}"
+        );
         assert!(p.contains("Dispatcher"), "{p}");
-        assert!(p.contains(SmellKind::Dispatcher.hint()), "hint not rendered:\n{p}");
+        assert!(
+            p.contains(SmellKind::Dispatcher.hint()),
+            "hint not rendered:\n{p}"
+        );
         assert!(p.contains("src/app.rs:10-41"), "wrong 1-based span:\n{p}");
     }
 
@@ -433,10 +475,18 @@ mod tests {
             composite_score: 0.1,
             ..Default::default()
         };
-        let p = build_header(&entity(EntityKind::Function, m), "src/app.rs", &Thresholds::default(), PromptContext::Full);
+        let p = build_header(
+            &entity(EntityKind::Function, m),
+            "src/app.rs",
+            &Thresholds::default(),
+            PromptContext::Full,
+        );
 
         assert!(p.contains("within its threshold"), "{p}");
-        assert!(!p.contains("## Detected smells"), "clean entity got a smell section:\n{p}");
+        assert!(
+            !p.contains("## Detected smells"),
+            "clean entity got a smell section:\n{p}"
+        );
     }
 
     /// Metrics below the warn line are noise — the agent should not have to
@@ -444,20 +494,31 @@ mod tests {
     #[test]
     fn metrics_under_the_warn_line_are_omitted() {
         let m = EntityMetrics {
-            cyclomatic: Some(25), // over
+            cyclomatic: Some(25),          // over
             cognitive_complexity: Some(1), // well under
-            loc: 8,               // well under
-            fan_out: 1,           // well under
+            loc: 8,                        // well under
+            fan_out: 1,                    // well under
             param_count: Some(1),
             max_nesting: Some(1),
             composite_score: 0.6,
             ..Default::default()
         };
-        let p = build_header(&entity(EntityKind::Function, m), "src/app.rs", &Thresholds::default(), PromptContext::Full);
+        let p = build_header(
+            &entity(EntityKind::Function, m),
+            "src/app.rs",
+            &Thresholds::default(),
+            PromptContext::Full,
+        );
 
         assert!(p.contains("cyclomatic complexity = 25"), "{p}");
-        assert!(!p.contains("cognitive complexity ="), "under-threshold metric leaked:\n{p}");
-        assert!(!p.contains("lines of code ="), "under-threshold metric leaked:\n{p}");
+        assert!(
+            !p.contains("cognitive complexity ="),
+            "under-threshold metric leaked:\n{p}"
+        );
+        assert!(
+            !p.contains("lines of code ="),
+            "under-threshold metric leaked:\n{p}"
+        );
     }
 
     /// Containers are scored on a different metric set than callables, and
@@ -474,12 +535,23 @@ mod tests {
             smells: vec![SmellKind::GodClass],
             ..Default::default()
         };
-        let p = build_header(&entity(EntityKind::Struct, m), "src/app.rs", &Thresholds::default(), PromptContext::Full);
+        let p = build_header(
+            &entity(EntityKind::Struct, m),
+            "src/app.rs",
+            &Thresholds::default(),
+            PromptContext::Full,
+        );
 
         assert!(p.contains("field count = 24"), "{p}");
         assert!(p.contains("method count = 31"), "{p}");
-        assert!(!p.contains("cyclomatic"), "callable metric on a container:\n{p}");
-        assert!(!p.contains("parameter count"), "callable metric on a container:\n{p}");
+        assert!(
+            !p.contains("cyclomatic"),
+            "callable metric on a container:\n{p}"
+        );
+        assert!(
+            !p.contains("parameter count"),
+            "callable metric on a container:\n{p}"
+        );
     }
 
     /// Enums hold variants, not fields, and are scored against a different
@@ -492,7 +564,12 @@ mod tests {
             composite_score: 0.9,
             ..Default::default()
         };
-        let p = build_header(&entity(EntityKind::Enum, m), "src/app.rs", &Thresholds::default(), PromptContext::Full);
+        let p = build_header(
+            &entity(EntityKind::Enum, m),
+            "src/app.rs",
+            &Thresholds::default(),
+            PromptContext::Full,
+        );
 
         assert!(p.contains("variant count = 20"), "{p}");
         assert!(!p.contains("field count"), "enum labelled as fields:\n{p}");
@@ -510,7 +587,12 @@ mod tests {
             composite_score: 0.7,
             ..Default::default()
         };
-        let p = build_header(&entity(EntityKind::Function, m), "src/app.rs", &Thresholds::default(), PromptContext::Full);
+        let p = build_header(
+            &entity(EntityKind::Function, m),
+            "src/app.rs",
+            &Thresholds::default(),
+            PromptContext::Full,
+        );
 
         assert!(p.contains("fan-in = 40"), "{p}");
         assert!(p.contains("dependency cycle"), "{p}");
@@ -528,7 +610,10 @@ mod tests {
     fn absent_prompt_context_is_full() {
         assert_eq!(PromptContext::parse(None).unwrap(), PromptContext::Full);
         assert_eq!(PromptContext::parse(Some("")).unwrap(), PromptContext::Full);
-        assert_eq!(PromptContext::parse(Some(" full ")).unwrap(), PromptContext::Full);
+        assert_eq!(
+            PromptContext::parse(Some(" full ")).unwrap(),
+            PromptContext::Full
+        );
         assert_eq!(
             context_body(PromptContext::Full, CTX, RANGES, Some(TARGET)),
             CTX
@@ -540,7 +625,10 @@ mod tests {
     fn ranges_mode_carries_locations_not_source() {
         let body = context_body(PromptContext::Ranges, CTX, RANGES, Some(TARGET));
         assert_eq!(body, RANGES);
-        assert!(!body.contains("fn target()"), "source leaked into ranges mode:\n{body}");
+        assert!(
+            !body.contains("fn target()"),
+            "source leaked into ranges mode:\n{body}"
+        );
         assert!(body.len() < CTX.len(), "ranges should be smaller");
     }
 
@@ -550,15 +638,24 @@ mod tests {
     fn hybrid_carries_the_target_source_once_plus_ranges() {
         let body = context_body(PromptContext::Hybrid, CTX, RANGES, Some(TARGET));
         assert_eq!(body.matches("fn target() {}").count(), 1, "{body}");
-        assert!(!body.contains("fn neighbour()"), "neighbour source leaked:\n{body}");
-        assert!(body.contains("src/b.rs:4-6"), "neighbour range missing:\n{body}");
+        assert!(
+            !body.contains("fn neighbour()"),
+            "neighbour source leaked:\n{body}"
+        );
+        assert!(
+            body.contains("src/b.rs:4-6"),
+            "neighbour range missing:\n{body}"
+        );
     }
 
     /// Unchecking the target's file leaves no source to embed. Degrading to
     /// ranges beats emitting a section that promises source and has none.
     #[test]
     fn hybrid_without_target_source_degrades_to_ranges() {
-        assert_eq!(context_body(PromptContext::Hybrid, CTX, RANGES, None), RANGES);
+        assert_eq!(
+            context_body(PromptContext::Hybrid, CTX, RANGES, None),
+            RANGES
+        );
     }
 
     /// Silently treating a typo as `full` would hand back an expensive prompt
@@ -573,19 +670,32 @@ mod tests {
     /// Each preamble must describe what actually follows it.
     #[test]
     fn each_mode_describes_its_own_body() {
-        let m = EntityMetrics { cyclomatic: Some(30), composite_score: 1.0, ..Default::default() };
+        let m = EntityMetrics {
+            cyclomatic: Some(30),
+            composite_score: 1.0,
+            ..Default::default()
+        };
         let e = entity(EntityKind::Function, m);
         let t = Thresholds::default();
 
         let full = build_header(&e, "src/app.rs", &t, PromptContext::Full);
-        assert!(full.contains("source of the target entity and its immediate neighbours follows"), "{full}");
+        assert!(
+            full.contains("source of the target entity and its immediate neighbours follows"),
+            "{full}"
+        );
 
         let ranges = build_header(&e, "src/app.rs", &t, PromptContext::Ranges);
         assert!(ranges.contains("locations, not contents"), "{ranges}");
-        assert!(!ranges.contains("source of the target entity and its immediate neighbours follows"), "{ranges}");
+        assert!(
+            !ranges.contains("source of the target entity and its immediate neighbours follows"),
+            "{ranges}"
+        );
 
         let hybrid = build_header(&e, "src/app.rs", &t, PromptContext::Hybrid);
-        assert!(hybrid.contains("target entity's source follows in full"), "{hybrid}");
+        assert!(
+            hybrid.contains("target entity's source follows in full"),
+            "{hybrid}"
+        );
     }
 
     /// Ratios keep their decimals; counts do not grow a `.00` tail.
@@ -602,14 +712,24 @@ mod tests {
     fn a_value_on_its_threshold_reads_as_at_not_over() {
         let t = Thresholds::default();
         let on_the_line = finding("max nesting depth", "gloss", t.nest.bad, &t.nest);
-        assert!(on_the_line.render().contains("at the red threshold of 5"), "{}", on_the_line.render());
+        assert!(
+            on_the_line.render().contains("at the red threshold of 5"),
+            "{}",
+            on_the_line.render()
+        );
 
         let past_it = finding("max nesting depth", "gloss", t.nest.bad + 2.0, &t.nest);
-        assert!(past_it.render().contains("over the red threshold of 5"), "{}", past_it.render());
+        assert!(
+            past_it.render().contains("over the red threshold of 5"),
+            "{}",
+            past_it.render()
+        );
 
         let on_the_warn_line = finding("parameter count", "gloss", t.params.warn, &t.params);
         assert!(
-            on_the_warn_line.render().contains("at the warn threshold of 4"),
+            on_the_warn_line
+                .render()
+                .contains("at the warn threshold of 4"),
             "{}",
             on_the_warn_line.render()
         );

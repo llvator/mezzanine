@@ -19,6 +19,12 @@
 //!     added or renamed cannot be silently filled from an older entry.
 //!   * the resolved `tree-sitter*` versions in `Cargo.lock` — a grammar bump
 //!     changes the tree the parsers walk without changing a line of our code.
+//!   * `vendor/tree-sitter-dart/src/{parser,scanner}.c` — the one grammar
+//!     that is not in `Cargo.lock` to be read, so regenerating it would
+//!     otherwise leave every warm cache serving the old grammar's trees.
+//!
+//! It also compiles that vendored grammar, which is the other reason this
+//! script exists. See `vendor/tree-sitter-dart/README.md`.
 //!
 //! Analyzer stages downstream of the merge are deliberately *not* hashed:
 //! they run after every cache read, so their output is never stored.
@@ -27,6 +33,8 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+
+    compile_dart_grammar(&root);
 
     // Cargo re-runs this script when any of these change. Directories are
     // walked recursively, so a new parser file counts without listing it.
@@ -40,6 +48,7 @@ fn main() {
         hash_rust_sources(&root, &root.join(dir), &mut hasher);
     }
     hash_grammar_versions(&root.join("Cargo.lock"), &mut hasher);
+    hash_vendored_grammar(&root, &mut hasher);
 
     // Twelve hex chars: this only has to separate cache generations on one
     // machine, and it ends up in a directory name a human reads.
@@ -47,6 +56,51 @@ fn main() {
     println!("cargo:rustc-env=NAO_PARSE_FINGERPRINT={fingerprint}");
 
     println!("cargo:rustc-env=NAO_GIT_COMMIT={}", git_commit(&root));
+}
+
+/// Build the vendored Dart grammar into the crate.
+///
+/// It is C rather than a crates.io dependency because no published
+/// `tree-sitter-dart` both understands Dart 3 and targets a grammar ABI our
+/// `tree-sitter` can load — `vendor/tree-sitter-dart/README.md` has the
+/// whole story. `src/parser/dart/mod.rs` declares the `tree_sitter_dart`
+/// symbol this produces.
+fn compile_dart_grammar(root: &Path) {
+    let dir = root.join("vendor/tree-sitter-dart/src");
+    println!("cargo:rerun-if-changed=vendor/tree-sitter-dart/src");
+
+    cc::Build::new()
+        .include(&dir)
+        .file(dir.join("parser.c"))
+        // The external scanner carries Dart's string and comment states,
+        // which the generated tables cannot express on their own.
+        .file(dir.join("scanner.c"))
+        // Generated C: upstream's warnings are not ours to fix, and they
+        // would drown every real one in the build log.
+        .warnings(false)
+        .compile("tree-sitter-dart");
+}
+
+/// Fold the vendored grammar into the fingerprint.
+///
+/// Every other grammar reaches the hash through its `Cargo.lock` version;
+/// this one has no version to read, so its compiled sources are hashed
+/// directly. `grammar.js` is deliberately excluded — it is an input to
+/// generation, not to the build, so a comment-only edit there must not read
+/// as a new parse generation.
+fn hash_vendored_grammar(root: &Path, hasher: &mut blake3::Hasher) {
+    for name in ["parser.c", "scanner.c"] {
+        let path = root.join("vendor/tree-sitter-dart/src").join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => hasher.update(&bytes),
+            // Same reasoning as `hash_rust_sources`: a fingerprint computed
+            // from a partial read keys a cache generation nothing agrees with.
+            Err(e) => panic!(
+                "cannot read {} for the parse fingerprint: {e}",
+                path.display()
+            ),
+        };
+    }
 }
 
 /// Short commit of the build, for the version stamp `/api/hello` reports.
@@ -99,7 +153,10 @@ fn hash_rust_sources(root: &Path, dir: &Path, hasher: &mut blake3::Hasher) {
             // Unreadable source is a broken checkout, not something to paper
             // over: a fingerprint computed from a partial read would key a
             // cache generation that no other build agrees with.
-            Err(e) => panic!("cannot read {} for the parse fingerprint: {e}", file.display()),
+            Err(e) => panic!(
+                "cannot read {} for the parse fingerprint: {e}",
+                file.display()
+            ),
         }
     }
 }

@@ -7,10 +7,52 @@
 //! loop — a location-free "expected identifier inside body" is not
 //! actionable in a 200-line file.
 
-use super::ast::{
-    qualify_child, split_kind_prefix, strip_kind_prefix, ChildRef, DefKind, DefStmt, EdgeRef, Loc,
-};
-use super::lexer::{SpannedToken, Token};
+use super::ast::{qualify_child, ChildRef, DefKind, DefStmt, EdgeRef, Loc};
+use super::lexer::{tokenize, SpannedToken, Token};
+
+/// Every keyword that opens a definition, longest-prefix first so
+/// `fu`/`concept` are matched before `f`/`c` when used as an id prefix.
+const ALL_KINDS: [DefKind; 6] = [
+    DefKind::Functionality,
+    DefKind::Concept,
+    DefKind::Extension,
+    DefKind::Feature,
+    DefKind::Category,
+    DefKind::UiPage,
+];
+
+/// The kind a definition keyword opens, or `None` for a word that
+/// isn't one.
+fn kind_from_keyword(kw: &str) -> Option<DefKind> {
+    ALL_KINDS.into_iter().find(|k| k.keyword() == kw)
+}
+
+/// True for kinds whose names must be flat (no dots). Only
+/// Functionalities are qualified; UI pages accept any path.
+fn requires_bare_name(kind: DefKind) -> bool {
+    matches!(
+        kind,
+        DefKind::Extension | DefKind::Category | DefKind::Feature | DefKind::Concept
+    )
+}
+
+/// Split a leading kind prefix (`fu.`, `concept.`, `e.`, `f.`, `c.`,
+/// `ui.`) off a name, returning the kind it named and the remainder.
+/// Lets authors write `f protocol` and `f f.protocol` interchangeably.
+fn split_kind_prefix(qualname: &str) -> (Option<DefKind>, String) {
+    for kind in ALL_KINDS {
+        let prefix = format!("{}.", kind.keyword());
+        if let Some(rest) = qualname.strip_prefix(&prefix) {
+            return (Some(kind), rest.to_string());
+        }
+    }
+    (None, qualname.to_string())
+}
+
+/// Drop a leading kind prefix, keeping only the name.
+fn strip_kind_prefix(qualname: &str) -> String {
+    split_kind_prefix(qualname).1
+}
 
 /// An import statement plus its source range, so the `ImportInfo` the
 /// analyzer sees can point at the line the author wrote.
@@ -27,12 +69,33 @@ pub(super) struct ParseOutput {
     pub warnings: Vec<String>,
 }
 
+/// Parse a whole `.elv` source: tokenize it, then recover a flat list
+/// of imports and definitions.
+///
+/// The token stream never leaves this module. Phase 1 is the only
+/// reader of a token, so it owns producing one — a caller that had to
+/// lex first would also have to remember to drain the lexer's
+/// diagnostics, and forgetting is silent. They arrive here in
+/// `warnings` alongside the parser's own, in source order.
+pub(super) fn parse_source(src: &str) -> ParseOutput {
+    let (tokens, lex_diags) = tokenize(src);
+    let mut out = Parser::new(&tokens).parse_file();
+    // Lexing ran first, so its complaints read first.
+    out.warnings.splice(
+        0..0,
+        lex_diags
+            .into_iter()
+            .map(|d| format!("elevator: {}", d.message)),
+    );
+    out
+}
+
 /// How deep a chain of (illegal) nested definitions we'll unwrap before
 /// giving up. Recovery recurses, so this is what keeps a file of
 /// nothing but `{` from blowing the stack.
 const MAX_NESTING: usize = 16;
 
-pub(super) struct Parser<'a> {
+struct Parser<'a> {
     tokens: &'a [SpannedToken],
     pos: usize,
     depth: usize,
@@ -40,7 +103,7 @@ pub(super) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(super) fn new(tokens: &'a [SpannedToken]) -> Self {
+    fn new(tokens: &'a [SpannedToken]) -> Self {
         Self {
             tokens,
             pos: 0,
@@ -49,7 +112,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn parse_file(mut self) -> ParseOutput {
+    fn parse_file(mut self) -> ParseOutput {
         self.parse_import_prelude();
         while self.peek().is_some() {
             self.skip_separators();
@@ -93,7 +156,7 @@ impl<'a> Parser<'a> {
         let Some(kw) = self.peek_ident().map(str::to_string) else {
             return false;
         };
-        let Some(kind) = DefKind::from_keyword(&kw) else {
+        let Some(kind) = kind_from_keyword(&kw) else {
             self.warn_here(&format!(
                 "unexpected top-level keyword `{}` (expected `import`, `e`, `c`, `f`, `fu`, `concept`, or `ui`)",
                 kw
@@ -150,7 +213,7 @@ impl<'a> Parser<'a> {
                     qualname
                 ),
             );
-        } else if kind.requires_bare_name() && qualname.contains('.') {
+        } else if requires_bare_name(kind) && qualname.contains('.') {
             self.warn_at(
                 at,
                 &format!(
@@ -213,7 +276,7 @@ impl<'a> Parser<'a> {
                 def.used_by.extend(list);
             }
             "cr" => self.parse_code_refs(def),
-            _ => match DefKind::from_keyword(kw) {
+            _ => match kind_from_keyword(kw) {
                 Some(child_kind) => self.parse_child_ref(def, child_kind),
                 None => {
                     self.warn_here(&format!("unexpected keyword `{}` inside body", kw));

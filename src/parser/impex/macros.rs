@@ -130,7 +130,10 @@ mod tests {
         let parsed = MacroTable::parse_definition("$catalog = apparel-deContentCatalog");
         assert_eq!(
             parsed,
-            Some(("catalog".to_string(), "apparel-deContentCatalog".to_string()))
+            Some((
+                "catalog".to_string(),
+                "apparel-deContentCatalog".to_string()
+            ))
         );
     }
 
@@ -169,6 +172,9 @@ mod tests {
         t.define("b".into(), "$a".into());
         // Should not panic / loop forever.
         let _ = t.substitute("$a");
-        assert!(!t.cycle_warnings.is_empty(), "cycle should produce a warning");
+        assert!(
+            !t.cycle_warnings.is_empty(),
+            "cycle should produce a warning"
+        );
     }
 }

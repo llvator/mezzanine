@@ -21,7 +21,13 @@ impl Renderer for AsciiRenderer {
         let mut output = String::new();
         let metrics = graph.metrics();
 
-        write_header(&mut output, config, metrics.node_count, metrics.edge_count, metrics.cycle_count)?;
+        write_header(
+            &mut output,
+            config,
+            metrics.node_count,
+            metrics.edge_count,
+            metrics.cycle_count,
+        )?;
 
         if config.display.group_by_file {
             write_grouped_entities(&mut output, graph, config)?;
@@ -41,18 +47,41 @@ fn write_header(
     relationships: usize,
     cycles: usize,
 ) -> Result<()> {
-    writeln!(output, "╔══════════════════════════════════════════════════════════════╗")?;
-    writeln!(output, "║              CODE DEPENDENCY VISUALIZATION                    ║")?;
-    writeln!(output, "║  Root: {:54} ║", truncate(&config.root_path.display().to_string(), 54))?;
-    writeln!(output, "╠══════════════════════════════════════════════════════════════╣")?;
-    writeln!(output, "║  Entities: {:5}  │  Relationships: {:5}  │  Cycles: {:5}  ║",
-        entities, relationships, cycles)?;
-    writeln!(output, "╚══════════════════════════════════════════════════════════════╝")?;
+    writeln!(
+        output,
+        "╔══════════════════════════════════════════════════════════════╗"
+    )?;
+    writeln!(
+        output,
+        "║              CODE DEPENDENCY VISUALIZATION                    ║"
+    )?;
+    writeln!(
+        output,
+        "║  Root: {:54} ║",
+        truncate(&config.root_path.display().to_string(), 54)
+    )?;
+    writeln!(
+        output,
+        "╠══════════════════════════════════════════════════════════════╣"
+    )?;
+    writeln!(
+        output,
+        "║  Entities: {:5}  │  Relationships: {:5}  │  Cycles: {:5}  ║",
+        entities, relationships, cycles
+    )?;
+    writeln!(
+        output,
+        "╚══════════════════════════════════════════════════════════════╝"
+    )?;
     writeln!(output)?;
     Ok(())
 }
 
-fn write_grouped_entities(output: &mut String, graph: &DependencyGraph, config: &Config) -> Result<()> {
+fn write_grouped_entities(
+    output: &mut String,
+    graph: &DependencyGraph,
+    config: &Config,
+) -> Result<()> {
     let file_groups = group_entity_ids_by_file(graph);
     for (file_path, entity_ids) in &file_groups {
         writeln!(output, "📄 {}", file_path)?;
@@ -66,7 +95,11 @@ fn write_grouped_entities(output: &mut String, graph: &DependencyGraph, config: 
         let classes: Vec<&CodeEntity> = entities
             .iter()
             .copied()
-            .filter(|e| e.kind == EntityKind::Class || e.kind == EntityKind::AbstractClass || e.kind == EntityKind::Struct)
+            .filter(|e| {
+                e.kind == EntityKind::Class
+                    || e.kind == EntityKind::AbstractClass
+                    || e.kind == EntityKind::Struct
+            })
             .collect();
         let interfaces: Vec<&CodeEntity> = entities
             .iter()
@@ -127,7 +160,11 @@ fn write_simple_group(
     if entities.is_empty() {
         return Ok(());
     }
-    let header_prefix = if indent == "    " { "└──" } else { "├──" };
+    let header_prefix = if indent == "    " {
+        "└──"
+    } else {
+        "├──"
+    };
     writeln!(output, "{} {}", header_prefix, label)?;
     for (i, entity) in entities.iter().enumerate() {
         let is_last = i == entities.len() - 1;
@@ -136,7 +173,12 @@ fn write_simple_group(
     Ok(())
 }
 
-fn write_entity_line(output: &mut String, entity: &CodeEntity, prefix: String, config: &Config) -> Result<()> {
+fn write_entity_line(
+    output: &mut String,
+    entity: &CodeEntity,
+    prefix: String,
+    config: &Config,
+) -> Result<()> {
     writeln!(
         output,
         "{} {} {}",
@@ -157,12 +199,22 @@ fn write_entity_deps(
     if deps.is_empty() {
         return Ok(());
     }
-    let dep_prefix = if is_last { "│       " } else { "│   │   " };
+    let dep_prefix = if is_last {
+        "│       "
+    } else {
+        "│   │   "
+    };
     if deps.len() > MAX_INLINE_DEPS {
         writeln!(output, "{} └─→ [{} dependencies]", dep_prefix, deps.len())?;
     } else {
         for (dep_entity, rel) in &deps {
-            writeln!(output, "{} └─→ {} ({})", dep_prefix, dep_entity.name, rel.kind.display_label())?;
+            writeln!(
+                output,
+                "{} └─→ {} ({})",
+                dep_prefix,
+                dep_entity.name,
+                rel.kind.display_label()
+            )?;
         }
     }
     Ok(())
@@ -173,7 +225,11 @@ fn tree_prefix(indent: &str, is_last: bool) -> String {
     format!("{}{}", indent, branch)
 }
 
-fn write_flat_entities(output: &mut String, graph: &DependencyGraph, config: &Config) -> Result<()> {
+fn write_flat_entities(
+    output: &mut String,
+    graph: &DependencyGraph,
+    config: &Config,
+) -> Result<()> {
     writeln!(output, "All Entities:")?;
     writeln!(output, "│")?;
     let entities: Vec<_> = graph.entities().collect();
@@ -190,15 +246,27 @@ fn write_dependency_summary(
     metrics: &crate::graph::GraphMetrics,
 ) -> Result<()> {
     writeln!(output)?;
-    writeln!(output, "═══════════════════════════════════════════════════════════════")?;
+    writeln!(
+        output,
+        "═══════════════════════════════════════════════════════════════"
+    )?;
     writeln!(output, "DEPENDENCY SUMMARY")?;
-    writeln!(output, "═══════════════════════════════════════════════════════════════")?;
+    writeln!(
+        output,
+        "═══════════════════════════════════════════════════════════════"
+    )?;
 
     if !metrics.most_connected.is_empty() {
         writeln!(output, "\nMost Connected Entities:")?;
         for (i, (id, count)) in metrics.most_connected.iter().take(5).enumerate() {
             if let Some(entity) = graph.get_entity(id) {
-                writeln!(output, "  {}. {} ({} connections)", i + 1, entity.name, count)?;
+                writeln!(
+                    output,
+                    "  {}. {} ({} connections)",
+                    i + 1,
+                    entity.name,
+                    count
+                )?;
             }
         }
     }
@@ -213,7 +281,11 @@ fn write_dependency_summary(
     }
 
     if metrics.cycle_count > 0 {
-        writeln!(output, "\n⚠️  WARNING: {} circular dependencies detected!", metrics.cycle_count)?;
+        writeln!(
+            output,
+            "\n⚠️  WARNING: {} circular dependencies detected!",
+            metrics.cycle_count
+        )?;
     }
     Ok(())
 }
@@ -239,7 +311,7 @@ fn entity_symbol(kind: EntityKind) -> &'static str {
 
 fn format_entity(entity: &crate::models::CodeEntity, config: &Config) -> String {
     let mut result = String::new();
-    
+
     // Visibility indicator
     let vis = match entity.visibility {
         crate::models::Visibility::Public => "+",
@@ -248,11 +320,11 @@ fn format_entity(entity: &crate::models::CodeEntity, config: &Config) -> String 
         crate::models::Visibility::Internal => "~",
         crate::models::Visibility::Crate => "~",
     };
-    
+
     result.push_str(vis);
     result.push(' ');
     result.push_str(&entity.name);
-    
+
     // Parameters for callables
     if config.display.show_parameters && entity.kind.is_callable() {
         result.push('(');
@@ -270,7 +342,7 @@ fn format_entity(entity: &crate::models::CodeEntity, config: &Config) -> String 
         result.push_str(&params.join(", "));
         result.push(')');
     }
-    
+
     // Return type
     if config.display.show_return_types {
         if let Some(ret) = &entity.return_type {
@@ -278,12 +350,12 @@ fn format_entity(entity: &crate::models::CodeEntity, config: &Config) -> String 
             result.push_str(ret);
         }
     }
-    
+
     // Line number
     if config.display.show_line_numbers {
         result.push_str(&format!(" [L{}]", entity.span.start.line + 1));
     }
-    
+
     result
 }
 

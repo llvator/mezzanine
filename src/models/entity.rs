@@ -9,51 +9,51 @@ use std::path::PathBuf;
 pub struct CodeEntity {
     /// Unique identifier for this entity
     pub id: String,
-    
+
     /// Human-readable name
     pub name: String,
-    
+
     /// Fully qualified name (e.g., `module::submodule::ClassName`)
     pub qualified_name: String,
-    
+
     /// Type of entity
     pub kind: EntityKind,
-    
+
     /// Visibility/accessibility
     pub visibility: Visibility,
-    
+
     /// File where this entity is defined
     pub file_path: PathBuf,
-    
+
     /// Location within the file
     pub span: super::Span,
-    
+
     /// Parent entity (e.g., class containing a method)
     pub parent_id: Option<String>,
-    
+
     /// Documentation/comments
     pub documentation: Option<String>,
-    
+
     /// Language-specific attributes
     pub attributes: Vec<String>,
-    
+
     /// Generic parameters (for classes/functions)
     pub generics: Vec<String>,
-    
+
     /// For functions: parameter types
     pub parameters: Vec<Parameter>,
-    
+
     /// For functions: return type
     pub return_type: Option<String>,
-    
+
     /// Implemented interfaces/traits
     pub implements: Vec<String>,
-    
+
     /// Extended/inherited types. For most languages this has at most one entry
     /// (single-inheritance: `class X extends Y`). For Java interfaces it can
     /// hold multiple (`interface A extends B, C`).
     pub extends: Vec<String>,
-    
+
     /// Tags for filtering and categorization. Ordered set so serialized
     /// output is byte-stable across runs (AN-002).
     pub tags: BTreeSet<String>,
@@ -384,7 +384,7 @@ impl EntityKind {
             EntityKind::Function | EntityKind::Method | EntityKind::Macro
         )
     }
-    
+
     /// Returns a display name for the entity kind
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -460,7 +460,7 @@ impl CodeEntity {
         let name = name.into();
         let file_path_buf: PathBuf = file_path.into();
         let id = format!("{}:{}:{}", file_path_buf.display(), span.start.line, &name);
-        
+
         Self {
             id: id.clone(),
             qualified_name: name.clone(),
@@ -484,25 +484,25 @@ impl CodeEntity {
             metrics: EntityMetrics::default(),
         }
     }
-    
+
     /// Builder pattern: set visibility
     pub fn with_visibility(mut self, visibility: Visibility) -> Self {
         self.visibility = visibility;
         self
     }
-    
+
     /// Builder pattern: set parent ID
     pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
         self.parent_id = Some(parent_id.into());
         self
     }
-    
+
     /// Builder pattern: set documentation
     pub fn with_documentation(mut self, doc: impl Into<String>) -> Self {
         self.documentation = Some(doc.into());
         self
     }
-    
+
     /// Builder pattern: add a tag
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.insert(tag.into());

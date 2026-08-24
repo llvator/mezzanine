@@ -686,9 +686,17 @@ pub fn extract(node: &Node, source: &str) -> Option<Extracted> {
         // tree-sitter-java emits each primitive keyword as its own node kind
         // (boolean_type, int_type, …) rather than a single `primitive_type`.
         // We normalise them to one construct kind for rule/lesson authors.
-        "boolean_type" | "void_type" | "integral_type" | "floating_point_type"
-        | "byte_type" | "short_type" | "int_type" | "long_type" | "char_type"
-        | "float_type" | "double_type" => Some(Extracted {
+        "boolean_type"
+        | "void_type"
+        | "integral_type"
+        | "floating_point_type"
+        | "byte_type"
+        | "short_type"
+        | "int_type"
+        | "long_type"
+        | "char_type"
+        | "float_type"
+        | "double_type" => Some(Extracted {
             kind: "primitive_type",
             attrs: primitive_type_attrs(node, source),
         }),
@@ -883,19 +891,35 @@ fn class_attrs(node: &Node, source: &str) -> Attrs {
     );
     attrs.insert(
         "in_default_package".to_string(),
-        if file_has_package(node) { "false".into() } else { "true".into() },
+        if file_has_package(node) {
+            "false".into()
+        } else {
+            "true".into()
+        },
     );
     attrs.insert(
         "is_abstract".to_string(),
-        if has_modifier(node, source, "abstract") { "true".into() } else { "false".into() },
+        if has_modifier(node, source, "abstract") {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert(
         "is_final".to_string(),
-        if has_modifier(node, source, "final") { "true".into() } else { "false".into() },
+        if has_modifier(node, source, "final") {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert(
         "is_sealed".to_string(),
-        if has_modifier(node, source, "sealed") { "true".into() } else { "false".into() },
+        if has_modifier(node, source, "sealed") {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     if let Some(sc) = node.child_by_field_name("superclass") {
         // `superclass` wraps the actual parent type as a child; the wrapper's
@@ -906,9 +930,9 @@ fn class_attrs(node: &Node, source: &str) -> Attrs {
             .map(|s| s.trim().to_string())
             .filter(|s| s != "extends" && !s.is_empty());
         let text = inner_text.or_else(|| {
-            sc.utf8_text(source.as_bytes()).ok().map(|t| {
-                t.trim().trim_start_matches("extends").trim().to_string()
-            })
+            sc.utf8_text(source.as_bytes())
+                .ok()
+                .map(|t| t.trim().trim_start_matches("extends").trim().to_string())
         });
         if let Some(t) = text {
             if !t.is_empty() {
@@ -918,7 +942,11 @@ fn class_attrs(node: &Node, source: &str) -> Attrs {
     }
     attrs.insert(
         "has_abstract_methods".to_string(),
-        if class_has_abstract_methods(node, source) { "true".into() } else { "false".into() },
+        if class_has_abstract_methods(node, source) {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -928,7 +956,9 @@ fn class_attrs(node: &Node, source: &str) -> Attrs {
 /// enclosing class's "is this an abstract-class-without-abstract-members"
 /// rule.
 fn class_has_abstract_methods(node: &Node, source: &str) -> bool {
-    let Some(body) = node.child_by_field_name("body") else { return false };
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
     for i in 0..body.child_count() {
         let Some(child) = body.child(i) else { continue };
         if child.kind() != "method_declaration" {
@@ -981,11 +1011,19 @@ fn import_attrs(node: &Node, source: &str) -> Attrs {
     let is_wildcard = name.ends_with(".*");
     attrs.insert(
         "is_wildcard".to_string(),
-        if is_wildcard { "true".into() } else { "false".into() },
+        if is_wildcard {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert(
         "is_static".to_string(),
-        if is_static { "true".into() } else { "false".into() },
+        if is_static {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert("imported_name".to_string(), name);
     attrs
@@ -1006,8 +1044,12 @@ fn class_method_overrides(node: &Node, source: &str) -> (bool, bool) {
         if child.kind() != "method_declaration" {
             continue;
         }
-        let Some(name_node) = child.child_by_field_name("name") else { continue };
-        let Ok(name) = name_node.utf8_text(source.as_bytes()) else { continue };
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(source.as_bytes()) else {
+            continue;
+        };
         match name {
             "equals" => has_equals = true,
             "hashCode" => has_hashcode = true,
@@ -1044,7 +1086,10 @@ fn field_attrs(node: &Node, source: &str) -> Attrs {
                 .and_then(|c| c.utf8_text(source.as_bytes()).ok())
                 .map(|s| s.to_string())
         } else {
-            type_node.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
+            type_node
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|s| s.to_string())
         };
         if let Some(n) = name {
             attrs.insert("type_name".to_string(), n);
@@ -1070,7 +1115,11 @@ fn try_attrs(node: &Node) -> Attrs {
     let has_spec = node.kind() == "try_with_resources_statement";
     attrs.insert(
         "has_resource_spec".to_string(),
-        if has_spec { "true".into() } else { "false".into() },
+        if has_spec {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1086,7 +1135,11 @@ fn annotation_attrs(node: &Node, source: &str) -> Attrs {
     let is_marker = node.kind() == "marker_annotation";
     attrs.insert(
         "is_marker".to_string(),
-        if is_marker { "true".into() } else { "false".into() },
+        if is_marker {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     if let Some(name_node) = node.child_by_field_name("name") {
         if let Ok(text) = name_node.utf8_text(source.as_bytes()) {
@@ -1130,7 +1183,10 @@ fn local_variable_attrs(node: &Node, source: &str) -> Attrs {
                 .and_then(|c| c.utf8_text(source.as_bytes()).ok())
                 .map(|s| s.to_string())
         } else {
-            type_node.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
+            type_node
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|s| s.to_string())
         };
         if let Some(n) = name {
             attrs.insert("type_name".to_string(), n);
@@ -1138,7 +1194,11 @@ fn local_variable_attrs(node: &Node, source: &str) -> Attrs {
     }
     attrs.insert(
         "is_final".to_string(),
-        if has_modifier(node, source, "final") { "true".into() } else { "false".into() },
+        if has_modifier(node, source, "final") {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1164,18 +1224,24 @@ fn if_statement_attrs(node: &Node) -> Attrs {
     let mut attrs = Attrs::new();
 
     let consequence = node.child_by_field_name("consequence");
-    let consequence_is_block = consequence
-        .map(|c| c.kind() == "block")
-        .unwrap_or(false);
+    let consequence_is_block = consequence.map(|c| c.kind() == "block").unwrap_or(false);
     attrs.insert(
         "consequence_is_block".to_string(),
-        if consequence_is_block { "true".into() } else { "false".into() },
+        if consequence_is_block {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
 
     let alternative = node.child_by_field_name("alternative");
     attrs.insert(
         "has_else".to_string(),
-        if alternative.is_some() { "true".into() } else { "false".into() },
+        if alternative.is_some() {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     let else_kind = match alternative.map(|a| a.kind()) {
         None => "none",
@@ -1205,7 +1271,9 @@ fn if_statement_attrs(node: &Node) -> Attrs {
 /// more operands is the readability cliff Fowler's "Introduce Explaining
 /// Variable" refactor is meant to address.
 fn classify_condition_complexity(condition: Option<Node>) -> &'static str {
-    let Some(node) = condition else { return "simple" };
+    let Some(node) = condition else {
+        return "simple";
+    };
     let mut count: u32 = 0;
     let mut stack: Vec<Node> = vec![node];
     while let Some(n) = stack.pop() {
@@ -1236,7 +1304,9 @@ fn classify_condition_complexity(condition: Option<Node>) -> &'static str {
 /// equivalent to that statement, so `if (x) return y;` and
 /// `if (x) { return y; }` classify the same way.
 fn classify_then_kind(consequence: Option<Node>) -> &'static str {
-    let Some(node) = consequence else { return "other" };
+    let Some(node) = consequence else {
+        return "other";
+    };
     // Unwrap a block whose only meaningful child is one statement. Comments
     // and braces (`{`, `}`) are not named children, so child_count over
     // named_children gives the count of statements.
@@ -1384,7 +1454,9 @@ fn find_local_type(scope: &Node, name: &str, source: &str) -> Option<String> {
         }
     }
     for i in 0..scope.child_count() {
-        let Some(child) = scope.child(i) else { continue };
+        let Some(child) = scope.child(i) else {
+            continue;
+        };
         if let Some(t) = find_local_type(&child, name, source) {
             return Some(t);
         }
@@ -1517,7 +1589,10 @@ fn switch_statement_attrs(node: &Node, source: &str) -> Attrs {
         | Some("expression_statement") => {
             // expression_statement wraps a switch used purely for side effects —
             // that's still a "statement" position in spirit.
-            if matches!(node.parent().map(|p| p.kind()), Some("expression_statement")) {
+            if matches!(
+                node.parent().map(|p| p.kind()),
+                Some("expression_statement")
+            ) {
                 "statement"
             } else {
                 "expression"
@@ -1532,7 +1607,13 @@ fn switch_statement_attrs(node: &Node, source: &str) -> Attrs {
     let mut has_default = false;
     let body = node.child_by_field_name("body");
     if let Some(body) = body {
-        walk_switch_body(&body, source, &mut seen_colon, &mut seen_arrow, &mut has_default);
+        walk_switch_body(
+            &body,
+            source,
+            &mut seen_colon,
+            &mut seen_arrow,
+            &mut has_default,
+        );
     }
     let case_style = match (seen_colon, seen_arrow) {
         (true, true) => "mixed",
@@ -1543,7 +1624,11 @@ fn switch_statement_attrs(node: &Node, source: &str) -> Attrs {
     attrs.insert("case_style".to_string(), case_style.to_string());
     attrs.insert(
         "has_default".to_string(),
-        if has_default { "true".into() } else { "false".into() },
+        if has_default {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1599,7 +1684,11 @@ fn while_statement_attrs(node: &Node, source: &str) -> Attrs {
     let mut attrs = Attrs::new();
     attrs.insert(
         "condition_is_literal_true".to_string(),
-        if condition_is_literal_true(node, source) { "true".into() } else { "false".into() },
+        if condition_is_literal_true(node, source) {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     let body_is_block = node
         .child_by_field_name("body")
@@ -1607,7 +1696,11 @@ fn while_statement_attrs(node: &Node, source: &str) -> Attrs {
         .unwrap_or(false);
     attrs.insert(
         "body_is_block".to_string(),
-        if body_is_block { "true".into() } else { "false".into() },
+        if body_is_block {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1616,7 +1709,9 @@ fn while_statement_attrs(node: &Node, source: &str) -> Attrs {
 /// usually wrapped in a `parenthesized_expression`, so we peel one layer
 /// before checking the text.
 fn condition_is_literal_true(node: &Node, source: &str) -> bool {
-    let Some(cond) = node.child_by_field_name("condition") else { return false };
+    let Some(cond) = node.child_by_field_name("condition") else {
+        return false;
+    };
     let inner = if cond.kind() == "parenthesized_expression" {
         first_non_punct_child(&cond).unwrap_or(cond)
     } else {
@@ -1632,7 +1727,11 @@ fn do_statement_attrs(node: &Node, source: &str) -> Attrs {
     let mut attrs = Attrs::new();
     attrs.insert(
         "condition_is_literal_true".to_string(),
-        if condition_is_literal_true(node, source) { "true".into() } else { "false".into() },
+        if condition_is_literal_true(node, source) {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1654,7 +1753,11 @@ fn array_creation_attrs(node: &Node, source: &str) -> Attrs {
     let has_initializer = node.child_by_field_name("value").is_some();
     attrs.insert(
         "has_initializer".to_string(),
-        if has_initializer { "true".into() } else { "false".into() },
+        if has_initializer {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1694,7 +1797,9 @@ fn constructor_attrs(node: &Node, source: &str) -> Attrs {
 /// these as `explicit_constructor_invocation` whose first token is `this`
 /// or `super`.
 fn constructor_delegation(node: &Node) -> &'static str {
-    let Some(body) = node.child_by_field_name("body") else { return "none" };
+    let Some(body) = node.child_by_field_name("body") else {
+        return "none";
+    };
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
         if child.kind() != "explicit_constructor_invocation" {
@@ -1745,15 +1850,27 @@ fn interface_attrs(node: &Node, source: &str) -> Attrs {
     }
     attrs.insert(
         "has_default_methods".to_string(),
-        if has_default { "true".into() } else { "false".into() },
+        if has_default {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert(
         "has_static_methods".to_string(),
-        if has_static { "true".into() } else { "false".into() },
+        if has_static {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert(
         "is_sealed".to_string(),
-        if has_modifier(node, source, "sealed") { "true".into() } else { "false".into() },
+        if has_modifier(node, source, "sealed") {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1771,7 +1888,11 @@ fn instanceof_attrs(node: &Node, source: &str) -> Attrs {
     let is_pattern = node.child_by_field_name("name").is_some();
     attrs.insert(
         "is_pattern".to_string(),
-        if is_pattern { "true".into() } else { "false".into() },
+        if is_pattern {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1880,7 +2001,11 @@ fn record_attrs(node: &Node, source: &str) -> Attrs {
     }
     attrs.insert(
         "has_instance_field".to_string(),
-        if has_instance_field { "true".into() } else { "false".into() },
+        if has_instance_field {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1904,7 +2029,10 @@ fn method_reference_attrs(node: &Node, source: &str) -> Attrs {
         if kind == "::" || kind == "type_arguments" {
             continue;
         }
-        let text = child.utf8_text(source.as_bytes()).ok().map(|s| s.trim().to_string());
+        let text = child
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(|s| s.trim().to_string());
         if receiver_text.is_none() {
             if kind == "super" {
                 receiver_is_super = true;
@@ -1919,7 +2047,12 @@ fn method_reference_attrs(node: &Node, source: &str) -> Attrs {
     let reference_kind = match (&target_text, receiver_is_super, &receiver_text) {
         (Some(t), _, _) if t == "new" => "constructor",
         (_, true, _) => "super",
-        (_, _, Some(r)) if r.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) => {
+        (_, _, Some(r))
+            if r.chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false) =>
+        {
             "static_or_unbound"
         }
         _ => "bound",
@@ -1964,7 +2097,11 @@ fn enum_attrs(node: &Node, source: &str) -> Attrs {
     attrs.insert("constant_count".to_string(), constant_count.to_string());
     attrs.insert(
         "has_mutable_field".to_string(),
-        if has_mutable_field { "true".into() } else { "false".into() },
+        if has_mutable_field {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -1999,11 +2136,19 @@ fn type_parameters_attrs(node: &Node, source: &str) -> Attrs {
     let has_non_conventional = names.iter().any(|n| !is_conventional_type_param(n));
     attrs.insert(
         "has_non_conventional_name".to_string(),
-        if has_non_conventional { "true".into() } else { "false".into() },
+        if has_non_conventional {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert(
         "has_bounds".to_string(),
-        if has_bounds { "true".into() } else { "false".into() },
+        if has_bounds {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs.insert("names".to_string(), names.join(", "));
     attrs
@@ -2014,7 +2159,9 @@ fn type_parameters_attrs(node: &Node, source: &str) -> Attrs {
 /// `t`, `Type`, `Element`, `ResultType` all fail.
 fn is_conventional_type_param(name: &str) -> bool {
     let mut chars = name.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_uppercase() {
         return false;
     }
@@ -2036,7 +2183,11 @@ fn ternary_attrs(node: &Node) -> Attrs {
         || branch_is_ternary(node.child_by_field_name("alternative"));
     attrs.insert(
         "is_nested".to_string(),
-        if is_nested { "true".into() } else { "false".into() },
+        if is_nested {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }
@@ -2069,7 +2220,9 @@ fn catch_attrs(node: &Node, source: &str) -> Attrs {
         // direct child of kind `catch_type` (which itself contains the
         // pipe-separated identifiers).
         for j in 0..child.child_count() {
-            let Some(grandchild) = child.child(j) else { continue };
+            let Some(grandchild) = child.child(j) else {
+                continue;
+            };
             if grandchild.kind() != "catch_type" {
                 continue;
             }
@@ -2087,7 +2240,11 @@ fn catch_attrs(node: &Node, source: &str) -> Attrs {
     }
     attrs.insert(
         "is_multi_catch".to_string(),
-        if is_multi { "true".into() } else { "false".into() },
+        if is_multi {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
 
     let is_empty = node
@@ -2100,7 +2257,11 @@ fn catch_attrs(node: &Node, source: &str) -> Attrs {
         .unwrap_or(false);
     attrs.insert(
         "is_empty".to_string(),
-        if is_empty { "true".into() } else { "false".into() },
+        if is_empty {
+            "true".into()
+        } else {
+            "false".into()
+        },
     );
     attrs
 }

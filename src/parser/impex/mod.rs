@@ -224,7 +224,9 @@ fn handle_header(header: &ImpexHeader, ctx: &mut ParseCtx<'_>) {
 }
 
 fn emit_reference_column(target_type: &str, column: &Column, ctx: &mut ParseCtx<'_>) {
-    let Some(attrs) = &column.target_attrs else { return };
+    let Some(attrs) = &column.target_attrs else {
+        return;
+    };
     if attrs.is_empty() {
         return;
     }
@@ -253,7 +255,8 @@ fn emit_reference_column(target_type: &str, column: &Column, ctx: &mut ParseCtx<
         .iter()
         .any(|(k, v)| k == "unique" && v == "true")
     {
-        rel.metadata.insert("identity".to_string(), "true".to_string());
+        rel.metadata
+            .insert("identity".to_string(), "true".to_string());
     }
     if let Some(b) = ctx.current_branch() {
         rel.metadata.insert("branch".to_string(), b.to_string());
@@ -382,8 +385,10 @@ fn flush_macro_warnings(ctx: &mut ParseCtx<'_>) {
     unresolved.sort();
     unresolved.dedup();
     for name in unresolved {
-        ctx.result
-            .add_warning(format!("Impex macro `${}` referenced before definition", name));
+        ctx.result.add_warning(format!(
+            "Impex macro `${}` referenced before definition",
+            name
+        ));
     }
     for w in std::mem::take(&mut ctx.macros.cycle_warnings) {
         ctx.result.add_warning(w);

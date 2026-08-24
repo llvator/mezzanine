@@ -32,9 +32,8 @@ pub(super) fn parse_modifier_attributes(node: &Node, source: &str) -> Vec<String
         for child in modifiers.children(&mut cursor) {
             match child.kind() {
                 "public" | "private" | "protected" => {}
-                "static" | "final" | "abstract" | "synchronized"
-                | "native" | "transient" | "volatile" | "default"
-                | "strictfp" => {
+                "static" | "final" | "abstract" | "synchronized" | "native" | "transient"
+                | "volatile" | "default" | "strictfp" => {
                     attrs.push(child.kind().to_string());
                 }
                 "marker_annotation" | "annotation" => {

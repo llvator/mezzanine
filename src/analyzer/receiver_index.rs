@@ -15,7 +15,7 @@
 //! it — on a ghost, visibly unresolved.
 
 use crate::models::{CodeEntity, EntityKind, Relationship};
-use crate::parser::rust_base_type_name;
+use crate::parser::rust_type_names::base_type_name as rust_base_type_name;
 use std::collections::HashMap;
 
 /// `struct name → (field name → declared type)` over every Rust struct in the
@@ -49,10 +49,7 @@ impl FieldIndex {
         for entity in structs {
             let fields = by_struct.entry(entity.name.clone()).or_default();
             for field in &entity.fields {
-                let Some(declared) = field
-                    .type_name
-                    .as_deref()
-                    .and_then(rust_base_type_name)
+                let Some(declared) = field.type_name.as_deref().and_then(rust_base_type_name)
                 else {
                     continue;
                 };
@@ -97,7 +94,10 @@ impl FieldIndex {
 /// the time the graph is built, so they never reach a renderer.
 pub(super) fn resolve_deferred(relationships: &mut [Relationship], index: &FieldIndex) {
     for rel in relationships.iter_mut() {
-        let hint = match (rel.metadata.get("recv_path"), rel.metadata.get("recv_member")) {
+        let hint = match (
+            rel.metadata.get("recv_path"),
+            rel.metadata.get("recv_member"),
+        ) {
             (Some(path), Some(member)) => Some((path.clone(), member.clone())),
             _ => None,
         };
@@ -120,7 +120,8 @@ mod tests {
     use std::path::Path;
 
     fn rust_struct(name: &str, file: &str, fields: &[(&str, &str)]) -> CodeEntity {
-        let mut entity = CodeEntity::new(name, EntityKind::Struct, Path::new(file), Span::default());
+        let mut entity =
+            CodeEntity::new(name, EntityKind::Struct, Path::new(file), Span::default());
         entity.fields = fields
             .iter()
             .map(|(fname, ftype)| Parameter {
@@ -139,8 +140,10 @@ mod tests {
             format!("recv.{}::{}", path, member),
             RelationshipKind::Calls,
         );
-        rel.metadata.insert("recv_path".to_string(), path.to_string());
-        rel.metadata.insert("recv_member".to_string(), member.to_string());
+        rel.metadata
+            .insert("recv_path".to_string(), path.to_string());
+        rel.metadata
+            .insert("recv_member".to_string(), member.to_string());
         rel
     }
 
@@ -195,7 +198,11 @@ mod tests {
 
     #[test]
     fn an_unknown_field_leaves_the_edge_where_the_parser_left_it() {
-        let entities = vec![rust_struct("CodeEntity", "src/a.rs", &[("kind", "EntityKind")])];
+        let entities = vec![rust_struct(
+            "CodeEntity",
+            "src/a.rs",
+            &[("kind", "EntityKind")],
+        )];
         let rel = resolve_one(&entities, "CodeEntity.nonesuch", "act");
         assert_eq!(rel.target_id, "recv.CodeEntity.nonesuch::act");
     }
@@ -267,15 +274,27 @@ mod tests {
         ];
         resolve_deferred(&mut rels, &index);
         for rel in &rels {
-            assert!(!rel.metadata.contains_key("recv_path"), "{:?}", rel.metadata);
-            assert!(!rel.metadata.contains_key("recv_member"), "{:?}", rel.metadata);
+            assert!(
+                !rel.metadata.contains_key("recv_path"),
+                "{:?}",
+                rel.metadata
+            );
+            assert!(
+                !rel.metadata.contains_key("recv_member"),
+                "{:?}",
+                rel.metadata
+            );
         }
     }
 
     #[test]
     fn edges_without_a_hint_are_untouched() {
         let index = FieldIndex::build(std::iter::empty());
-        let mut rels = vec![Relationship::new("caller", "Foo::bar", RelationshipKind::Calls)];
+        let mut rels = vec![Relationship::new(
+            "caller",
+            "Foo::bar",
+            RelationshipKind::Calls,
+        )];
         resolve_deferred(&mut rels, &index);
         assert_eq!(rels[0].target_id, "Foo::bar");
     }

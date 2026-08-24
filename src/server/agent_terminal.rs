@@ -70,7 +70,11 @@ pub(crate) struct TerminalResponse {
 /// Constant-time-ish comparison. The token is short and local, but there is no
 /// reason to leak its prefix through timing.
 fn tokens_match(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// Is this request from a page *this server itself* served?
@@ -87,7 +91,10 @@ fn tokens_match(a: &str, b: &str) -> bool {
 /// in the startup banner.
 fn is_same_origin(headers: &HeaderMap) -> bool {
     let get = |k: header::HeaderName| {
-        headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_owned)
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
     };
     let (Some(origin), Some(host)) = (get(header::ORIGIN), get(header::HOST)) else {
         // No Origin means a non-browser client. Those must bring the token —
@@ -121,7 +128,13 @@ fn resolve_terminal() -> Option<String> {
     } else if cfg!(target_os = "windows") {
         &["wt.exe", "cmd.exe"]
     } else {
-        &["x-terminal-emulator", "gnome-terminal", "konsole", "alacritty", "xterm"]
+        &[
+            "x-terminal-emulator",
+            "gnome-terminal",
+            "konsole",
+            "alacritty",
+            "xterm",
+        ]
     };
     candidates
         .iter()
@@ -132,7 +145,11 @@ fn resolve_terminal() -> Option<String> {
 /// Is `binary` runnable? Same probe as the VS Code side uses, for the same
 /// reason: spawning and hoping produces a window that flashes an error.
 fn which(binary: &str) -> bool {
-    let probe = if cfg!(target_os = "windows") { "where" } else { "which" };
+    let probe = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
     Command::new(probe)
         .arg(binary)
         .output()
@@ -145,13 +162,21 @@ fn which(binary: &str) -> bool {
 /// The prompt goes in a file rather than a command-line argument for the
 /// reason UI-037 measured: a real hotspot's prompt is ~94 KB in `full` mode,
 /// which would hit `ARG_MAX` and mangle quoting. The agent reads the file.
-fn write_launcher(repo_root: &Path, prompt: &str, claude: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+fn write_launcher(
+    repo_root: &Path,
+    prompt: &str,
+    claude: &str,
+) -> std::io::Result<(PathBuf, PathBuf)> {
     let dir = std::env::temp_dir().join(format!("nao-agent-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let prompt_file = dir.join("refactor.prompt.md");
     std::fs::write(&prompt_file, prompt)?;
 
-    let script = dir.join(if cfg!(target_os = "windows") { "launch.cmd" } else { "launch.command" });
+    let script = dir.join(if cfg!(target_os = "windows") {
+        "launch.cmd"
+    } else {
+        "launch.command"
+    });
     let body = if cfg!(target_os = "windows") {
         format!(
             "@echo off\r\ncd /d \"{}\"\r\n{} \"Read '{}' and carry out the refactoring task it describes.\"\r\n",
@@ -227,10 +252,16 @@ pub(crate) async fn terminal_handler(
     };
     let assembly = {
         let graph = state.graph.read().map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Graph lock poisoned: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Graph lock poisoned: {e}"),
+            )
         })?;
         let config = state.config.read().map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Config lock poisoned: {e}"),
+            )
         })?;
         super::scope_handler::collect_scope(&graph, &config.root_path, &scope_req)?
     };
@@ -264,10 +295,16 @@ pub(crate) async fn terminal_handler(
     ))?;
 
     let (prompt_file, script) = write_launcher(&repo_root, &prompt, &claude).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not stage the launcher: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not stage the launcher: {e}"),
+        )
     })?;
     launch(&terminal, &script).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not launch {terminal}: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not launch {terminal}: {e}"),
+        )
     })?;
 
     Ok(Json(TerminalResponse {
@@ -346,9 +383,16 @@ mod tests {
         let (prompt_file, script) = write_launcher(&dir, &big, "claude").unwrap();
 
         let body = std::fs::read_to_string(&script).unwrap();
-        assert!(body.len() < 2_000, "prompt was inlined into the script: {} bytes", body.len());
+        assert!(
+            body.len() < 2_000,
+            "prompt was inlined into the script: {} bytes",
+            body.len()
+        );
         assert!(body.contains(&prompt_file.display().to_string()), "{body}");
-        assert_eq!(std::fs::read_to_string(&prompt_file).unwrap().len(), 200_000);
+        assert_eq!(
+            std::fs::read_to_string(&prompt_file).unwrap().len(),
+            200_000
+        );
 
         let _ = std::fs::remove_dir_all(prompt_file.parent().unwrap());
     }

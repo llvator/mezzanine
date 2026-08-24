@@ -4,11 +4,19 @@
 //! markdown body. Frontmatter declares `id`, `language`, `applies-to`, optional
 //! `match:`, `severity`, `kind`. The body holds the user-visible content
 //! (typically a `# Title`, then `## Good` / `## Bad` / `## Why` sections).
+//!
+//! Only the rule lives here. The frontmatter split is [`super::content_files`]'s
+//! (both content kinds share it), the `match:` primitives are
+//! [`super::predicate`]'s, and the complaint type is [`super::issues`]'s.
 
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use super::content_files::{split_frontmatter, walk_markdown_files};
+use super::issues::{LoadIssue, LoadIssueSeverity};
+use super::predicate::MatchOp;
 
 /// Frontmatter shape, deserialized from the YAML header of a rule file.
 #[derive(Debug, Deserialize)]
@@ -69,115 +77,9 @@ impl Rule {
     }
 }
 
-/// A single predicate primitive applied to one attribute. Per ADR-0002, this set
-/// is intentionally small — extend by adding parser-emitted attributes, not by
-/// adding code-handler escape hatches.
-#[derive(Debug, Clone)]
-pub enum MatchOp {
-    Eq(String),
-    In(Vec<String>),
-    Absent,
-    Present,
-}
-
-/// A single load-time issue surfaced by the loader or validator. Errors drop
-/// the rule from the index; warnings keep the rule but log a diagnostic.
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadIssue {
-    pub path: PathBuf,
-    pub rule_id: Option<String>,
-    pub severity: LoadIssueSeverity,
-    pub field: Option<String>,
-    pub message: String,
-    pub suggestion: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LoadIssueSeverity {
-    Error,
-    Warning,
-}
-
-impl MatchOp {
-    fn from_yaml(v: &serde_yaml::Value) -> Result<Self> {
-        match v {
-            serde_yaml::Value::String(s) => Ok(MatchOp::Eq(s.clone())),
-            serde_yaml::Value::Mapping(m) => {
-                let mut keys: Vec<String> = m
-                    .keys()
-                    .filter_map(|k| k.as_str().map(|s| s.to_string()))
-                    .collect();
-                if keys.len() != 1 {
-                    return Err(anyhow!(
-                        "match operator must be a single-key mapping, got keys: {:?}",
-                        keys
-                    ));
-                }
-                let key = keys.remove(0);
-                let val = m
-                    .get(serde_yaml::Value::String(key.clone()))
-                    .ok_or_else(|| anyhow!("missing value for operator {}", key))?;
-                match key.as_str() {
-                    "eq" => val
-                        .as_str()
-                        .map(|s| MatchOp::Eq(s.to_string()))
-                        .ok_or_else(|| anyhow!("`eq` value must be a string")),
-                    "in" => val
-                        .as_sequence()
-                        .map(|seq| {
-                            MatchOp::In(
-                                seq.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect(),
-                            )
-                        })
-                        .ok_or_else(|| anyhow!("`in` value must be a sequence")),
-                    "absent" => val
-                        .as_bool()
-                        .filter(|b| *b)
-                        .map(|_| MatchOp::Absent)
-                        .ok_or_else(|| anyhow!("`absent: true` is the only accepted form")),
-                    "present" => val
-                        .as_bool()
-                        .filter(|b| *b)
-                        .map(|_| MatchOp::Present)
-                        .ok_or_else(|| anyhow!("`present: true` is the only accepted form")),
-                    other => Err(anyhow!(
-                        "unknown predicate primitive `{}` (ADR-0002: no Rust-handler escape hatch; \
-                         allowed: eq, in, absent, present)",
-                        other
-                    )),
-                }
-            }
-            _ => Err(anyhow!(
-                "match value must be a string (shorthand for `eq`) or a single-key mapping"
-            )),
-        }
-    }
-}
-
-/// Split a `---`-delimited frontmatter from the body. Visible to sibling
-/// modules (lessons) so the shared file format stays one implementation.
-pub(super) fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
-    let raw = raw.trim_start_matches('\u{feff}');
-    let raw = raw.trim_start_matches('\n');
-    let rest = raw
-        .strip_prefix("---")
-        .ok_or_else(|| anyhow!("file must start with `---` frontmatter delimiter"))?;
-    let rest = rest.trim_start_matches('\n');
-    let end = rest
-        .find("\n---")
-        .ok_or_else(|| anyhow!("frontmatter must end with `---` on its own line"))?;
-    let frontmatter = &rest[..end];
-    let after = &rest[end + 4..];
-    let body = after.trim_start_matches('\n');
-    Ok((frontmatter, body))
-}
-
 fn parse_one(path: &Path) -> Result<Rule> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let (frontmatter_str, body) = split_frontmatter(&raw)
         .with_context(|| format!("splitting frontmatter in {}", path.display()))?;
     let fm: Frontmatter = serde_yaml::from_str(frontmatter_str)
@@ -186,12 +88,15 @@ fn parse_one(path: &Path) -> Result<Rule> {
     let match_predicate = if let Some(raw) = fm.r#match {
         let mut compiled = HashMap::new();
         for (k, v) in raw {
-            let op = MatchOp::from_yaml(&v).with_context(|| {
-                format!("compiling `match.{}` in {}", k, path.display())
-            })?;
+            let op = MatchOp::from_yaml(&v)
+                .with_context(|| format!("compiling `match.{}` in {}", k, path.display()))?;
             compiled.insert(k, op);
         }
-        if compiled.is_empty() { None } else { Some(compiled) }
+        if compiled.is_empty() {
+            None
+        } else {
+            Some(compiled)
+        }
     } else {
         None
     };
@@ -232,7 +137,7 @@ pub(super) fn load_all(content_root: &Path) -> Result<(Vec<Rule>, Vec<LoadIssue>
         if !rules_dir.is_dir() {
             continue;
         }
-        let rule_files = super::scan::walk_markdown_files(&rules_dir)
+        let rule_files = walk_markdown_files(&rules_dir)
             .with_context(|| format!("walking rules dir {}", rules_dir.display()))?;
         for path in rule_files {
             match parse_one(&path) {

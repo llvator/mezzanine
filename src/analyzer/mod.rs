@@ -1,29 +1,32 @@
 //! Code analysis and dependency resolution.
 
-mod file_walker;
 mod dependency_resolver;
-mod parse_store;
+mod file_walker;
+pub mod folder_shape;
 mod lsp_tracer;
 mod markdown_links;
+mod parse_store;
 mod receiver_index;
 pub mod sql_fold;
 
-pub use file_walker::{is_test_path, FileWalker};
 pub use dependency_resolver::DependencyResolver;
+pub use file_walker::{is_test_path, FileWalker};
 pub use parse_store::ParseStore;
 
 use crate::config::Config;
-use crate::models::{CodeEntity, EntityKind, Precision, Relationship, RelationshipKind, FileInfo, Position, Span};
 use crate::models::file_info::Language;
+use crate::models::{
+    CodeEntity, EntityKind, FileInfo, Position, Precision, Relationship, RelationshipKind, Span,
+};
 use crate::parser::{self};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::{Deserialize, Serialize};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Sentinel error returned by `Analyzer::analyze_with_cancel` when the
 /// caller flips the cancel flag mid-run. Callers catch this and skip
@@ -82,6 +85,11 @@ pub struct Analyzer {
     files: HashMap<PathBuf, FileInfo>,
     /// Import information by file
     imports: HashMap<PathBuf, Vec<crate::parser::language_parser::ImportInfo>>,
+    /// Where each cross-file import was written (AN-024). Filled by
+    /// `resolve_dependencies` from the same map above, once the whole
+    /// file set is known — a specifier cannot be resolved to a file
+    /// before the analysis knows which files there are.
+    import_sites: Vec<crate::models::ImportSite>,
     /// Cross-file warnings surfaced during resolution (e.g. Elevator
     /// out-of-scope references). Populated by the post-merge passes
     /// that have access to the merged graph; flushed into
@@ -99,10 +107,11 @@ impl Analyzer {
             relationships: Vec::new(),
             files: HashMap::new(),
             imports: HashMap::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         }
     }
-    
+
     /// Run the analysis on the configured path. Equivalent to
     /// `analyze_with_cancel` with a never-flipped flag — preserved so
     /// callers that don't need cancellation (CLI `analyze`, tests) stay
@@ -199,7 +208,10 @@ impl Analyzer {
             .collect();
         progress.finish_with_message("done");
         let (hits, misses) = store.stats();
-        eprintln!("  Parse store: {} hits, {} misses (re-parsed {} changed/new files)", hits, misses, misses);
+        eprintln!(
+            "  Parse store: {} hits, {} misses (re-parsed {} changed/new files)",
+            hits, misses, misses
+        );
         results
     }
 
@@ -266,7 +278,8 @@ impl Analyzer {
     /// `files`, `file_entities`, `entities`, `relationships`, `imports`.
     fn merge_parse_results(&mut self, parse_results: Vec<ParsedFile>) {
         for parsed in parse_results {
-            self.files.insert(parsed.file_info.path.clone(), parsed.file_info);
+            self.files
+                .insert(parsed.file_info.path.clone(), parsed.file_info);
             for entity in parsed.entities {
                 self.file_entities
                     .entry(entity.file_path.clone())
@@ -395,8 +408,10 @@ impl Analyzer {
         self.create_branch_entities();
 
         eprintln!("  Resolving dependencies...");
-        let resolver = DependencyResolver::new(&self.config, &self.entities, &self.imports);
+        let resolver =
+            DependencyResolver::new(&self.config, &self.entities, &self.imports, &self.files);
         let dep_relationships = resolver.resolve()?;
+        self.import_sites = resolver.import_sites();
         self.relationships.extend(dep_relationships);
 
         self.validate_elevator_imports();
@@ -646,13 +661,20 @@ impl Analyzer {
     fn build_result(&self) -> AnalysisResult {
         let mut entities: Vec<CodeEntity> = self.entities.values().cloned().collect();
         entities.sort_by(|a, b| {
-            (&a.file_path, a.span.start.offset, &a.id)
-                .cmp(&(&b.file_path, b.span.start.offset, &b.id))
+            (&a.file_path, a.span.start.offset, &a.id).cmp(&(
+                &b.file_path,
+                b.span.start.offset,
+                &b.id,
+            ))
         });
         let mut relationships = self.relationships.clone();
         relationships.sort_by(|a, b| {
-            (&a.source_id, &a.target_id, a.kind.display_label(), &a.label)
-                .cmp(&(&b.source_id, &b.target_id, b.kind.display_label(), &b.label))
+            (&a.source_id, &a.target_id, a.kind.display_label(), &a.label).cmp(&(
+                &b.source_id,
+                &b.target_id,
+                b.kind.display_label(),
+                &b.label,
+            ))
         });
         let mut files: Vec<FileInfo> = self.files.values().cloned().collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -660,6 +682,7 @@ impl Analyzer {
             entities,
             relationships,
             files,
+            import_sites: self.import_sites.clone(),
             warnings: self.warnings.clone(),
         }
     }
@@ -711,7 +734,7 @@ impl Analyzer {
         store.put(&abs_path, &content_hash, &parsed);
         Ok(parsed)
     }
-    
+
     /// Create Parameter entities for each function/method parameter
     /// and TakesParam relationships pointing into the function.
     fn create_parameter_entities(&mut self) {
@@ -719,7 +742,14 @@ impl Analyzer {
             .entities
             .values()
             .filter(|e| e.kind.is_callable() && !e.parameters.is_empty())
-            .map(|e| (e.id.clone(), e.file_path.clone(), e.span, e.parameters.clone()))
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    e.file_path.clone(),
+                    e.span,
+                    e.parameters.clone(),
+                )
+            })
             .collect();
 
         for (func_id, file_path, span, params) in callables {
@@ -732,23 +762,16 @@ impl Analyzer {
                 let display_name = member_label(&param.name, param.type_name.as_deref());
 
                 let param_id = format!("{}::param::{}", func_id, param.name);
-                let mut entity = CodeEntity::new(
-                    display_name,
-                    EntityKind::Parameter,
-                    file_path.clone(),
-                    span,
-                );
+                let mut entity =
+                    CodeEntity::new(display_name, EntityKind::Parameter, file_path.clone(), span);
                 entity.id = param_id.clone();
                 entity.qualified_name = entity.name.clone();
                 entity.parent_id = Some(func_id.clone());
 
                 self.entities.insert(param_id.clone(), entity);
 
-                let rel = Relationship::new(
-                    param_id,
-                    func_id.clone(),
-                    RelationshipKind::TakesParam,
-                );
+                let rel =
+                    Relationship::new(param_id, func_id.clone(), RelationshipKind::TakesParam);
                 self.relationships.push(rel);
             }
         }
@@ -784,10 +807,7 @@ impl Analyzer {
                 // Skip obviously-synthetic names the language parsers
                 // produced before we fixed the subscript / attribute-chain
                 // bugs (still defensive, cheap).
-                if field.name.is_empty()
-                    || field.name.contains('[')
-                    || field.name.contains('.')
-                {
+                if field.name.is_empty() || field.name.contains('[') || field.name.contains('.') {
                     continue;
                 }
 
@@ -800,12 +820,8 @@ impl Analyzer {
                     continue;
                 }
 
-                let mut entity = CodeEntity::new(
-                    display_name,
-                    EntityKind::Variable,
-                    file_path.clone(),
-                    span,
-                );
+                let mut entity =
+                    CodeEntity::new(display_name, EntityKind::Variable, file_path.clone(), span);
                 entity.id = field_id.clone();
                 entity.qualified_name = entity.name.clone();
                 entity.parent_id = Some(owner_id.clone());
@@ -883,8 +899,7 @@ impl Analyzer {
                     accumulated.push('.');
                 }
                 accumulated.push_str(segment);
-                let entity_id =
-                    format!("{}::branch::{}", caller_id, accumulated);
+                let entity_id = format!("{}::branch::{}", caller_id, accumulated);
                 let prefix_key = (caller_id.clone(), accumulated.clone());
                 if !self.entities.contains_key(&entity_id) {
                     let mut entity = CodeEntity::new(
@@ -900,8 +915,7 @@ impl Analyzer {
                         info.span,
                     );
                     entity.id = entity_id.clone();
-                    entity.qualified_name =
-                        format!("{}::{}", caller_id, accumulated);
+                    entity.qualified_name = format!("{}::{}", caller_id, accumulated);
                     entity.parent_id = Some(parent_entity_id.clone());
                     entity.tags.insert("branch_node".to_string());
                     self.entities.insert(entity_id.clone(), entity);
@@ -935,21 +949,22 @@ impl Analyzer {
 
         // Filter entities by kind
         if !filters.entity_kinds.is_empty() {
-            self.entities.retain(|_, e| filters.entity_kinds.contains(&e.kind));
+            self.entities
+                .retain(|_, e| filters.entity_kinds.contains(&e.kind));
         }
-        
+
         // Filter relationships by kind
         if !filters.relationship_kinds.is_empty() {
             self.relationships
                 .retain(|r| filters.relationship_kinds.contains(&r.kind));
         }
-        
+
         // Filter by minimum weight
         if filters.min_weight > 0 {
             self.relationships
                 .retain(|r| r.weight >= filters.min_weight);
         }
-        
+
         // Filter by name patterns (if any)
         // TODO: Implement regex matching
     }
@@ -1023,9 +1038,8 @@ impl Analyzer {
         }
     }
 
-
     /// Every name that appears at either end of an edge that is not mere
-    /// containment or assignment — plus the last dotted segment of each.
+    /// containment or assignment — plus the last qualified segment of each.
     ///
     /// The segments are why this is not a one-liner. At this point in the
     /// pipeline a call's `target_id` is often still the name the source wrote
@@ -1036,20 +1050,40 @@ impl Analyzer {
     /// `adder = functools.partial(make, 1)` was dropped and the call to it
     /// landed on `ghost:adder`. Matching what the graph builder matches keeps
     /// the two passes agreeing about what a name refers to.
+    ///
+    /// Both separators, because both spell the same thing. A Rust reader of
+    /// `use crate::vocab::LIMIT` records `vocab::LIMIT` (AN-028), and reading
+    /// only the dotted spelling left the constant looking unreferenced and
+    /// dropped it out from under its own edge. Adding `::` rescued no other
+    /// entity in this repo, so it costs the cut nothing.
     fn structural_endpoints(&self) -> HashSet<&str> {
         let mut ends = HashSet::new();
         for rel in &self.relationships {
-            if matches!(rel.kind, RelationshipKind::Contains | RelationshipKind::WritesTo) {
+            if matches!(
+                rel.kind,
+                RelationshipKind::Contains | RelationshipKind::WritesTo
+            ) {
                 continue;
             }
             for end in [rel.source_id.as_str(), rel.target_id.as_str()] {
-                ends.insert(end);
-                if let Some(last) = end.rsplit('.').next() {
-                    ends.insert(last);
-                }
+                Self::with_segments(end, &mut ends);
             }
         }
         ends
+    }
+
+    /// One endpoint and the last segment of it under either qualifier.
+    ///
+    /// Beside [`Self::structural_endpoints`] rather than inside it because
+    /// the loop it sits in is charged for every branch it holds, and the
+    /// second separator was one branch more than the ceiling allows.
+    fn with_segments<'a>(end: &'a str, ends: &mut HashSet<&'a str>) {
+        ends.insert(end);
+        for separator in [".", "::"] {
+            if let Some(last) = end.rsplit(separator).next() {
+                ends.insert(last);
+            }
+        }
     }
 
     /// Analyze a specific file
@@ -1057,7 +1091,8 @@ impl Analyzer {
         let language = parser::detect_language(path);
         let store = ParseStore::open();
         let parsed = Self::parse_file_standalone(path, language, &store)?;
-        self.files.insert(parsed.file_info.path.clone(), parsed.file_info);
+        self.files
+            .insert(parsed.file_info.path.clone(), parsed.file_info);
         for entity in parsed.entities {
             self.file_entities
                 .entry(entity.file_path.clone())
@@ -1074,30 +1109,28 @@ impl Analyzer {
         // what strips the transient hints, and they must not reach the graph.
         self.resolve_deferred_receivers();
 
-        let file_entities: Vec<CodeEntity> = self
-            .file_entities
-            .get(path)
-            .cloned()
-            .unwrap_or_default();
-        
-        let entity_ids: std::collections::HashSet<_> = 
+        let file_entities: Vec<CodeEntity> =
+            self.file_entities.get(path).cloned().unwrap_or_default();
+
+        let entity_ids: std::collections::HashSet<_> =
             file_entities.iter().map(|e| &e.id).collect();
-        
+
         let relationships: Vec<Relationship> = self
             .relationships
             .iter()
             .filter(|r| entity_ids.contains(&r.source_id) || entity_ids.contains(&r.target_id))
             .cloned()
             .collect();
-        
+
         Ok(AnalysisResult {
             entities: file_entities,
             relationships,
             files: self.files.get(path).cloned().into_iter().collect(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         })
     }
-    
+
     /// Get entities at a specific depth from the root
     pub fn get_entities_at_depth(&self, depth: usize) -> Vec<&CodeEntity> {
         if depth == 0 {
@@ -1114,11 +1147,11 @@ impl Analyzer {
                 .values()
                 .filter(|e| e.parent_id.is_none())
                 .collect();
-            
+
             for _ in 0..depth {
-                let parent_ids: std::collections::HashSet<_> = 
+                let parent_ids: std::collections::HashSet<_> =
                     current_level.iter().map(|e| &e.id).collect();
-                
+
                 current_level = self
                     .entities
                     .values()
@@ -1130,7 +1163,7 @@ impl Analyzer {
                     })
                     .collect();
             }
-            
+
             current_level
         }
     }
@@ -1285,13 +1318,18 @@ fn stub_layer_tag(id: &str) -> &'static str {
 pub struct AnalysisResult {
     /// All discovered entities
     pub entities: Vec<CodeEntity>,
-    
+
     /// All discovered relationships
     pub relationships: Vec<Relationship>,
-    
+
     /// Information about analyzed files
     pub files: Vec<FileInfo>,
-    
+
+    /// Where each cross-file import was written (AN-024). File-granular
+    /// rather than entity-granular, and so beside the relationships
+    /// rather than among them — see [`crate::models::ImportSite`].
+    pub import_sites: Vec<crate::models::ImportSite>,
+
     /// Any warnings generated during analysis
     pub warnings: Vec<String>,
 }
@@ -1301,12 +1339,18 @@ impl AnalysisResult {
     pub fn entities_of_kind(&self, kind: crate::models::EntityKind) -> Vec<&CodeEntity> {
         self.entities.iter().filter(|e| e.kind == kind).collect()
     }
-    
+
     /// Get relationships of a specific kind
-    pub fn relationships_of_kind(&self, kind: crate::models::RelationshipKind) -> Vec<&Relationship> {
-        self.relationships.iter().filter(|r| r.kind == kind).collect()
+    pub fn relationships_of_kind(
+        &self,
+        kind: crate::models::RelationshipKind,
+    ) -> Vec<&Relationship> {
+        self.relationships
+            .iter()
+            .filter(|r| r.kind == kind)
+            .collect()
     }
-    
+
     /// Get all dependencies (imports, calls, etc.) for an entity
     pub fn dependencies_of(&self, entity_id: &str) -> Vec<&Relationship> {
         self.relationships
@@ -1314,7 +1358,7 @@ impl AnalysisResult {
             .filter(|r| r.source_id == entity_id && r.kind.is_dependency())
             .collect()
     }
-    
+
     /// Get entities that depend on a specific entity
     pub fn dependents_of(&self, entity_id: &str) -> Vec<&Relationship> {
         self.relationships
@@ -1328,6 +1372,122 @@ impl AnalysisResult {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    // --------------------------------------------------------------
+    //  Type-only imports, end to end (AN-022)
+    // --------------------------------------------------------------
+
+    /// The ticket's fixture, written to disk and analysed whole.
+    ///
+    /// `main.ts` and `a.ts` both name a type from `vocab.ts` and nothing
+    /// else, so neither specifier survives compilation; `main.ts` also
+    /// imports a *function* from `a.ts`, which does.
+    fn type_only_fixture(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "nao-an022-{}-{}-{}",
+            name,
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.ts"),
+            "import type { T } from './vocab';\n\
+             import { f } from './a';\n\
+             export function main(t: T) { f(t); }\n",
+        )
+        .unwrap();
+        // The other spelling: the keyword on the specifier, not the
+        // statement, and no value beside it to keep the module alive.
+        std::fs::write(
+            src.join("a.ts"),
+            "import { type T } from './vocab';\n\
+             export function f(_t: T) {}\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("vocab.ts"), "export type T = 'x' | 'y';\n").unwrap();
+        root
+    }
+
+    fn analyse(root: &Path) -> AnalysisResult {
+        let config = Config {
+            root_path: root.to_path_buf(),
+            ..Config::default()
+        };
+        Analyzer::new(config).analyze().unwrap()
+    }
+
+    /// Both spellings reach the site, and the ordinary import beside them
+    /// does not.
+    #[test]
+    fn both_spellings_of_import_type_reach_the_edge() {
+        let root = type_only_fixture("sites");
+        let result = analyse(&root);
+
+        let mark = |from: &str, to: &str| {
+            result
+                .import_sites
+                .iter()
+                .find(|s| s.from.ends_with(from) && s.to.ends_with(to))
+                .unwrap_or_else(|| panic!("no site {from} → {to}: {:?}", result.import_sites))
+                .is_type_only
+        };
+        assert!(mark("main.ts", "vocab.ts"), "statement-level `import type`");
+        assert!(mark("a.ts", "vocab.ts"), "specifier-level `{{ type T }}`");
+        assert!(!mark("main.ts", "a.ts"), "an ordinary `import {{ f }}`");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AN-025's answer, end to end: an arrow the build erases is left out
+    /// of every shape score (ADR 0026).
+    ///
+    /// The fixture is AN-022's own miniature of the failure. Two of three
+    /// edges step one level down; `main.ts → vocab.ts` skips one, because
+    /// `main.ts` also reaches `vocab.ts` through `a.ts` — and both arrows
+    /// onto `vocab.ts` are `import type`. Before this ticket `src` was
+    /// held at `tangled`, `layering` 0.67, by two edges no bundler ever
+    /// resolves, which is exactly the reading five rounds of `reshape`
+    /// could not offer.
+    ///
+    /// Deliberately replaces AN-022's `marking_an_edge_erased_moves_no_score`,
+    /// which asserted these same numbers unchanged and said in its own doc
+    /// comment that a reviewer changing the answer should be changing this
+    /// test on purpose. This is that change.
+    #[test]
+    fn an_erased_edge_is_left_out_of_the_shape_scores() {
+        let root = type_only_fixture("shape");
+        let result = analyse(&root);
+        let graph = crate::graph::DependencyGraph::from_analysis(&result);
+
+        let src = graph
+            .module_metrics()
+            .iter()
+            .find(|m| m.path.ends_with("src"))
+            .expect("the fixture has one folder");
+        let shape = src.metrics.shape.as_ref().expect("the folder is drawn");
+
+        // One arrow left — `main.ts → a.ts`, the one ordinary import in
+        // the fixture — and it steps a level cleanly.
+        assert_eq!(shape.layering, Some(1.0), "the erased edges still count");
+        assert_eq!(shape.acyclicity, 1.0);
+        // Every child is still drawn: discounting an arrow does not delete
+        // the file it points at. `vocab.ts` is now reached by nothing, so
+        // ADR 0022 charges it as a second root and the gate moves from
+        // `layering` to `arborescence` rather than disappearing.
+        assert_eq!(shape.child_count, 3);
+        assert_eq!(shape.arborescence, Some(0.5));
+        assert_eq!(shape.pattern, crate::models::ShapePattern::Hierarchical);
+        assert!(
+            matches!(shape.blocker, Some(crate::models::ShapeBlocker::Merges(_))),
+            "{:?}",
+            shape.blocker
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// One physical file, two ways to reach it — which is all a symlink is,
     /// and the normal shape of a spec directory kept outside the tree it
@@ -1352,11 +1512,18 @@ mod tests {
         assert_eq!(first.file_path, real);
 
         let second = Analyzer::parse_file_standalone(&linked, Language::Rust, &store).unwrap();
-        assert_eq!(second.file_path, linked, "the cached entry's path leaked through");
+        assert_eq!(
+            second.file_path, linked,
+            "the cached entry's path leaked through"
+        );
         assert!(
             second.entities.iter().all(|e| e.file_path == linked),
             "entities kept the other spelling: {:?}",
-            second.entities.iter().map(|e| &e.file_path).collect::<Vec<_>>()
+            second
+                .entities
+                .iter()
+                .map(|e| &e.file_path)
+                .collect::<Vec<_>>()
         );
 
         // And the first spelling still hits, rather than each run evicting
@@ -1399,17 +1566,38 @@ mod tests {
             let result = analyzer.analyze().expect("analysis should succeed");
             let graph = crate::graph::DependencyGraph::from_analysis(&result);
 
-            let ids: Vec<&str> = result.entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>();
+            let ids: Vec<&str> = result
+                .entities
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>();
             let rels: Vec<(String, String, &'static str)> = result
                 .relationships
                 .iter()
-                .map(|r| (r.source_id.clone(), r.target_id.clone(), r.kind.display_label()))
+                .map(|r| {
+                    (
+                        r.source_id.clone(),
+                        r.target_id.clone(),
+                        r.kind.display_label(),
+                    )
+                })
                 .collect();
             let fans: Vec<(String, u32, u32, usize)> = graph
                 .entities()
-                .map(|e| (e.id.clone(), e.metrics.fan_in, e.metrics.fan_out, e.metrics.smells.len()))
+                .map(|e| {
+                    (
+                        e.id.clone(),
+                        e.metrics.fan_in,
+                        e.metrics.fan_out,
+                        e.metrics.smells.len(),
+                    )
+                })
                 .collect();
-            (ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(), rels, fans)
+            (
+                ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                rels,
+                fans,
+            )
         };
 
         assert_eq!(run(), run(), "two runs on an identical tree diverged");
@@ -1452,7 +1640,9 @@ mod tests {
     fn analyze_fixture(dir: &Path, include_locals: bool) -> AnalysisResult {
         let mut config = Config::for_path(dir);
         config.analysis.include_locals = include_locals;
-        Analyzer::new(config).analyze().expect("analysis should succeed")
+        Analyzer::new(config)
+            .analyze()
+            .expect("analysis should succeed")
     }
 
     fn named<'a>(result: &'a AnalysisResult, name: &str) -> Vec<&'a CodeEntity> {
@@ -1467,7 +1657,10 @@ mod tests {
         let dir = assignments_fixture("drops");
         let result = analyze_fixture(&dir, false);
 
-        assert!(named(&result, "MAX_RETRIES").is_empty(), "module constant survived");
+        assert!(
+            named(&result, "MAX_RETRIES").is_empty(),
+            "module constant survived"
+        );
         assert!(named(&result, "step").is_empty(), "function local survived");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1495,7 +1688,11 @@ mod tests {
                 .find(|e| e.name == "Session")
                 .and_then(|e| e.metrics.field_count)
         };
-        assert_eq!(count_of(&with), count_of(&without), "field_count moved with the cut");
+        assert_eq!(
+            count_of(&with),
+            count_of(&without),
+            "field_count moved with the cut"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1545,7 +1742,10 @@ mod tests {
             })
             .map(|r| (r.source_id.clone(), r.target_id.clone()))
             .collect();
-        assert!(dangling.is_empty(), "edges left pointing nowhere: {dangling:?}");
+        assert!(
+            dangling.is_empty(),
+            "edges left pointing nowhere: {dangling:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1557,7 +1757,10 @@ mod tests {
         let dir = assignments_fixture("restores");
         let result = analyze_fixture(&dir, true);
 
-        assert!(!named(&result, "MAX_RETRIES").is_empty(), "constant missing");
+        assert!(
+            !named(&result, "MAX_RETRIES").is_empty(),
+            "constant missing"
+        );
         assert!(!named(&result, "step").is_empty(), "local missing");
         assert!(!named(&result, "adder").is_empty(), "alias missing");
 
@@ -1628,8 +1831,7 @@ mod tests {
     fn parse_store_hit_matches_cold_parse() {
         use crate::parser;
         let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyzer/mod.rs");
-        let cache = std::env::temp_dir()
-            .join(format!("nao-an003-hit-{}", std::process::id()));
+        let cache = std::env::temp_dir().join(format!("nao-an003-hit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
         let store = ParseStore::open_at(cache.clone());
         let lang = parser::detect_language(&file);
@@ -1703,7 +1905,10 @@ mod tests {
         let crossings: Vec<String> = graph
             .relationships()
             .filter_map(|r| {
-                let (s, t) = (ext_of.get(r.source_id.as_str())?, ext_of.get(r.target_id.as_str())?);
+                let (s, t) = (
+                    ext_of.get(r.source_id.as_str())?,
+                    ext_of.get(r.target_id.as_str())?,
+                );
                 ((s == "ts" && t == "rs") || (s == "rs" && t == "ts"))
                     .then(|| format!("{} -> {}", r.source_id, r.target_id))
             })
@@ -1732,11 +1937,7 @@ mod tests {
             .analyze_with_cancel(&cancel)
             .expect_err("preset flag should abort");
 
-        assert!(
-            err.is::<Cancelled>(),
-            "expected Cancelled, got: {:?}",
-            err
-        );
+        assert!(err.is::<Cancelled>(), "expected Cancelled, got: {:?}", err);
     }
 
     /// Sanity check: with a fresh flag, the cancellable path runs to
@@ -1825,4 +2026,226 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --------------------------------------------------------------
+    //  An imported constant is a dependency (AN-028)
+    // --------------------------------------------------------------
+
+    /// Two files and one constant: the declaring module, and a function in
+    /// another file that imports the constant and reads it.
+    fn constant_fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "nao-an028-{}-{}-{}",
+            name,
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for (file, body) in files {
+            std::fs::write(src.join(file), body).unwrap();
+        }
+        root
+    }
+
+    /// The reader's edge onto the constant, or a panic naming what was found
+    /// instead. Read off the built graph rather than the raw relationships,
+    /// so the assertion covers the name resolving to the declaring file and
+    /// not merely an edge being recorded.
+    fn value_edge_target(result: &AnalysisResult, reader: &str) -> CodeEntity {
+        let graph = crate::graph::DependencyGraph::from_analysis(result);
+        let source = result
+            .entities
+            .iter()
+            .find(|e| e.name == reader)
+            .unwrap_or_else(|| panic!("no `{reader}` entity in {:?}", result.entities));
+        let (target, _) = graph
+            .dependencies(&source.id)
+            .into_iter()
+            .find(|(_, r)| r.kind == RelationshipKind::UsesValue)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no UsesValue edge out of `{reader}`: {:?}",
+                    graph.dependencies(&source.id)
+                )
+            });
+        target.clone()
+    }
+
+    /// The ticket's TypeScript fixture. Two constants, one reader, and the
+    /// default analysis — `include_locals` off, so this also covers the
+    /// constant surviving `drop_local_assignments` on the strength of the
+    /// edge alone.
+    #[test]
+    fn a_typescript_constant_read_across_files_is_a_dependency() {
+        let root = constant_fixture(
+            "ts",
+            &[
+                (
+                    "settings.ts",
+                    "export const DEFAULTS = { level: 1 };\nexport const LIMIT = 5;\n",
+                ),
+                (
+                    "ui.ts",
+                    "import { DEFAULTS, LIMIT } from './settings';\n\
+                     export function show(): number { return DEFAULTS.level + LIMIT; }\n",
+                ),
+            ],
+        );
+        let result = analyse(&root);
+        let target = value_edge_target(&result, "show");
+
+        assert!(!target.tags.contains("ghost"), "{target:?}");
+        assert_eq!(target.name, "LIMIT");
+        assert!(
+            target.file_path.ends_with("settings.ts"),
+            "the edge must land on the declaring file, not {:?}",
+            target.file_path
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same shape in Rust, which reaches the constant through `use`
+    /// rather than through a relative specifier.
+    #[test]
+    fn a_rust_constant_read_across_files_is_a_dependency() {
+        let root = constant_fixture(
+            "rs",
+            &[
+                ("vocab.rs", "pub const LIMIT: u32 = 5;\n"),
+                (
+                    "user.rs",
+                    "use crate::vocab::LIMIT;\n\
+                     pub fn show() -> u32 { LIMIT + 1 }\n",
+                ),
+                ("main.rs", "mod user;\nmod vocab;\nfn main() {}\n"),
+            ],
+        );
+        let result = analyse(&root);
+        let target = value_edge_target(&result, "show");
+
+        assert!(!target.tags.contains("ghost"), "{target:?}");
+        assert_eq!(target.name, "LIMIT");
+        assert!(
+            target.file_path.ends_with("vocab.rs"),
+            "the edge must land on the declaring file, not {:?}",
+            target.file_path
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name the reader also declares is not an import it reads. Without
+    /// this cut the shadowing parameter below bound to `repo.rs`, drawing a
+    /// dependency the body never has.
+    #[test]
+    fn a_shadowed_import_name_is_not_read_from_the_module_it_came_from() {
+        let root = constant_fixture(
+            "shadow",
+            &[
+                ("repo.rs", "pub fn clone_dir() -> u32 { 1 }\n"),
+                (
+                    "jobs.rs",
+                    "use crate::repo::clone_dir;\n\
+                     pub fn sanitize(clone_dir: u32) -> u32 { clone_dir + 1 }\n",
+                ),
+                ("main.rs", "mod jobs;\nmod repo;\nfn main() {}\n"),
+            ],
+        );
+        let result = analyse(&root);
+        let graph = crate::graph::DependencyGraph::from_analysis(&result);
+        let source = result
+            .entities
+            .iter()
+            .find(|e| e.name == "sanitize")
+            .expect("no `sanitize` entity");
+
+        assert!(
+            !graph
+                .dependencies(&source.id)
+                .iter()
+                .any(|(_, r)| r.kind == RelationshipKind::UsesValue),
+            "a shadowed name must not be read as the import it hides"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --------------------------------------------------------------
+    //  A module reached only through an enum variant (AN-029)
+    // --------------------------------------------------------------
+
+    /// The ticket's Rust fixture: a vocabulary module whose only reader
+    /// names it through a variant, in no signature and no call. ADR 0021
+    /// dropped `Type::variant` paths because "`UsesType` already carries"
+    /// the owner; here nothing does, so before ADR 0028 the only edges into
+    /// `vocab.rs` were its own `contains`.
+    #[test]
+    fn a_variant_read_through_an_imported_type_is_a_dependency() {
+        let root = constant_fixture(
+            "variant",
+            &[
+                ("vocab.rs", "pub enum Kind { A, B }\n"),
+                (
+                    "user.rs",
+                    "use crate::vocab::Kind;\n\
+                     pub fn pick() -> u32 { match Kind::A { Kind::A => 1, Kind::B => 2 } }\n",
+                ),
+                ("main.rs", "mod user;\nmod vocab;\nfn main() {}\n"),
+            ],
+        );
+        let result = analyse(&root);
+        let target = value_edge_target(&result, "pick");
+
+        assert!(!target.tags.contains("ghost"), "{target:?}");
+        assert_eq!(target.name, "Kind");
+        assert!(
+            target.file_path.ends_with("vocab.rs"),
+            "the edge must land on the declaring file, not {:?}",
+            target.file_path
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the CamelCase cut. `vocab::LIMIT` reaches the
+    /// constant through the *module*, whose only entity is the `mod vocab;`
+    /// line in `main.rs` — so admitting a lowercase owner would draw
+    /// `user.rs -> main.rs`, a file the reader does not depend on.
+    #[test]
+    fn a_constant_reached_through_a_module_path_draws_no_edge_to_the_mod_line() {
+        let root = constant_fixture(
+            "modpath",
+            &[
+                ("vocab.rs", "pub const LIMIT: u32 = 5;\n"),
+                (
+                    "user.rs",
+                    "use crate::vocab;\n\
+                     pub fn show() -> u32 { vocab::LIMIT + 1 }\n",
+                ),
+                ("main.rs", "mod user;\nmod vocab;\nfn main() {}\n"),
+            ],
+        );
+        let result = analyse(&root);
+        let graph = crate::graph::DependencyGraph::from_analysis(&result);
+        let source = result
+            .entities
+            .iter()
+            .find(|e| e.name == "show")
+            .expect("no `show` entity");
+
+        assert!(
+            !graph
+                .dependencies(&source.id)
+                .iter()
+                .any(|(t, r)| r.kind == RelationshipKind::UsesValue
+                    && t.file_path.ends_with("main.rs")),
+            "a module-qualified read must not land on the `mod` line"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
+

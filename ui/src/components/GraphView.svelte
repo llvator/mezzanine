@@ -7,15 +7,19 @@
   import {
     graphData, selectedNode, hoveredNode, hoverLocked, hoverDepth, viewMode,
     showLabels, showKindLabels, showLinkLabels, viewportWidth, graphLevel, hoverMode,
-    toggleExpanded,
+    toggleExpanded, shapePicture,
   } from '../stores/graph';
   import { focusedPane } from '../stores/keymap';
-  import { displayPlan, displaySearchMatchIds, linkKeyFor, type DisplayPlan } from '../viewmodels/displayPlan';
+  import { displayPlan, displaySearchHighlightIds, linkKeyFor, type DisplayPlan } from '../viewmodels/displayPlan';
   import { drawnIdsOf } from '../viewmodels/drawCeiling';
-  import { diffActive, diffStatusMap, diffSourceChangedMap, diffDimOpacity, DIFF_COLORS, normalizeEntityId } from '../stores/diff';
-  import { autoFitView, activeTheme, folderCohesion, showFolderHulls, hullDepth } from '../stores/settings';
-  import { forceFolderCohesion, cohesionStrengthFor, folderKeyOf, ancestorChainOf, type FolderCohesionForce } from '../utils/forceCohesion';
-  import { makeSeeder } from '../utils/layoutSeed';
+  import { diffActive, diffStatusMap, diffSourceChangedMap, diffDimOpacity, diffContextOpacity, DIFF_COLORS, normalizeEntityId } from '../stores/diff';
+  import { autoFitView, activeTheme, folderCohesion, showFolderHulls, hullDepth, groupGrain } from '../stores/settings';
+  import {
+    forceFolderCohesion, cohesionStrengthFor, groupKeyOf, groupChainOf,
+    groupGrainFor, folderTierDepth, type FolderCohesionForce, type GroupGrain,
+  } from '../utils/forceCohesion';
+  import { linkFolderWeights } from '../utils/linkFolderWeights';
+  import { makeSeeder, wedgeKeyOf, fileWedgeKeyOf } from '../utils/layoutSeed';
   import {
     newcomers, worthMarking, noteArrivals, pruneArrivals, msUntilNextExpiry,
     ARRIVAL_HIGHLIGHT_MS, type ArrivalLog,
@@ -41,6 +45,12 @@
   import { nodeEncoding } from '../stores/encoding';
   import type { NodeEncoding } from '../viewmodels/nodeEncoding';
   import { ARROW_LEN, arrowHeadPoint, linkStrokeWidth } from '../viewmodels/linkGeometry';
+  import {
+    SHAPE_EDGE_COLORS,
+    shapeEdgeVerdicts,
+    verdictFor,
+    type ShapeEdgeVerdict,
+  } from '../viewmodels/shapeView';
   import { overviewDots, canvasViewport } from '../stores/overview';
   import { centreTransform, type OverviewDot } from '../viewmodels/overviewFrame';
 
@@ -100,6 +110,41 @@
   let container: HTMLDivElement;
   let svgEl: SVGSVGElement;
   let simulation: d3.Simulation<D3Node, D3Link>;
+  /** UI-102 — the folder term on the link force. Built once and never
+   *  rebuilt: it is stateless apart from a degree cache keyed on the links
+   *  array it was handed, so it survives every rebuild of the simulation and
+   *  every incremental `links()` swap without being re-wired. `folderKeyOf`
+   *  is passed so this, the cohesion force and the hulls cannot disagree
+   *  about what a group is. */
+  const linkWeights = linkFolderWeights((n) => groupKeyOf(n, currentGrain()));
+
+  /**
+   * The grain in force right now (UI-103).
+   *
+   * Read through `groupGrainFor` and never straight from the store, so the
+   * File and Module levels cannot be handed a grain they have no meaning for.
+   * Called rather than cached because `linkWeights` above is built once and
+   * outlives every level and grain change — a captured value there would go
+   * stale silently, where a call cannot.
+   */
+  function currentGrain(): GroupGrain {
+    return groupGrainFor(get(graphLevel), get(groupGrain));
+  }
+
+  /** The chain every consumer resolves membership through, at the grain now
+   *  in force. `Infinity` for the overlays: a region has to hold every node
+   *  beneath it whatever depth is drawn (UI-070). */
+  function chainFor(n: D3Node, limit?: number): string[] {
+    return groupChainOf(n, currentGrain(), limit);
+  }
+
+  /** The seed's wedge key at the grain now in force. `layoutSeed` keeps its
+   *  own key functions rather than taking the chain, because a wedge is one
+   *  arc and not a nesting — see `fileWedgeKeyOf` on why a root-level file
+   *  still needs the reserved arc. */
+  function wedgeKeyForGrain(): (n: D3Node) => string {
+    return currentGrain() === 'file' ? fileWedgeKeyOf : wedgeKeyOf;
+  }
   /** Chrome colours for the active theme. Re-read at each render and on
    *  theme change — the values are baked onto SVG attributes at join time,
    *  so a CSS variable swap alone would leave the canvas stale (UI-009). */
@@ -117,7 +162,10 @@
   let unsubscribers: (() => void)[] = [];
   let initialized = false;
   /** Track what mode we last applied so resize knows whether to restart sim. */
-  let currentMode: 'force' | 'tree' = 'force';
+  /** Which layout is on screen. `tree` and `shape` are both *pinned* — the
+   *  simulation is stopped and every node sits where a viewmodel put it —
+   *  so everything below tests `!== 'force'` rather than naming them. */
+  let currentMode: 'force' | 'tree' | 'shape' = 'force';
   /** Pending auto-fit timer — cleared when a new layout starts so we don't
    *  queue multiple fits on rapid plan changes. */
   let autoFitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -446,6 +494,35 @@
     simulation.alpha(0.3).restart();
   }
 
+  /** Re-read the group grain and rebuild everything membership decides
+   *  (UI-103).
+   *
+   *  Heavier than `applyCohesion` on purpose. That one changes a number the
+   *  force reads every tick; this changes *which groups exist*, and the force
+   *  resolves those once, in `initialize` — which d3 re-runs only when the
+   *  node array is set. Re-setting the same array is therefore the whole
+   *  point of the call and not a redundant assignment.
+   *
+   *  It deliberately does NOT reseed. The seed exists so the first settle
+   *  doesn't start from an arrangement that carries no structural
+   *  information; nodes already settled at folder grain are a *good* start
+   *  for file grain, files being inside the folders they just clustered
+   *  into. Reseeding would throw the reader's picture away to re-derive
+   *  something the canvas already knows.
+   *
+   *  The hulls and the traffic counts are redrawn directly rather than left
+   *  to the tick handler, because both must also update in tree mode and
+   *  when the simulation has already cooled. */
+  function applyGrain(): void {
+    if (!initialized) return;
+    if (currentMode === 'force' && simulation) {
+      simulation.nodes(simulation.nodes());
+      simulation.alpha(0.5).restart();
+    }
+    if (lastPlan) computeRegionTraffic(lastPlan);
+    drawHulls(true);
+  }
+
   // ── Folder hulls (UI-055) ──────────────────────────────────────────────
 
   /** Node ids the plan is currently drawing. A hull is computed from these
@@ -459,6 +536,10 @@
    *  per group on every one of ~60 ticks a second is not. */
   const HULL_INTERVAL_MS = 100;
   let lastHullDraw = 0;
+
+  /** The plan currently on screen, for the overlays that have to be rebuilt
+   *  by something other than a plan change. Null until the first apply. */
+  let lastPlan: DisplayPlan | null = null;
 
   const hullPath = d3.line<[number, number]>()
     .x((p) => p[0])
@@ -671,8 +752,7 @@
     const candidates: { id: string }[] = [];
     nodeSel.each((d: D3Node) => {
       candidates.push({ id: d.id });
-      const key = folderKeyOf(d);
-      chains.set(d.id, key === null ? [] : ancestorChainOf(key, Infinity));
+      chains.set(d.id, chainFor(d, Infinity));
     });
     const links: { source: string; target: string }[] = [];
     linkSel.each((l: D3Link) => {
@@ -713,10 +793,7 @@
     // the leaf regions.
     const hulls = computeFolderHulls(drawn, {
       radiusOf: (d) => encoding.radius(d),
-      keysOf: (d) => {
-        const key = folderKeyOf(d);
-        return key === null ? [] : ancestorChainOf(key, Infinity);
-      },
+      keysOf: (d) => chainFor(d, Infinity),
       tiers: get(hullDepth),
     });
     regionHulls = hulls;
@@ -809,12 +886,61 @@
    * are kind-level distinctions independent of the new tag layer.
    */
   function linkStrokeColour(d: D3Link): string {
+    // In the shape view colour means the edge's *verdict*, not its kind —
+    // which is the entire content of that view, and the one place this
+    // function's usual reading is deliberately overridden. Every edge there
+    // is a merged `DependsOn` anyway, so the kind palette would paint the
+    // whole picture one colour and say nothing (UI-108). The legend follows
+    // the same switch; see `FilterPanel`.
+    const verdict = shapeVerdictOf(d);
+    if (verdict) return SHAPE_EDGE_COLORS[verdict];
     const tags = d.tags ?? [];
     if (tags.includes('bean_lookup')) return '#9575CD';
     if (tags.includes('dynamic_sql') || tags.includes('dynamic_impex') || tags.includes('unresolved')) {
       return '#FFB74D';
     }
     return LINK_COLORS[d.kind_raw] || '#666';
+  }
+
+  /**
+   * The verdict table, rebuilt whenever the picture changes and null when
+   * the shape view is off — which is what makes `linkStrokeColour` fall
+   * back to the kind palette everywhere else with no mode test of its own.
+   */
+  let shapeEdgeVerdictMap: ReturnType<typeof shapeEdgeVerdicts> | null = null;
+  $: shapeEdgeVerdictMap =
+    $viewMode === 'shape' && $shapePicture ? shapeEdgeVerdicts($shapePicture) : null;
+
+  /** Node id → the scope path it stands for. The verdict table is expressed
+   *  in paths, and `collapseGraph` mints fresh ids on every republish. */
+  let nodePathById = new Map<string, string>();
+  $: nodePathById = new Map($graphData.nodes.map((n) => [n.id, n.original_id]));
+
+  // Repaint when either input to `linkStrokeColour`'s shape branch settles.
+  //
+  // The display plan is a *derived* store, so its subscriber runs
+  // synchronously the moment `viewMode` is set — before these two reactive
+  // statements have run. Painting only from there left every edge in the
+  // shape view at the merged-dependency colour, which is the one failure
+  // that looks like a working view: correct positions, and a palette
+  // silently still meaning something else.
+  $: repaintEdges(shapeEdgeVerdictMap, nodePathById);
+
+  function repaintEdges(
+    _verdicts: ReturnType<typeof shapeEdgeVerdicts> | null,
+    _paths: Map<string, string>,
+  ): void {
+    if (!initialized || !linkSel) return;
+    linkSel.attr('stroke', (d: D3Link) => linkStrokeColour(d));
+  }
+
+  /** This edge's shape verdict, or null when the shape view is not on. */
+  function shapeVerdictOf(d: D3Link): ShapeEdgeVerdict | null {
+    if (!shapeEdgeVerdictMap) return null;
+    const from = nodePathById.get(sourceId(d));
+    const to = nodePathById.get(targetId(d));
+    if (from === undefined || to === undefined) return null;
+    return verdictFor(shapeEdgeVerdictMap, from, to);
   }
 
   function bindingSuffix(d: D3Link): string {
@@ -862,10 +988,10 @@
 
   function computeSuppressedKind(plan: DisplayPlan): string | null {
     if (!linkSel) return null;
-    // Graph mode only. The tree layout is sparse, its labels don't collide,
-    // and they carry the hierarchy's meaning — suppressing there would remove
-    // signal rather than noise.
-    if (plan.mode === 'tree') return null;
+    // Graph mode only. The laid-out modes are sparse, their labels don't
+    // collide, and they carry the hierarchy's meaning — suppressing there
+    // would remove signal rather than noise.
+    if (plan.mode !== 'force') return null;
     const counts = new Map<string, number>();
     let total = 0;
     linkSel.each((d: D3Link) => {
@@ -896,6 +1022,10 @@
 
   function applyDisplayPlan(plan: DisplayPlan): void {
     if (!nodeSel || !linkSel) { console.log('[GraphView] applyDisplayPlan: skipped (no DOM)'); return; }
+    // Kept so a grain change can recount region traffic without waiting for
+    // the next plan (UI-103). Membership is the only thing the grain moves;
+    // which nodes are drawn is not its business.
+    lastPlan = plan;
     console.log(`[GraphView] applyDisplayPlan: mode=${plan.mode} visibleNodes=${plan.visibleNodeIds.size} visibleLinks=${plan.visibleLinkKeys.size} selectedId=${plan.selectedId}`);
     const prevSelectedId = currentSelectedId;
     currentSelectedId = plan.selectedId ?? null;
@@ -917,17 +1047,30 @@
     // From the plan, not the diff store: the plan knows which rule dimmed
     // these nodes and therefore which opacity it meant (UI-050).
     const dimOpacity = plan.dimOpacity;
+    // Three tiers, not two (UI-112). A node a diff rung recruited — the far
+    // end of a changed edge, or something one hop out — is drawn, but it is
+    // not what the reader changed, and at `neighbourhood` it can outnumber
+    // what they did change several times over. Checked before `visible`
+    // because it is a subset of it: membership is still the rung's answer,
+    // this only weights it.
+    const nodeOpacity = (id: string): number => {
+      if (plan.contextNodeIds.has(id)) return plan.contextOpacity;
+      if (plan.visibleNodeIds.has(id)) return 1;
+      if (plan.dimmedNodeIds.has(id)) return dimOpacity;
+      return 0;
+    };
     nodeSel
       .style('display', (d) => {
         if (plan.visibleNodeIds.has(d.id)) return null;
         if (plan.dimmedNodeIds.has(d.id) && dimOpacity > 0) return null;
         return 'none';
-      })
-      .attr('opacity', (d) => {
-        if (plan.visibleNodeIds.has(d.id)) return 1;
-        if (plan.dimmedNodeIds.has(d.id)) return dimOpacity;
-        return 0;
       });
+    // Through the same named transition the enter fade uses, so this write is
+    // the one that lands. A plain `.attr` here was silently overwritten for
+    // every node that had just entered: the 400 ms fade was still running and
+    // finished on 1, which is why a fresh canvas drew its whole neighbourhood
+    // at full strength no matter what the plan said.
+    nodeSel.transition('fade').duration(200).attr('opacity', (d) => nodeOpacity(d.id));
 
     // Visibility: links + labels + badges. Show links where both endpoints
     // are visible or dimmed (when dimOpacity > 0).
@@ -939,21 +1082,29 @@
       if (dimOpacity > 0 && nodeShown(sourceId(d)) && nodeShown(targetId(d))) return null;
       return 'none';
     };
-    linkSel.style('display', lkVis).attr('opacity', (d: D3Link) => {
-      if (plan.visibleLinkKeys.has(linkKeyFor(d))) return 1;
-      return dimOpacity;
-    });
+    // A line is never louder than the quieter of the two nodes it joins. Left
+    // at 1, an edge running into recruited context stays fully drawn while
+    // the node it points at fades, which reads as an arrow into nothing —
+    // and at `neighbourhood`, where untouched wiring is drawn, that is most
+    // of the lines on screen.
+    const linkOpacity = (d: D3Link): number => {
+      const ends = Math.min(nodeOpacity(sourceId(d)), nodeOpacity(targetId(d)));
+      if (plan.visibleLinkKeys.has(linkKeyFor(d))) return ends;
+      return Math.min(dimOpacity, ends);
+    };
+    linkSel.style('display', lkVis).attr('opacity', linkOpacity);
+    // Entering and leaving the shape view changes what every line's colour
+    // MEANS, and the joins that set it run only when the link set changes.
+    // Re-applied here so the picture arriving repaints edges that were
+    // already on screen — without it the reader gets shape positions in
+    // relationship-kind colours, which is the one combination that reads as
+    // a verdict and is not one.
+    linkSel.attr('stroke', (d: D3Link) => linkStrokeColour(d));
     suppressedKind = computeSuppressedKind(plan);
     lastLinkVisible = lkVis;
     linkLabelSel.style('display', (d: D3Link) => linkLabelDisplay(d, lkVis(d)))
-      .attr('opacity', (d: D3Link) => {
-        if (plan.visibleLinkKeys.has(linkKeyFor(d))) return 1;
-        return dimOpacity;
-      });
-    orderBadgeSel.style('display', lkVis).attr('opacity', (d: D3Link) => {
-      if (plan.visibleLinkKeys.has(linkKeyFor(d))) return 1;
-      return dimOpacity;
-    });
+      .attr('opacity', linkOpacity);
+    orderBadgeSel.style('display', lkVis).attr('opacity', linkOpacity);
 
     // Direction-aware edge labels: follow the same `isReversed` predicate
     // that the arrow-flip uses, so arrow direction and label perspective
@@ -1005,8 +1156,8 @@
     // Layout
     const w = container.clientWidth;
     const h = container.clientHeight;
-    if (plan.mode === 'tree') {
-      currentMode = 'tree';
+    if (plan.mode !== 'force') {
+      currentMode = plan.mode;
       simulation?.stop();
       // No file hulls in the new tree mode — they clashed with the strict
       // hierarchical layout. Can be reintroduced when needed.
@@ -1019,15 +1170,17 @@
         return p ? { x: cx + p.x, y: cy + p.y } : null;
       };
 
-      // Pin and animate visible nodes to their tree positions. The
-      // .attr('opacity', 1) ensures nodes that just entered via an
-      // incremental updateGraph (which starts them at opacity 0) become
-      // visible — without it, this transition cancels the enter fade-in
-      // and the node stays invisible.
+      // Pin and animate visible nodes to their tree positions. The opacity
+      // attr ensures nodes that just entered via an incremental updateGraph
+      // (which starts them at opacity 0) become visible — without it, this
+      // transition cancels the enter fade-in and the node stays invisible.
+      // It goes through `nodeOpacity` rather than landing on 1, or this
+      // transition would undo the context tier every time the tree re-lays
+      // out — the same way it used to undo the enter fade.
       nodeSel
         .filter((d) => plan.visibleNodeIds.has(d.id))
         .transition().duration(600)
-        .attr('opacity', 1)
+        .attr('opacity', (d) => nodeOpacity(d.id))
         .attr('transform', (d) => {
           const p = posOf(d.id);
           if (!p) return `translate(${d.x ?? 0},${d.y ?? 0})`;
@@ -1071,7 +1224,7 @@
       // Force mode. If we were pinned (tree mode), release fx/fy and kick
       // the simulation. Otherwise this is a no-op layout-wise — visibility
       // changes above are enough for a pure filter update.
-      const wasTreeOrPinned = currentMode === 'tree';
+      const wasTreeOrPinned = currentMode !== 'force';
       currentMode = 'force';
       if (wasTreeOrPinned) {
         nodeSel.each((d) => { d.fx = null; d.fy = null; });
@@ -1153,7 +1306,7 @@
    *  mouseout, and giving them separate visual treatments would make the
    *  canvas say two things where the user asked one question. */
   function highlightGroup(d: D3Node) {
-    const members = groupMemberIds($graphData.nodes, d, folderKeyOf);
+    const members = groupMemberIds($graphData.nodes, d, (n) => groupKeyOf(n, currentGrain()));
     // A ghost is in no group. Lighting up every other ghost would invent a
     // grouping that does not exist, so the honest answer is to light nothing
     // — and leaving the canvas untouched says that more clearly than dimming
@@ -1420,7 +1573,7 @@
     // does. Since a force layout converges near where it began, that made
     // the settled picture partly an artefact of array order, and made the
     // same repo look different on consecutive loads.
-    const seeder = makeSeeder(data.nodes, w, h);
+    const seeder = makeSeeder(data.nodes, w, h, wedgeKeyForGrain());
     data.nodes.forEach((n) => {
       const p = seeder.position(n);
       n.x = p.x; n.y = p.y;
@@ -1462,7 +1615,18 @@
       .append('path').attr('fill', canvasColors.arrowFill).attr('d', 'M0,-4L10,0L0,4');
 
     simulation = d3.forceSimulation<D3Node>(data.nodes)
-      .force('link', d3.forceLink<D3Node, D3Link>(data.links).id((d) => d.id).distance(120))
+      // UI-102. Distance and strength are folder-aware: an edge between two
+      // unrelated directories rests nearly three times further out and keeps
+      // a fraction of d3's default strength, so it can no longer tow a
+      // low-degree node clean out of its own folder while cohesion offers
+      // 0.05 against it. Same-folder
+      // edges keep the old distance and the untouched default. The accessors
+      // outlive every `links()` swap on the incremental path, so there is
+      // nothing to re-apply there. See utils/linkFolderWeights.ts.
+      .force('link', d3.forceLink<D3Node, D3Link>(data.links)
+        .id((d) => d.id)
+        .distance(linkWeights.distance)
+        .strength(linkWeights.strength))
       .force('charge', d3.forceManyBody().strength(-400))
       .force('center', d3.forceCenter(w / 2, h / 2))
       // Weak pull toward the centre on both axes. forceCenter only
@@ -1477,10 +1641,17 @@
       .force('y', d3.forceY(h / 2).strength(0.05))
       .force('collision', d3.forceCollide().radius(collisionRadius()))
       // UI-052. Everything above is edge-driven or global; this is the only
-      // force that knows two nodes live in the same folder. Strength is a
+      // force that knows two nodes live in the same group. Strength is a
       // user setting, and `cohesionStrengthFor` zeroes it at Module level
-      // where each node already is a folder. See utils/forceCohesion.ts.
-      .force('cohesion', forceFolderCohesion()
+      // where each node already is a folder. The chain is passed in rather
+      // than imported by the force (UI-103), so the grain is decided here,
+      // once, alongside every other consumer. See utils/forceCohesion.ts.
+      // UI-113. The folder depth travels with the chain: at file grain the
+      // folder sits one tier in, and without saying so it would collect
+      // `ANCESTOR_DECAY` on top of the coverage discount and stop holding
+      // together — which is what took the folder outlines away when a reader
+      // asked for files.
+      .force('cohesion', forceFolderCohesion((n) => chainFor(n), () => folderTierDepth(currentGrain()))
         .strength(cohesionStrengthFor(get(graphLevel), get(folderCohesion))));
 
     linkSel = g.append('g').attr('class', 'links-group').selectAll('line').data(data.links).join('line')
@@ -1691,7 +1862,7 @@
     // Transfer positions to new node objects (collapseGraph creates fresh objects).
     const w = container.clientWidth;
     const h = container.clientHeight;
-    const seeder = makeSeeder(data.nodes, w, h);
+    const seeder = makeSeeder(data.nodes, w, h, wedgeKeyForGrain());
     for (const n of data.nodes) {
       const old = oldPositions.get(n.id);
       if (old) {
@@ -1802,7 +1973,13 @@
             .attr('font-size', '11px').attr('fill', canvasColors.nameLabelFill).attr('pointer-events', 'none')
             .text((d) => d.name);
 
-          g.transition().duration(400).attr('opacity', 1);
+          // Named, because `applyDisplayPlan` runs microseconds later and has
+          // the only correct answer for this attribute — a node entering into
+          // the diff's context tier must not land on 1. A transition replaces
+          // the pending one of the same name on the same element, so the plan
+          // gets the last word and the fade-in survives; unnamed, the two
+          // would both write `opacity` and this one would finish last.
+          g.transition('fade').duration(400).attr('opacity', 1);
           return g;
         },
         (update) => update, // surviving nodes keep their DOM + position
@@ -1883,6 +2060,9 @@
     unsubscribers.push(hullDepth.subscribe(() => {
       if (initialized) drawHulls(true);
     }));
+    // The grain is not an overlay redraw (UI-103): it changes what the force
+    // groups by, so it has to re-initialize and re-settle. See `applyGrain`.
+    unsubscribers.push(groupGrain.subscribe(() => applyGrain()));
 
     // 1. Lifecycle AND rendering, from one signal.
     //
@@ -1947,13 +2127,17 @@
       }
     }));
 
-    // 2b. Re-apply plan when dim opacity changes (slider interaction).
-    unsubscribers.push(diffDimOpacity.subscribe(() => {
-      if (initialized) {
-        const plan = get(displayPlan);
-        applyDisplayPlan(plan);
-      }
-    }));
+    // 2b. Re-apply plan when either opacity tier changes (slider
+    // interaction) — the Rest slider and the Context slider alike, since
+    // neither moves a single node in or out of the drawn set.
+    for (const opacity of [diffDimOpacity, diffContextOpacity]) {
+      unsubscribers.push(opacity.subscribe(() => {
+        if (initialized) {
+          const plan = get(displayPlan);
+          applyDisplayPlan(plan);
+        }
+      }));
+    }
 
     // 3. Cosmetic toggles — direct DOM mutations, no plan involvement.
     unsubscribers.push(showLabels.subscribe((v) => {
@@ -1974,7 +2158,9 @@
     // 4. Display-search (within-view highlight). Standalone because it's a
     //    view-only overlay — including it in displayPlan would couple the
     //    plan to visibleNodeIds and introduce a feedback loop.
-    unsubscribers.push(displaySearchMatchIds.subscribe((ids) => {
+    //    Every match until the reader ticks rows in the result list, then
+    //    the ticked ones — see `pickedHighlight`.
+    unsubscribers.push(displaySearchHighlightIds.subscribe((ids) => {
       if (initialized && nodeSel) {
         nodeSel.classed('search-display-match', (d: D3Node) => ids.has(d.id));
       }

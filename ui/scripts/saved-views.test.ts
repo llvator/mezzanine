@@ -186,3 +186,40 @@ test('the summary names the scope and the level', () => {
   assert.match(stateSummary(state({ autoLevel: false, level: 'module' })), /module/);
   assert.match(stateSummary(state({ spec: ['a', 'b'] })), /spec ×2/);
 });
+
+// --- UI-104: a mixed picture is a picture, so a view has to hold it ---
+
+test('the ring focus survives a round trip', () => {
+  const s = normalizeState(state({ ringFocus: 'ui/src/stores', ringReach: 3 }));
+  assert.equal(s.ringFocus, 'ui/src/stores');
+  assert.equal(s.ringReach, 3);
+});
+
+test('a view with rings is not the same picture as one without', () => {
+  // The level alone names only the OUTER grain once a focus is set, so two
+  // states agreeing on `level` can still be two different canvases. If this
+  // compared equal the list would mark a mixed view active while showing a
+  // uniform one.
+  const uniform = state({ level: 'module' });
+  const mixed = state({ level: 'module', ringFocus: 'ui/src' });
+  assert.equal(sameState(uniform, mixed), false);
+  assert.equal(sameState(mixed, state({ level: 'module', ringFocus: 'ui/src', ringReach: 2 })), false);
+});
+
+test('an empty ring focus is no focus, not a focus on the repo root', () => {
+  // `''` as a path seeds every entity in the repo, so a stray empty string in
+  // a hand-edited file would silently draw the whole graph at entity grain.
+  assert.equal(normalizeState({ ringFocus: '' }).ringFocus, null);
+  assert.equal(normalizeState({ ringFocus: 42 }).ringFocus, null);
+});
+
+test('a hand-written reach is clamped rather than believed', () => {
+  assert.equal(normalizeState({ ringReach: 900 }).ringReach, 4);
+  assert.equal(normalizeState({ ringReach: -3 }).ringReach, 0);
+  assert.equal(normalizeState({ ringReach: 'two' }).ringReach, emptyState().ringReach);
+});
+
+test('the row subtitle says a view is focused', () => {
+  const summary = stateSummary(state({ level: 'module', ringFocus: 'ui/src', ringReach: 2 }));
+  assert.match(summary, /focus ui\/src \+2/);
+});

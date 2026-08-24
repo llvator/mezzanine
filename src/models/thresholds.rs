@@ -64,32 +64,122 @@ pub struct Thresholds {
 
     // --- Scope scoring context ---
     pub min_entities_for_cohesion: f32,
+
+    // --- Folder shape (inverted: higher is better) ---
+    //
+    // These gate the `ShapePattern` ladder. The first five are cut-offs on
+    // measures that already run 0–1, so unlike the pairs above they are
+    // single values, and a *higher* number is the good end. The sixth
+    // counts children, where *lower* is the good end — it is a different
+    // kind of bar and is documented as such.
+    /// Below this share of level-stepping edges a folder reads as tangled
+    /// rather than hierarchical.
+    pub shape_layering: f32,
+    /// Share of a folder's drawn edges that must be branching rather than
+    /// merging for it to count as fractal — how close its picture is to a
+    /// tree. Read beside `shape_layering`: same denominator, same scale,
+    /// deliberately different question.
+    pub shape_arborescence: f32,
+    /// Entry concentration a folder must reach to count as fractal — how
+    /// much of the traffic arriving from outside lands on one file.
+    pub shape_entry: f32,
+    /// Mean compliance a folder's subfolders must reach for it to count as
+    /// fractal. The recursive gate.
+    pub shape_child: f32,
+    /// Overall compliance a folder must reach to count as fractal.
+    pub shape_compliance: f32,
+    /// Most immediate children — files and subfolders together — a folder
+    /// may hold and still count as fractal. A count rather than a ratio,
+    /// which is why it is the one bar here that is not an `f32`.
+    ///
+    /// Unlike the five above this is a convention, not a measurement of the
+    /// drawing, and it is the only gate that can be cleared without any
+    /// edge changing. It earns its place because self-similarity is a claim
+    /// about a picture a reader can hold at once, and a folder of forty
+    /// files fails that however cleanly its edges step (ADR 0014). Like
+    /// `shape_arborescence` it gates the tier and stays out of
+    /// `compliance`, so a wide folder still reports an honest blend.
+    pub shape_max_children: u32,
 }
 
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            cc: WarnBad { warn: 10.0, bad: 20.0 },
-            cognitive: WarnBad { warn: 8.0, bad: 15.0 },
-            nest: WarnBad { warn: 3.0, bad: 5.0 },
-            loc_callable: WarnBad { warn: 30.0, bad: 60.0 },
-            loc_container: WarnBad { warn: 100.0, bad: 200.0 },
-            params: WarnBad { warn: 4.0, bad: 6.0 },
-            fan_out: WarnBad { warn: 7.0, bad: 15.0 },
-            fields: WarnBad { warn: 8.0, bad: 15.0 },
-            variants: WarnBad { warn: 6.0, bad: 12.0 },
-            method_count: WarnBad { warn: 15.0, bad: 25.0 },
-            public_field_ratio: WarnBad { warn: 0.5, bad: 0.8 },
+            cc: WarnBad {
+                warn: 10.0,
+                bad: 20.0,
+            },
+            cognitive: WarnBad {
+                warn: 8.0,
+                bad: 15.0,
+            },
+            nest: WarnBad {
+                warn: 3.0,
+                bad: 5.0,
+            },
+            loc_callable: WarnBad {
+                warn: 30.0,
+                bad: 60.0,
+            },
+            loc_container: WarnBad {
+                warn: 100.0,
+                bad: 200.0,
+            },
+            params: WarnBad {
+                warn: 4.0,
+                bad: 6.0,
+            },
+            fan_out: WarnBad {
+                warn: 7.0,
+                bad: 15.0,
+            },
+            fields: WarnBad {
+                warn: 8.0,
+                bad: 15.0,
+            },
+            variants: WarnBad {
+                warn: 6.0,
+                bad: 12.0,
+            },
+            method_count: WarnBad {
+                warn: 15.0,
+                bad: 25.0,
+            },
+            public_field_ratio: WarnBad {
+                warn: 0.5,
+                bad: 0.8,
+            },
 
-            file_entity_count: WarnBad { warn: 15.0, bad: 30.0 },
-            file_loc: WarnBad { warn: 400.0, bad: 800.0 },
-            file_fan_out: WarnBad { warn: 10.0, bad: 20.0 },
+            file_entity_count: WarnBad {
+                warn: 15.0,
+                bad: 30.0,
+            },
+            file_loc: WarnBad {
+                warn: 400.0,
+                bad: 800.0,
+            },
+            file_fan_out: WarnBad {
+                warn: 10.0,
+                bad: 20.0,
+            },
 
-            module_entity_count: WarnBad { warn: 60.0, bad: 150.0 },
-            module_loc: WarnBad { warn: 2000.0, bad: 5000.0 },
-            module_fan_out: WarnBad { warn: 15.0, bad: 30.0 },
+            module_entity_count: WarnBad {
+                warn: 60.0,
+                bad: 150.0,
+            },
+            module_loc: WarnBad {
+                warn: 2000.0,
+                bad: 5000.0,
+            },
+            module_fan_out: WarnBad {
+                warn: 15.0,
+                bad: 30.0,
+            },
 
-            cohesion: WarnBad { warn: 0.6, bad: 0.3 },
+            cohesion: WarnBad {
+                warn: 0.6,
+                bad: 0.3,
+            },
 
             god_class_fields: 10.0,
             god_class_methods: 15.0,
@@ -105,6 +195,37 @@ impl Default for Thresholds {
             data_bag_max_methods: 3.0,
 
             min_entities_for_cohesion: 5.0,
+
+            shape_layering: 0.7,
+            // Deliberately the same cut-off as the line above. The two are
+            // ratios over the same drawn edges, so an equal bar is the only
+            // one that needs no explaining — a reader comparing "layered
+            // 0.89, branching 0.67" is reading one scale. Measured on this
+            // repo: 24 folders have edges to score, 15 clear it on layering
+            // and 9 on branching, and the gate costs two folders their
+            // fractal badge (src/parser/elevator, vscode-extension/src).
+            shape_arborescence: 0.7,
+            shape_entry: 0.6,
+            shape_child: 0.8,
+            shape_compliance: 0.85,
+            // Eight. It began at seven, from the span of what a reader
+            // holds at once, and that first note said plainly that the
+            // repo could not yet validate it: every folder over the bar
+            // was already cyclic or tangled, so the gate never fired.
+            //
+            // Two days of use supplied the missing evidence, and it argued
+            // for one more. Once several folders had been taken up the
+            // ladder, breadth became the most common blocker among the
+            // ones whose graphs were already clean — and three of them sat
+            // at exactly eight. `src/parser/rust/declarations` is a
+            // perfect tree (branching 1.00, acyclic, properly layered) and
+            // was held off `fractal` by a single file. A bar that stops a
+            // spanning tree is measuring the wrong thing.
+            //
+            // Eight still refuses the folders the gate was written for —
+            // the twelve-to-thirty-nine-child levels nobody takes in at a
+            // glance — while letting a clean eight through. See ADR 0018.
+            shape_max_children: 8,
         }
     }
 }

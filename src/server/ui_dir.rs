@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::{Router, response::Html, routing::get};
+use axum::{response::Html, routing::get, Router};
 
 /// Environment variable equivalent of `--ui-dir`, for wrapper scripts and
 /// launchers that have nowhere to put a flag.
@@ -132,8 +132,12 @@ pub fn print_banner_line(port: u16, ui: Option<&Path>) {
             eprintln!("                   from {}", dir.display());
         }
         None => {
-            eprintln!("   UI:             none bundled — http://localhost:{port}/ explains the options");
-            eprintln!("                   (pass --ui-dir, or open a UI elsewhere and point it here)");
+            eprintln!(
+                "   UI:             none bundled — http://localhost:{port}/ explains the options"
+            );
+            eprintln!(
+                "                   (pass --ui-dir, or open a UI elsewhere and point it here)"
+            );
         }
     }
 }

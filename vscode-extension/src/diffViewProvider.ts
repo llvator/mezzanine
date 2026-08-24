@@ -331,6 +331,13 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
   function renderFilters() {
     if (!state?.active) return '';
     const dimPct = Math.round((state.dimOpacity || 0) * 100);
+    // UI-112. Above the narrowest rung the ladder draws code the reader did
+    // not touch, and at full strength it is drawn exactly like the code they
+    // did. The narrowest rung recruits nothing, so the row is absent there
+    // rather than present and inert. (No backticks in here — this whole file
+    // section is itself a template literal.)
+    const ctxPct = Math.round((state.contextOpacity ?? 1) * 100);
+    const recruits = state.level !== 'edits';
     const disabledAttr = state.filtersEnabled ? '' : ' disabled';
     const disabledClass = state.filtersEnabled ? '' : ' disabled';
     const masterOffHint = !state.filtersEnabled
@@ -372,6 +379,9 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
       + selectionHint
       + ladder
       + undrawable
+      + (recruits
+          ? '<div class="dim-row"><span>Context opacity</span><input type="range" min="10" max="100" step="5" value="' + (ctxPct) + '" id="ctx-slider"' + disabledAttr + ' title="How strongly the entities this rung recruited are drawn, against the edits it grew from. It cannot remove anything \u2014 stepping down a rung is what does that."><span class="dim-val">' + ctxPct + '%</span></div>'
+          : '')
       + (!state.hasSelection
           ? '<div class="dim-row"><span>Rest opacity</span><input type="range" min="0" max="15" value="' + (dimPct) + '" id="dim-slider"' + disabledAttr + ' title="Opacity of the entities the ladder left out"><span class="dim-val">' + dimPct + '%</span></div>'
           : '')
@@ -427,6 +437,14 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
       dim.addEventListener('input', (e) => {
         const v = Number(e.target.value) / 100;
         vscode.postMessage({ type: 'command', command: 'setDiffDimOpacity', value: v });
+      });
+    }
+
+    const ctx = document.getElementById('ctx-slider');
+    if (ctx) {
+      ctx.addEventListener('input', (e) => {
+        const v = Number(e.target.value) / 100;
+        vscode.postMessage({ type: 'command', command: 'setDiffContextOpacity', value: v });
       });
     }
   }

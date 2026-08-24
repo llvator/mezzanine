@@ -18,6 +18,7 @@
 import { get, writable } from 'svelte/store';
 import { refreshData } from './scope';
 import { loadDiff } from './diff';
+import { refreshShape } from './shape';
 import { apiUrl, isVscode } from '../vscodeAdapter';
 import { endpoint } from '../endpoint';
 import { probe } from './connection';
@@ -94,6 +95,11 @@ export function connectLiveReload(url?: string): void {
       liveReloading.set(true);
       try {
         await refreshData();
+        // The shape picture is a separate fetch, so it does not come along
+        // with the graph — and a stale one is worse than no picture at all
+        // here: the whole view is a claim about edges that may have just
+        // been the ones edited. Silent when the view was never opened.
+        await refreshShape();
       } finally {
         liveReloading.set(false);
       }

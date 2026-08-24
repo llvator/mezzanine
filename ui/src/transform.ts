@@ -125,6 +125,7 @@ const EXT_LANGUAGE_MAP: Record<string, string> = {
   cpp: 'C++', cc: 'C++', cxx: 'C++', hpp: 'C++', hxx: 'C++',
   c: 'C', h: 'C', rb: 'Ruby', swift: 'Swift',
   kt: 'Kotlin', kts: 'Kotlin', scala: 'Scala', sc: 'Scala', php: 'PHP',
+  dart: 'Dart',
   groovy: 'Groovy', gradle: 'Groovy',
   elv: 'Elevator',
   sql: 'SQL',
@@ -153,6 +154,12 @@ const REL_KIND_MAP: Record<string, { raw: string; label: string }> = {
   implements: { raw: 'Implements', label: 'implements' },
   depends_on: { raw: 'DependsOn', label: 'depends on' },
   uses_type: { raw: 'UsesType', label: 'uses type' },
+  // A function named as a value rather than called — a handler handed to
+  // a dispatcher. A dependency, not a call; see ADR 0021.
+  uses_fn: { raw: 'UsesFn', label: 'uses fn' },
+  // An imported constant (or any imported binding) read as a value. Same
+  // coupling as `uses_fn`, on a name that is not a function; see ADR 0027.
+  uses_value: { raw: 'UsesValue', label: 'uses value' },
   returns: { raw: 'Returns', label: 'returns' },
   takes_param: { raw: 'TakesParam', label: 'takes param' },
   // ansible-deploy edges.
@@ -186,6 +193,11 @@ export function relKindRaw(kind: string): string {
  * GR-010 (`bean_lookup`), GR-011 (`dynamic_sql`), GR-012
  * (`dynamic_impex`). Tags ship as their parsers land; the rendering
  * is in place for whichever are on the wire today.
+ *
+ * `goroutine` and `deferred` come from the Go parser. They mark *how* a
+ * call is scheduled — on another goroutine, or when the function returns —
+ * which is not recoverable from the target and changes how the edge should
+ * be read: neither runs where it is written.
  */
 const RELATIONSHIP_TAG_KEYS = new Set([
   'null_safe',
@@ -195,6 +207,8 @@ const RELATIONSHIP_TAG_KEYS = new Set([
   'dynamic_sql',
   'dynamic_impex',
   'unresolved',
+  'goroutine',
+  'deferred',
 ]);
 
 /** Pull tag-flag keys out of a relationship's metadata. Treats

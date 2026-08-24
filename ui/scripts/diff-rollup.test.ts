@@ -24,7 +24,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { rollUpByScope, rollUpCounts, scopeChain, normalizeScopePath } from '../src/viewmodels/diffRollup.ts';
+import { rollUpByScope, rollUpCounts, scopeChain, normalizeScopePath, normalizeEntityId } from '../src/viewmodels/diffRollup.ts';
 import { collapseGraph } from '../src/viewmodels/collapseGraph.ts';
 import type { EntityDiff, ChangeStatus } from '../src/stores/diff.ts';
 import type { D3Node, GraphData } from '../src/types/graph.ts';
@@ -73,6 +73,53 @@ test('a base-worktree path is brought back to repo-relative', () => {
     'ui/src/App.svelte',
   );
   assert.equal(normalizeScopePath('ui/src/App.svelte'), 'ui/src/App.svelte');
+});
+
+// ── the id spelling both sides of a diff have to agree on ─────────────────
+//
+// The graph's ids are absolute and a diff's come from a temp worktree, so
+// every diff lookup on the canvas runs through `normalizeEntityId` on both
+// sides. When the two disagree the miss reads as "not in the diff", which is
+// indistinguishable from an unchanged entity — so these are the assertions
+// that keep a whole subtree from silently dropping out of diff mode.
+
+test('a worktree-side id is brought back to repo-relative', () => {
+  assert.equal(
+    normalizeEntityId('/var/folders/x/T/nao-diff-head-abc123/src/diff.rs:12:foo'),
+    'src/diff.rs:12:foo',
+  );
+});
+
+test('an absolute id and its worktree twin normalize to the same key', () => {
+  // The regression: `ui/src/...` contains `src/`, which used to be tried
+  // first and won, so the absolute side became `src/stores/mirror.ts:…` and
+  // the diff side stayed `ui/src/stores/mirror.ts:…`. Every entity under
+  // `ui/` lost its status, its deltas and its before-source, while `src/`
+  // worked — which is what kept it hidden.
+  const absolute = '/home/me/proj/ui/src/stores/mirror.ts:114:nodeById';
+  const worktree = '/var/folders/x/T/nao-diff-head-abc/ui/src/stores/mirror.ts:114:nodeById';
+  assert.equal(normalizeEntityId(absolute), 'ui/src/stores/mirror.ts:114:nodeById');
+  assert.equal(normalizeEntityId(absolute), normalizeEntityId(worktree));
+});
+
+test('the marker nearest the front of the path wins, not the front of the list', () => {
+  assert.equal(
+    normalizeEntityId('/home/me/proj/docs/agents/guide.md:1:intro'),
+    'docs/agents/guide.md:1:intro',
+  );
+});
+
+test('a marker only counts at a segment boundary', () => {
+  // `mysrc/` is not `src/`, and a substring match would have said it was.
+  assert.equal(
+    normalizeEntityId('/home/me/proj/mysrc/thing.rs:3:f'),
+    '/home/me/proj/mysrc/thing.rs:3:f',
+  );
+});
+
+test('an id that is already repo-relative is left alone', () => {
+  assert.equal(normalizeEntityId('src/diff.rs:12:foo'), 'src/diff.rs:12:foo');
+  assert.equal(normalizeEntityId('ui/src/App.svelte:1:App'), 'ui/src/App.svelte:1:App');
 });
 
 // ── what the collapsed canvas asks ────────────────────────────────────────

@@ -29,17 +29,52 @@ use super::super::language_parser::ParseResult;
 /// Std/typing names that carry no project-level dependency signal.
 const STD_TYPES: &[&str] = &[
     // typing / collections.abc
-    "List", "Dict", "Set", "FrozenSet", "Tuple", "Optional", "Union", "Any",
-    "Callable", "Iterator", "Iterable", "Sequence", "Mapping",
-    "MutableMapping", "Type", "Self", "Literal", "ClassVar", "Final",
-    "Annotated", "TypeVar", "Generic", "Protocol", "Awaitable", "Coroutine",
-    "Generator", "AsyncIterator", "AsyncIterable", "AsyncGenerator",
-    "NoReturn", "Never", "IO", "TextIO", "BinaryIO", "NamedTuple",
+    "List",
+    "Dict",
+    "Set",
+    "FrozenSet",
+    "Tuple",
+    "Optional",
+    "Union",
+    "Any",
+    "Callable",
+    "Iterator",
+    "Iterable",
+    "Sequence",
+    "Mapping",
+    "MutableMapping",
+    "Type",
+    "Self",
+    "Literal",
+    "ClassVar",
+    "Final",
+    "Annotated",
+    "TypeVar",
+    "Generic",
+    "Protocol",
+    "Awaitable",
+    "Coroutine",
+    "Generator",
+    "AsyncIterator",
+    "AsyncIterable",
+    "AsyncGenerator",
+    "NoReturn",
+    "Never",
+    "IO",
+    "TextIO",
+    "BinaryIO",
+    "NamedTuple",
     "TypedDict",
     // builtins / constants that can appear inside annotations
-    "None", "True", "False",
+    "None",
+    "True",
+    "False",
     // common stdlib classes
-    "Path", "Exception", "ValueError", "TypeError", "KeyError",
+    "Path",
+    "Exception",
+    "ValueError",
+    "TypeError",
+    "KeyError",
     "RuntimeError",
 ];
 
@@ -146,10 +181,7 @@ mod tests {
     fn extracts_project_types_and_drops_typing_names() {
         assert_eq!(named_types("Order"), vec!["Order"]);
         assert_eq!(named_types("Optional[Order]"), vec!["Order"]);
-        assert_eq!(
-            named_types("Dict[str, LineItem]"),
-            vec!["LineItem"]
-        );
+        assert_eq!(named_types("Dict[str, LineItem]"), vec!["LineItem"]);
         assert_eq!(named_types("int"), Vec::<String>::new());
         assert_eq!(named_types("List[int]"), Vec::<String>::new());
     }
@@ -182,10 +214,7 @@ mod tests {
 
     #[test]
     fn dedups_and_keeps_dotted_tails() {
-        assert_eq!(
-            named_types("tuple[Order, Order]"),
-            vec!["Order"]
-        );
+        assert_eq!(named_types("tuple[Order, Order]"), vec!["Order"]);
         // Dotted annotations split on the dot; both segments are
         // candidates, lowercase module prefixes drop out.
         assert_eq!(named_types("models.Order"), vec!["Order"]);

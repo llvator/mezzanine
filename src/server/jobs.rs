@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use tokio::sync::Semaphore;
 
-use super::repo::{
-    analyze_repo, clone_dir, persist, JobStatus, RepoRegistry, RepoSlot,
-};
+use super::repo::{analyze_repo, clone_dir, persist, JobStatus, RepoRegistry, RepoSlot};
 
 /// Knobs the ticket asks to be configurable, resolved once at startup.
 #[derive(Clone)]
@@ -186,10 +184,7 @@ fn clone(url: &str, dir: &Path, config: &JobConfig) -> Result<()> {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "clone timed out after {}s",
-                config.clone_timeout.as_secs()
-            );
+            bail!("clone timed out after {}s", config.clone_timeout.as_secs());
         }
         Some(s) if !s.success() => {
             bail!("clone failed: {}", sanitize_git_stderr(&stderr, dir));
@@ -254,7 +249,13 @@ fn sanitize_git_stderr(text: &str, clone_dir: &Path) -> String {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("Cloning into"))
-        .map(|l| if dir.is_empty() { l.to_string() } else { l.replace(&dir, "<clone-dir>") })
+        .map(|l| {
+            if dir.is_empty() {
+                l.to_string()
+            } else {
+                l.replace(&dir, "<clone-dir>")
+            }
+        })
         .collect();
     if lines.is_empty() {
         return "git exited with an error but wrote no diagnostics".to_string();
@@ -295,7 +296,10 @@ mod tests {
 
     #[test]
     fn sanitize_caps_a_runaway_error() {
-        let stderr = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let stderr = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(
             sanitize_git_stderr(&stderr, Path::new("/x")),
             "line 1; line 2; line 3; line 4; line 5"

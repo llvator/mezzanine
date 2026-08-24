@@ -32,6 +32,7 @@ export const ALL_ANALYSIS_LANGUAGES: readonly string[] = [
   'ruby',
   'swift',
   'kotlin',
+  'dart',
   'scala',
   'php',
   'groovy',

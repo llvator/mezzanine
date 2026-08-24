@@ -25,8 +25,11 @@
     showLabels, showKindLabels, showLinkLabels,
     treeDensity, treeMaxDepth, hoverDepth, hoverMode,
     setTreeDepth, cycleTreeDensity, DENSITY_LABELS,
+    ringFocusPath, ringReach,
   } from '../stores/graph';
+  import { closeShape, shapeFolder } from '../stores/shape';
   import { everyFileIsOneEntity } from '../viewmodels/collapseGraph';
+  import { markPathOf } from '../viewmodels/markSet';
   import { autoLevel, drillIntoMarks, markedStats } from '../stores/scope';
   import {
     canGoBack, canGoForward, backTitle, forwardTitle, backDepth, goBack, goForward,
@@ -72,6 +75,27 @@
     lvl === 'entity' && entityIsFile
       ? 'Every file in this graph holds exactly one entity, so this is the same picture as File.'
       : LEVEL_TITLES[lvl];
+
+  /** UI-104. The scope a focus gesture would centre the rings on — a path, so
+   *  it survives the level change turning it on causes. Null when nothing is
+   *  selected, which is also when the control has nothing to offer. */
+  $: focusCandidate = $selectedNode ? markPathOf($selectedNode) : null;
+
+  /** Offered when it can act: something is selected to focus, or a focus is
+   *  already set and needs a way back. A permanently disabled button that says
+   *  "select something first" teaches less than one that appears when the
+   *  gesture becomes available — the same bargain `Drill into N marked` makes
+   *  two groups down. */
+  $: ringsOffered = $ringFocusPath !== null || focusCandidate !== null;
+
+  function toggleRingFocus(): void {
+    if ($ringFocusPath !== null) ringFocusPath.set(null);
+    else if (focusCandidate !== null) ringFocusPath.set(focusCandidate);
+  }
+
+  $: ringTitle = $ringFocusPath !== null
+    ? `Rings are centred on ${$ringFocusPath}. Everything more than ${$ringReach} hop${$ringReach === 1 ? '' : 's'} away is drawn at ${$graphLevel} level. Click to go back to one grain everywhere.`
+    : `Keep ${focusCandidate} and its neighbours as entities, and draw the rest of the graph at the level chosen above.`;
 </script>
 
 <header class="canvas-toolbar" class:collapsed
@@ -95,7 +119,9 @@
         <!-- Collapsed, the bar still has to say what it is hiding, or the
              active level and view mode become invisible state. -->
         <span class="toolbar-summary">
-          {$viewMode === 'graph' ? 'Graph' : 'Tree'} · {$graphLevel}
+          {$viewMode === 'shape'
+            ? `Shape: ${$shapeFolder || '(root)'}`
+            : `${$viewMode === 'graph' ? 'Graph' : 'Tree'} · ${$graphLevel}`}
           {$autoFitView ? ' · auto-fit' : ''}
           <!-- A marked set has a ring on the canvas but its only *control* is
                inside this bar, so a collapsed toolbar would leave the reader
@@ -190,6 +216,19 @@
           <button class="control-btn" on:click={() => graphView?.toggleViewMode()}>
             {$viewMode === 'graph' ? 'Tree View' : 'Graph View'}
           </button>
+          <!-- UI-108 — the way OUT of the shape view, and the only thing on
+               screen that says which folder it is drawing. Offered only in
+               that mode: unlike Graph and Tree there is nothing to switch
+               *to* without first choosing a folder, and the choosing is done
+               from the Quality panel's Shape column where the verdict is. -->
+          {#if $viewMode === 'shape'}
+            <button
+              class="control-btn active"
+              aria-pressed="true"
+              on:click={closeShape}
+              title="Leave the shape view and go back to the force graph"
+            >Shape: {$shapeFolder || '(root)'} ✕</button>
+          {/if}
           <!-- Only offered when there is a spec to draw. A button that opens a
                pane reading "no Elevator spec in this project" is a promise the
                project cannot keep, and every project without `.elv` files
@@ -221,6 +260,37 @@
               >{lvl[0].toUpperCase() + lvl.slice(1)}</button>
             {/each}
           </div>
+          <!-- UI-104. With a focus set the level button above names the OUTER
+               grain and the rings hold the middle, so one picture is drawn at
+               two grains: the code you are reading as entities, the code it
+               sits in as files or folders. The two controls compose rather
+               than overriding each other, which is why this is not a fourth
+               level button. -->
+          {#if ringsOffered}
+            <div class="ring-toggle" role="group" aria-label="Ring focus">
+              <button
+                class="control-btn"
+                class:active={$ringFocusPath !== null}
+                aria-pressed={$ringFocusPath !== null}
+                data-probe="ring-focus"
+                title={ringTitle}
+                on:click={toggleRingFocus}
+              >{$ringFocusPath !== null ? 'Focused ✓' : 'Keep focus detailed'}</button>
+              {#if $ringFocusPath !== null}
+                <label
+                  class="ring-reach"
+                  title="How many hops from the focus stay entities. 0 is the focused scope alone."
+                >reach
+                  <input
+                    type="number" min="0" max="4" step="1"
+                    data-probe="ring-reach"
+                    value={$ringReach}
+                    on:input={(e) => ringReach.set(Math.max(0, Math.min(4, Number(e.currentTarget.value) || 0)))}
+                  />
+                </label>
+              {/if}
+            </div>
+          {/if}
         </div>
       </div>
 
@@ -526,6 +596,32 @@
     gap: 0;
     border-radius: 4px;
     overflow: hidden;
+  }
+
+  /* Deliberately NOT joined into `.level-toggle`'s segmented strip. The rings
+     compose with the level rather than replacing it, and a fourth segment
+     against three would read as a fourth level — the one thing this is not. */
+  .ring-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ring-reach {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .ring-reach input {
+    width: 44px;
+    padding: 3px 4px;
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
   }
   .level-toggle .level-btn {
     border-radius: 0;

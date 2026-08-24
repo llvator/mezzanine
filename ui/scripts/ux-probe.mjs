@@ -27,7 +27,8 @@
  * change; the fallback then stops being load-bearing.
  *
  *   app-root · left-panel · details-panel · right-panel · canvas · toolbar
- *   stats-bar · mode-bar · sidebar-top · scope-tree · quality-table
+ *   stats-bar · canvas-bottom-bar · canvas-stats · mode-bar
+ *   sidebar-top · scope-tree · quality-table
  *   pin-toggle · search-input · search-results · legend
  *   scope-query · file-filter · file-tree
  *   quality-summary · metric-threshold · quality-population
@@ -821,6 +822,94 @@ function installProbeLib() {
       };
     },
 
+    /**
+     * The share of nodes sitting nearer some *other* folder's centroid than
+     * their own — split by whether the node has an edge leaving its folder
+     * (UI-102).
+     *
+     * The number the other two cannot produce. `cohesionRatio` averages over
+     * every node, so a folder whose three linked members were towed away
+     * still scores well on the strength of the majority that stayed;
+     * `kinshipRatio` only ever looks at cross-folder *pairs*. Neither can
+     * separate "this folder is loose" from "three of its files were dragged
+     * out by their edges", and the second is what a reader reports as folder
+     * grouping not working on anything that isn't a free node.
+     *
+     * Nearest-centroid rather than distance-to-own-centroid, which was the
+     * first build here and is wrong on real data. That version compared nodes
+     * with a crossing edge against nodes without one — but on a real payload
+     * the second population is mostly *free* nodes, which charge pushes to
+     * the rim with nothing to pull them back, so it scored the strays as
+     * closer to home than the control and the check could not fail. Membership
+     * needs no control population: a node whose own region's centre is not the
+     * nearest one is misplaced whatever else is on the canvas, and it is also
+     * the literal thing the report describes.
+     *
+     * Only folders with `MIN_HULL_MEMBERS` members take part, as centroids
+     * and as members. Below that UI-055 draws no outline, so there is no
+     * region for a node to be inside or outside of, and a folder of one has
+     * itself as its centroid and can never be misplaced.
+     */
+    folderMisplacement() {
+      const MIN_MEMBERS = 3;
+      const ns = this.nodePositions().filter((n) => n.folder !== null);
+      const byId = new Map(ns.map((n) => [n.id, n]));
+
+      // Nodes with at least one drawn edge whose other end is in a different
+      // folder. Read off the links the canvas actually drew, not off the
+      // payload: a filtered-out edge exerts no force and must not classify.
+      const crossing = new Set();
+      for (const l of document.querySelectorAll('line.link')) {
+        if (l.style.display === 'none') continue;
+        const d = l.__data__;
+        if (!d) continue;
+        const s = byId.get(typeof d.source === 'object' ? d.source?.id : d.source);
+        const t = byId.get(typeof d.target === 'object' ? d.target?.id : d.target);
+        if (!s || !t || s.folder === t.folder) continue;
+        crossing.add(s.id); crossing.add(t.id);
+      }
+
+      const groups = new Map();
+      for (const n of ns) {
+        if (!groups.has(n.folder)) groups.set(n.folder, []);
+        groups.get(n.folder).push(n);
+      }
+      const centroids = [];
+      for (const [folder, members] of groups) {
+        if (members.length < MIN_MEMBERS) continue;
+        centroids.push({
+          folder,
+          x: members.reduce((a, n) => a + n.x, 0) / members.length,
+          y: members.reduce((a, n) => a + n.y, 0) / members.length,
+        });
+      }
+      const rendered = document.querySelectorAll('g.node').length;
+      if (centroids.length < 2) {
+        return { share: null, regions: centroids.length, nodes: ns.length, rendered };
+      }
+
+      let all = 0, allN = 0, cross = 0, crossN = 0, own = 0, ownN = 0;
+      for (const c of centroids) {
+        for (const n of groups.get(c.folder)) {
+          let nearest = null, best = Infinity;
+          for (const o of centroids) {
+            const d = Math.hypot(n.x - o.x, n.y - o.y);
+            if (d < best) { best = d; nearest = o.folder; }
+          }
+          const misplaced = nearest !== c.folder ? 1 : 0;
+          all += misplaced; allN++;
+          if (crossing.has(n.id)) { cross += misplaced; crossN++; } else { own += misplaced; ownN++; }
+        }
+      }
+      return {
+        share: all / allN,
+        crossingShare: crossN ? cross / crossN : null,
+        internalShare: ownN ? own / ownN : null,
+        misplaced: all, measured: allN, crossingNodes: crossN, internalNodes: ownN,
+        regions: centroids.length, nodes: ns.length, rendered,
+      };
+    },
+
     // ── hub demotion (UI-056) ────────────────────────────────────────────
 
     setDemote(on) {
@@ -1153,6 +1242,25 @@ function installProbeLib() {
         depth: Number(b.getAttribute('data-probe').replace('hull-depth-', '')),
         label: b.textContent.trim(),
         active: b.getAttribute('aria-pressed') === 'true',
+      }));
+    },
+
+    /** Which level of the tree is the innermost region (UI-103). */
+    setGroupGrain(grain) {
+      const b = document.querySelector(`[data-probe="group-grain-${grain}"]`);
+      if (!b) return false;
+      b.click();
+      return b.getAttribute('aria-pressed') === 'true';
+    },
+
+    groupGrainState() {
+      return [...document.querySelectorAll('[data-probe^="group-grain-"]')].map((b) => ({
+        grain: b.getAttribute('data-probe').replace('group-grain-', ''),
+        label: b.textContent.trim(),
+        active: b.getAttribute('aria-pressed') === 'true',
+        // Italic = chosen but not in force at this level, which is the
+        // sidebar's only way of saying so.
+        inert: b.classList.contains('grain-inert'),
       }));
     },
 
@@ -1540,6 +1648,18 @@ function installProbeLib() {
         // would have missed the point entirely.
         links: Number((counts.match(/(\d+)\s+relationships/) ?? [0, 0])[1]),
         undrawable: document.querySelector('[data-probe="diff-undrawable"]')?.textContent.trim() ?? null,
+        // UI-112. A rung above `edits` draws code the reader did not touch,
+        // and the only place that distinction lands is the rendered opacity —
+        // so it is read off the nodes rather than off the control.
+        faded: nodes.filter((n) => {
+          const st = getComputedStyle(n);
+          const o = Number(st.opacity);
+          return st.display !== 'none' && o > 0 && o < 1;
+        }).length,
+        contextPct: (() => {
+          const el = document.querySelector('[data-probe="diff-context-opacity"]');
+          return el ? Number(el.value) : null;
+        })(),
       };
     },
 
@@ -1621,6 +1741,14 @@ function installProbeLib() {
     storeCohesion(level) {
       try { localStorage.setItem('nao-folder-cohesion', level); } catch { /* ignore */ }
       return localStorage.getItem('nao-folder-cohesion') === level;
+    },
+
+    /** Set the grain before a load, so a measurement gets the UI-053 seed for
+     *  that grain rather than inheriting the previous grain's settle — the
+     *  same reason `storeCohesion` exists. */
+    storeGrain(grain) {
+      try { localStorage.setItem('nao-group-grain', grain); } catch { /* ignore */ }
+      return localStorage.getItem('nao-group-grain') === grain;
     },
 
     // ── actions ──────────────────────────────────────────────────────────
@@ -1815,11 +1943,59 @@ async function settledGrouping(page, level) {
   const out = {
     kinship: await page.eval(() => window.__probe.kinshipRatio()),
     cohesion: await page.eval(() => window.__probe.cohesionRatio()),
+    // UI-102. Read from the same settle as the other two rather than from a
+    // load of its own: the three numbers describe one layout, and taking them
+    // from different settles would let a run-to-run wobble show up as a
+    // trade-off between them that never happened.
+    stray: await page.eval(() => window.__probe.folderMisplacement()),
   };
   settledGrouping.cache.set(level, out);
   return out;
 }
 settledGrouping.cache = new Map();
+
+/**
+ * Settle one *grain* from a fresh load and report what it drew (UI-103).
+ *
+ * A sibling of `settledGrouping` rather than a parameter on it, because the
+ * two vary different things and share only the settle. Same fresh-load
+ * discipline and for the same reason: switching grain on a live graph
+ * restarts alpha from wherever the previous grain left the nodes, so the
+ * measurement would inherit that local minimum instead of starting from the
+ * UI-053 seed the grain actually gets in use.
+ *
+ * Cohesion is pinned at `low` — the shipped default, and the setting the
+ * folder numbers on UI-102 were taken at, so the two tickets' figures are
+ * comparable.
+ */
+async function settledGrain(page, grain) {
+  const hit = settledGrain.cache.get(grain);
+  if (hit) return hit;
+  await page.eval((g) => window.__probe.storeGrain(g), grain);
+  await page.eval(() => window.__probe.storeCohesion('low'));
+  await page.goto(APP); await ready(page);
+  const scope = await widestScope(page);
+  const scoped = await page.eval((p) => window.__probe.scopeRowState(p), scope);
+  if (!scoped?.checked) await page.eval((p) => window.__probe.toggleScopePath(p), scope);
+  await clearDiff(page);
+  // Entity level, explicitly, and this is the whole reason the suite cannot
+  // reuse `settledGrouping`. `groupGrainFor` collapses the grain to `folder`
+  // anywhere else — correctly, since at File level every node already is a
+  // file — so a suite that let `autoLevel` pick would measure the folder
+  // grain twice and report the two as identical, which is exactly what the
+  // first version of this did.
+  await page.eval(() => window.__probe.setLevel('Entity'));
+  await waitSettled(page);
+  const out = {
+    hulls: await page.eval(() => window.__probe.hulls()),
+    kinship: await page.eval(() => window.__probe.kinshipRatio()),
+    cohesion: await page.eval(() => window.__probe.cohesionRatio()),
+    stray: await page.eval(() => window.__probe.folderMisplacement()),
+  };
+  settledGrain.cache.set(grain, out);
+  return out;
+}
+settledGrain.cache = new Map();
 
 async function ready(page, ms = 6000) {
   await page.eval(installProbeLib);
@@ -2723,12 +2899,17 @@ const SUITES = {
       },
       {
         id: 'no-bottom-overlap',
-        criterion: 'Stats bar and mode bar never overlap',
+        criterion: 'Canvas stats and mode bar never overlap',
         async run(page) {
+          // `canvas-stats` and `mode-bar` share one flex strip along the
+          // canvas floor, so at every width one has to give way rather than
+          // be drawn over. (This read `stats-bar` until UI-109 — that name
+          // followed StatsBar up into the toolbar, where it cannot collide
+          // with anything down here and the check proved nothing.)
           const results = {};
           for (const w of [1600, 1440, 1280, 1152, 1024]) {
             await page.viewport(w, 800); await sleep(900);
-            results[w] = await page.eval(() => window.__probe.overlap('stats-bar', 'mode-bar'));
+            results[w] = await page.eval(() => window.__probe.overlap('canvas-stats', 'mode-bar'));
           }
           await page.viewport(1280, 800);
           const bad = Object.entries(results).filter(([, v]) => v);
@@ -2759,7 +2940,7 @@ const SUITES = {
           await page.viewport(1600, 1000); await sleep(3000);
           await page.viewport(1280, 800); await sleep(3000);
           const clipped = await page.eval(() => window.__probe.clippedNodes());
-          const overlap = await page.eval(() => window.__probe.overlap('stats-bar', 'mode-bar'));
+          const overlap = await page.eval(() => window.__probe.overlap('canvas-stats', 'mode-bar'));
           return ok(clipped.length === 0 && !overlap, { clipped: clipped.length, overlap });
         },
       },
@@ -3503,6 +3684,203 @@ const SUITES = {
     ],
   },
 
+  'ui-103': {
+    ticket: 'UI-103', title: 'A file can be a region',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      settledGrain.cache.clear();
+
+      widestScope.chosen = null;
+      await page.eval(() => window.__probe?.storeGrain('folder'));
+      await page.goto(APP); await ready(page);
+    },
+    checks: [
+      {
+        id: 'grain-control-present',
+        criterion: 'A two-step grain control sits with cohesion, one step active',
+        async run(page) {
+          const segs = await page.eval(() => window.__probe.groupGrainState());
+          const active = segs.filter((s) => s.active);
+          return ok(segs.length === 2 && active.length === 1,
+            segs, segs.length === 2 ? '' : 'no grain control — is it inside the Graph Visualization block?');
+        },
+      },
+      {
+        id: 'file-grain-draws-file-regions',
+        criterion: 'Choosing Files outlines files, not the folders holding them',
+        async run(page) {
+          // The feature, stated as the thing a reader would look at. A region
+          // path with a dot in its last segment is a file; the folder grain
+          // can never produce one, so this cannot pass by accident.
+          const m = await settledGrain(page, 'file');
+          const files = m.hulls.filter((h) => h.d && h.path && /\.[a-z]+$/i.test(h.path));
+          return ok(files.length > 0,
+            { drawn: m.hulls.filter((h) => h.d).length, fileRegions: files.length, sample: files.slice(0, 4).map((h) => h.path) },
+            files.length > 0 ? '' : 'no file earned an outline — MIN_HULL_MEMBERS or the foreign-share guard is rejecting all of them');
+        },
+      },
+      {
+        id: 'folder-grain-draws-no-file-region',
+        criterion: 'The folder grain is not leaked into by the file grain',
+        async run(page) {
+          // The half of UI-103 that must not move, stated as the one thing
+          // about it that is stable here.
+          //
+          // Deliberately NOT a misplacement threshold. The grain only means
+          // anything at Entity level, and Entity level on this scope is far
+          // over `RENDER_BUDGET`, so the canvas draws a ranked subset and
+          // which folders keep the three drawn members an outline needs
+          // varies run to run — measured that way the folder grain scored 17
+          // regions once and 0 the next time, on unchanged code. UI-102's
+          // suite already holds the misplacement threshold, at File level
+          // where the whole scope is drawn. What is invariant regardless of
+          // which nodes survive the ceiling is that no region here is a file.
+          const m = await settledGrain(page, 'folder');
+          const files = m.hulls.filter((h) => h.d && h.path && /\.[a-z]+$/i.test(h.path));
+          return ok(files.length === 0,
+            { drawn: m.hulls.filter((h) => h.d).length, fileRegions: files.map((h) => h.path) },
+            files.length === 0 ? '' : 'a file region was drawn at folder grain');
+        },
+      },
+      {
+        id: 'the-grain-actually-changes-the-picture',
+        criterion: 'The two grains do not settle the same canvas',
+        async run(page) {
+          // The check the first version of this suite needed and did not
+          // have. Both grains reported identical numbers to three decimals
+          // because nothing forced Entity level, so `groupGrainFor` collapsed
+          // file to folder and the suite measured one thing twice while
+          // reporting a pass. Comparing the two settles is what makes that
+          // failure mode loud.
+          //
+          // No threshold on the direction or size of the difference: file
+          // grain re-bases `tierWeightFor`'s depth-0 exemption from the
+          // folder onto the file, so folder cohesion legitimately loosens and
+          // there is no number it must hit. The numbers are reported so the
+          // ticket can record them.
+          const folder = await settledGrain(page, 'folder');
+          const file = await settledGrain(page, 'file');
+          const num = (m) => ({
+            cohesion: m.cohesion?.ratio ?? null,
+            misplaced: m.stray?.share ?? null,
+            regions: m.hulls.filter((h) => h.d).length,
+          });
+          const a = num(folder);
+          const b = num(file);
+          const differs = a.cohesion !== b.cohesion || a.regions !== b.regions;
+          return ok(differs, { folder: a, file: b },
+            differs ? '' : 'both grains settled identically — is Entity level actually being set?');
+        },
+      },
+    ],
+  },
+
+  'ui-102': {
+    ticket: 'UI-102', title: 'A crossing edge no longer tows a node out of its folder',
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      settledGrouping.cache.clear();
+      widestScope.chosen = null;
+      await page.goto(APP); await ready(page);
+    },
+    checks: [
+      {
+        id: 'regions-to-be-misplaced-between',
+        criterion: 'The scope drew at least two folders big enough to have outlines',
+        async run(page) {
+          // Below two regions nothing can be nearer to the wrong one, and the
+          // share would read 0 for want of anywhere to go rather than because
+          // the layout is right.
+          const m = (await settledGrouping(page, 'low')).stray;
+          return ok(m?.share !== null && m?.regions >= 2, m,
+            m?.share !== null ? '' : `regions=${m?.regions} — nothing here can be measured`);
+        },
+      },
+      {
+        id: 'nodes-sit-in-their-own-region',
+        criterion: 'Few nodes sit nearer another folder\'s centre than their own',
+        async run(page) {
+          // Measured at `low`, the shipped default, because that is the
+          // setting the report came from and the one where the folder force
+          // has least to spend on the argument.
+          //
+          // The threshold is an absolute standing property, not a
+          // before/after: the fix has no toggle, so a comparison needs two
+          // builds and cannot live in a suite. The controlled version is in
+          // `graph-grouping.test.ts`, which settles the same forces over a
+          // built world with and without the folder term. What the two builds
+          // measured here is recorded on the ticket.
+          const m = (await settledGrouping(page, 'low')).stray;
+          if (m?.share === null) return ok(false, m, 'nothing to measure');
+          return ok(m.share < 0.25,
+            { share: +m.share.toFixed(3), misplaced: m.misplaced, measured: m.measured, regions: m.regions },
+            m.share < 0.25 ? '' : 'a quarter of the drawn nodes sit closer to a folder they are not in');
+        },
+      },
+      {
+        id: 'a-crossing-edge-is-not-what-misplaces-a-node',
+        criterion: 'Nodes with an edge out of their folder are misplaced no more often than nodes without one',
+        async run(page) {
+          // The report, as a comparison the layout either earns or does not.
+          // A folder-blind link force makes exactly this split: the nodes it
+          // can tow are the nodes with somewhere to be towed to, so their
+          // share runs ahead of the rest. Reported with both populations, so
+          // a pass on a scope where one of them is three nodes is visible as
+          // such rather than as a result.
+          const m = (await settledGrouping(page, 'low')).stray;
+          if (m?.crossingShare === null || m?.internalShare === null) {
+            return ok(false, m, 'one population is empty — this scope cannot answer the question');
+          }
+          const gap = m.crossingShare - m.internalShare;
+          return ok(gap < 0.15, {
+            crossing: +m.crossingShare.toFixed(3), internal: +m.internalShare.toFixed(3), gap: +gap.toFixed(3),
+            crossingNodes: m.crossingNodes, internalNodes: m.internalNodes,
+          }, gap < 0.15 ? '' : 'an edge out of the folder is still what decides whether a node stays in it');
+        },
+      },
+      {
+        id: 'folders-were-not-loosened-to-buy-it',
+        criterion: 'Same-folder nodes are no less clustered than UI-052 left them',
+        async run(page) {
+          // The trade this change could silently make. Lengthening crossing
+          // edges spreads the canvas, and misplacement improves for free if
+          // every folder grew apart from every other. `cohesionRatio` is
+          // scale-invariant, so holding it is what says the strays came home
+          // rather than the canvas moving out from under the measurement.
+          const c = (await settledGrouping(page, 'low')).cohesion;
+          if (!c?.ratio) return ok(false, c, 'no same-folder pairs to measure');
+          return ok(c.ratio < 0.75, { ratio: +c.ratio.toFixed(3), intraPairs: c.intraPairs },
+            c.ratio < 0.75 ? '' : 'folders are no tighter than chance — the link change cost UI-052 its property');
+        },
+      },
+      {
+        id: 'subtrees-still-cohere',
+        criterion: 'The tree signal UI-069 added survived the link change',
+        async run(page) {
+          // Weakening crossing edges weakens exactly the edges that used to
+          // hold two sibling folders near each other. If kinship is what paid
+          // for the misplacement number, this catches it — and it is the
+          // reason the decay constant in `linkFolderWeights` is the same one
+          // the cohesion force uses rather than something harsher.
+          const k = (await settledGrouping(page, 'low')).kinship;
+          if (!k?.ratio) return ok(false, k, 'this scope has no tree depth');
+          return ok(k.ratio < 0.75, { ratio: +k.ratio.toFixed(3), kinPairs: k.kinPairs, farPairs: k.farPairs },
+            k.ratio < 0.75 ? '' : 'subtrees scattered — the crossing edges that held them were weakened too far');
+        },
+      },
+      {
+        id: 'draws-what-it-drew',
+        criterion: 'A folder-aware link force is a layout change, not a filter',
+        async run(page) {
+          const g = await settledGrouping(page, 'low');
+          return ok(g.stray.rendered === g.cohesion.rendered && g.stray.rendered > 0,
+            { stray: g.stray.rendered, cohesion: g.cohesion.rendered },
+            g.stray.rendered > 0 ? '' : 'nothing rendered');
+        },
+      },
+    ],
+  },
+
   'ui-053': {
     ticket: 'UI-053', title: 'Folder-seeded initial positions',
     async setup(page) {
@@ -3687,10 +4065,31 @@ const SUITES = {
           // structural rather than unlucky — a parent's outline touches its
           // child's along the top, so their names are anchored within a few
           // pixels of each other by construction, not by accident.
+          //
+          // Run at both grains (UI-103). File grain multiplies the label
+          // count — every drawn file with `MIN_HULL_MEMBERS` entities earns a
+          // name — so `separateLabels` is under far more pressure there, and
+          // measuring only the folder case would leave the harder half
+          // untested. Folder grain is restored at the end: the suites share a
+          // page, and a grain left set would silently re-run every check
+          // after this one against a different picture.
           await page.eval(() => window.__probe.setHullDepth(3));
           await sleep(1500);
-          const { labels, collisions } = await page.eval(() => window.__probe.hullLabelBoxes());
-          return ok(collisions.length === 0, { names: labels.length, collisions },
+          const byGrain = {};
+          for (const grain of ['folder', 'file']) {
+            await page.eval((g) => window.__probe.setGroupGrain(g), grain);
+            await sleep(1500);
+            byGrain[grain] = await page.eval(() => window.__probe.hullLabelBoxes());
+          }
+          await page.eval(() => window.__probe.setGroupGrain('folder'));
+          // Longer than the per-grain waits above because restoring the grain
+          // re-runs the force's `initialize` and restarts at alpha 0.5 — a
+          // full re-settle, not an overlay redraw — and the next check in
+          // this suite reads the hulls this leaves behind.
+          await sleep(3000);
+          const collisions = [...byGrain.folder.collisions, ...byGrain.file.collisions];
+          const counts = { folderNames: byGrain.folder.labels.length, fileNames: byGrain.file.labels.length };
+          return ok(collisions.length === 0, { ...counts, collisions },
             collisions.length === 0 ? ''
               : `${collisions.length} pair(s) overlap, worst ${collisions.reduce((w, c) => Math.max(w, c.overlapX), 0)}px across`);
         },
@@ -4309,6 +4708,37 @@ const SUITES = {
         },
       },
       {
+        id: 'the-badge-covers-no-other-control',
+        criterion: 'The diff badge, at its widest, hides neither the mode bar nor the overview',
+        async run(page) {
+          // A loaded diff is when the bottom-left group is longest: seed
+          // split, four rungs, both opacity sliders and the undrawn count. It
+          // used to run straight under the refresh button and the endpoint
+          // chip, which stayed clickable-looking and were not.
+          //
+          // Measured at `rewiring`, which is the widest the group ever gets:
+          // the Context slider (UI-112) is absent at `edits`, and the undrawn
+          // count is absent at `neighbourhood`. Only this rung shows both.
+          // Measured on the badge, not on the strip group around it: a flex
+          // item that has been shrunk still reports the smaller box while its
+          // contents spill past it, which is precisely how this went wrong.
+          await page.eval((l) => window.__probe.setDiffLevel(l), 'rewiring');
+          await sleep(1500);
+          const results = {};
+          for (const w of [1600, 1440, 1280, 1152]) {
+            await page.viewport(w, 900); await sleep(900);
+            results[w] = {
+              modeBar: await page.eval(() => window.__probe.overlap('diff-badge', 'mode-bar')),
+              overview: await page.eval(() => window.__probe.overlap('diff-badge', 'overview-panel')),
+            };
+          }
+          await page.viewport(1600, 1000); await sleep(900);
+          const bad = Object.entries(results).filter(([, v]) => v.modeBar || v.overview);
+          return ok(bad.length === 0, results,
+            bad.length ? `the badge sits on another control at ${bad.map((b) => b[0]).join(', ')}px` : '');
+        },
+      },
+      {
         id: 'edits-draws-no-untouched-wiring',
         criterion: 'The narrowest rung draws strictly fewer edges than the widest',
         async run(page) {
@@ -4326,6 +4756,26 @@ const SUITES = {
           const pass = edits.links < neighbourhood.links;
           return ok(pass, { edits: edits.links, neighbourhood: neighbourhood.links },
             pass ? '' : 'the narrow rung drew as many edges as the wide one — edges are not being filtered');
+        },
+      },
+      {
+        id: 'the-neighbourhood-is-not-drawn-like-the-edits',
+        criterion: 'What a rung recruits is drawn quieter than what was edited (UI-112)',
+        async run(page) {
+          // The complaint this exists for: widening to Neighbourhood multiplies
+          // the node count, and every added node arrives drawn exactly like the
+          // handful that changed — so the picture gains context and loses its
+          // subject. The Context slider is a third opacity tier, and it must be
+          // absent at `edits`, which recruits nothing to weight.
+          await page.eval((l) => window.__probe.setDiffLevel(l), 'edits');
+          await sleep(2500);
+          const edits = await page.eval(() => window.__probe.diffState());
+          await page.eval((l) => window.__probe.setDiffLevel(l), 'neighbourhood');
+          await sleep(2500);
+          const wide = await page.eval(() => window.__probe.diffState());
+          const pass = edits.contextPct === null && wide.contextPct !== null && wide.faded > 0;
+          return ok(pass, { edits, neighbourhood: wide },
+            pass ? '' : 'the recruited neighbourhood is drawn at the same strength as the edits');
         },
       },
       {

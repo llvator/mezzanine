@@ -90,11 +90,15 @@ pub fn extract(
     if entities.is_empty() {
         return Err("no Elevator entities found — is this a spec directory?".to_string());
     }
-    let by_id: HashMap<String, &CodeEntity> =
-        entities.iter().map(|e| (e.id.clone(), *e)).collect();
+    let by_id: HashMap<String, &CodeEntity> = entities.iter().map(|e| (e.id.clone(), *e)).collect();
 
     let seeds = resolve_selectors(selectors, &entities, &by_id)?;
-    Ok(extract_seeds(result, &seeds, &selectors.join(", "), source_label))
+    Ok(extract_seeds(
+        result,
+        &seeds,
+        &selectors.join(", "),
+        source_label,
+    ))
 }
 
 /// The Elevator entities of an analysis, in analysis order.
@@ -123,9 +127,12 @@ pub fn extract_seeds(
     source_label: &str,
 ) -> Slice {
     let entities: Vec<&CodeEntity> = elevator_entities(result);
-    let by_id: HashMap<String, &CodeEntity> =
-        entities.iter().map(|e| (e.id.clone(), *e)).collect();
-    let seeds: Vec<String> = seeds.iter().filter(|id| by_id.contains_key(*id)).cloned().collect();
+    let by_id: HashMap<String, &CodeEntity> = entities.iter().map(|e| (e.id.clone(), *e)).collect();
+    let seeds: Vec<String> = seeds
+        .iter()
+        .filter(|id| by_id.contains_key(*id))
+        .cloned()
+        .collect();
     let graph = Containment::build(result, &by_id);
 
     // Members = seeds + everything below them. A Feature's
@@ -392,7 +399,11 @@ impl Rendering<'_> {
         let _ = writeln!(out, "#");
         let _ = writeln!(out, "# Source:    {}", source_label);
         let _ = writeln!(out, "# Selection: {}", selection_label);
-        let _ = writeln!(out, "# Slice:     {}", kind_summary(self.by_id, self.members));
+        let _ = writeln!(
+            out,
+            "# Slice:     {}",
+            kind_summary(self.by_id, self.members)
+        );
         let context_note = !self.ancestors.is_empty();
         if context_note {
             let _ = writeln!(
@@ -487,13 +498,16 @@ impl Rendering<'_> {
     /// never defines stays dropped, so the slice doesn't paper over
     /// the source's gap.
     fn write_ref_list(&self, out: &mut String, field: &str, mut targets: Vec<String>) {
-        targets.retain(|id| {
-            self.emitted.contains(id) || !self.by_id[id].tags.contains("unresolved")
-        });
+        targets
+            .retain(|id| self.emitted.contains(id) || !self.by_id[id].tags.contains("unresolved"));
         if targets.is_empty() {
             return;
         }
-        targets.sort_by(|a, b| self.by_id[a].qualified_name.cmp(&self.by_id[b].qualified_name));
+        targets.sort_by(|a, b| {
+            self.by_id[a]
+                .qualified_name
+                .cmp(&self.by_id[b].qualified_name)
+        });
         let refs: Vec<String> = targets.iter().map(|id| ref_name(self.by_id[id])).collect();
         let _ = writeln!(out, "    {}: {}", field, refs.join(", "));
     }
@@ -600,7 +614,11 @@ fn kind_summary(by_id: &HashMap<String, &CodeEntity>, ids: &BTreeSet<String>) ->
         (EntityKind::Extension, "extension", "extensions"),
         (EntityKind::Category, "category", "categories"),
         (EntityKind::Feature, "feature", "features"),
-        (EntityKind::Functionality, "functionality", "functionalities"),
+        (
+            EntityKind::Functionality,
+            "functionality",
+            "functionalities",
+        ),
         (EntityKind::Concept, "concept", "concepts"),
         (EntityKind::UiPage, "UI page", "UI pages"),
     ];

@@ -26,7 +26,11 @@ pub(super) fn extract_tsdoc(node: &Node, source: &str) -> Option<String> {
         .lines()
         .map(|l| {
             let t = l.trim();
-            if t.starts_with('*') { t[1..].trim_start().to_string() } else { t.to_string() }
+            if t.starts_with('*') {
+                t[1..].trim_start().to_string()
+            } else {
+                t.to_string()
+            }
         })
         .collect();
     if lines.is_empty() || lines.iter().all(|l| l.is_empty()) {

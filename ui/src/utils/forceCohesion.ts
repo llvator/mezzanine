@@ -37,6 +37,32 @@ export type CohesionLevel = 'off' | 'low' | 'medium' | 'high';
 
 export const COHESION_LEVELS: readonly CohesionLevel[] = ['off', 'low', 'medium', 'high'];
 
+/**
+ * What the innermost group is (UI-103).
+ *
+ * `folder` is the shipped reading and the default. `file` moves the innermost
+ * group one level down, so a region is the unit an author actually composed
+ * rather than the directory they filed it in — which is what lets
+ * `regionTraffic`'s inside-against-crossing counts answer "is this file
+ * cohesive, or a junk drawer?" without inventing a concept or making a new
+ * claim about the code.
+ *
+ * Note the vocabulary trap this feature was reported through: *module* in nao
+ * already means the directory — `collapseGraph`'s `scopeIdFor` derives it as
+ * `dirname(file_path)` and `folderKeyOf` below deliberately agrees with it —
+ * so module grouping is the folder grain, not a third option.
+ */
+export type GroupGrain = 'folder' | 'file';
+
+export const GROUP_GRAINS: readonly GroupGrain[] = ['folder', 'file'];
+
+/** Plural, because the control names what the regions on the canvas *are*,
+ *  not what one node belongs to. */
+export const GROUP_GRAIN_LABELS: Record<GroupGrain, string> = {
+  folder: 'Folders',
+  file: 'Files',
+};
+
 /** Velocity-nudge coefficients, applied as `(centroid - position) * k * alpha`.
  *
  *  `off` is exactly 0 rather than a small number: the force must be provably
@@ -93,7 +119,47 @@ export function folderKeyOf(node: D3Node): string | null {
  */
 function normalizeDir(dir: string): string {
   if (dir === '.') return '';
-  return dir.startsWith('./') ? dir.slice(2) : dir;
+  return stripDotSlash(dir);
+}
+
+/** The half of `normalizeDir` that is not about directories, so `fileKeyOf`
+ *  can normalise the same spelling without inheriting the `.` → `''` rule,
+ *  which is meaningless for a file. */
+function stripDotSlash(path: string): string {
+  return path.startsWith('./') ? path.slice(2) : path;
+}
+
+/**
+ * The file itself as a group key (UI-103).
+ *
+ * Normalised exactly as `folderKeyOf` normalises the directory, and for the
+ * same reason one level down: AN-015 emits `./ui/src/stores/graph.ts` and
+ * `ui/src/stores/graph.ts` from a single analyze run, and compared as raw
+ * strings that is one file arriving as two regions with two centroids.
+ *
+ * Ghosts return `null` on exactly the same terms — they are not in the tree at
+ * any grain — which is what lets `groupChainOf` test the pair once.
+ */
+export function fileKeyOf(node: D3Node): string | null {
+  const p = node.file_path;
+  if (!p) return null;
+  return stripDotSlash(p);
+}
+
+/**
+ * Where the node's own folder sits in the chain at this grain (UI-113).
+ *
+ * 0 at folder grain, 1 at file grain, because `groupChainOf` prepends the file
+ * and nothing else. Derived here rather than counted by the caller so that the
+ * chain and the tier the weighting exempts can never disagree — the same
+ * "exactly one definition of a group" rule `groupChainOf` exists to keep.
+ *
+ * A node with no group has no folder tier either, but the answer is still 0/1
+ * rather than null: `initialize` never reaches the weighting for an empty
+ * chain, so there is no case for a caller to handle.
+ */
+export function folderTierDepth(grain: GroupGrain): number {
+  return grain === 'file' ? 1 : 0;
 }
 
 /**
@@ -169,6 +235,59 @@ export function ancestorChainOf(key: string, limit: number = MAX_TIERS): string[
 }
 
 /**
+ * The innermost group a node belongs to at this grain, or `null` when it is in
+ * none.
+ *
+ * What the hover highlight and the link force need: one key to compare for
+ * equality. `groupChainOf` is the same answer with everything above it.
+ */
+export function groupKeyOf(node: D3Node, grain: GroupGrain): string | null {
+  return grain === 'file' ? fileKeyOf(node) : folderKeyOf(node);
+}
+
+/**
+ * A node's group and every group above it, innermost first — **the** single
+ * definition of a group (UI-103).
+ *
+ * `f grouping`'s promise is that the force, the seed, the outlines, the hover
+ * membership and the traffic counts all read one answer, so a highlight can
+ * never light a different set from the region it is drawn inside. This is that
+ * answer once the reader is allowed to choose a grain; `folderKeyOf` and
+ * `ancestorChainOf` remain the folder implementation it delegates to rather
+ * than a second definition anyone calls directly.
+ *
+ * The file is an **extra** tier, not one taken from the folders: the ancestor
+ * chain keeps its own `limit`, so the folder reach a reader has tuned is
+ * unchanged at either grain and only the per-tick pair count grows — nodes × 5
+ * rather than nodes × 4 in the worst case, still linear.
+ *
+ * A file holding one drawn entity needs no special case. `initialize` already
+ * drops any tier of fewer than two members before normalising, and hands its
+ * share to the tiers that can act — so such a node is pulled by its folder at
+ * full strength, which is the "lone file in a folder of its own" rule one
+ * level down.
+ *
+ * `limit` defaults to the force's cap; the outlines and the traffic counts
+ * pass `Infinity` for the reason `ancestorChainOf` gives.
+ */
+export function groupChainOf(
+  node: D3Node,
+  grain: GroupGrain,
+  limit: number = MAX_TIERS,
+): string[] {
+  const folder = folderKeyOf(node);
+  const file = fileKeyOf(node);
+  // Ghost. Not in the tree, so in no group at any grain — a shared key would
+  // collect every unrelated stdlib reference into one phantom region and drag
+  // it across the canvas. The same exemption `folderHulls`, `regionTraffic`
+  // and `hoverHighlight` each document. Both keys read the one `file_path`, so
+  // they are null together and one test covers the pair.
+  if (folder === null || file === null) return [];
+  const chain = ancestorChainOf(folder, limit);
+  return grain === 'file' ? [file, ...chain] : chain;
+}
+
+/**
  * How much of an ancestor tier's decayed pull survives, given the share of
  * the graph it holds.
  *
@@ -188,15 +307,48 @@ export function ancestorChainOf(key: string, limit: number = MAX_TIERS): string[
  * kinship ratio went from 0.845 to 0.927, the wrong way. Coverage catches
  * that case and the exact-ancestor case with one rule.
  *
- * The node's own folder (`depth === 0`) is deliberately exempt. That pull is
- * UI-052's promise, and a scope narrowed to a single folder must keep
+ * The node's own innermost group (`depth === 0`) is deliberately exempt. That
+ * pull is UI-052's promise, and a scope narrowed to a single folder must keep
  * behaving as it did rather than losing its cohesion to a rule about
  * ancestors.
+ *
+ * `folderDepth` exempts the node's own **folder** from `ANCESTOR_DECAY` as
+ * well, wherever the grain has put it (UI-113).
+ *
+ * The decay prices a tier for being an *ancestor* — one step further from the
+ * group the node was actually written into. At file grain that description
+ * stops fitting the folder: `groupChainOf` prepends the file, the folder
+ * lands at depth 1, and it collects a discount meant for the subtree *above*
+ * it while still being a group the node is directly in. Because `initialize`
+ * normalises a node's tiers to sum to one, that is not a small trim — the
+ * folder's share of the pull falls from 100% to 18%, folders stop being
+ * spatially coherent, and `MAX_FOREIGN_SHARE` then correctly refuses to
+ * outline them. Measured on this repo's `ui/src` at Medium cohesion: five
+ * folder regions at folder grain, one at file grain.
+ *
+ * That was the shipped behaviour and UI-103 recorded it as an acceptable
+ * re-basing, which it was while the reader could only see one grain at a
+ * time. It is not acceptable as the answer to "draw files *and* the folders
+ * around them", which is what `hullDepth: 2` at file grain promises.
+ *
+ * The coverage term is deliberately still applied. It is a different rule
+ * answering a different question — a tier holding most of the graph has the
+ * graph's centroid whatever depth it sits at — and dropping it too was
+ * measured as strictly worse: seven file regions lost to buy no extra folder.
+ *
+ * At folder grain `folderDepth` is 0, the `depth === 0` branch has already
+ * returned, and this is byte-identical to the pre-UI-113 function.
  */
-export function tierWeightFor(depth: number, size: number, total: number): number {
+export function tierWeightFor(
+  depth: number,
+  size: number,
+  total: number,
+  folderDepth: number = 0,
+): number {
   if (depth === 0) return 1;
   if (total <= 0) return 0;
-  return ANCESTOR_DECAY ** depth * (1 - size / total);
+  const decay = depth === folderDepth ? 1 : ANCESTOR_DECAY ** depth;
+  return decay * (1 - size / total);
 }
 
 /**
@@ -210,6 +362,23 @@ export function tierWeightFor(depth: number, size: number, total: number): numbe
 export function cohesionStrengthFor(level: GraphLevel, choice: CohesionLevel): number {
   if (level === 'module') return 0;
   return COHESION_STRENGTH[choice];
+}
+
+/**
+ * The grain actually in force at the level being drawn (UI-103).
+ *
+ * File grain is an Entity-level reading and collapses to `folder` everywhere
+ * else. At File level every node already *is* a file, so every file region
+ * would hold exactly one member, fall under `MIN_HULL_MEMBERS` and draw
+ * nothing — a control that silently does something is worse than one that is
+ * plainly unavailable. At Module level the force is inert anyway.
+ *
+ * Deliberately shaped like `cohesionStrengthFor`: the stored choice is what
+ * the reader picked and is never overwritten, so returning to Entity level
+ * restores the grain they were reading at rather than the fallback.
+ */
+export function groupGrainFor(level: GraphLevel, choice: GroupGrain): GroupGrain {
+  return level === 'entity' ? choice : 'folder';
 }
 
 export interface FolderCohesionForce {
@@ -229,8 +398,32 @@ export interface FolderCohesionForce {
  * With UI-069 those passes are over (node, tier) pairs rather than nodes, so
  * the cost is nodes × depth with depth capped at `MAX_TIERS` — still linear,
  * and bounded by a constant multiple of the old cost.
+ *
+ * `chainOf` is injected rather than imported, for the reason `folderHulls`
+ * gives about its own `keysOf`: it keeps the grain out of this module and
+ * keeps the force reading the same definition of a group as everything else.
+ * The default is the folder grain, so a caller that has no opinion gets the
+ * pre-UI-103 force exactly.
+ *
+ * `folderDepthOf` says where in that chain the node's own folder sits, so the
+ * weighting can exempt it from `ANCESTOR_DECAY` (UI-113). It travels beside
+ * `chainOf` rather than being inferred from it because this module still has
+ * no opinion about what a group key *is* — a caller passing a chain from
+ * somewhere other than `groupChainOf` (UI-059's detected communities, when it
+ * lands) says which tier is the folder the same way. Callers derive it with
+ * `folderTierDepth(grain)` so the pair cannot drift; the default pairs with
+ * the default `chainOf`.
+ *
+ * A **function**, read at `initialize`, for the same reason `chainOf` is one:
+ * a grain change re-initializes this force in place rather than rebuilding it
+ * (`GraphView.applyGrain`), so a depth captured at construction would go stale
+ * against a chain that had already moved — the folder exemption would land on
+ * the file tier, or on nothing.
  */
-export function forceFolderCohesion(): FolderCohesionForce {
+export function forceFolderCohesion(
+  chainOf: (node: D3Node) => string[] = (node) => groupChainOf(node, 'folder'),
+  folderDepthOf: () => number = () => 0,
+): FolderCohesionForce {
   let nodes: SimNode[] = [];
   /**
    * Per-node tier lists, flattened. Node `i` owns
@@ -298,15 +491,13 @@ export function forceFolderCohesion(): FolderCohesionForce {
     const chains = new Array<number[]>(ns.length);
     let placed = 0;
     for (let i = 0; i < ns.length; i++) {
-      const key = folderKeyOf(ns[i]);
-      // null = ghost. Not in the tree, so in no group at any tier — giving
-      // them a shared key would collect every unrelated stdlib reference into
-      // one phantom group and drag it across the canvas. They are also out of
-      // the coverage denominator: a tier holding every *placed* node holds
-      // the whole tree, whatever else is on the canvas.
-      if (key === null) { chains[i] = []; continue; }
+      const chain = chainOf(ns[i]);
+      // Empty = ghost. `groupChainOf` explains why they are in no group at any
+      // tier; the consequence here is that they are also out of the coverage
+      // denominator, since a tier holding every *placed* node holds the whole
+      // tree whatever else is on the canvas.
+      if (chain.length === 0) { chains[i] = []; continue; }
       placed++;
-      const chain = ancestorChainOf(key);
       const groups = new Array<number>(chain.length);
       for (let d = 0; d < chain.length; d++) {
         let g = index.get(chain[d]);
@@ -334,8 +525,11 @@ export function forceFolderCohesion(): FolderCohesionForce {
     tierStart = new Array<number>(ns.length + 1);
     tierGroup = [];
     tierWeight = [];
+    // Read once per initialize, not per tier: the grain cannot change midway
+    // through a pass, and this is inside the hot path's setup.
+    const folderDepth = folderDepthOf();
     const weightAt = (chain: number[], d: number): number =>
-      (groupSize[chain[d]] < 2 ? 0 : tierWeightFor(d, groupSize[chain[d]], placed));
+      (groupSize[chain[d]] < 2 ? 0 : tierWeightFor(d, groupSize[chain[d]], placed, folderDepth));
     for (let i = 0; i < ns.length; i++) {
       tierStart[i] = tierGroup.length;
       const chain = chains[i];

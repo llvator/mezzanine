@@ -1,7 +1,7 @@
 //! Language parser trait and common functionality.
 
-use crate::models::{CodeEntity, Relationship, FileInfo, Span, Position};
 use crate::models::file_info::Language;
+use crate::models::{CodeEntity, FileInfo, Position, Relationship, Span};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -11,16 +11,16 @@ use std::path::Path;
 pub struct ParseResult {
     /// File information
     pub file_info: Option<FileInfo>,
-    
+
     /// Entities found in the file
     pub entities: Vec<CodeEntity>,
-    
+
     /// Relationships found in the file
     pub relationships: Vec<Relationship>,
-    
+
     /// Imports/dependencies detected
     pub imports: Vec<ImportInfo>,
-    
+
     /// Any warnings during parsing
     pub warnings: Vec<String>,
 
@@ -51,13 +51,13 @@ pub struct ParseResult {
 pub struct ImportInfo {
     /// The import path/module name
     pub path: String,
-    
+
     /// Specific items imported (empty if importing entire module)
     pub items: Vec<String>,
-    
+
     /// Is this a relative import?
     pub is_relative: bool,
-    
+
     /// The alias if renamed
     pub alias: Option<String>,
 
@@ -72,12 +72,42 @@ pub struct ImportInfo {
     #[serde(default)]
     pub is_wildcard: bool,
 
+    /// Set when the statement is a re-export — `export { X } from './y'`
+    /// — rather than an import (AN-024). The file names another module's
+    /// symbol in order to hand it on; it does not use it itself.
+    ///
+    /// Recorded because the distinction is the one an agent most often has
+    /// to reconstruct by hand: an edge that looks like a direct dependency
+    /// on a file the reader never named, arriving through a shim. Reshape's
+    /// own rules call a re-export shim not-a-door, so the edge it produces
+    /// has to say which kind it is.
+    #[serde(default)]
+    pub is_reexport: bool,
+
     /// Set when the import sits inside an `if` or a `try` (PY-024). A
     /// conditional import is a weaker claim than an unconditional one: the
     /// dependency may be optional, version-gated, or one of several
     /// interchangeable alternatives.
     #[serde(default)]
     pub condition: Option<ImportCondition>,
+
+    /// Set when the build erases the statement: TypeScript's
+    /// `import type { X } from './y'`, and Python's `if TYPE_CHECKING:`
+    /// (AN-022). The specifier is never resolved at runtime and the module
+    /// is not in the emitted bundle.
+    ///
+    /// Named for the category rather than for a keyword, because the
+    /// category is wider than TypeScript: a Rust `use` that only names a
+    /// trait for a bound and an annotation-only Java import are the same
+    /// fact, and each language should answer this question in the same
+    /// field.
+    ///
+    /// A statement counts only when *every* name it binds is erased.
+    /// `import { type X, y }` still resolves the specifier for `y`, so it
+    /// is an ordinary dependency wearing a `type` keyword on one of its
+    /// names.
+    #[serde(default)]
+    pub is_type_only: bool,
 }
 
 /// Why an import is conditional. The two cases mean different things to a
@@ -97,10 +127,10 @@ pub enum ImportCondition {
 pub trait LanguageParser: Send + Sync {
     /// Get the language this parser handles
     fn language(&self) -> Language;
-    
+
     /// Parse source code and extract entities and relationships
     fn parse(&self, path: &Path, content: &str) -> Result<ParseResult>;
-    
+
     /// Check if this parser can handle the given file
     fn can_parse(&self, path: &Path) -> bool {
         path.extension()
@@ -119,27 +149,27 @@ impl ParseResult {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Add an entity to the result
     pub fn add_entity(&mut self, entity: CodeEntity) {
         self.entities.push(entity);
     }
-    
+
     /// Add a relationship to the result
     pub fn add_relationship(&mut self, rel: Relationship) {
         self.relationships.push(rel);
     }
-    
+
     /// Add an import
     pub fn add_import(&mut self, import: ImportInfo) {
         self.imports.push(import);
     }
-    
+
     /// Add a warning
     pub fn add_warning(&mut self, warning: impl Into<String>) {
         self.warnings.push(warning.into());
     }
-    
+
     /// Merge another parse result into this one
     pub fn merge(&mut self, other: ParseResult) {
         self.entities.extend(other.entities);
@@ -159,7 +189,9 @@ impl ImportInfo {
             alias: None,
             span,
             is_wildcard: false,
+            is_reexport: false,
             condition: None,
+            is_type_only: false,
         }
     }
 
@@ -169,22 +201,34 @@ impl ImportInfo {
         self
     }
 
+    /// `export { X } from './y'` — a name passed on rather than used.
+    pub fn reexport(mut self) -> Self {
+        self.is_reexport = true;
+        self
+    }
+
     /// Record that this import sits inside an `if` or a `try`.
     pub fn conditional(mut self, condition: ImportCondition) -> Self {
         self.condition = Some(condition);
         self
     }
-    
+
+    /// `import type { X } from './y'` — a statement the build erases.
+    pub fn type_only(mut self) -> Self {
+        self.is_type_only = true;
+        self
+    }
+
     pub fn with_items(mut self, items: Vec<String>) -> Self {
         self.items = items;
         self
     }
-    
+
     pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
         self.alias = Some(alias.into());
         self
     }
-    
+
     pub fn relative(mut self) -> Self {
         self.is_relative = true;
         self
@@ -211,7 +255,10 @@ pub fn node_text<'a>(node: &tree_sitter::Node, source: &'a str) -> &'a str {
 
 /// Find the first direct child of `node` with the given AST `kind`.
 /// Common utility used by every tree-sitter based parser.
-pub fn find_child_by_kind<'a>(node: &tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+pub fn find_child_by_kind<'a>(
+    node: &tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == kind {

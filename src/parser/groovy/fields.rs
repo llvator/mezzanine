@@ -76,7 +76,9 @@ pub(super) fn has_field_annotation(node: &Node, source: &str) -> bool {
             found
         }
     };
-    let Some(modifiers) = modifiers else { return false };
+    let Some(modifiers) = modifiers else {
+        return false;
+    };
     let mut cursor = modifiers.walk();
     for child in modifiers.children(&mut cursor) {
         if child.kind() == "marker_annotation" || child.kind() == "annotation" {

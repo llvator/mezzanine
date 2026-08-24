@@ -11,6 +11,7 @@ c agent_tools {
     f overview
     f spec_slice
     f shape_tools
+    f reshape
     f navigation_tools
     f dead_code
     f assess_change
@@ -23,8 +24,15 @@ f protocol {
 }
 
 f shape_tools {
-    d: "The orientation half of the surface — what is here and what is wrong with it. map renders a folder's files and entities with loc/complexity/coupling; quality ranks smells and complexity hotspots; hotspots crosses metrics with churn; context bundles one entity with its signature, callers and callees. All read-only, all capped (MAX_BODY_LINES, cap_lines, cap_chars) because the budget being protected is the agent's context window, not the terminal."
+    d: "The orientation half of the surface — what is here and what is wrong with it. map renders a folder's files and entities with loc/complexity/coupling; quality ranks smells and complexity hotspots; hotspots crosses metrics with churn; context bundles one entity with its signature, callers and callees. All read-only, all capped (MAX_BODY_LINES, cap_lines, cap_chars) because the budget being protected is the agent's context window, not the terminal. quality carries a folder_shape_section beside the hotspots — the folders short of Fractal, worst tier first — and each line LEADS with what is holding that folder back, ahead of the five ratios, since the blocker is the only part of the line naming something to change; the tier hints follow once per verdict present rather than per row."
     cr: "src/mcp/tools.rs"
+    references: f.metrics
+}
+
+f reshape {
+    d: "The half of folder shape quality cannot do: not where the organisation is worst, but what exactly to change. quality ranks verdicts; a line reading 'tangled, layered 0.61' names a defect and none of the six edges that caused it, which is not something an agent can act on. This hands over f.metrics.picture — the children with their levels, every edge marked step / skip / back, the doors and the traffic through them — and then ONE instruction, scoped to one rung of the ladder. next_rung_section is driven entirely by ShapeBlocker, which the analyzer already decided: expanding a gate it did not name would be a second opinion about which tier a folder is on, and asking for all four rungs at once produces work that never starts. Every cut-off is printed beside the measurement it judges, off Thresholds, since a number with no bar cannot separate a near miss from a disaster. It analyses the ROOT rather than the named folder, unlike every other tool here — half of what a picture says is who reaches in, and analysing the folder alone would report a clean facade for every folder in the repo. The load-bearing part is the forbidden list: entry_concentration is won by a mod.rs that re-exports everything and arborescence by one wrapper per caller, both leaving every caller coupled to exactly what it was coupled to before, so a tool that did not name those moves would teach agents to produce them and the measure would stop describing anything within a week. The test it gives for all of them is one line — after the change, does anything depend on a DIFFERENT thing than it did before — and the loop closes in render_change_report, which reports folders whose tier moved, regressions first."
+    cr: "src/mcp/reshape.rs", "src/mcp/tools.rs"
+    references: f.metrics
 }
 
 f navigation_tools {

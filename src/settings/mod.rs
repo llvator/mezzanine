@@ -35,8 +35,8 @@ pub mod report;
 pub use report::{Origin, Row, SettingsReport, Tier};
 
 use crate::config::Config;
-use crate::models::EntityKind;
 use crate::models::file_info::Language;
+use crate::models::EntityKind;
 
 /// Explicit override of the user-scope directory, for tests and for wrapper
 /// scripts with nowhere to put a flag. Exists for the same reason
@@ -44,11 +44,19 @@ use crate::models::file_info::Language;
 /// writing — the developer's real home directory.
 const CONFIG_DIR_ENV: &str = "NAO_CONFIG_DIR";
 
-/// The repo-scope directory, resolved against the *analyzed root* rather than
-/// the process working directory. `nao watch /elsewhere/repo` reads
-/// `/elsewhere/repo/.nao/settings.json`, or the file would be useless the
-/// moment you analyze anything but the directory you are standing in.
+/// The repo-scope directory, resolved against the *repo the analyzed path
+/// lies in* rather than the process working directory. `nao watch
+/// /elsewhere/repo` reads `/elsewhere/repo/.nao/settings.json`, or the file
+/// would be useless the moment you analyze anything but the directory you are
+/// standing in — and `nao analyze src` reads that same file, or the normal way
+/// to ask a shape question about one part of a tree would be the one
+/// invocation that drops the tree's configuration (CFG-012).
 const REPO_DIR: &str = ".nao";
+
+/// What marks the top of a checkout. A *file* rather than a directory in a
+/// linked worktree, which `assess_change` analyzes, so the test is existence
+/// and not `is_dir`.
+const GIT_DIR: &str = ".git";
 
 const FILE_NAME: &str = "settings.json";
 
@@ -65,7 +73,10 @@ pub const DEFAULT_PORT: u16 = 3000;
 const REJECTED: &[(&str, &str)] = &[
     ("allow_agent_spawn", "it opens a terminal on this machine"),
     ("no_token", "it drops the pairing-token requirement"),
-    ("allow_origin", "it lets another browser origin read your source"),
+    (
+        "allow_origin",
+        "it lets another browser origin read your source",
+    ),
     (
         "allow_unsafe_passes",
         "it permits passes that execute build scripts from the analyzed tree",
@@ -77,7 +88,7 @@ const REJECTED: &[(&str, &str)] = &[
 pub enum Scope {
     /// `~/.config/nao/settings.json` — properties of this installation.
     User,
-    /// `<analyzed-root>/.nao/settings.json` — properties of the repo.
+    /// `<repo-root>/.nao/settings.json` — properties of the repo.
     Repo,
 }
 
@@ -255,9 +266,24 @@ pub struct Settings {
     /// Extra ignore globs. **Extends** the built-in defaults rather than
     /// replacing them (ADR-0008): writing one extra rule should not silently
     /// re-enable scanning `node_modules`.
+    ///
+    /// Matched against the path **relative to the repo root** — the root this
+    /// file is itself read from, so the file and the patterns inside it agree
+    /// about what "the repo" means (CFG-013). `src/contracts.d.ts` names that
+    /// file whether the run is `nao analyze .`, `nao analyze src` or
+    /// `nao analyze /abs/path/repo/src`. Outside a checkout there is no repo
+    /// root to find and the analyzed root stands in for it.
+    ///
+    /// One surprise is kept deliberately: **`*` crosses `/`**, so `*.d.ts`
+    /// matches `src/a.d.ts` and the leading `**/` of the built-in defaults is
+    /// decorative. It is not the better semantics. It is what every pattern
+    /// written against nao so far relies on, and a filter that quietly stops
+    /// filtering is a worse failure than one that filters too widely and can
+    /// be read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exclude_patterns: Vec<String>,
-    /// Extra include globs. Extends, for symmetry with `exclude_patterns`.
+    /// Extra include globs. Extends, and matched against the same
+    /// repo-relative path, for symmetry with `exclude_patterns`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include_patterns: Vec<String>,
 
@@ -322,10 +348,68 @@ pub fn repo_path(root: &Path) -> PathBuf {
 /// The repo-scope directory for an analyzed root, whether or not it exists.
 ///
 /// Exported because settings are no longer the only thing that lives there —
-/// saved views (`views.json`) are repo-scope for the same reason, and the
-/// spelling of the directory belongs in one place.
+/// saved views (`views.json`) are repo-scope for the same reason, and both the
+/// spelling of the directory and the root it hangs off belong in one place.
 pub fn repo_dir(root: &Path) -> PathBuf {
-    root.join(REPO_DIR)
+    repo_root(root).join(REPO_DIR)
+}
+
+/// The repo an analyzed path belongs to: the nearest ancestor holding a
+/// `.git`, or the analyzed path itself when there is none.
+///
+/// One answer per checkout, which is what "properties of the repo" means
+/// (ADR-0008). `nao analyze .`, `nao analyze src` and `nao deps src/a/b.ts`
+/// all configure themselves from the same file, and no file from an
+/// intermediate directory can surprise a reader who pointed nao at a
+/// subfolder. It also bounds the security question the module docs open with:
+/// the file always comes from inside the checkout the reader pointed into,
+/// never from a parent directory they were not thinking about.
+///
+/// Walked rather than asked of `git rev-parse`: the walk answers for a path
+/// that does not exist yet, works with no git binary on the machine, and
+/// cannot block.
+///
+/// The answer keeps the caller's spelling — a relative analyzed root yields a
+/// relative repo root — because [`Config::spec_root`](crate::config::Config::spec_root)
+/// and the file walk compare these paths against each other lexically, and
+/// mixing an absolute root with a relative walk is how the spec layer goes
+/// silently empty.
+pub fn repo_root(root: &Path) -> PathBuf {
+    let Some(absolute) = absolutize(root) else {
+        return root.to_path_buf();
+    };
+    let Some(levels) = absolute
+        .ancestors()
+        .position(|dir| dir.join(GIT_DIR).exists())
+    else {
+        // Outside a checkout the analyzed root *is* the repo, which is the
+        // right answer for `nao analyze /some/loose/directory`.
+        return root.to_path_buf();
+    };
+    match root.ancestors().nth(levels) {
+        // `Path::ancestors` bottoms out in the empty path, which joins onto a
+        // sibling of the caller's rather than onto the current directory.
+        Some(dir) if dir.as_os_str().is_empty() => PathBuf::from("."),
+        Some(dir) => dir.to_path_buf(),
+        // The checkout is above the relative spelling the caller used — say
+        // it absolutely rather than manufacture a run of `..`.
+        None => absolute
+            .ancestors()
+            .nth(levels)
+            .unwrap_or(&absolute)
+            .to_path_buf(),
+    }
+}
+
+/// `root` as an absolute path, without touching the filesystem beyond asking
+/// for the working directory. Deliberately not `canonicalize`: the path may
+/// not exist yet, and resolving symlinks would answer for a directory the
+/// caller never named.
+fn absolutize(root: &Path) -> Option<PathBuf> {
+    if root.is_absolute() {
+        return Some(root.to_path_buf());
+    }
+    std::env::current_dir().ok().map(|cwd| cwd.join(root))
 }
 
 /// The repo-scope file as raw JSON, for a writer that has to preserve keys it
@@ -355,10 +439,7 @@ pub fn read_raw(path: &Path) -> Result<serde_json::Map<String, serde_json::Value
 /// interrupted save leaves the previous settings intact instead of half a
 /// JSON document. Pretty-printed because this file is meant to be read and
 /// reviewed in a diff — the same bargain `views.json` makes next door.
-pub fn write(
-    path: &Path,
-    body: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
+pub fn write(path: &Path, body: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let text = serde_json::to_string_pretty(body).map_err(|e| e.to_string())?;
@@ -419,7 +500,11 @@ pub fn user_scoped() -> Loaded {
         return Loaded::default();
     };
     let (user, warnings) = read(&path, Scope::User);
-    Loaded { repo: Settings::default(), user, warnings }
+    Loaded {
+        repo: Settings::default(),
+        user,
+        warnings,
+    }
 }
 
 /// Both scopes, repo winning over user, for a trusted local root.
@@ -433,19 +518,26 @@ pub fn load(root: &Path) -> Settings {
 /// output is emitted in exactly one place and cannot drift from what the
 /// browser is shown.
 pub fn load_scoped(root: &Path) -> Loaded {
-    let (repo, mut warnings) = read(&repo_path(root), Scope::Repo);
+    let repo_root = repo_root(root);
+    let (mut repo, mut warnings) = read(&repo_root.join(REPO_DIR).join(FILE_NAME), Scope::Repo);
+    repo.rebase_spec_dir(&repo_root, root);
     let (user, user_warnings) = user_path()
         .map(|p| read(&p, Scope::User))
         .unwrap_or_default();
     warnings.extend(user_warnings);
     warnings.iter().for_each(Warning::print);
-    Loaded { repo, user, warnings }
+    Loaded {
+        repo,
+        user,
+        warnings,
+    }
 }
 
 impl Settings {
     /// Name every key that will not be honoured, then clear it.
     fn validate(&mut self, scope: Scope, from: &Path) -> Vec<Warning> {
         let mut warnings = self.report_rejected(from);
+        warnings.extend(self.clear_malformed_globs(from));
         if scope == Scope::Repo {
             warnings.extend(self.clear_user_only(from));
             warnings.extend(self.clear_escaping_spec_dir(from));
@@ -453,6 +545,52 @@ impl Settings {
             warnings.extend(self.clear_repo_only(from));
         }
         warnings
+    }
+
+    /// Re-express a repo-scope `spec_dir` against the directory the file was
+    /// actually read from.
+    ///
+    /// The key is relative to the repo, and since CFG-012 the repo is the
+    /// checkout rather than the analyzed root: `spec_dir: "docs/domain"` at
+    /// the top of a repo means `<repo>/docs/domain` whether the reader typed
+    /// `nao analyze .` or `nao analyze src`. Resolving it against the analyzed
+    /// root instead would send `nao analyze src` looking for
+    /// `src/docs/domain`, which is the failure
+    /// [`Config::spec_root`](crate::config::Config::spec_root) is written to
+    /// avoid: a spec layer that is empty for a reason nobody can see.
+    ///
+    /// Runs after [`Self::clear_escaping_spec_dir`], so what is joined here is
+    /// already known to be relative and free of `..` — the result cannot name
+    /// anywhere but inside the repo. A no-op in the ordinary case, where the
+    /// two roots are the same directory.
+    ///
+    /// Which *spelling* comes out is not cosmetic, because
+    /// [`Config::spec_root`](crate::config::Config::spec_root) joins anything
+    /// relative onto the analyzed root and
+    /// [`Config::spec_is_outside_root`](crate::config::Config::spec_is_outside_root)
+    /// then decides from that one path whether the spec needs a walk of its
+    /// own. A spec above the analyzed directory has to come out absolute or
+    /// the join puts it back underneath; a spec *inside* it has to come out
+    /// relative or the walk covers the same files twice under two spellings.
+    fn rebase_spec_dir(&mut self, repo_root: &Path, analyzed: &Path) {
+        if repo_root == analyzed {
+            return;
+        }
+        let Some(dir) = self.spec_dir.take() else {
+            return;
+        };
+        let (Some(base), Some(analyzed)) = (absolutize(repo_root), absolutize(analyzed)) else {
+            self.spec_dir = Some(dir);
+            return;
+        };
+        // Collected through `components` to drop the interior `.` that
+        // joining a relative root onto the working directory leaves behind.
+        let target: PathBuf = base.join(dir).components().collect();
+        let analyzed: PathBuf = analyzed.components().collect();
+        self.spec_dir = Some(match target.strip_prefix(&analyzed) {
+            Ok(inside) => inside.to_path_buf(),
+            Err(_) => target,
+        });
     }
 
     /// Drop a repo-scope `spec_dir` that names anywhere but inside the repo.
@@ -465,7 +603,10 @@ impl Settings {
     /// is a hole.
     fn clear_escaping_spec_dir(&mut self, from: &Path) -> Vec<Warning> {
         let escapes = self.spec_dir.as_ref().is_some_and(|dir| {
-            dir.is_absolute() || dir.components().any(|c| c == std::path::Component::ParentDir)
+            dir.is_absolute()
+                || dir
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
         });
         if !escapes {
             return Vec::new();
@@ -480,6 +621,38 @@ impl Settings {
              elsewhere."
                 .to_string(),
         )]
+    }
+
+    /// Drop pattern-list entries that are not globs at all.
+    ///
+    /// `glob::Pattern` refuses an unclosed `[`, and the walker used to
+    /// discard that refusal with `.ok()` — leaving a typo indistinguishable
+    /// from a pattern doing its job. The check belongs here rather than
+    /// there because this is the last layer that still knows *which file*
+    /// the pattern was written in, and a rejection that cannot name the file
+    /// is half a diagnostic (CFG-015).
+    ///
+    /// Both scopes, since both may set either list.
+    fn clear_malformed_globs(&mut self, from: &Path) -> Vec<Warning> {
+        let mut warnings = Vec::new();
+        for (key, list) in [
+            ("exclude_patterns", &mut self.exclude_patterns),
+            ("include_patterns", &mut self.include_patterns),
+        ] {
+            list.retain(|p| match glob::Pattern::new(p) {
+                Ok(_) => true,
+                Err(e) => {
+                    warnings.push(Warning::new(
+                        from,
+                        Some(key),
+                        Severity::Ignored,
+                        format!("`{key}`: `{p}` is not a valid glob ({e}) — ignoring it."),
+                    ));
+                    false
+                }
+            });
+        }
+        warnings
     }
 
     /// Report unrecognized keys, calling out the privileged ones by the thing
@@ -558,8 +731,11 @@ impl Settings {
     /// name that field cannot resurrect a key `report_rejected` refused.
     pub fn analysis_scope_of(config: &Config) -> Self {
         let a = &config.analysis;
-        let mut languages: Vec<String> =
-            a.languages.iter().map(|l| l.filter_name().to_string()).collect();
+        let mut languages: Vec<String> = a
+            .languages
+            .iter()
+            .map(|l| l.filter_name().to_string())
+            .collect();
         languages.sort();
         Self {
             // Empty means "no filter", which the file spells by omitting the
@@ -715,9 +891,7 @@ fn concat(mut lower: Vec<String>, upper: Vec<String>) -> Vec<String> {
 fn misplaced(from: &Path, keys: &[(&str, bool)], why: &str) -> Vec<Warning> {
     keys.iter()
         .filter(|(_, present)| *present)
-        .map(|(key, _)| {
-            Warning::new(from, Some(key), Severity::Ignored, format!("`{key}` {why}"))
-        })
+        .map(|(key, _)| Warning::new(from, Some(key), Severity::Ignored, format!("`{key}` {why}")))
         .collect()
 }
 
@@ -737,8 +911,11 @@ mod tests {
 
     impl TempConfig {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("nao-settings-test-{}-{}", std::process::id(), tag));
+            let dir = std::env::temp_dir().join(format!(
+                "nao-settings-test-{}-{}",
+                std::process::id(),
+                tag
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -781,7 +958,10 @@ mod tests {
         // unrecognized bag — which nothing reads.
         assert_eq!(settings.unrecognized.len(), 4);
         for (key, _) in REJECTED {
-            assert!(settings.unrecognized.contains_key(*key), "{key} vanished silently");
+            assert!(
+                settings.unrecognized.contains_key(*key),
+                "{key} vanished silently"
+            );
         }
     }
 
@@ -800,7 +980,8 @@ mod tests {
     #[test]
     fn repo_scope_drops_installation_keys() {
         let dir = TempConfig::new("repo-uidir");
-        let path = dir.write(r#"{"ui_dir":"/tmp/x","content_fallback":"/tmp/y","language":["rust"]}"#);
+        let path =
+            dir.write(r#"{"ui_dir":"/tmp/x","content_fallback":"/tmp/y","language":["rust"]}"#);
         let settings = values(&path, Scope::Repo);
         assert_eq!(settings.ui_dir, None);
         assert_eq!(settings.content_fallback, None);
@@ -822,7 +1003,10 @@ mod tests {
     fn a_repo_scope_spec_dir_inside_the_repo_is_honored() {
         let dir = TempConfig::new("spec-inside");
         let path = dir.write(r#"{"spec_dir":"docs/domain"}"#);
-        assert_eq!(values(&path, Scope::Repo).spec_dir, Some(PathBuf::from("docs/domain")));
+        assert_eq!(
+            values(&path, Scope::Repo).spec_dir,
+            Some(PathBuf::from("docs/domain"))
+        );
     }
 
     /// The regression that matters for this key: `spec_dir` is a path nao
@@ -830,11 +1014,167 @@ mod tests {
     /// outside the tree it came with.
     #[test]
     fn a_repo_scope_spec_dir_may_not_escape_the_repo() {
-        for body in [r#"{"spec_dir":"/etc"}"#, r#"{"spec_dir":"../../elsewhere"}"#] {
+        for body in [
+            r#"{"spec_dir":"/etc"}"#,
+            r#"{"spec_dir":"../../elsewhere"}"#,
+        ] {
             let dir = TempConfig::new("spec-escape");
             let path = dir.write(body);
-            assert_eq!(values(&path, Scope::Repo).spec_dir, None, "{body} was honored");
+            assert_eq!(
+                values(&path, Scope::Repo).spec_dir,
+                None,
+                "{body} was honored"
+            );
         }
+    }
+
+    /// A checkout with a repo-scope settings file at its top, for the tests
+    /// that are about *where* the file is found rather than what is in it.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "nao-settings-tree-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        /// The checkout marker. `body` decides which kind: `None` writes the
+        /// ordinary directory, `Some` the single-line file a linked worktree
+        /// gets instead.
+        fn git(&self, body: Option<&str>) {
+            match body {
+                Some(text) => std::fs::write(self.0.join(GIT_DIR), text).unwrap(),
+                None => {
+                    std::fs::create_dir_all(self.0.join(GIT_DIR)).unwrap();
+                }
+            }
+        }
+
+        fn settings(&self, body: &str) {
+            std::fs::create_dir_all(self.0.join(REPO_DIR)).unwrap();
+            std::fs::write(self.0.join(REPO_DIR).join(FILE_NAME), body).unwrap();
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Comparable by value, so a test can say two loads agree without
+    /// listing every key that would have to be checked one at a time.
+    fn shape(settings: &Settings) -> serde_json::Value {
+        serde_json::to_value(settings).unwrap()
+    }
+
+    /// CFG-012, the regression this whole resolution exists for. Analyzing a
+    /// subdirectory is the normal way to ask a shape question about one part
+    /// of a tree, and it used to be the one invocation that silently dropped
+    /// the tree's configuration.
+    #[test]
+    fn every_path_in_one_checkout_reads_the_same_repo_file() {
+        let tree = TempTree::new("subdir");
+        tree.git(None);
+        tree.settings(r#"{"language":["typescript"],"exclude_patterns":["**/core/**"]}"#);
+        tree.dir("src/core");
+
+        let root = shape(&load_scoped(&tree.0).repo);
+        assert_eq!(
+            root,
+            serde_json::json!({
+                "language": ["typescript"],
+                "exclude_patterns": ["**/core/**"],
+            }),
+            "the whole-repo invocation did not read the file"
+        );
+        for sub in ["src", "src/core"] {
+            assert_eq!(
+                shape(&load_scoped(&tree.0.join(sub)).repo),
+                root,
+                "`nao analyze {sub}` disagreed with the repo root"
+            );
+        }
+    }
+
+    /// The marker is a *file* in a linked worktree, and `assess_change`
+    /// analyzes worktrees — so the test is existence, not `is_dir`.
+    #[test]
+    fn a_worktree_is_a_checkout_too() {
+        let tree = TempTree::new("worktree");
+        tree.git(Some("gitdir: /somewhere/.git/worktrees/wt\n"));
+        tree.settings(r#"{"include_tests":true}"#);
+        let sub = tree.dir("src");
+
+        assert_eq!(repo_root(&sub), tree.0);
+        assert_eq!(load_scoped(&sub).repo.include_tests, Some(true));
+    }
+
+    /// `nao analyze /some/loose/directory` keeps the behaviour it had: with
+    /// no checkout to stop at, the analyzed root is the repo.
+    #[test]
+    fn outside_a_checkout_the_analyzed_root_is_the_repo() {
+        let tree = TempTree::new("loose");
+        let sub = tree.dir("src");
+        // Only meaningful if the temp directory is not itself inside a
+        // checkout — the same assumption the tests above make about `~`.
+        if sub.ancestors().any(|dir| dir.join(GIT_DIR).exists()) {
+            return;
+        }
+        assert_eq!(repo_root(&sub), sub);
+    }
+
+    /// The key is relative to the repo, so it has to follow the file to
+    /// whichever root won — or a spec at the top of the checkout would be
+    /// looked for underneath the subdirectory being analyzed.
+    #[test]
+    fn a_repo_scope_spec_dir_resolves_against_the_checkout() {
+        let tree = TempTree::new("spec-rebased");
+        tree.git(None);
+        tree.settings(r#"{"spec_dir":"docs/domain"}"#);
+        let sub = tree.dir("src");
+
+        assert_eq!(
+            load_scoped(&sub).repo.spec_dir,
+            Some(tree.0.join("docs/domain")),
+            "the spec directory was resolved against the analyzed root"
+        );
+        assert_eq!(
+            load_scoped(&tree.0).repo.spec_dir,
+            Some(PathBuf::from("docs/domain")),
+            "analyzing the repo root rewrote a path that was already right"
+        );
+    }
+
+    /// A relative analyzed root must yield a relative repo root: the walk and
+    /// [`Config::spec_root`] compare these paths lexically, and an absolute
+    /// answer here would make a spec inside the tree look like one outside it.
+    #[test]
+    fn the_answer_keeps_the_spelling_it_was_asked_in() {
+        let tree = TempTree::new("spelling");
+        tree.git(None);
+        let cwd = std::env::current_dir().unwrap();
+        // Every ancestor of the fixture is absolute, so the relative case has
+        // to be asked from inside it — done by hand rather than with
+        // `set_current_dir`, which is process-wide and racy under a threaded
+        // runner. `repo_root` resolves a relative root against the working
+        // directory, so the check is that the *shape* of the answer follows
+        // the shape of the question.
+        assert!(repo_root(&tree.0.join("src")).is_absolute());
+        assert!(repo_root(&cwd.join("src")).is_absolute());
+        assert!(!repo_root(Path::new("src")).is_absolute());
     }
 
     /// `--spec-dir` beat the file before this ran; it must still win after.
@@ -847,7 +1187,10 @@ mod tests {
             ..Default::default()
         };
         settings.apply_to_config(&mut config);
-        assert_eq!(config.analysis.spec_dir, Some(PathBuf::from("from/the/flag")));
+        assert_eq!(
+            config.analysis.spec_dir,
+            Some(PathBuf::from("from/the/flag"))
+        );
     }
 
     #[test]
@@ -872,7 +1215,10 @@ mod tests {
         let w = warnings.first().expect("the key was refused silently");
         assert_eq!(w.severity, Severity::Rejected);
         assert_eq!(w.key.as_deref(), Some("allow_agent_spawn"));
-        assert!(w.message.contains("opens a terminal"), "the reason has to survive");
+        assert!(
+            w.message.contains("opens a terminal"),
+            "the reason has to survive"
+        );
     }
 
     /// The everyday case: a typo reads as "nao is broken" unless the key is
@@ -885,6 +1231,29 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].severity, Severity::Ignored);
         assert_eq!(warnings[0].file, path);
+    }
+
+    /// A glob that does not parse used to be dropped by the walker's
+    /// `.ok()`, which knows neither the key nor the file. Rejecting it here
+    /// is what lets the message name both (CFG-015).
+    #[test]
+    fn a_glob_that_does_not_parse_is_named_and_dropped() {
+        let dir = TempConfig::new("warn-bad-glob");
+        let path = dir.write(r#"{"exclude_patterns":["**/gen/**","**/[unclosed"]}"#);
+        let (settings, warnings) = read(&path, Scope::Repo);
+        assert_eq!(
+            settings.exclude_patterns,
+            vec!["**/gen/**".to_string()],
+            "the good pattern has to survive the bad one"
+        );
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key.as_deref(), Some("exclude_patterns"));
+        assert_eq!(warnings[0].file, path);
+        assert!(
+            warnings[0].message.contains("**/[unclosed"),
+            "the reader has to be able to search their file for it: {}",
+            warnings[0].message
+        );
     }
 
     /// A file that failed to parse is the warning most easily missed, because
@@ -920,7 +1289,9 @@ mod tests {
     /// we never understood.
     #[test]
     fn read_raw_separates_an_absent_file_from_an_unreadable_one() {
-        assert!(read_raw(Path::new("/nonexistent/nao/settings.json")).unwrap().is_empty());
+        assert!(read_raw(Path::new("/nonexistent/nao/settings.json"))
+            .unwrap()
+            .is_empty());
         let dir = TempConfig::new("raw-malformed");
         assert!(read_raw(&dir.write("{ not json")).is_err());
     }
@@ -929,15 +1300,24 @@ mod tests {
     fn a_written_file_reads_back_and_omits_what_nobody_set() {
         let dir = TempConfig::new("write-roundtrip");
         let path = dir.0.join(FILE_NAME);
-        let settings = Settings { max_depth: Some(7), ..Default::default() };
+        let settings = Settings {
+            max_depth: Some(7),
+            ..Default::default()
+        };
         let serde_json::Value::Object(body) = serde_json::to_value(&settings).unwrap() else {
             unreachable!()
         };
         write(&path, &body).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("null"), "an unset key was written as null: {text}");
-        assert!(text.ends_with('\n'), "a settings file should end with a newline");
+        assert!(
+            !text.contains("null"),
+            "an unset key was written as null: {text}"
+        );
+        assert!(
+            text.ends_with('\n'),
+            "a settings file should end with a newline"
+        );
         assert_eq!(values(&path, Scope::Repo).max_depth, Some(7));
     }
 
@@ -948,7 +1328,10 @@ mod tests {
         let path = dir.write(r#"{"allow_agent_spawn":true,"max_depth":4}"#);
         let settings = values(&path, Scope::Repo);
         let text = serde_json::to_string(&settings).unwrap();
-        assert!(!text.contains("allow_agent_spawn"), "serializing resurrected it: {text}");
+        assert!(
+            !text.contains("allow_agent_spawn"),
+            "serializing resurrected it: {text}"
+        );
     }
 
     #[test]
@@ -1009,20 +1392,16 @@ mod tests {
         };
         settings.apply_to_config(&mut config);
         assert_eq!(config.analysis.exclude_patterns.len(), before + 1);
-        assert!(
-            config
-                .analysis
-                .exclude_patterns
-                .iter()
-                .any(|p| p.contains("node_modules"))
-        );
-        assert!(
-            config
-                .analysis
-                .exclude_patterns
-                .iter()
-                .any(|p| p == "**/generated/**")
-        );
+        assert!(config
+            .analysis
+            .exclude_patterns
+            .iter()
+            .any(|p| p.contains("node_modules")));
+        assert!(config
+            .analysis
+            .exclude_patterns
+            .iter()
+            .any(|p| p == "**/generated/**"));
     }
 
     /// CFG-005. The durable way to ask for assignment detail: `nao watch` and
@@ -1056,15 +1435,27 @@ mod tests {
     #[test]
     fn a_depth_flag_outranks_the_file() {
         let mut config = Config::default();
-        let settings = Settings { max_depth: Some(3), ..Default::default() };
-        settings.apply_with(&mut config, Flags { max_depth: Some(7), ..Default::default() });
+        let settings = Settings {
+            max_depth: Some(3),
+            ..Default::default()
+        };
+        settings.apply_with(
+            &mut config,
+            Flags {
+                max_depth: Some(7),
+                ..Default::default()
+            },
+        );
         assert_eq!(config.analysis.max_depth, 7);
     }
 
     #[test]
     fn the_file_depth_applies_when_no_flag_was_passed() {
         let mut config = Config::default();
-        let settings = Settings { max_depth: Some(9), ..Default::default() };
+        let settings = Settings {
+            max_depth: Some(9),
+            ..Default::default()
+        };
         settings.apply_with(&mut config, Flags::default());
         assert_eq!(config.analysis.max_depth, 9);
     }
@@ -1084,8 +1475,17 @@ mod tests {
     #[test]
     fn a_min_weight_flag_would_outrank_the_file() {
         let mut config = Config::default();
-        let settings = Settings { min_weight: Some(1), ..Default::default() };
-        settings.apply_with(&mut config, Flags { min_weight: Some(5), ..Default::default() });
+        let settings = Settings {
+            min_weight: Some(1),
+            ..Default::default()
+        };
+        settings.apply_with(
+            &mut config,
+            Flags {
+                min_weight: Some(5),
+                ..Default::default()
+            },
+        );
         assert_eq!(config.filters.min_weight, 5);
     }
 

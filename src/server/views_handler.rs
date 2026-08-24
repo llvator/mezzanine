@@ -61,7 +61,10 @@ fn current_version() -> u32 {
 
 impl Default for ViewsFile {
     fn default() -> Self {
-        Self { version: current_version(), views: Vec::new() }
+        Self {
+            version: current_version(),
+            views: Vec::new(),
+        }
     }
 }
 
@@ -77,8 +80,9 @@ fn views_path(root: &Path) -> PathBuf {
 /// file we failed to parse invites the next save to overwrite it.
 fn read_views(path: &Path) -> Result<ViewsFile, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str::<ViewsFile>(&text)
-            .map_err(|e| format!("{}: {e}", path.display())),
+        Ok(text) => {
+            serde_json::from_str::<ViewsFile>(&text).map_err(|e| format!("{}: {e}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ViewsFile::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
@@ -102,7 +106,10 @@ fn write_views(path: &Path, file: &ViewsFile) -> Result<(), String> {
 /// What a client may not store, checked before anything is written.
 fn validate(file: &ViewsFile) -> Result<(), String> {
     if file.views.len() > MAX_VIEWS {
-        return Err(format!("too many views ({}, max {MAX_VIEWS})", file.views.len()));
+        return Err(format!(
+            "too many views ({}, max {MAX_VIEWS})",
+            file.views.len()
+        ));
     }
     if let Some(v) = file.views.iter().find(|v| v.name.trim().is_empty()) {
         return Err(format!("view {} has no name", v.id));
@@ -118,9 +125,12 @@ pub(crate) async fn get_views_handler(
     State(state): State<AppState>,
 ) -> Result<Json<ViewsFile>, (StatusCode, String)> {
     let root = state.repo_root.read().await.clone();
-    read_views(&views_path(&root))
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read saved views — {e}")))
+    read_views(&views_path(&root)).map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not read saved views — {e}"),
+        )
+    })
 }
 
 /// PUT /api/views — replace the whole list.
@@ -136,8 +146,12 @@ pub(crate) async fn put_views_handler(
 ) -> Result<Json<ViewsFile>, (StatusCode, String)> {
     validate(&file).map_err(|e| (StatusCode::BAD_REQUEST, format!("Rejected — {e}")))?;
     let root = state.repo_root.read().await.clone();
-    write_views(&views_path(&root), &file)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save views — {e}")))?;
+    write_views(&views_path(&root), &file).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save views — {e}"),
+        )
+    })?;
     Ok(Json(file))
 }
 
@@ -189,7 +203,10 @@ mod tests {
     #[test]
     fn a_written_list_reads_back_with_its_opaque_state() {
         let root = TempRoot::new("roundtrip");
-        let file = ViewsFile { version: 1, views: vec![view("v1", "Parsers only")] };
+        let file = ViewsFile {
+            version: 1,
+            views: vec![view("v1", "Parsers only")],
+        };
         write_views(&root.path(), &file).unwrap();
 
         let back = read_views(&root.path()).unwrap();
@@ -212,14 +229,23 @@ mod tests {
     #[test]
     fn a_save_leaves_no_temp_file_behind() {
         let root = TempRoot::new("atomic");
-        write_views(&root.path(), &ViewsFile { version: 1, views: vec![view("v1", "One")] })
-            .unwrap();
+        write_views(
+            &root.path(),
+            &ViewsFile {
+                version: 1,
+                views: vec![view("v1", "One")],
+            },
+        )
+        .unwrap();
         assert!(!root.path().with_extension("json.tmp").exists());
     }
 
     #[test]
     fn a_nameless_view_is_rejected() {
-        let mut file = ViewsFile { version: 1, views: vec![view("v1", "  ")] };
+        let mut file = ViewsFile {
+            version: 1,
+            views: vec![view("v1", "  ")],
+        };
         assert!(validate(&file).is_err());
         file.views[0].name = "Named".into();
         assert!(validate(&file).is_ok());
@@ -227,7 +253,9 @@ mod tests {
 
     #[test]
     fn more_views_than_the_ceiling_are_rejected() {
-        let views = (0..=MAX_VIEWS).map(|i| view(&format!("v{i}"), "x")).collect();
+        let views = (0..=MAX_VIEWS)
+            .map(|i| view(&format!("v{i}"), "x"))
+            .collect();
         assert!(validate(&ViewsFile { version: 1, views }).is_err());
     }
 }

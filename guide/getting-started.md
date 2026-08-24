@@ -6,7 +6,7 @@ Nao is two CLI binaries plus a VS Code extension. They share one Rust analysis e
 
 | | What it does | When to use it |
 |---|---|---|
-| **`nao`** binary | Parses Rust / Python / JS / TS / Java / Kotlin / Groovy / Impex / Elevator. Emits JSON / DOT / Mermaid / ASCII output. Powers a watch server with SSE for live reload. | Code analysis from the command line; the watch server the VS Code extension talks to. |
+| **`nao`** binary | Parses Rust / Python / JS / TS / Java / Kotlin / Dart / Groovy / Impex / Elevator. Emits JSON / DOT / Mermaid / ASCII output. Powers a watch server with SSE for live reload. | Code analysis from the command line; the watch server the VS Code extension talks to. |
 | **`elevator`** binary | Standalone CLI focused on `.elv` spec files. Same engine as `nao analyze -l elevator`, focused command line. | Working on Elevator (.elv) specs without the rest of Nao. LLM context bundles. |
 | **VS Code extension** | Activity-bar view, force-directed graph, side panels, bidirectional editor sync. | Most users — the primary way to use Nao. |
 
@@ -303,6 +303,14 @@ Three behaviours worth knowing:
   replace them. Adding `**/generated/**` does not re-enable scanning
   `node_modules`. `language` and `kind` work the other way — they're a choice,
   so the narrower scope wins outright.
+- **A pattern is matched against the path relative to the repo root** — the
+  same root the settings file is read from. So `src/contracts.d.ts` excludes
+  that file whether you run `nao analyze .`, `nao analyze src`, or
+  `nao analyze /path/to/repo/src`; one spelling works from anywhere. Analyze a
+  directory that isn't in a checkout and the analyzed root stands in for the
+  repo root. Note that `*` crosses `/`, so `*.d.ts` matches `src/a.d.ts` and
+  the leading `**/` above is decorative — surprising, but every pattern
+  written so far relies on it.
 - **A bad settings file is never fatal.** Malformed JSON, an unknown key, or a
   key in the wrong scope prints a warning naming the key and the file, then the
   command runs as if that line weren't there.

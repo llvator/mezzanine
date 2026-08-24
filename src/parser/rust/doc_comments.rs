@@ -41,7 +41,10 @@ fn doc_body(text: &str) -> Option<(Marker, String)> {
 /// One `///` or `//!` line, minus its marker, the single space authors put
 /// after it, and the trailing newline the node carries.
 fn line_body(rest: &str) -> String {
-    rest.strip_prefix(' ').unwrap_or(rest).trim_end().to_string()
+    rest.strip_prefix(' ')
+        .unwrap_or(rest)
+        .trim_end()
+        .to_string()
 }
 
 /// Which item a doc comment describes: the one after it, or the one around it.

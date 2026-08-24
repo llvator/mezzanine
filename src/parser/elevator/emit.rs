@@ -4,11 +4,41 @@
 //! references work: a body may name a child defined later in the file,
 //! or in a sibling `.elv` the analyzer merges in afterwards.
 
-use super::ast::{entity_id, leaf_segment, qualify_child, DefKind, DefStmt};
 use super::super::language_parser::ParseResult;
-use crate::models::{CodeEntity, Relationship, RelationshipKind, Span, Visibility};
+use super::ast::{qualify_child, DefKind, DefStmt};
+use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, Span, Visibility};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Full entity id for a kind + qualified name. The id format is this
+/// phase's business alone — phase 1 never builds one, so a change here
+/// can't silently disagree with something the parser assumed.
+fn entity_id(kind: DefKind, qualname: &str) -> String {
+    format!("elevator::{}.{}", id_segment(kind), qualname)
+}
+
+/// The segment an id uses for a kind. Identical to the keyword today;
+/// kept separate so the id format can outlive a keyword rename.
+fn id_segment(kind: DefKind) -> &'static str {
+    kind.keyword()
+}
+
+/// The last dot-separated segment — the entity's display name.
+fn leaf_segment(qualname: &str) -> &str {
+    qualname.rsplit('.').next().unwrap_or(qualname)
+}
+
+/// The graph kind a definition kind becomes.
+fn entity_kind(kind: DefKind) -> EntityKind {
+    match kind {
+        DefKind::Extension => EntityKind::Extension,
+        DefKind::Category => EntityKind::Category,
+        DefKind::Feature => EntityKind::Feature,
+        DefKind::Functionality => EntityKind::Functionality,
+        DefKind::Concept => EntityKind::Concept,
+        DefKind::UiPage => EntityKind::UiPage,
+    }
+}
 
 /// Emit one entity per definition, then the edges every body declares.
 pub(super) fn emit(path: &Path, source: &str, defs: &[DefStmt], result: &mut ParseResult) {
@@ -49,7 +79,7 @@ fn build_entity(path: &Path, source: &str, def: &DefStmt, id: String) -> CodeEnt
     let span = def.span();
     let mut entity = CodeEntity::new(
         leaf_segment(&def.qualname).to_string(),
-        def.kind.entity_kind(),
+        entity_kind(def.kind),
         path,
         span,
     );
@@ -167,18 +197,12 @@ fn add_edge(
 
 /// Auto-create a stub entity if the given id isn't already present.
 /// Stubs are tagged so the renderer can flag them visually if needed.
-fn ensure_stub(
-    path: &Path,
-    kind: DefKind,
-    qualname: &str,
-    id: &str,
-    result: &mut ParseResult,
-) {
+fn ensure_stub(path: &Path, kind: DefKind, qualname: &str, id: &str, result: &mut ParseResult) {
     if result.entities.iter().any(|e| e.id == id) {
         return;
     }
     let leaf = leaf_segment(qualname).to_string();
-    let mut entity = CodeEntity::new(leaf, kind.entity_kind(), path, Span::default());
+    let mut entity = CodeEntity::new(leaf, entity_kind(kind), path, Span::default());
     entity.id = id.to_string();
     entity.qualified_name = qualname.to_string();
     entity.visibility = Visibility::Public;

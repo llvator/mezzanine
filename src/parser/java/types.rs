@@ -34,16 +34,58 @@ use super::super::language_parser::ParseResult;
 /// Common java.lang / java.util / java.time / java.math names that carry
 /// no project-level dependency signal.
 const STD_TYPES: &[&str] = &[
-    "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte",
-    "Short", "Character", "Object", "Void", "Number", "CharSequence",
-    "StringBuilder", "Comparable", "Runnable", "List", "ArrayList",
-    "LinkedList", "Map", "HashMap", "LinkedHashMap", "TreeMap", "Set",
-    "HashSet", "LinkedHashSet", "TreeSet", "Queue", "Deque", "ArrayDeque",
-    "Collection", "Iterable", "Iterator", "Optional", "Stream",
-    "Exception", "RuntimeException", "Error", "Throwable",
-    "IllegalArgumentException", "IllegalStateException", "IOException",
-    "CompletableFuture", "Future", "LocalDate", "LocalDateTime",
-    "LocalTime", "Instant", "Duration", "BigDecimal", "BigInteger", "UUID",
+    "String",
+    "Integer",
+    "Long",
+    "Double",
+    "Float",
+    "Boolean",
+    "Byte",
+    "Short",
+    "Character",
+    "Object",
+    "Void",
+    "Number",
+    "CharSequence",
+    "StringBuilder",
+    "Comparable",
+    "Runnable",
+    "List",
+    "ArrayList",
+    "LinkedList",
+    "Map",
+    "HashMap",
+    "LinkedHashMap",
+    "TreeMap",
+    "Set",
+    "HashSet",
+    "LinkedHashSet",
+    "TreeSet",
+    "Queue",
+    "Deque",
+    "ArrayDeque",
+    "Collection",
+    "Iterable",
+    "Iterator",
+    "Optional",
+    "Stream",
+    "Exception",
+    "RuntimeException",
+    "Error",
+    "Throwable",
+    "IllegalArgumentException",
+    "IllegalStateException",
+    "IOException",
+    "CompletableFuture",
+    "Future",
+    "LocalDate",
+    "LocalDateTime",
+    "LocalTime",
+    "Instant",
+    "Duration",
+    "BigDecimal",
+    "BigInteger",
+    "UUID",
 ];
 
 /// Drop `@Annotation` names (including dotted `@com.acme.Anno`) so
@@ -157,10 +199,7 @@ mod tests {
     #[test]
     fn extracts_project_types_and_drops_std_names() {
         assert_eq!(named_types("List<Order>"), vec!["Order"]);
-        assert_eq!(
-            named_types("Map<String, List<LineItem>>"),
-            vec!["LineItem"]
-        );
+        assert_eq!(named_types("Map<String, List<LineItem>>"), vec!["LineItem"]);
         assert_eq!(named_types("int"), Vec::<String>::new());
         assert_eq!(named_types("Optional<String>"), Vec::<String>::new());
     }

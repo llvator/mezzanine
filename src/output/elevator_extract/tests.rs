@@ -30,11 +30,8 @@ struct SpecDir(PathBuf);
 impl SpecDir {
     fn new(files: &[(&str, &str)]) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "nao-elv-extract-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nao-elv-extract-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).expect("create temp spec dir");
         for (name, body) in files {
             std::fs::write(dir.join(name), body).expect("write spec file");
@@ -274,7 +271,12 @@ fn slice_of_a_whole_category_reproduces_its_subtree() {
         "fu f.storage.write {",
         "concept versioning {",
     ] {
-        assert!(s.text.contains(expected), "missing `{}`:\n{}", expected, s.text);
+        assert!(
+            s.text.contains(expected),
+            "missing `{}`:\n{}",
+            expected,
+            s.text
+        );
     }
     // Selecting the top of a branch leaves nothing above it.
     assert_eq!(s.ancestors, 0);

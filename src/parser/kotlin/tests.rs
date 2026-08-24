@@ -22,16 +22,12 @@ fn uses_type_targets(result: &ParseResult, source_name: &str) -> Vec<String> {
         .filter(|e| e.name == source_name)
         .map(|e| e.id.as_str())
         .collect();
-    assert!(
-        !source_ids.is_empty(),
-        "entity `{source_name}` not found"
-    );
+    assert!(!source_ids.is_empty(), "entity `{source_name}` not found");
     let mut targets: Vec<String> = result
         .relationships
         .iter()
         .filter(|r| {
-            r.kind == RelationshipKind::UsesType
-                && source_ids.contains(&r.source_id.as_str())
+            r.kind == RelationshipKind::UsesType && source_ids.contains(&r.source_id.as_str())
         })
         .map(|r| r.target_id.clone())
         .collect();
@@ -110,10 +106,7 @@ fn class_body_property_types_yield_edges() {
     "#;
     let result = parse(src);
     assert_eq!(uses_type_targets(&result, "pending"), vec!["Order"]);
-    assert_eq!(
-        uses_type_targets(&result, "count"),
-        Vec::<String>::new()
-    );
+    assert_eq!(uses_type_targets(&result, "count"), Vec::<String>::new());
 }
 
 #[test]

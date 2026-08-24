@@ -42,6 +42,7 @@ elevator . --focus <entity>   context bundle before working on that area\n  \
 elevator . --check            errors = fix now; hints = a to-deepen list\n  \
 elevator . --code-map         duplicates and per-path coverage\n  \
 elevator . --drift            staleness radar: cr paths + identifier anchors vs the code\n  \
+elevator . --drift --fix      apply the cr path moves git recorded; report the rest\n  \
 elevator . --extract <entity> -o work/slice.elv   snapshot the branch you touched\n\n\
 Full language guide: elevator --docs"
 )]
@@ -111,6 +112,16 @@ struct Cli {
     /// at the code repository when specs live in a separate docs repo.
     #[arg(long, value_name = "DIR")]
     code_root: Option<PathBuf>,
+
+    /// With `--drift`, rewrite the `cr:` paths whose move git recorded,
+    /// instead of only reporting them. A path is rewritten only when
+    /// `git log -M --diff-filter=R` names the commit that moved it
+    /// *and* the new path exists — anything git cannot prove is left
+    /// for a human, including the identifier hints, which are prose and
+    /// have no mechanical fix. Writes `.elv` files under the spec path
+    /// only; the code root is read for evidence and never touched.
+    #[arg(long)]
+    fix: bool,
 
     /// Extract the named entities (and their descendants) into a
     /// standalone `.elv` file — a snapshot of one slice of the spec.
@@ -191,6 +202,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // `--fix` repairs what `--drift` found; on its own it has no
+    // findings to act on, and silently doing nothing would read as a
+    // fix that worked.
+    if cli.fix && !cli.drift {
+        eprintln!("error: --fix repairs drift findings; run it as `--drift --fix`");
+        return ExitCode::from(2);
+    }
+
     let mut config = Config::for_path(&cli.path).with_output_format(OutputFormat::ElevatorText);
     // Restrict the analyzer to Elevator files. Walking with no
     // language filter would pick up every source file in the
@@ -220,7 +239,12 @@ fn main() -> ExitCode {
 
     if cli.drift {
         let code_root = cli.code_root.clone().unwrap_or_else(|| cli.path.clone());
-        let report = output::elevator_drift::run(&result, &code_root);
+        let opts = output::elevator_drift::DriftOptions {
+            code_root: &code_root,
+            spec_root: &cli.path,
+            fix: cli.fix,
+        };
+        let report = output::elevator_drift::run(&result, &opts);
         print!("{}", report.text);
         return if report.has_errors {
             ExitCode::from(1)
@@ -364,10 +388,7 @@ fn run_check(result: &nao::analyzer::AnalysisResult) -> ExitCode {
         };
         println!("{}: {}", label, f.message);
     }
-    println!(
-        "\n{} error(s), {} hint(s).",
-        errors, hints
-    );
+    println!("\n{} error(s), {} hint(s).", errors, hints);
     if errors > 0 {
         ExitCode::from(1)
     } else {

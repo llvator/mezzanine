@@ -111,7 +111,7 @@ Two properties, both load-bearing:
   signal rather than reordering noise. It is also what makes the warm cache
   safe: stale-old is possible, stale-wrong is not.
 - **Type usage is exact** where parsers emit `UsesType` edges — Rust,
-  TypeScript/Svelte, Java, Kotlin, Python, Groovy. Elsewhere `impact` falls
+  TypeScript/Svelte, Java, Kotlin, Dart, Python, Groovy. Elsewhere `impact` falls
   back to a "used via members" approximation, and says so.
 
 ## Cost

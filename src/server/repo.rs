@@ -71,7 +71,6 @@ impl JobStatus {
             _ => None,
         }
     }
-
 }
 
 /// A slug's entry in the registry: its current pipeline status, the analyzed
@@ -161,7 +160,10 @@ impl RepoSlot {
         let state = self.state();
         RepoSummary {
             slug: self.slug.clone(),
-            url: self.url.clone().or_else(|| state.as_ref().and_then(|s| s.url.clone())),
+            url: self
+                .url
+                .clone()
+                .or_else(|| state.as_ref().and_then(|s| s.url.clone())),
             sha: state.as_ref().and_then(|s| s.sha.clone()),
             ready_at: state.as_ref().map(|s| s.ready_at).unwrap_or(0),
             entity_count: state.as_ref().map(|s| s.graph.node_count()).unwrap_or(0),
@@ -331,9 +333,9 @@ pub(crate) fn parse_github_url(input: &str) -> Result<GithubRepo> {
     const PREFIX: &str = "https://github.com/";
     let raw = input.trim();
 
-    let rest = raw
-        .strip_prefix(PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("only https://github.com/<owner>/<repo> URLs are accepted"))?;
+    let rest = raw.strip_prefix(PREFIX).ok_or_else(|| {
+        anyhow::anyhow!("only https://github.com/<owner>/<repo> URLs are accepted")
+    })?;
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
 
@@ -352,9 +354,7 @@ pub(crate) fn parse_github_url(input: &str) -> Result<GithubRepo> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
         {
-            anyhow::bail!(
-                "invalid {label} `{part}`: expected letters, digits, `.`, `_` or `-`"
-            );
+            anyhow::bail!("invalid {label} `{part}`: expected letters, digits, `.`, `_` or `-`");
         }
     }
 
@@ -436,8 +436,11 @@ pub(crate) fn persist(cache_dir: &Path, state: &RepoState, result: &AnalysisResu
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let snapshot = snapshot_path(cache_dir, &state.slug);
-    write_atomic(&snapshot, &zstd::encode_all(&*serde_json::to_vec(result)?, ZSTD_LEVEL)?)
-        .context("writing analysis.json.zst")?;
+    write_atomic(
+        &snapshot,
+        &zstd::encode_all(&*serde_json::to_vec(result)?, ZSTD_LEVEL)?,
+    )
+    .context("writing analysis.json.zst")?;
 
     let meta = CachedMeta {
         slug: state.slug.clone(),
@@ -446,8 +449,11 @@ pub(crate) fn persist(cache_dir: &Path, state: &RepoState, result: &AnalysisResu
         ready_at: state.ready_at,
         root_path: state.root_path.clone(),
     };
-    write_atomic(&meta_path(cache_dir, &state.slug), &serde_json::to_vec(&meta)?)
-        .context("writing meta.json")?;
+    write_atomic(
+        &meta_path(cache_dir, &state.slug),
+        &serde_json::to_vec(&meta)?,
+    )
+    .context("writing meta.json")?;
     Ok(())
 }
 
@@ -512,7 +518,12 @@ fn compress_legacy_snapshot(cache_dir: &Path, slug: &str, result: &AnalysisResul
 
 /// Rebuild one cached repo. `Err` means the cache entry is unusable — the
 /// caller skips it, leaving the slug free to be re-submitted.
-fn rehydrate_one(cache_dir: &Path, slug: &str, include_tests: bool, languages: &Option<Vec<String>>) -> Result<RepoState> {
+fn rehydrate_one(
+    cache_dir: &Path,
+    slug: &str,
+    include_tests: bool,
+    languages: &Option<Vec<String>>,
+) -> Result<RepoState> {
     let meta: CachedMeta = serde_json::from_slice(&std::fs::read(meta_path(cache_dir, slug))?)
         .context("reading meta.json")?;
     let result = read_snapshot(cache_dir, slug)?;
@@ -687,17 +698,17 @@ mod tests {
     #[test]
     fn github_url_rejects_everything_else() {
         for bad in [
-            "http://github.com/a/b",                  // not https
-            "https://gitlab.com/a/b",                 // wrong host
+            "http://github.com/a/b",  // not https
+            "https://gitlab.com/a/b", // wrong host
             "https://bitbucket.org/a/b",
-            "git@github.com:a/b.git",                 // ssh
+            "git@github.com:a/b.git", // ssh
             "ssh://git@github.com/a/b",
             "git://github.com/a/b",
-            "https://github.com/a",                   // no repo
-            "https://github.com/a/b/tree/main",       // extra segments
-            "https://github.com//b",                  // empty owner
-            "https://github.com/a/",                  // empty repo
-            "https://github.com/../b",                // traversal
+            "https://github.com/a",             // no repo
+            "https://github.com/a/b/tree/main", // extra segments
+            "https://github.com//b",            // empty owner
+            "https://github.com/a/",            // empty repo
+            "https://github.com/../b",          // traversal
             "https://github.com/a/..",
             "https://user:pw@github.com/a/b",         // userinfo
             "https://github.com:22/a/b",              // port
@@ -723,7 +734,10 @@ mod tests {
             "https://github.com/a/b.git",
         ] {
             let slug = parse_github_url(good).unwrap().slug;
-            assert!(!slug.contains('/') && !slug.contains(".."), "unsafe: {slug}");
+            assert!(
+                !slug.contains('/') && !slug.contains(".."),
+                "unsafe: {slug}"
+            );
         }
     }
 
@@ -777,7 +791,11 @@ mod tests {
         let root = std::env::temp_dir().join("nao-cache-corrupt-test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("a__b")).unwrap();
-        std::fs::write(root.join("a__b").join("meta.json"), br#"{"slug":"a__b","url":null,"sha":null,"ready_at":0,"root_path":"/tmp"}"#).unwrap();
+        std::fs::write(
+            root.join("a__b").join("meta.json"),
+            br#"{"slug":"a__b","url":null,"sha":null,"ready_at":0,"root_path":"/tmp"}"#,
+        )
+        .unwrap();
         std::fs::write(root.join("a__b").join("analysis.json.zst"), b"not zstd").unwrap();
         assert!(rehydrate(&root, false, &None).is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -791,8 +809,14 @@ mod tests {
         let root = std::env::temp_dir().join("nao-cache-roundtrip-test");
         let _ = std::fs::remove_dir_all(&root);
 
-        let (state, result) =
-            analyze_repo("a__b", Some("u".into()), Path::new("src/server"), false, &None).unwrap();
+        let (state, result) = analyze_repo(
+            "a__b",
+            Some("u".into()),
+            Path::new("src/server"),
+            false,
+            &None,
+        )
+        .unwrap();
         // The submission path analyzes through this function, so this is
         // where the AN-004 guarantee has to hold for cloned repos too.
         if !unsafe_passes_allowed() {
@@ -844,7 +868,11 @@ mod tests {
 
         // Exactly what SRV-004 left behind: uncompressed snapshot, meta, and
         // three rendered files nothing reads.
-        std::fs::write(dir.join("analysis.json"), serde_json::to_vec(&result).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("analysis.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
         let meta = CachedMeta {
             slug: "a__b".into(),
             url: None,
@@ -865,7 +893,10 @@ mod tests {
         }
         // The snapshot is migrated in place, so an upgraded cache stops
         // paying the old price without waiting to be re-submitted.
-        assert!(!dir.join("analysis.json").exists(), "should have been compressed");
+        assert!(
+            !dir.join("analysis.json").exists(),
+            "should have been compressed"
+        );
         assert!(dir.join("analysis.json.zst").exists());
 
         // And the migrated entry still loads on the next boot.

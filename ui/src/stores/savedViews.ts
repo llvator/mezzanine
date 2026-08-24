@@ -26,6 +26,8 @@ import { apiUrl, serveRepo } from '../vscodeAdapter';
 import {
   graphData,
   graphLevel,
+  ringFocusPath,
+  ringReach,
   generalEntityTypes,
   generalRelTypes,
   generalOutgoing,
@@ -36,6 +38,7 @@ import {
   showGhostNodes,
   showBuiltinGhosts,
   showTemplateVars,
+  structureOnly,
   searchHidesNonMatches,
 } from './graph';
 import { asNavigation, autoLevel, applySelection, fullGraphDataStore, scopeRules } from './scope';
@@ -82,6 +85,8 @@ export function captureState(): ViewState {
     scope: get(scopeRules).map((r) => ({ ...r })),
     level: get(graphLevel),
     autoLevel: get(autoLevel),
+    ringFocus: get(ringFocusPath),
+    ringReach: get(ringReach),
     entityTypes: [...get(generalEntityTypes)],
     relTypes: [...get(generalRelTypes)],
     outgoing: get(generalOutgoing),
@@ -92,6 +97,7 @@ export function captureState(): ViewState {
     showGhosts: get(showGhostNodes),
     showBuiltinGhosts: get(showBuiltinGhosts),
     showTemplateVars: get(showTemplateVars),
+    structureOnly: get(structureOnly),
     spec: [...get(specSelection)],
     searchTerm: get(searchTerm),
     searchIds: [...get(committedSearchIds)],
@@ -174,10 +180,16 @@ export async function restoreState(s: ViewState): Promise<Dropped> {
     // exclusions the seed does not touch, and the display toggles.
     autoLevel.set(s.autoLevel);
     graphLevel.set(s.level);
+    // Beside the level, and for the same reason: with a focus set the level
+    // names the outer grain, so restoring one without the other draws a
+    // picture the reader never saw.
+    ringFocusPath.set(s.ringFocus);
+    ringReach.set(s.ringReach);
     hiddenLanguages.set(new Set(s.hiddenLanguages));
     showGhostNodes.set(s.showGhosts);
     showBuiltinGhosts.set(s.showBuiltinGhosts);
     showTemplateVars.set(s.showTemplateVars);
+    structureOnly.set(s.structureOnly);
     searchHidesNonMatches.set(s.searchHides);
 
     // Clear the outgoing search before the scope moves: its committed ids are
@@ -225,9 +237,10 @@ export function restoreView(view: SavedView): Promise<Dropped> {
  */
 export const currentState: Readable<ViewState> = derived(
   [
-    scopeRules, graphLevel, autoLevel, generalEntityTypes, generalRelTypes,
+    scopeRules, graphLevel, autoLevel, ringFocusPath, ringReach,
+    generalEntityTypes, generalRelTypes,
     generalOutgoing, generalIncoming, levelOverrides, hiddenLanguages, hiddenFiles,
-    showGhostNodes, showBuiltinGhosts, showTemplateVars, specSelection, searchTerm,
+    showGhostNodes, showBuiltinGhosts, showTemplateVars, structureOnly, specSelection, searchTerm,
     committedSearchIds, searchHidesNonMatches,
   ],
   () => captureState(),

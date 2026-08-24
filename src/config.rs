@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::models::{EntityKind, RelationshipKind};
 use crate::models::file_info::Language;
+use crate::models::{EntityKind, RelationshipKind};
 use crate::output::OutputFormat;
 
 /// Main configuration for the Nao.
@@ -297,6 +297,24 @@ impl AnalysisConfig {
     }
 }
 
+/// The ignore globs every analysis starts with, before any settings file
+/// adds to them (they extend rather than replace — ADR-0008).
+///
+/// Named rather than written inline so the walker can tell a shipped default
+/// from a pattern somebody wrote. That distinction is the whole of CFG-015's
+/// exemption: `**/vendor/**` matches nothing in most repos *by design*, and a
+/// zero-match warning about it on every run in every repo would train the
+/// reader to skip past the line that matters.
+pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
+    "**/node_modules/**",
+    "**/target/**",
+    "**/.git/**",
+    "**/vendor/**",
+    "**/__pycache__/**",
+    "**/dist/**",
+    "**/build/**",
+];
+
 impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
@@ -307,15 +325,10 @@ impl Default for AnalysisConfig {
             include_docs: false,
             include_locals: false,
             include_stdlib: false,
-            exclude_patterns: vec![
-                "**/node_modules/**".to_string(),
-                "**/target/**".to_string(),
-                "**/.git/**".to_string(),
-                "**/vendor/**".to_string(),
-                "**/__pycache__/**".to_string(),
-                "**/dist/**".to_string(),
-                "**/build/**".to_string(),
-            ],
+            exclude_patterns: DEFAULT_EXCLUDE_PATTERNS
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             include_patterns: Vec::new(), // Include all by default
             allow_unsafe_passes: default_allow_unsafe_passes(),
             spec_dir: None, // Every .elv under the root is the spec
@@ -326,7 +339,7 @@ impl Default for AnalysisConfig {
 impl Default for FilterConfig {
     fn default() -> Self {
         Self {
-            entity_kinds: HashSet::new(), // All kinds
+            entity_kinds: HashSet::new(),       // All kinds
             relationship_kinds: HashSet::new(), // All kinds
             min_weight: 0,
             only_with_dependencies: false,

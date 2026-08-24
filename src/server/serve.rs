@@ -39,9 +39,9 @@ use super::repo::{
     analyze_repo, is_valid_slug, parse_github_url, rehydrate, unsafe_passes_allowed, RepoRegistry,
     RepoSlot, RepoState, RepoSummary,
 };
-use super::ui_dir;
 use super::scope_handler::{collect_scope, finish_scope};
 use super::types::{CommitInfo, ScopeRequest, ScopeResponse};
+use super::ui_dir;
 
 /// Everything `nao serve` needs from the CLI, in one place so `main.rs`
 /// doesn't grow a nine-argument call.
@@ -103,11 +103,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     serve_checked(opts, policy, ui)
 }
 
-fn serve_checked(
-    opts: ServeOptions,
-    policy: AccessPolicy,
-    ui: Option<PathBuf>,
-) -> Result<()> {
+fn serve_checked(opts: ServeOptions, policy: AccessPolicy, ui: Option<PathBuf>) -> Result<()> {
     let ServeOptions {
         port,
         seeds,
@@ -124,7 +120,12 @@ fn serve_checked(
     // "never looked", not "the repo had no file". Built before the seeds are
     // analyzed so a warning about the operator's own settings file is printed
     // in the same breath as the rest of startup.
-    let settings = Arc::new(settings_report(port, ui.as_deref(), include_tests, &languages));
+    let settings = Arc::new(settings_report(
+        port,
+        ui.as_deref(),
+        include_tests,
+        &languages,
+    ));
 
     let mut repos: HashMap<String, Arc<RepoSlot>> = HashMap::new();
 
@@ -136,7 +137,10 @@ fn serve_checked(
             state.slug,
             state.graph.node_count()
         );
-        repos.insert(state.slug.clone(), Arc::new(RepoSlot::ready(Arc::new(state))));
+        repos.insert(
+            state.slug.clone(),
+            Arc::new(RepoSlot::ready(Arc::new(state))),
+        );
     }
 
     for (slug, path) in &seeds {
@@ -195,8 +199,11 @@ fn settings_report(
             config.analysis.languages.insert(lang);
         }
     }
-    let effective =
-        Effective { port: Some(port), ui_dir: ui.map(|p| p.to_path_buf()), ..Default::default() };
+    let effective = Effective {
+        port: Some(port),
+        ui_dir: ui.map(|p| p.to_path_buf()),
+        ..Default::default()
+    };
     let flags = crate::settings::report::named(&[
         ("port", true),
         ("include_tests", include_tests),
@@ -205,7 +212,13 @@ fn settings_report(
     ]);
     crate::settings::SettingsReport::build(
         None,
-        &Inputs { loaded: &loaded, flags: &flags, config: &config, effective: &effective, repo_scope_read: false },
+        &Inputs {
+            loaded: &loaded,
+            flags: &flags,
+            config: &config,
+            effective: &effective,
+            repo_scope_read: false,
+        },
     )
 }
 
@@ -336,8 +349,8 @@ async fn submit_repo(
     State(state): State<ServeState>,
     Json(req): Json<SubmitRequest>,
 ) -> Result<(StatusCode, Json<RepoSummary>), (StatusCode, String)> {
-    let repo = parse_github_url(&req.url)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let repo =
+        parse_github_url(&req.url).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
 
     let code = match jobs::submit(
         &state.repos,
@@ -486,12 +499,8 @@ fn print_startup_banner(
     eprintln!("🚀 nao serve running at http://localhost:{port}");
     eprintln!("   Cache: {}", cache_dir.display());
     if unsafe_passes_allowed() {
-        eprintln!(
-            "   ⚠ NAO_SERVE_ALLOW_UNSAFE_PASSES is set — analysis passes that"
-        );
-        eprintln!(
-            "     execute code from the analyzed repo (rust-analyzer/build.rs)"
-        );
+        eprintln!("   ⚠ NAO_SERVE_ALLOW_UNSAFE_PASSES is set — analysis passes that");
+        eprintln!("     execute code from the analyzed repo (rust-analyzer/build.rs)");
         eprintln!("     are ENABLED. Do not use this on repos you don't trust.");
     } else {
         eprintln!("   Code-executing analysis passes: off (tree-sitter only)");

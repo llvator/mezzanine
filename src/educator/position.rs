@@ -7,10 +7,10 @@
 //! Java file is fast enough (<30ms typical) that this stays comfortably under
 //! the hover latency budget.
 
+use super::corpus::Educator;
 use super::lessons::Lesson;
 use super::predicate::{self, Attrs};
 use super::rules::Rule;
-use super::Educator;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
@@ -147,19 +147,14 @@ fn byte_offset_at(source: &str, line: u32, col: u32) -> Option<usize> {
 }
 
 /// Run the position query.
-pub fn query(
-    educator: &Educator,
-    file: &Path,
-    line: u32,
-    col: u32,
-) -> Result<PositionResponse> {
+pub fn query(educator: &Educator, file: &Path, line: u32, col: u32) -> Result<PositionResponse> {
     let language = match file.extension().and_then(|s| s.to_str()) {
         Some("java") => "java",
         _ => return Ok(PositionResponse::empty("unknown")),
     };
 
-    let source = std::fs::read_to_string(file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let source =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let offset = match byte_offset_at(&source, line, col) {
         Some(off) => off,
         None => return Ok(PositionResponse::empty(language)),

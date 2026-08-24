@@ -137,6 +137,8 @@ function snap(over: Partial<FilterSnapshot> = {}): FilterSnapshot {
     showGhosts: true,
     showBuiltinGhosts: true,
     showTemplateVars: true,
+    structureOnly: false,
+    exemptBody: null,
     ...over,
   };
 }
@@ -179,6 +181,25 @@ test('the first failing filter is the one reported', () => {
   // send the user to a control that is not the one deciding.
   const r = classifyBlock(node(), snap({ kinds: new Set(['Class']), langs: new Set(['rust']) }));
   assert.equal(r?.kind, 'kind');
+});
+
+test('an internal is blamed on the grain control, never on its kind', () => {
+  // The badge has to name the control that is actually deciding. Every kind
+  // box is ticked here — a Branch is held back by "Structure only", and
+  // sending the reader to the Branch checkbox would send them to a control
+  // already showing everything it can. UI-113.
+  const branch = node({ kind_raw: 'Branch', kind: 'branch', body_of: 'parse' });
+  const on = snap({ structureOnly: true, kinds: new Set(['Function', 'Branch']) });
+  assert.deepEqual(
+    { ...classifyBlock(branch, on) },
+    { kind: 'internals', value: 'parse', label: 'inside a function body', reversible: true },
+  );
+  // Off, and it is drawn like anything else.
+  assert.equal(classifyBlock(branch, snap({ kinds: new Set(['Function', 'Branch']) })), null);
+  // Selected owner: its body is on screen, so nothing is blocking the row.
+  assert.equal(classifyBlock(branch, snap({
+    structureOnly: true, exemptBody: 'parse', kinds: new Set(['Function', 'Branch']),
+  })), null);
 });
 
 test('a ghost with an empty file path is not blamed on the file filter', () => {

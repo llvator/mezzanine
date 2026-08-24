@@ -12,32 +12,32 @@
 //! - Configurable depth for dependency traversal
 //! - Filter by entity type (classes, functions, interfaces)
 
-pub mod models;
-pub mod parser;
 pub mod analyzer;
-pub mod graph;
-pub mod output;
+pub mod check;
 pub mod config;
-pub mod settings;
-pub mod init;
 pub mod diff;
-pub mod server;
 pub mod educator;
+pub mod graph;
+pub mod init;
 pub mod mcp;
+pub mod models;
+pub mod output;
+pub mod parser;
+pub mod server;
+pub mod settings;
 
-pub use models::*;
 pub use analyzer::Analyzer;
-pub use graph::DependencyGraph;
 pub use config::Config;
+pub use graph::DependencyGraph;
+pub use models::*;
 
 /// Re-export commonly used types
 pub mod prelude {
-    pub use crate::models::{
-        CodeEntity, EntityKind, Relationship, RelationshipKind,
-        FileInfo, Position, Span,
-    };
     pub use crate::analyzer::Analyzer;
-    pub use crate::graph::DependencyGraph;
-    pub use crate::output::{OutputFormat, Renderer};
     pub use crate::config::Config;
+    pub use crate::graph::DependencyGraph;
+    pub use crate::models::{
+        CodeEntity, EntityKind, FileInfo, Position, Relationship, RelationshipKind, Span,
+    };
+    pub use crate::output::{OutputFormat, Renderer};
 }

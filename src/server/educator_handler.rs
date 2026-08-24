@@ -71,9 +71,7 @@ pub(crate) async fn scan_handler(
 
 /// `GET /api/educator/diagnostics` — surfaces the load-time issues for tooling
 /// (the VS Code extension renders these as a notification).
-pub(crate) async fn diagnostics_handler(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub(crate) async fn diagnostics_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let issues = state.educator.issues();
     let error_count = issues
         .iter()

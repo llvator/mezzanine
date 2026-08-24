@@ -7,9 +7,10 @@
 //! several Features is expressed as Concepts.
 //!
 //! Submodules follow the same split as the tree-sitter parsers:
-//! - [`lexer`] — tokenizer; recovers from stray characters
+//! - [`lexer`] — tokenizer; recovers from stray characters. Private to
+//!   [`grammar`], which is the only reader of a token.
 //! - [`ast`] — [`ast::DefStmt`] and friends, plus id/name helpers
-//! - [`grammar`] — phase 1: tokens → definitions, with diagnostics
+//! - [`grammar`] — phase 1: source → definitions, with diagnostics
 //! - [`emit`] — phase 2: definitions → entities + edges
 //!
 //! ## Syntax
@@ -104,8 +105,7 @@ use crate::models::Span;
 use anyhow::Result;
 use std::path::Path;
 
-use self::grammar::Parser;
-use self::lexer::tokenize;
+use self::grammar::parse_source;
 
 pub struct ElevatorParser;
 
@@ -128,14 +128,12 @@ impl LanguageParser for ElevatorParser {
 
     fn parse(&self, path: &Path, content: &str) -> Result<ParseResult> {
         let mut result = ParseResult::new();
-        let (tokens, lex_diags) = tokenize(content);
-        for d in lex_diags {
-            result.add_warning(format!("elevator: {}", d.message));
-        }
 
         // Phase 1 — a flat list of imports + definitions. No resolution
-        // happens here; bodies are captured verbatim.
-        let parsed = Parser::new(&tokens).parse_file();
+        // happens here; bodies are captured verbatim. Tokenizing is the
+        // grammar's own business, and lexical complaints come back in
+        // the same `warnings` list as the parser's.
+        let parsed = parse_source(content);
         for w in parsed.warnings {
             result.add_warning(w);
         }

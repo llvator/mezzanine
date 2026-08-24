@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 
-use super::{Educator, Lesson, Rule};
+use super::corpus::Educator;
+use super::lessons::Lesson;
+use super::rules::Rule;
 
 /// Render the full index markdown for a language. Deterministic — same
 /// corpus produces the same bytes.
@@ -113,10 +115,7 @@ pub fn render_index(educator: &Educator, language: &str) -> String {
                 let _ = writeln!(
                     out,
                     "| [{}]({}) | {} | {} |",
-                    lesson.id,
-                    link,
-                    lesson.level,
-                    lesson.title
+                    lesson.id, link, lesson.level, lesson.title
                 );
             }
             let _ = writeln!(out);

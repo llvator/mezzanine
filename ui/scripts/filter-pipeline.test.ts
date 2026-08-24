@@ -24,6 +24,7 @@ import {
   filterPipeline,
   nameList,
   pipelineSummary,
+  stageRuns,
   type FilterStageId,
   type PipelineInput,
 } from '../src/viewmodels/filterPipeline.ts';
@@ -31,12 +32,14 @@ import {
 /** Nothing filtering anything: every switch at its "show me everything"
  *  position, in a dataset that has ghosts and template vars to hide. */
 const clear = (): PipelineInput => ({
+  view: 'force',
   kinds: { hidden: [], total: 11 },
   relations: { hidden: [], total: 7, outgoingHidden: false, incomingHidden: false },
   languages: { hidden: [], total: 3 },
   files: { hidden: [], total: 40 },
   ghosts: { allHidden: false, builtinsHidden: false, present: true, builtinsPresent: true },
   templateVars: { hidden: false, present: true },
+  structure: { on: false, hidden: 120, open: null },
   spec: null,
   search: null,
   diff: null,
@@ -113,11 +116,12 @@ test('whatever is active is a subsequence of the declared order', () => {
   input.ghosts.allHidden = true;
   input.templateVars.hidden = true;
   input.spec = { entities: ['Auth'], paths: 2 };
+  input.structure = { on: true, hidden: 120, open: null };
   input.kinds = { hidden: ['Parameter'], total: 11 };
   input.languages = { hidden: ['Markdown'], total: 3 };
   input.files = { hidden: ['a.ts'], total: 40 };
   input.search = { term: 'x', kept: 1, hides: true };
-  input.diff = { level: 'edits', dims: false };
+  input.diff = { level: 'edits', facet: 'all', dims: false };
   input.focus = { name: 'f', depth: 1, mode: 'force' };
   input.relations = { hidden: ['Contains'], total: 7, outgoingHidden: false, incomingHidden: false };
   input.levels.directHidden = true;
@@ -172,6 +176,28 @@ test('a dimming search says the graph is still there', () => {
   const hiding = stage(input, 'search');
   assert.equal(hiding.dims, false);
   assert.match(hiding.detail, /removed/);
+});
+
+test('the seed split is named on the chip, and only when it is on (UI-109)', () => {
+  // A filter the strip does not report is the silence this module was opened
+  // for, and this one hides nodes. But `all` is not a filter — naming it would
+  // claim one the reader never applied.
+  const input = clear();
+  input.diff = { level: 'edits', facet: 'all', dims: false };
+  assert.equal(stage(input, 'diff').value, 'edits only');
+  assert.equal(stage(input, 'diff').clearHint, 'Stop filtering by the diff');
+
+  input.diff = { level: 'neighbourhood', facet: 'new', dims: false };
+  const split = stage(input, 'diff');
+  assert.equal(split.value, 'new · edits + one hop');
+  assert.match(split.detail, /did not exist on the base side/);
+  // Stepwise, like `ghosts`: the narrower of the two controls comes off first,
+  // so a canvas the facet emptied has a way out that does not also discard the
+  // rung the reader chose.
+  assert.equal(split.clearHint, 'Draw both new and existing changes');
+
+  input.diff = { level: 'edits', facet: 'existing', dims: false };
+  assert.match(stage(input, 'diff').detail, /changed in place/);
 });
 
 test('a selection is reported as a filter, because it is one', () => {
@@ -239,11 +265,12 @@ test('every stage carries a distinct restoration, not a generic Clear', () => {
   input.ghosts.allHidden = true;
   input.templateVars.hidden = true;
   input.spec = { entities: ['Auth'], paths: 2 };
+  input.structure = { on: true, hidden: 120, open: null };
   input.kinds = { hidden: ['Parameter'], total: 11 };
   input.languages = { hidden: ['Markdown'], total: 3 };
   input.files = { hidden: ['a.ts'], total: 40 };
   input.search = { term: 'x', kept: 1, hides: true };
-  input.diff = { level: 'rewiring', dims: false };
+  input.diff = { level: 'rewiring', facet: 'all', dims: false };
   input.focus = { name: 'f', depth: 1, mode: 'tree' };
   input.relations = { hidden: ['Contains'], total: 7, outgoingHidden: false, incomingHidden: true };
   input.levels.directHidden = true;
@@ -252,6 +279,79 @@ test('every stage carries a distinct restoration, not a generic Clear', () => {
   const hints = filterPipeline(input).map((s) => s.clearHint);
   assert.equal(new Set(hints).size, hints.length, 'clear hints must be distinguishable');
   for (const hint of hints) assert.notEqual(hint.trim(), '');
+});
+
+// --- what the current view mode actually runs ---
+//
+// The strip's promise is that a chip means a filter is *running*, and the same
+// store state means different things in the canvas's three modes. Claiming a
+// stage the mode never reaches is the "teaches the reader to ignore it" failure
+// above, with the extra insult of an `×` that changes nothing.
+
+/** Every switch flipped, so each test below is about the mode and not about
+ *  which filter happened to be set. */
+const everything = (view: PipelineInput['view']): PipelineInput => ({
+  ...clear(),
+  view,
+  kinds: { hidden: ['Parameter'], total: 11 },
+  languages: { hidden: ['toml'], total: 3 },
+  files: { hidden: ['a.rs'], total: 40 },
+  relations: { hidden: ['Contains'], total: 7, outgoingHidden: false, incomingHidden: true },
+  ghosts: { allHidden: true, builtinsHidden: true, present: true, builtinsPresent: true },
+  templateVars: { hidden: true, present: true },
+  structure: { on: true, hidden: 120, open: 'parse' },
+  spec: { entities: ['Checkout'], paths: 2 },
+  search: { term: 'parse', kept: 4, hides: true },
+  diff: { level: 'edits', facet: 'all', dims: false },
+  focus: { name: 'f', depth: 2, mode: 'force' },
+  levels: { directHidden: true, crossLevelHidden: false, peerHiddenLevels: [], overridesOff: 0 },
+  hubs: { count: 3 },
+});
+
+test('force mode reports every filter that is set', () => {
+  assert.deepEqual(ids(everything('force')), [...STAGE_ORDER]);
+});
+
+test('tree mode reports only the filters its BFS consults', () => {
+  // `computeTreePositions` re-implements a subset of `nodePassesFilters` —
+  // kinds, relationship types, files, ghosts — and `compute` runs the diff
+  // ladder over its reach. Languages, the templating layer, the spec
+  // cross-filter, a committed search and hub demotion never reach it, and the
+  // strip is not allowed to imply otherwise.
+  assert.deepEqual(
+    ids(everything('tree')),
+    ['ghosts', 'structure', 'kinds', 'files', 'diff', 'focus', 'relations', 'levels'],
+  );
+});
+
+test('the diff ladder is reported in tree mode, where it now applies', () => {
+  // The regression this pair exists for: the ladder ran in force mode alone,
+  // so selecting a node in tree view silently switched the rungs off while
+  // the chip kept saying they were on.
+  const input = clear();
+  input.diff = { level: 'rewiring', facet: 'new', dims: false };
+  input.focus = { name: 'f', depth: 1, mode: 'tree' };
+  assert.ok(ids(input).includes('diff'));
+  input.view = 'tree';
+  assert.ok(ids(input).includes('diff'));
+});
+
+test('the shape view reports nothing, because it filters nothing', () => {
+  // It returns from `displayPlan` straight after placement: what is on screen
+  // is one folder the reader asked for by name, and none of these controls
+  // touches it.
+  assert.deepEqual(ids(everything('shape')), []);
+  assert.deepEqual(filterPipeline(everything('shape')), []);
+});
+
+test('stageRuns covers every stage in STAGE_ORDER', () => {
+  // A stage added to the union type but not to `RUNS_IN` would throw on the
+  // `.includes`, and it would throw only in whichever mode first drew it.
+  for (const id of STAGE_ORDER) {
+    for (const view of ['force', 'tree', 'shape'] as const) {
+      assert.equal(typeof stageRuns(id, view), 'boolean', `${id} in ${view}`);
+    }
+  }
 });
 
 // --- effective depth ---

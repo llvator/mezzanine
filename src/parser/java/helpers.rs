@@ -30,9 +30,8 @@ pub(super) fn parse_modifier_attributes(node: &Node, source: &str) -> Vec<String
             match child.kind() {
                 // Skip access modifiers (handled by parse_visibility)
                 "public" | "private" | "protected" => {}
-                "static" | "final" | "abstract" | "synchronized"
-                | "native" | "transient" | "volatile" | "default"
-                | "strictfp" | "sealed" | "non-sealed" => {
+                "static" | "final" | "abstract" | "synchronized" | "native" | "transient"
+                | "volatile" | "default" | "strictfp" | "sealed" | "non-sealed" => {
                     attrs.push(child.kind().to_string());
                 }
                 "marker_annotation" | "annotation" => {
@@ -52,10 +51,12 @@ pub(super) fn parse_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     for child in node.children(&mut cursor) {
         match child.kind() {
             "formal_parameter" => {
-                let name = child.child_by_field_name("name")
+                let name = child
+                    .child_by_field_name("name")
                     .map(|n| node_text(&n, source).to_string())
                     .unwrap_or_default();
-                let type_name = child.child_by_field_name("type")
+                let type_name = child
+                    .child_by_field_name("type")
                     .map(|t| node_text(&t, source).to_string());
 
                 params.push(Parameter {
@@ -79,9 +80,7 @@ pub(super) fn parse_parameters(node: &Node, source: &str) -> Vec<Parameter> {
                 let type_name = child
                     .children(&mut inner)
                     .find(|c| {
-                        c.is_named()
-                            && c.kind() != "modifiers"
-                            && c.kind() != "variable_declarator"
+                        c.is_named() && c.kind() != "modifiers" && c.kind() != "variable_declarator"
                     })
                     .map(|t| format!("{}...", node_text(&t, source)));
 

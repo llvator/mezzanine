@@ -4,9 +4,9 @@ What Nao does today, how its tools are organized, why they make human
 coders and coding agents more effective, and where it could go next.
 
 Nao builds a single typed graph — Entities and Relationships with
-per-entity metrics — from heterogeneous source files. Ten languages have
-dedicated parsers (Rust, Python, TypeScript, Svelte, Java, Kotlin, Groovy,
-Impex, Ansible, Elevator specs); everything else falls back to a generic
+per-entity metrics — from heterogeneous source files. Twelve languages have
+dedicated parsers (Rust, Python, TypeScript, Svelte, Java, Go, Kotlin, Dart,
+Groovy, Impex, Ansible, Elevator specs); everything else falls back to a generic
 parser with reduced fidelity. See the README for what each tier gives you.
 Everything below is a different way of asking that graph a question.
 
@@ -41,13 +41,13 @@ Four roles cover the surface. Each role answers one kind of question.
 | MCP `quality` | Smells (God Class, Dispatcher, Feature Envy, Shotgun Surgery, Data Bag), top offenders by composite refactor pressure, dependency cycles |
 | MCP `hotspots` | Git churn × complexity — risk ranking that complexity alone cannot give (complex-but-stable ranks low) |
 | Metrics engine | Cyclomatic, cognitive, nesting, fan-in/out, instability, WMC, chain depth, PageRank, composite score |
-| Elevator spec health | `--check` (broken refs, orphans), `--code-map` (same code claimed twice), `--drift` (cr paths that no longer resolve, identifiers in `d:` no longer found in the claimed code) |
+| Elevator spec health | `--check` (broken refs, orphans), `--code-map` (same code claimed twice), `--drift` (cr paths that no longer resolve, identifiers in `d:` no longer found in the claimed code), `--drift --fix` (rewrites the cr paths git recorded a rename for) |
 
 ### 3. Impact analyst — "what happens if I touch this?"
 
 | Surface | What it gives |
 | --- | --- |
-| MCP `impact` | Blast radius of one entity: what it uses, direct dependents, transitive dependents level by level — exact at the type level via `UsesType` edges (Rust, TypeScript/Svelte, Java, Kotlin, Python) |
+| MCP `impact` | Blast radius of one entity: what it uses, direct dependents, transitive dependents level by level — exact at the type level via `UsesType` edges (Rust, TypeScript/Svelte, Java, Go, Kotlin, Dart, Python) |
 | MCP `tests_for` | Which tests reach an entity (direct or transitive), including Rust inline `mod tests` |
 | MCP `assess_change` | Working tree vs a git ref: per-entity metric deltas, added/removed entities, smell churn |
 | `nao diff` / UI diff overlay | The same change intelligence, visually |
@@ -104,7 +104,7 @@ Two properties make the loop trustworthy: analysis is **deterministic**
 (identical trees → byte-identical graphs, so every reported delta is
 real signal — AN-002), and type usage is **exact** where parsers emit
 `UsesType` edges from signatures and fields — Rust (RS-001),
-TypeScript/Svelte (TS-001), Java (JV-001), Kotlin (KT-001), and
+TypeScript/Svelte (TS-001), Java (JV-001), Go, Kotlin (KT-001), Dart and
 Python (PY-025).
 
 Call edges are the other half of that loop, and they are *measured* rather
@@ -146,7 +146,7 @@ empty result as proof — see the limitations below.
   that *do* share an entity space — Java/Groovy/Kotlin/Impex,
   TypeScript/JavaScript/Svelte — still resolve into each other.
 - Type usage is the exact layer, and only where `UsesType` is emitted: Rust,
-  TypeScript/Svelte, Java, Kotlin, Python, Groovy. Impex, Ansible and the
+  TypeScript/Svelte, Java, Go, Kotlin, Dart, Python, Groovy. Impex, Ansible and the
   generic fallback have no type edges, so `impact` there is the "used via
   members" approximation. Groovy's edges only reach what the code declares —
   a `def` is the absence of a type, not a type, so dynamically-typed members
@@ -216,6 +216,12 @@ Roughly ordered by leverage-to-effort within each group.
   [--code-root]` verifies the spec's anchors against the code — every
   `cr:` path resolves (error), every identifier named in `d:` still
   appears in the claimed files (hint; the rename/delete signal).
+  `--drift --fix` then repairs the subset the repository can prove:
+  a `cr:` path whose move git recorded, and whose new path exists, is
+  rewritten in place. Deliberately not extended to guesses — a dead
+  path with a single same-named file elsewhere is offered as a
+  candidate to confirm, never applied, because a `cr:` that can be
+  inferred is no longer an anchor worth trusting.
   Next step-up: surfacing the same claimed-by join inside
   `assess_change`, so an agent self-reviewing a diff is told which
   spec entities its change touches.

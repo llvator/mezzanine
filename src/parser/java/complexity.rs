@@ -1,6 +1,6 @@
 //! Method-body metrics: cyclomatic + cognitive complexity, max nesting.
 //!
-//! Mirrors [`crate::parser::rust::complexity`] so per-entity scoring lines
+//! Mirrors [`crate::parser::rust::bodies::complexity`] so per-entity scoring lines
 //! up across languages. The Rust pass is the reference: nesting structures
 //! count `+1 + depth` for cognitive complexity, flat increments count `+1`,
 //! and every branch adds `+1` to cyclomatic. The tree-sitter-java node

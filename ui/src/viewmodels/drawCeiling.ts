@@ -103,10 +103,12 @@ export function gateByDrawCeiling(
     visibleNodeIds: new Set(),
     visibleLinkKeys: new Set(),
     dimmedNodeIds: new Set(),
+    contextNodeIds: new Set(),
     treePositions: new Map(),
     nodeDistances: null,
     selectedId: null,
     dimOpacity: 0,
+    contextOpacity: 1,
     overflow: { drawn, ceiling },
   };
 }

@@ -2,7 +2,7 @@
 
 A VS Code extension that visualises code relationships and dependencies
 directly in your editor. Built on top of the `nao` Rust backend which
-parses Rust, Python, JavaScript/TypeScript, Java, and Kotlin via
+parses Rust, Python, JavaScript/TypeScript, Java, Go, Kotlin and Dart via
 tree-sitter.
 
 ## Install on a new machine (from the git repo)

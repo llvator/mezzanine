@@ -1,5 +1,11 @@
 //! Function-body metrics: cyclomatic + cognitive complexity, max nesting,
 //! and return-tuple cardinality.
+//!
+//! Read by [`super::declarations`] while it builds a function entity, and by
+//! nothing in [`super::bodies`]. It grew there, but a body's metrics are not
+//! something the body *yields* — they are a property of the node the
+//! declaration already has in hand, which is what the files at this level are
+//! for. Living here leaves `bodies` with a single entrance.
 
 use tree_sitter::Node;
 
@@ -16,7 +22,7 @@ use tree_sitter::Node;
 /// increment cognitive — the `match` itself is counted.
 ///
 /// Keeps the traversal iterative to stay cheap on large bodies.
-pub(super) fn compute_complexity(body: &Node) -> (u32, u32, u32) {
+pub(in crate::parser::rust) fn compute_complexity(body: &Node) -> (u32, u32, u32) {
     let mut complexity: u32 = 1;
     let mut cognitive: u32 = 0;
     let mut max_depth: u32 = 0;
@@ -108,7 +114,7 @@ pub(super) fn compute_complexity(body: &Node) -> (u32, u32, u32) {
 /// the return type is not a tuple (or is a single-element type).
 ///
 /// Handles `Result<(A, B, C), E>` by finding the tuple inside the generic args.
-pub(super) fn count_return_tuple_elements(return_type_node: &Node) -> Option<u32> {
+pub(in crate::parser::rust) fn count_return_tuple_elements(return_type_node: &Node) -> Option<u32> {
     // DFS to find the first tuple_type node.
     let mut stack = vec![*return_type_node];
     while let Some(node) = stack.pop() {

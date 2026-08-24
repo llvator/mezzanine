@@ -1,6 +1,8 @@
 import { writable, derived, get } from 'svelte/store';
-import type { D3Node, GraphData, GraphLevel, ViewMode, LevelOverrides, TriState } from '../types/graph';
+import type { D3Node, FolderPicture, GraphData, GraphLevel, ViewMode, LevelOverrides, TriState } from '../types/graph';
 import { collapseGraph } from '../viewmodels/collapseGraph';
+import { grainFromPlan, planRingGrain, ringsFor, seedFromPath } from '../viewmodels/mixedGrain';
+import { shapeResolvers } from '../viewmodels/shapeView';
 import type { HoverMode } from '../viewmodels/hoverHighlight';
 
 // Entity-level source of truth, written by `publishGraph`. Every other
@@ -41,6 +43,51 @@ export function collapseAllScopes(): void {
   expandedScopes.set(new Set());
 }
 
+/**
+ * The scope the rings are drawn around, or `null` for one grain everywhere
+ * (UI-104).
+ *
+ * A **path**, never an id, and for the same reason marks are
+ * (`f.visual_scopes.marked_set`): a ring plan's whole job is to survive the
+ * level change it causes, and `collapseGraph` mints fresh ids on every one of
+ * those. Seeding from `selectedNode` instead would be worse than merely
+ * fragile — it would make `graphData` depend on the selection, and a reader
+ * who focused a File rollup would watch the rings open it into entities and
+ * delete the node that seeded them.
+ *
+ * `markPathOf` is what turns a circle into this: an entity gives its file, a
+ * File rollup its own path, a Module rollup its directory — one field meaning
+ * "the narrowest scope this circle is evidence of" at every level.
+ */
+export const ringFocusPath = writable<string | null>(null);
+
+/** How many hops from the focus stay at Entity grain. 0 is the focused scope
+ *  alone; the level buttons say what everything past it is drawn as. */
+export const ringReach = writable<number>(1);
+
+/**
+ * The folder picture the shape view is drawing, or `null` when it is not
+ * (UI-108).
+ *
+ * Lives here, beside `ringFocusPath` and `expandedScopes`, because it is an
+ * *input to the aggregation* — `graphData` derives from it. The fetching,
+ * the verdict beside it and the error handling live in `stores/shape.ts`,
+ * which imports from this file and is never imported by it: that module
+ * needs `viewMode`, and the reverse edge would close the store cycle
+ * `collapseGraph`'s header warns about, leaving `graphData` undefined at
+ * module-eval time.
+ */
+export const shapePicture = writable<FolderPicture | null>(null);
+
+// --- View mode ---
+//
+// Declared above `graphData` rather than beside the other view state, and
+// that placement is load-bearing: `shape` is the one mode that changes how
+// the graph is *aggregated*, so the derived store below reads it, and a
+// `const` referenced before its declaration is a temporal-dead-zone throw
+// at module-eval time rather than an undefined.
+export const viewMode = writable<ViewMode>('graph');
+
 // --- Graph data ---
 //
 // The graph that components render. Purely derived from `rawEntityGraph +
@@ -52,10 +99,32 @@ export function collapseAllScopes(): void {
 // the recomputation is atomic: every subscriber sees the same consistent
 // (raw, level) pair.
 export const graphData = derived(
-  [rawEntityGraph, graphLevel, expandedScopes],
-  ([$raw, $level, $expanded]) => {
-    const result = collapseGraph($raw, $level, $expanded);
-    console.log(`[graphData derived] level=${$level} expanded=${$expanded.size} rawNodes=${$raw.nodes.length} → collapsedNodes=${result.nodes.length} collapsedLinks=${result.links.length}`);
+  [rawEntityGraph, graphLevel, expandedScopes, ringFocusPath, ringReach, shapePicture, viewMode],
+  ([$raw, $level, $expanded, $focus, $reach, $picture, $mode]) => {
+    // The shape view resolves both grain and scope from the picture the
+    // engine sent, and overrides the level control entirely: it draws one
+    // folder's immediate children with each subfolder as one circle, which
+    // is not a level any of the three buttons name. Everything unrelated to
+    // the folder resolves to no scope at all and leaves the canvas — the
+    // filtering half of the view, done here rather than as a filter stage
+    // because it is a different *aggregation*, not a narrowing of one.
+    if ($mode === 'shape' && $picture) {
+      const { grainOf, scopeOf } = shapeResolvers($picture);
+      return collapseGraph($raw, 'file', new Set(), grainOf, scopeOf);
+    }
+    // With a focus set the level button names the OUTER grain and the rings
+    // hold the middle, so the two controls compose instead of overriding each
+    // other. Without one there is nothing to measure distance from, and the
+    // uniform path runs exactly as it always did — including the Entity-level
+    // early return, which is why `grainOf` is passed as undefined rather than
+    // as a resolver that happens to answer Entity.
+    let grainOf = undefined;
+    if ($focus !== null) {
+      const rings = ringsFor($reach, $level);
+      grainOf = grainFromPlan(planRingGrain($raw.nodes, $raw.links, seedFromPath($raw.nodes, $focus), rings), rings);
+    }
+    const result = collapseGraph($raw, $level, $expanded, grainOf);
+    console.log(`[graphData derived] level=${$level} expanded=${$expanded.size} focus=${$focus ?? '—'} reach=${$reach} rawNodes=${$raw.nodes.length} → collapsedNodes=${result.nodes.length} collapsedLinks=${result.links.length}`);
     return result;
   },
 );
@@ -122,8 +191,6 @@ export const hoverDepth = writable<number>(1);
  *  picture, not a preference about how the tool should open. */
 export const hoverMode = writable<HoverMode>('connections');
 
-// --- View mode ---
-export const viewMode = writable<ViewMode>('graph');
 
 // --- Display toggles ---
 export const showLabels = writable(true);
@@ -162,6 +229,29 @@ export const searchHidesNonMatches = writable(false);
 export const searchDimOpacity = writable(0.15);
 
 // --- General filters ---
+
+/**
+ * Draw only what a file declares, not what its functions do (UI-113).
+ *
+ * On by default, and that default is the whole point: a scope opens with its
+ * declarations — functions, methods, types, their fields and properties — and
+ * without the parameters, branch arms and loop bodies inside them. On this
+ * repo that is 7 179 of 21 615 entities, a third of the canvas, and none of
+ * it is what a reader who just opened a folder is looking at.
+ *
+ * Not a preset over the kind checkboxes, which cannot express it: `Function`
+ * is one kind whether it is a module's entry point or a closure inside a
+ * callback, and unticking `Branch` today also severs the calls made inside
+ * one. `liftBodies` is the half that makes this safe — the bypassed edges are
+ * re-routed onto the enclosing callable, so hiding a body costs no
+ * relationships (1 100 calls on this repo that a plain kind filter loses).
+ *
+ * Selecting a callable exempts its own body, which is the gesture the filter
+ * is built around: the internals are what you want *after* you have picked
+ * something to read, not while you are still deciding what to read.
+ */
+export const structureOnly = writable(true);
+
 export const generalEntityTypes = writable<Set<string>>(new Set());
 export const generalRelTypes = writable<Set<string>>(new Set());
 export const generalOutgoing = writable(true);

@@ -1,8 +1,18 @@
 //! Syntax tree the Elevator parser produces in phase 1 and consumes in
 //! phase 2. Deliberately dumb: it records what the author wrote plus
-//! where they wrote it, and resolves nothing.
+//! where they wrote it.
+//!
+//! What lives here is what both phases have to agree on. A rule only
+//! one phase needs lives with that phase — surface syntax (which
+//! keywords open a definition, how a `f.` prefix is stripped) in
+//! [`super::grammar`], graph identity (how a kind and a name become an
+//! entity id) in [`super::emit`]. So this file resolves nothing, with
+//! one deliberate exception: [`qualify_child`], which the parser needs
+//! too when it recovers an illegally nested definition into a
+//! top-level one, and which would be a bug the moment the two phases
+//! disagreed about it.
 
-use crate::models::{EntityKind, Position, Span};
+use crate::models::{Position, Span};
 
 /// The six definable entity kinds, keyed by their source keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,17 +25,6 @@ pub(super) enum DefKind {
     UiPage,
 }
 
-/// Every keyword that opens a definition, longest-prefix first so
-/// `fu`/`concept` are matched before `f`/`c` when used as an id prefix.
-pub(super) const ALL_KINDS: [DefKind; 6] = [
-    DefKind::Functionality,
-    DefKind::Concept,
-    DefKind::Extension,
-    DefKind::Feature,
-    DefKind::Category,
-    DefKind::UiPage,
-];
-
 impl DefKind {
     pub(super) fn keyword(self) -> &'static str {
         match self {
@@ -36,37 +35,6 @@ impl DefKind {
             DefKind::Concept => "concept",
             DefKind::UiPage => "ui",
         }
-    }
-
-    /// The segment used in entity ids (`elevator::<segment>.<qualname>`).
-    /// Identical to the keyword today; kept separate so the id format
-    /// can outlive a keyword rename.
-    pub(super) fn id_segment(self) -> &'static str {
-        self.keyword()
-    }
-
-    pub(super) fn entity_kind(self) -> EntityKind {
-        match self {
-            DefKind::Extension => EntityKind::Extension,
-            DefKind::Category => EntityKind::Category,
-            DefKind::Feature => EntityKind::Feature,
-            DefKind::Functionality => EntityKind::Functionality,
-            DefKind::Concept => EntityKind::Concept,
-            DefKind::UiPage => EntityKind::UiPage,
-        }
-    }
-
-    pub(super) fn from_keyword(kw: &str) -> Option<Self> {
-        ALL_KINDS.into_iter().find(|k| k.keyword() == kw)
-    }
-
-    /// True for kinds whose names must be flat (no dots). Only
-    /// Functionalities are qualified; UI pages accept any path.
-    pub(super) fn requires_bare_name(self) -> bool {
-        matches!(
-            self,
-            DefKind::Extension | DefKind::Category | DefKind::Feature | DefKind::Concept
-        )
     }
 }
 
@@ -160,34 +128,6 @@ impl EdgeRef {
     pub(super) fn resolve_kind(&self, default: DefKind) -> DefKind {
         self.kind.unwrap_or(default)
     }
-}
-
-/// Split a leading kind prefix (`fu.`, `concept.`, `e.`, `f.`, `c.`,
-/// `ui.`) off a name, returning the kind it named and the remainder.
-/// Lets authors write `f protocol` and `f f.protocol` interchangeably.
-pub(super) fn split_kind_prefix(qualname: &str) -> (Option<DefKind>, String) {
-    for kind in ALL_KINDS {
-        let prefix = format!("{}.", kind.keyword());
-        if let Some(rest) = qualname.strip_prefix(&prefix) {
-            return (Some(kind), rest.to_string());
-        }
-    }
-    (None, qualname.to_string())
-}
-
-/// Drop a leading kind prefix, keeping only the name.
-pub(super) fn strip_kind_prefix(qualname: &str) -> String {
-    split_kind_prefix(qualname).1
-}
-
-/// The last dot-separated segment — the entity's display name.
-pub(super) fn leaf_segment(qualname: &str) -> &str {
-    qualname.rsplit('.').next().unwrap_or(qualname)
-}
-
-/// Full entity id for a kind + qualified name.
-pub(super) fn entity_id(kind: DefKind, qualname: &str) -> String {
-    format!("elevator::{}.{}", kind.id_segment(), qualname)
 }
 
 /// Resolve a child reference's qualified name in its parent's context.

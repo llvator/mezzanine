@@ -83,7 +83,7 @@ Per entity (functions, methods, classes/structs, files):
 
 ## Supported languages
 
-Ten languages have dedicated parsers. They differ in what they give you, so
+Twelve languages have dedicated parsers. They differ in what they give you, so
 the tiers below are by capability rather than by a first-class/fallback split.
 
 **Full: entities, call edges, and exact `UsesType` edges from signatures and
@@ -95,7 +95,9 @@ fields** — this is the tier where `impact` is type-accurate.
 | Python | |
 | JavaScript / TypeScript | |
 | Java | |
+| Go | Resolves a call through what the file declares — receiver to type, type to field, field to type — so `s.repo.Find()` reaches `Repository.Find` rather than a node named after the expression. `go` and `defer` edges are tagged with the keyword that scheduled them |
 | Kotlin | |
+| Dart | Full Dart 3 — class modifiers, records, patterns, extension types. Its grammar is vendored rather than pulled from crates.io; see `vendor/tree-sitter-dart/` |
 | Groovy | Includes Spring bean and embedded-script handling. Only what the code declares: `def` is the absence of a type, so dynamically-typed members carry no edge |
 | Svelte | Component-level; much smaller in scope than the others |
 
@@ -152,8 +154,9 @@ To leave it on for every surface at once, put it in the settings file:
 A pinned `"language"` list does **not** override this. Asking for docs
 explicitly beats a config file that never mentioned them.
 
-Everything else — **including Go** — falls back to a generic parser with
-reduced fidelity: entities but no reliable relationships.
+Everything else — **including C#, C/C++, Ruby, Swift, Scala and PHP** —
+falls back to a generic parser with reduced fidelity: entities but no
+reliable relationships.
 
 Call-edge accuracy is measured, not assumed: **93.7% recall at 98.6%
 precision** against a rust-analyzer oracle on this repo. That is Rust-only;
@@ -181,7 +184,53 @@ nao analyze ./my-project -l rust -l python
 
 # Scope to a subtree / limit traversal depth
 nao analyze ./my-project -d 5
+
+# Grade the tree against the rules the repo declared in .nao/rules.json
+# (exit 1 on a breach, 2 on a rules file nao cannot use, --format json for CI)
+nao check ./my-project
 ```
+
+### Declared rules
+
+`nao check` fails on the rules a project wrote down, and on nothing else —
+nao ships no rules of its own, so a repo without `.nao/rules.json` passes and
+says so ([ADR 0024](docs/adr/0024-a-check-fails-on-the-projects-rules-not-naos.md)).
+
+```json
+{
+  "rules": {
+    "max_entities_per_file": 7,
+    "max_elements_per_entity": 7,
+    "max_importers_per_file": 1,
+    "max_doors_per_folder": 1
+  },
+  "exempt": ["**/*.d.ts"]
+}
+```
+
+The four rules the [shape/](shape/) examples are built to hold, and each is a
+count with the bar beside it:
+
+- `max_entities_per_file` — what a reader meets on opening the file:
+  declarations, not import statements, so a re-export shim is counted where
+  the symbol is *declared*.
+- `max_elements_per_entity` — the members of a class or interface, the
+  parameters of a function.
+- `max_importers_per_file` — how many other files depend on this one, counted
+  against the file that declares what they use. A breach names every importer
+  and the line it was written on, including the ones that arrived through a
+  re-export and never typed the path.
+- `max_doors_per_folder` — how many files an outsider lands on. Ties count:
+  two files taking the same most traffic are two doors, and no tie-breaker is
+  invented.
+
+`exempt` globs are matched against the path relative to the repo root. An
+exempt file is reported apart from the passes, never among them, and is not
+evidence against a file that is checked.
+
+Every breach is reported (not one per folder) with the `file:line` to open —
+a folder carries no line — and an unknown rule name, an unusable value or a
+glob that does not compile is an error rather than a silent skip.
 
 ## Repo health
 
@@ -191,11 +240,11 @@ A snapshot of `src/` against the same complexity ceiling CI enforces (cyclomatic
 <!-- repo-health:start -->
 | Metric | Value |
 |---|---|
-| Source files (Rust) | 163 |
-| Functions analyzed | 2048 |
-| Functions above ceiling (grandfathered) | 110 |
-| Cyclomatic complexity (p50 / p90 / max) | 2 / 9 / 41 |
-| Cognitive complexity (p50 / p90 / max) | 1 / 12 / 129 |
+| Source files (Rust) | 214 |
+| Functions analyzed | 2921 |
+| Functions above ceiling (grandfathered) | 107 |
+| Cyclomatic complexity (p50 / p90 / max) | 2 / 8 / 41 |
+| Cognitive complexity (p50 / p90 / max) | 1 / 10 / 129 |
 | Max nesting depth (p50 / p90 / max) | 1 / 3 / 12 |
 <!-- repo-health:end -->
 

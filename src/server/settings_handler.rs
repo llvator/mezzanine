@@ -55,14 +55,18 @@ pub(crate) async fn settings_handler(
 
 fn build_report(state: &AppState, root: &Path) -> Result<SettingsReport, (StatusCode, String)> {
     let view = &state.settings_view;
-    let loaded = view
-        .loaded
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Settings lock poisoned: {e}")))?;
-    let config = state
-        .config
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {e}")))?;
+    let loaded = view.loaded.read().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Settings lock poisoned: {e}"),
+        )
+    })?;
+    let config = state.config.read().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Config lock poisoned: {e}"),
+        )
+    })?;
     Ok(SettingsReport::build(
         Some(root),
         &Inputs {
@@ -102,8 +106,12 @@ pub(crate) async fn save_analysis_scope_handler(
     })?;
 
     let merged = merge_analysis_keys(existing, &current_scope(&state)?)?;
-    settings::write(&path, &merged)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save — {e}")))?;
+    settings::write(&path, &merged).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save — {e}"),
+        )
+    })?;
 
     refresh(&state, &root)?;
     build_report(&state, &root).map(Json)
@@ -113,10 +121,12 @@ pub(crate) async fn save_analysis_scope_handler(
 /// file. Read off the live `Config` rather than the startup flags: the point
 /// of the button is to keep an experiment the reader just made.
 fn current_scope(state: &AppState) -> Result<Settings, (StatusCode, String)> {
-    let config = state
-        .config
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {e}")))?;
+    let config = state.config.read().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Config lock poisoned: {e}"),
+        )
+    })?;
     Ok(Settings::analysis_scope_of(&config))
 }
 
@@ -132,7 +142,10 @@ fn merge_analysis_keys(
 ) -> Result<serde_json::Map<String, serde_json::Value>, (StatusCode, String)> {
     reject_escaping_spec_dir(scope)?;
     let serde_json::Value::Object(fresh) = serde_json::to_value(scope).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not serialize settings — {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not serialize settings — {e}"),
+        )
     })?
     else {
         unreachable!("Settings serializes as an object");
@@ -159,7 +172,10 @@ fn merge_analysis_keys(
 /// reads), so saving it would produce a file that silently stops working.
 fn reject_escaping_spec_dir(scope: &Settings) -> Result<(), (StatusCode, String)> {
     let escapes = scope.spec_dir.as_ref().is_some_and(|dir| {
-        dir.is_absolute() || dir.components().any(|c| c == std::path::Component::ParentDir)
+        dir.is_absolute()
+            || dir
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
     });
     if escapes {
         return Err((
@@ -178,11 +194,12 @@ fn reject_escaping_spec_dir(scope: &Settings) -> Result<(), (StatusCode, String)
 /// copy: what the loader makes of the file is the only thing worth reporting.
 fn refresh(state: &AppState, root: &Path) -> Result<(), (StatusCode, String)> {
     let fresh = settings::load_scoped(root);
-    let mut slot = state
-        .settings_view
-        .loaded
-        .write()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Settings lock poisoned: {e}")))?;
+    let mut slot = state.settings_view.loaded.write().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Settings lock poisoned: {e}"),
+        )
+    })?;
     *slot = fresh;
     Ok(())
 }
@@ -223,7 +240,10 @@ mod tests {
     fn clearing_a_filter_removes_the_key_rather_than_stranding_it() {
         let before = existing(json!({ "language": ["rust", "python"] }));
         let after = merge_analysis_keys(before, &scope()).unwrap();
-        assert!(!after.contains_key("language"), "a stale filter survived the save");
+        assert!(
+            !after.contains_key("language"),
+            "a stale filter survived the save"
+        );
     }
 
     #[test]
@@ -231,8 +251,8 @@ mod tests {
         let mut config = Config::default();
         config.analysis.include_docs = true;
         config.analysis.max_depth = 7;
-        let after = merge_analysis_keys(Default::default(), &Settings::analysis_scope_of(&config))
-            .unwrap();
+        let after =
+            merge_analysis_keys(Default::default(), &Settings::analysis_scope_of(&config)).unwrap();
         assert_eq!(after.get("include_docs"), Some(&json!(true)));
         assert_eq!(after.get("max_depth"), Some(&json!(7)));
     }
@@ -266,7 +286,12 @@ mod tests {
     #[test]
     fn a_save_can_never_introduce_a_privileged_key() {
         let after = merge_analysis_keys(Default::default(), &scope()).unwrap();
-        for key in ["allow_agent_spawn", "no_token", "allow_origin", "allow_unsafe_passes"] {
+        for key in [
+            "allow_agent_spawn",
+            "no_token",
+            "allow_origin",
+            "allow_unsafe_passes",
+        ] {
             assert!(!after.contains_key(key), "{key} reached a written file");
         }
     }

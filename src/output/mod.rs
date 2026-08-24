@@ -1,21 +1,23 @@
 //! Output formatters for visualization.
 
-mod dot_renderer;
-mod mermaid_renderer;
-mod json_renderer;
 mod ascii_renderer;
-pub(crate) mod elevator_text_renderer;
+pub mod deps_report;
+mod dot_renderer;
 pub mod elevator_check;
 pub mod elevator_code_map;
 pub mod elevator_drift;
 pub mod elevator_extract;
+pub mod elevator_fix;
 pub mod elevator_list;
+pub(crate) mod elevator_text_renderer;
+mod json_renderer;
+mod mermaid_renderer;
 
-pub use dot_renderer::DotRenderer;
-pub use mermaid_renderer::MermaidRenderer;
-pub use json_renderer::JsonRenderer;
 pub use ascii_renderer::AsciiRenderer;
+pub use dot_renderer::DotRenderer;
 pub use elevator_text_renderer::ElevatorTextRenderer;
+pub use json_renderer::JsonRenderer;
+pub use mermaid_renderer::MermaidRenderer;
 
 use crate::config::Config;
 use crate::graph::DependencyGraph;

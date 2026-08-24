@@ -21,8 +21,8 @@
 //! is a speedup, never a source of failure.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use super::ParsedFile;
 
@@ -146,9 +146,10 @@ impl ParseStore {
     /// `Analyzer::parse_file_standalone`.
     pub(crate) fn get(&self, abs_path: &Path, content_hash: &str) -> Option<ParsedFile> {
         let path = self.entry_path(abs_path)?;
-        match std::fs::read(&path).ok().and_then(|bytes| {
-            serde_json::from_slice::<StoredEntry>(&bytes).ok()
-        }) {
+        match std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StoredEntry>(&bytes).ok())
+        {
             // The entry is keyed by path alone, so it may hold a parse of
             // *different* content for that path. The hash recorded beside the
             // parse is what makes that safe: a mismatch is a miss, never a
@@ -171,15 +172,25 @@ impl ParseStore {
     /// reader — even in a second `nao` process — never sees a torn entry.
     pub(crate) fn put(&self, abs_path: &Path, content_hash: &str, parsed: &ParsedFile) {
         let Some(dir) = self.dir.as_ref() else { return };
-        let Some(final_path) = self.entry_path(abs_path) else { return };
-        let Ok(bytes) = serde_json::to_vec(&EntryRef { content_hash, parsed }) else {
+        let Some(final_path) = self.entry_path(abs_path) else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec(&EntryRef {
+            content_hash,
+            parsed,
+        }) else {
             return;
         };
         if std::fs::create_dir_all(dir).is_err() {
             return;
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!("{}.{}.{}.tmp", key_stem(abs_path), std::process::id(), seq));
+        let tmp = dir.join(format!(
+            "{}.{}.{}.tmp",
+            key_stem(abs_path),
+            std::process::id(),
+            seq
+        ));
         if std::fs::write(&tmp, &bytes).is_err() {
             return;
         }
@@ -192,7 +203,10 @@ impl ParseStore {
 
     /// `(hits, misses)` since this store was opened.
     pub fn stats(&self) -> (u64, u64) {
-        (self.hits.load(Ordering::Relaxed), self.misses.load(Ordering::Relaxed))
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Absolute path of the entry file for `(abs_path, content_hash)`, or
@@ -242,7 +256,9 @@ struct StoredEntry {
 /// branches in place) is no longer a hit. `nao diff` is unaffected — it
 /// analyses git worktrees, which are distinct paths.
 fn key_stem(abs_path: &Path) -> String {
-    blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex().to_string()
+    blake3::hash(abs_path.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 /// Delete parse-store generations that are no longer current and have gone
@@ -256,18 +272,23 @@ fn key_stem(abs_path: &Path) -> String {
 /// run — trading a disk leak for exactly the repeated rebuilding this is meant
 /// to avoid.
 fn prune_stale_generations(current: &Path) {
-    let Some(parse_root) = current.parent() else { return };
-    let Ok(entries) = std::fs::read_dir(parse_root) else { return };
+    let Some(parse_root) = current.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parse_root) else {
+        return;
+    };
     let grace = Duration::from_secs(STALE_GENERATION_DAYS * 24 * 60 * 60);
     for entry in entries.flatten() {
         let path = entry.path();
         if path == current || !path.is_dir() {
             continue;
         }
-        let untouched_for = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .and_then(|t| SystemTime::now().duration_since(t).map_err(std::io::Error::other));
+        let untouched_for = entry.metadata().and_then(|m| m.modified()).and_then(|t| {
+            SystemTime::now()
+                .duration_since(t)
+                .map_err(std::io::Error::other)
+        });
         if matches!(untouched_for, Ok(age) if age > grace) {
             // Best-effort, like every other store operation: a failure here
             // costs disk, never correctness.
@@ -301,8 +322,11 @@ mod tests {
     /// A unique-per-test temp cache root, isolated from `~/.cache` and
     /// from sibling tests. Removed if a stale one exists.
     fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir()
-            .join(format!("nao-parse-store-test-{}-{}", std::process::id(), tag));
+        let root = std::env::temp_dir().join(format!(
+            "nao-parse-store-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -310,7 +334,12 @@ mod tests {
     /// A small but non-trivial `ParsedFile` to round-trip through the store.
     fn sample(path: &Path) -> ParsedFile {
         let span = Span::new(Position::new(0, 0, 0), Position::new(1, 0, 10));
-        let entity = CodeEntity::new("foo".to_string(), EntityKind::Function, path.to_path_buf(), span);
+        let entity = CodeEntity::new(
+            "foo".to_string(),
+            EntityKind::Function,
+            path.to_path_buf(),
+            span,
+        );
         ParsedFile {
             file_path: path.to_path_buf(),
             file_info: FileInfo {
@@ -345,7 +374,11 @@ mod tests {
         store.put(path, "h1", &original);
 
         let hit = store.get(path, "h1").expect("second lookup must hit");
-        assert_eq!(json(&original), json(&hit), "stored parse diverged from original");
+        assert_eq!(
+            json(&original),
+            json(&hit),
+            "stored parse diverged from original"
+        );
         assert_eq!(store.stats(), (1, 1), "one hit, one miss");
     }
 
@@ -366,7 +399,11 @@ mod tests {
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
             .collect();
-        assert_eq!(entries.len(), 1, "four revisions of one file must leave one entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "four revisions of one file must leave one entry"
+        );
     }
 
     #[test]
@@ -427,7 +464,11 @@ mod tests {
             "a parser change must move the cache generation, but {tag} does not carry the fingerprint"
         );
         assert!(
-            tag.starts_with(&format!("{}-{}-", env!("CARGO_PKG_VERSION"), PARSE_CACHE_SALT)),
+            tag.starts_with(&format!(
+                "{}-{}-",
+                env!("CARGO_PKG_VERSION"),
+                PARSE_CACHE_SALT
+            )),
             "crate version and salt must still lead the tag: {tag}"
         );
     }
@@ -466,7 +507,10 @@ mod tests {
         let b = Path::new("/proj/b.rs");
         store.put(a, "same", &sample(a));
         // Entity IDs are path-qualified, so b must not read a's entry.
-        assert!(store.get(b, "same").is_none(), "path must be part of the key");
+        assert!(
+            store.get(b, "same").is_none(),
+            "path must be part of the key"
+        );
     }
 
     #[test]
@@ -479,7 +523,10 @@ mod tests {
         // miss instead of erroring/panicking.
         let entry = store.entry_path(path).unwrap();
         std::fs::write(&entry, b"{ this is not valid json").unwrap();
-        assert!(store.get(path, "h1").is_none(), "corruption must read as a miss");
+        assert!(
+            store.get(path, "h1").is_none(),
+            "corruption must read as a miss"
+        );
     }
 
     #[test]

@@ -8,8 +8,9 @@ mod jobs;
 mod refactor_prompt;
 mod repo;
 mod scope_handler;
-mod settings_handler;
 mod serve;
+mod settings_handler;
+mod shape_handler;
 mod state;
 mod types;
 mod ui_dir;
@@ -19,12 +20,11 @@ pub use access::AccessOptions;
 pub use repo::{default_cache_dir, parse_seed};
 pub use serve::{serve, ServeOptions};
 
-
 use access::AccessPolicy;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
@@ -166,18 +166,36 @@ fn run_watch(opts: WatchOptions, policy: AccessPolicy, ui_dir: Option<PathBuf>) 
     let (watcher_stop_tx, watcher_stop_rx) = std::sync::mpsc::channel::<()>();
 
     let watcher_thread = spawn_file_watcher(
-        path.clone(), config.clone(), output_dir.clone(),
-        tx.clone(), shared_graph.clone(), shared_config.clone(),
-        watcher_stop_rx, debounce_ms,
+        path.clone(),
+        config.clone(),
+        output_dir.clone(),
+        tx.clone(),
+        shared_graph.clone(),
+        shared_config.clone(),
+        watcher_stop_rx,
+        debounce_ms,
     );
 
     rt.block_on(run_http_server(
         HttpServer {
-            path, output_dir, port, include_tests, include_docs, languages, spec_dir,
-            content_fallback, policy, ui_dir, allow_agent_spawn, pin_diff, settings,
+            path,
+            output_dir,
+            port,
+            include_tests,
+            include_docs,
+            languages,
+            spec_dir,
+            content_fallback,
+            policy,
+            ui_dir,
+            allow_agent_spawn,
+            pin_diff,
+            settings,
             settings_view,
         },
-        tx, shared_graph, shared_config,
+        tx,
+        shared_graph,
+        shared_config,
     ));
 
     let _ = watcher_stop_tx.send(());
@@ -201,11 +219,8 @@ fn spawn_file_watcher(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let (notify_tx, notify_rx) = std::sync::mpsc::channel();
-        let mut debouncer = new_debouncer(
-            std::time::Duration::from_millis(debounce_ms),
-            notify_tx,
-        )
-        .expect("Failed to create file watcher");
+        let mut debouncer = new_debouncer(std::time::Duration::from_millis(debounce_ms), notify_tx)
+            .expect("Failed to create file watcher");
 
         debouncer
             .watcher()
@@ -222,7 +237,9 @@ fn spawn_file_watcher(
         watch_outside_spec(debouncer.watcher(), &config);
 
         loop {
-            if stop_rx.try_recv().is_ok() { break; }
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
             match notify_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(Ok(events)) => {
                     // Asked of the *live* scope, not the watcher's startup
@@ -232,7 +249,9 @@ fn spawn_file_watcher(
                     // up for.
                     let scoped = with_live_scope(&config, &shared_config);
                     let worth_it = analyzable_changes(&events, &scoped);
-                    if worth_it.is_empty() { continue; }
+                    if worth_it.is_empty() {
+                        continue;
+                    }
                     log_changed_files(&worth_it);
                     handle_reanalysis(&config, &output_dir, &graph, &shared_config, &tx);
                 }
@@ -290,7 +309,10 @@ fn analyzable_changes(
         .collect();
 
     let ignored = crate::diff::ignored_paths(&config.root_path, &candidates);
-    candidates.into_iter().filter(|p| !ignored.contains(p)).collect()
+    candidates
+        .into_iter()
+        .filter(|p| !ignored.contains(p))
+        .collect()
 }
 
 fn log_changed_files(changed: &[String]) {
@@ -326,8 +348,12 @@ fn handle_reanalysis(
     let config = &with_live_scope(config, shared_config);
     match write_json(config, output_dir) {
         Ok((ents, rels, new_graph)) => {
-            if let Ok(mut g) = graph.write() { *g = new_graph; }
-            if let Ok(mut c) = shared_config.write() { *c = config.clone(); }
+            if let Ok(mut g) = graph.write() {
+                *g = new_graph;
+            }
+            if let Ok(mut c) = shared_config.write() {
+                *c = config.clone();
+            }
             eprintln!("   Re-analyzed: {} entities, {} relationships", ents, rels);
             let _ = tx.send(ReloadKind::Graph);
         }
@@ -419,7 +445,11 @@ async fn run_http_server(
                 ed
             }
             Err(e) => {
-                eprintln!("⚠ Educator: failed to load from {}: {:#}", content_root.display(), e);
+                eprintln!(
+                    "⚠ Educator: failed to load from {}: {:#}",
+                    content_root.display(),
+                    e
+                );
                 crate::educator::Educator::empty()
             }
         },
@@ -456,7 +486,14 @@ async fn run_http_server(
     // pinned server simply never has a live diff for it to refresh.
     tokio::spawn(follow_the_watcher(state.clone()));
 
-    let app = build_router(state, &output_dir, &policy, ui_dir.as_deref(), port, allow_agent_spawn);
+    let app = build_router(
+        state,
+        &output_dir,
+        &policy,
+        ui_dir.as_deref(),
+        port,
+        allow_agent_spawn,
+    );
     print_startup_banner(port, &policy, ui_dir.as_deref());
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -500,18 +537,24 @@ fn build_router(
     let app = Router::new()
         .route("/events", get(handlers::sse_handler))
         .route("/api/commits", get(handlers::commits_handler))
+        .route("/api/stashes", get(handlers::stashes_handler))
+        .route("/api/staged", get(handlers::staged_handler))
         .route(
             "/api/diff",
             get(handlers::diff_get_handler)
                 .post(diff_handler::diff_handler)
                 .delete(diff_handler::stop_diff_handler),
         )
-        .route("/api/root", get(handlers::get_root_handler).post(diff_handler::set_root_handler))
+        .route(
+            "/api/root",
+            get(handlers::get_root_handler).post(diff_handler::set_root_handler),
+        )
         .route("/api/graph", get(handlers::graph_handler))
         .route("/api/index", get(handlers::index_handler))
         .route("/api/details", get(handlers::details_handler))
         .route("/api/details/base", get(handlers::base_details_handler))
         .route("/api/scope", post(scope_handler::scope_handler))
+        .route("/api/shape", get(shape_handler::shape_handler))
         .route("/api/settings", get(settings_handler::settings_handler))
         .route(
             "/api/settings/analysis",
@@ -529,9 +572,15 @@ fn build_router(
             "/api/views",
             get(views_handler::get_views_handler).put(views_handler::put_views_handler),
         )
-        .route("/api/educator/position", get(educator_handler::position_handler))
+        .route(
+            "/api/educator/position",
+            get(educator_handler::position_handler),
+        )
         .route("/api/educator/scan", get(educator_handler::scan_handler))
-        .route("/api/educator/diagnostics", get(educator_handler::diagnostics_handler))
+        .route(
+            "/api/educator/diagnostics",
+            get(educator_handler::diagnostics_handler),
+        )
         .nest_service("/data", data_service);
 
     // The only route that executes code. Absent unless asked for, rather
@@ -539,7 +588,10 @@ fn build_router(
     // reached by a bug. Serve mode never gets it at all (SRV-012's reasoning:
     // a submitted repo must not reach a spawn path).
     let app = if allow_agent_spawn {
-        app.route("/api/agents/terminal", post(agent_terminal::terminal_handler))
+        app.route(
+            "/api/agents/terminal",
+            post(agent_terminal::terminal_handler),
+        )
     } else {
         app
     };
@@ -559,16 +611,20 @@ fn build_router(
     // a real refusal.
     // `/api/hello` is registered after the layers so neither wraps it: it is
     // the handshake that lets a refused page find out it was refused.
-    policy
-        .apply(ui_dir::mount(app, ui, port))
-        .route("/api/hello", access::hello_route(policy, "watch", allow_agent_spawn))
+    policy.apply(ui_dir::mount(app, ui, port)).route(
+        "/api/hello",
+        access::hello_route(policy, "watch", allow_agent_spawn),
+    )
 }
 
 fn print_startup_banner(port: u16, policy: &AccessPolicy, ui: Option<&std::path::Path>) {
     eprintln!();
     eprintln!("🚀 Server running at http://localhost:{}", port);
     eprintln!("   SSE endpoint:   http://localhost:{}/events", port);
-    eprintln!("   Data files:     http://localhost:{}/data/data.json", port);
+    eprintln!(
+        "   Data files:     http://localhost:{}/data/data.json",
+        port
+    );
     eprintln!("   API:            GET  /api/commits   - list recent commits");
     eprintln!("                   POST /api/diff      - compute diff between commits");
     eprintln!("                   DEL  /api/diff      - leave diff mode");
@@ -576,7 +632,9 @@ fn print_startup_banner(port: u16, policy: &AccessPolicy, ui: Option<&std::path:
     eprintln!("                   POST /api/root      - change root path and re-analyze");
     eprintln!("                   GET  /api/analysis/scope - current analyzed languages");
     eprintln!("                   POST /api/analysis/scope - narrow analyzed languages");
-    eprintln!("                   GET  /api/settings  - settings in effect, and where each came from");
+    eprintln!(
+        "                   GET  /api/settings  - settings in effect, and where each came from"
+    );
     eprintln!("                   POST /api/settings/analysis - save the analysis scope as this repo's default");
     access::print_allowed_origins(policy);
     access::print_pairing_token(policy);
@@ -593,7 +651,10 @@ mod tests {
     fn touched(paths: &[&std::path::Path]) -> Vec<DebouncedEvent> {
         paths
             .iter()
-            .map(|p| DebouncedEvent { path: p.to_path_buf(), kind: DebouncedEventKind::Any })
+            .map(|p| DebouncedEvent {
+                path: p.to_path_buf(),
+                kind: DebouncedEventKind::Any,
+            })
             .collect()
     }
 
@@ -607,7 +668,11 @@ mod tests {
         let root = std::path::Path::new("/repo");
         let config = crate::config::Config::for_path(root);
 
-        for quiet in ["target/debug/build_script.rs", "node_modules/pkg/index.js", "notes.txt"] {
+        for quiet in [
+            "target/debug/build_script.rs",
+            "node_modules/pkg/index.js",
+            "notes.txt",
+        ] {
             let events = touched(&[&root.join(quiet)]);
             assert!(
                 analyzable_changes(&events, &config).is_empty(),

@@ -166,3 +166,52 @@ test('membership speaks up when a filter is hiding members', () => {
 test('a region the traffic pass never saw falls back to the hull s own count', () => {
   assert.equal(membershipText(undefined, 7), '7');
 });
+
+// ── file grain (UI-103) ─────────────────────────────────────────────────
+
+test('a link inside one file is inside its file and inside its folder', () => {
+  // The acceptance criterion for pointing the counts one level down. Crossing
+  // is relative, so a relationship between two entities of the same file is
+  // contained at both levels, and the pair is what says *how far down* the
+  // coupling is contained.
+  const chains: Record<string, string[]> = {
+    a: ['p/one.ts', 'p'],
+    b: ['p/one.ts', 'p'],
+  };
+  const out = regionTraffic({
+    candidates: [{ id: 'a' }, { id: 'b' }],
+    isDrawn: () => true,
+    links: [{ source: 'a', target: 'b' }],
+    keysOf: (id) => chains[id] ?? [],
+  });
+  assert.deepEqual(out.get('p/one.ts'), { drawn: 2, total: 2, inside: 1, crossing: 0 });
+  assert.deepEqual(out.get('p'), { drawn: 2, total: 2, inside: 1, crossing: 0 });
+});
+
+test('a link between two files crosses each and stays inside the folder', () => {
+  // The reading the feature exists for: this is what tells a cohesive file
+  // from a junk drawer, and it is the same arithmetic one tier up that tells
+  // a subsystem from a directory someone filed things in.
+  const chains: Record<string, string[]> = {
+    a: ['p/one.ts', 'p'],
+    b: ['p/two.ts', 'p'],
+  };
+  const out = regionTraffic({
+    candidates: [{ id: 'a' }, { id: 'b' }],
+    isDrawn: () => true,
+    links: [{ source: 'a', target: 'b' }],
+    keysOf: (id) => chains[id] ?? [],
+  });
+  assert.deepEqual(out.get('p/one.ts'), { drawn: 1, total: 1, inside: 0, crossing: 1 });
+  assert.deepEqual(out.get('p/two.ts'), { drawn: 1, total: 1, inside: 0, crossing: 1 });
+  assert.deepEqual(out.get('p'), { drawn: 2, total: 2, inside: 1, crossing: 0 });
+});
+
+test('the membership tooltip takes its noun from the caller', () => {
+  // A tooltip saying "folder" over a file's row is a claim about the tree
+  // that the tree does not make.
+  assert.match(membershipTitle({ drawn: 3, total: 3, inside: 0, crossing: 0 }, 'file'),
+    /this file's nodes/);
+  assert.match(membershipTitle(undefined, 'file'), /from this file/);
+  assert.match(membershipTitle(undefined), /from this folder/);
+});

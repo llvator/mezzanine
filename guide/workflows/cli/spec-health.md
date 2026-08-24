@@ -62,6 +62,29 @@ scan of the claimed files to get.
 Use `--code-root` when the spec lives in a separate docs repository; it
 defaults to the spec path itself for co-located specs.
 
+### `--fix` — let the repository repair its own anchors
+
+```bash
+elevator spec --drift --fix -q
+```
+
+```
+## Missing cr paths (error)
+fu spec_health.drift
+  cr: src/output/elevator_drift.rs — not found under code root
+      → renamed to src/output/drift_report.rs in commit e8d39639 — `--fix` applies this
+
+## Applied fixes
+> Rewrote 1 of 1 repairable cr path(s) across 1 spec file(s), from git rename evidence.
+```
+
+Only moves git recorded, and only where the new path exists, are
+applied; the exit code then reflects what is *left*, so a spec whose
+every dead anchor was a rename exits 0. Anything git cannot prove — a
+deletion, a split, a directory whose files scattered — is reported
+unchanged. Run it without `--fix` first: the report names each rename
+and its commit either way, so the diff is never a surprise.
+
 ## `--code-map` — is any code claimed twice?
 
 ```bash

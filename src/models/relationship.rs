@@ -1,5 +1,6 @@
 //! Relationship types between code entities.
 
+use crate::models::Span;
 use serde::{Deserialize, Serialize};
 
 /// Represents a relationship between two code entities.
@@ -7,24 +8,42 @@ use serde::{Deserialize, Serialize};
 pub struct Relationship {
     /// Unique identifier for this relationship
     pub id: String,
-    
+
     /// Source entity ID
     pub source_id: String,
-    
+
     /// Target entity ID
     pub target_id: String,
-    
+
     /// Type of relationship
     pub kind: RelationshipKind,
-    
+
     /// Optional label for the relationship
     pub label: Option<String>,
-    
+
     /// Weight/strength (useful for visualization)
     pub weight: u32,
 
     /// Additional metadata
     pub metadata: std::collections::HashMap<String, String>,
+
+    /// Where the edge was *written* — the source-side statement that
+    /// created it (AN-024). `None` on every edge nobody has taught to
+    /// record its site yet.
+    ///
+    /// Deliberately not either endpoint's declaration span. A renderer
+    /// reaching for `target.span` prints where the depended-on thing *is*,
+    /// which is a different fact that coincides with this one often enough
+    /// to read as attribution — an import at the foot of one file, of a
+    /// symbol declared at the head of another, cites two unrelated lines.
+    ///
+    /// A field rather than a `metadata` key for the reason `precision` is
+    /// one: a location a consumer has to re-parse out of a string map is a
+    /// location most consumers will not print. `#[serde(default)]` plus
+    /// `skip_serializing_if` so pre-AN-024 caches load and a spanless edge
+    /// serialises byte-identically to what it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<Span>,
 
     /// Resolution precision of this edge (AN-004). `Some(Exact)` when a
     /// language server (rust-analyzer) resolved the call site to this
@@ -33,6 +52,40 @@ pub struct Relationship {
     /// …). `#[serde(default)]` so pre-AN-004 JSON loads cleanly as `None`.
     #[serde(default)]
     pub precision: Option<Precision>,
+}
+
+/// Where one file's dependency on another was written (AN-024).
+///
+/// The file-granularity companion to [`Relationship::span`], and the form
+/// a folder drawing can use: that drawing collapses every entity edge
+/// between two files into one arrow, so the arrow has no single site, but
+/// the import statements behind it each have one.
+///
+/// Kept beside the graph rather than on it. An import specifier resolves
+/// to a *file*, and a file is a node only when it is a Groovy script —
+/// which is why the resolver's `Imports` edges cover that one case and why
+/// nothing downstream could cite an import before this existed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImportSite {
+    /// The file the statement was written in.
+    pub from: std::path::PathBuf,
+    /// The file it names.
+    pub to: std::path::PathBuf,
+    /// 0-based line of the statement, as source files are indexed
+    /// everywhere else in the model. Renderers add the 1.
+    pub line: usize,
+    /// The statement was a re-export (`export { X } from './y'`), so the
+    /// file passes the name on without using it.
+    pub is_reexport: bool,
+    /// The build erases the statement — TypeScript's `import type`, Python's
+    /// `if TYPE_CHECKING:` — so no bundler ever resolves the specifier
+    /// (AN-022).
+    ///
+    /// Here as well as on the `Imports` edge's metadata because this is the
+    /// granularity every language gets: a folder drawing reads sites, and
+    /// the edge only exists where the importing file is a node.
+    #[serde(default)]
+    pub is_type_only: bool,
 }
 
 /// How a (call) edge's target was resolved. The load-bearing trust signal
@@ -75,7 +128,7 @@ pub enum RelationshipKind {
     Inherits,
     /// Interface/trait implementation
     Implements,
-    
+
     // Dependency relationships
     /// Imports/uses another entity
     Imports,
@@ -85,6 +138,31 @@ pub enum RelationshipKind {
     Instantiates,
     /// Uses as a type (parameter, return type, field)
     UsesType,
+    /// Names a function without calling it at that site — a function
+    /// passed as a value, most often a handler handed to a dispatcher
+    /// (`add_leaf(node, ctx, enums::parse_enum)`).
+    ///
+    /// A dependency of the same weight as a call: the naming file breaks
+    /// when the named function's signature changes. It is kept apart from
+    /// `Calls` because no call happens here, so call ordering and call-site
+    /// metadata would be fiction, and apart from `References` because that
+    /// kind is deliberately excluded from the coupling tallies and this is
+    /// coupling. Without it a dispatcher that reaches every sibling through
+    /// a function pointer draws as depending on none of them (ADR 0021).
+    UsesFn,
+    /// Reads a name declared in another file without calling it — a
+    /// constant, a shared lookup table, or any imported binding used as a
+    /// value.
+    ///
+    /// A dependency of the same weight as `UsesFn`, and for the same
+    /// reason ADR 0021 gives: change the constant's value or type and the
+    /// file that reads it changes with it. It is neither `Calls` (no call
+    /// happens, so call ordering and call-site metadata would be fiction)
+    /// nor `References` (that kind is deliberately outside the coupling
+    /// tallies, and this is coupling). Without it a module of shared
+    /// constants has no edges at all and draws as a stray nothing depends
+    /// on (ADR 0027).
+    UsesValue,
     /// References without calling
     References,
     /// ansible-deploy: a DeploymentEntry renders a TemplateFile
@@ -102,7 +180,7 @@ pub enum RelationshipKind {
     /// (SV-002). Same relation, same reason it counts as a dependency —
     /// the markup breaks if the target changes.
     Interpolates,
-    
+
     // Data flow relationships
     /// Reads from
     ReadsFrom,
@@ -112,7 +190,7 @@ pub enum RelationshipKind {
     Returns,
     /// Takes a parameter of type (type -> function)
     TakesParam,
-    
+
     // High-level relationships
     /// Depends on (generic dependency)
     DependsOn,
@@ -122,7 +200,7 @@ pub enum RelationshipKind {
     Provides,
     /// Requires functionality
     Requires,
-    
+
     // Association
     /// Generic association
     AssociatedWith,
@@ -141,13 +219,15 @@ impl RelationshipKind {
                 | RelationshipKind::Calls
                 | RelationshipKind::Instantiates
                 | RelationshipKind::UsesType
+                | RelationshipKind::UsesFn
+                | RelationshipKind::UsesValue
                 | RelationshipKind::DependsOn
                 | RelationshipKind::Requires
                 | RelationshipKind::RendersFrom
                 | RelationshipKind::Interpolates
         )
     }
-    
+
     /// Returns true if this is a structural/containment relationship
     pub fn is_structural(&self) -> bool {
         matches!(
@@ -159,9 +239,16 @@ impl RelationshipKind {
                 | RelationshipKind::Aggregates
         )
     }
-    
+
     /// Returns the generic display label for this relationship type.
     /// Prefer `display_label_for` when a language context is available.
+    ///
+    /// Split in two along the enum's own grouping — what one piece of code
+    /// does to another, against the deployment and architecture edges below
+    /// — because a single flat match over every kind cannot gain an arm
+    /// without the complexity gate charging for it, and a kind without a
+    /// label is worse than a long function. `every_kind_has_a_label` stands
+    /// in for the exhaustiveness the split gives up.
     pub fn display_label(&self) -> &'static str {
         match self {
             RelationshipKind::Contains => "contains",
@@ -173,6 +260,29 @@ impl RelationshipKind {
             RelationshipKind::Instantiates => "instantiates",
             RelationshipKind::UsesType => "uses type",
             RelationshipKind::References => "references",
+            other => other.naming_label(),
+        }
+    }
+
+    /// The kinds that name something without invoking it: a function handed
+    /// to a dispatcher (ADR 0021), a constant read from another file
+    /// (ADR 0027).
+    ///
+    /// A third step in the chain rather than two more arms above, for the
+    /// reason [`Self::display_label`] gives: a flat match cannot gain an arm
+    /// without the complexity gate charging for it.
+    fn naming_label(&self) -> &'static str {
+        match self {
+            RelationshipKind::UsesFn => "uses fn",
+            RelationshipKind::UsesValue => "uses value",
+            other => other.wider_label(),
+        }
+    }
+
+    /// The kinds that describe deployment topology, data flow and
+    /// architecture rather than one symbol reaching another.
+    fn wider_label(&self) -> &'static str {
+        match self {
             RelationshipKind::RendersFrom => "renders from",
             RelationshipKind::Interpolates => "interpolates",
             RelationshipKind::ReadsFrom => "reads from",
@@ -186,6 +296,8 @@ impl RelationshipKind {
             RelationshipKind::AssociatedWith => "associated with",
             RelationshipKind::ComposedOf => "composed of",
             RelationshipKind::Aggregates => "aggregates",
+            // Only the kinds `display_label` already answered reach here.
+            _ => "related to",
         }
     }
 
@@ -271,7 +383,7 @@ impl RelationshipKind {
             _ => self.display_label(),
         }
     }
-    
+
     /// Returns the arrow style for DOT/Graphviz output
     pub fn dot_arrow_style(&self) -> &'static str {
         match self {
@@ -283,7 +395,7 @@ impl RelationshipKind {
             _ => "normal",
         }
     }
-    
+
     /// Returns the line style for DOT/Graphviz output
     pub fn dot_line_style(&self) -> &'static str {
         match self {
@@ -305,7 +417,7 @@ impl Relationship {
         let source = source_id.into();
         let target = target_id.into();
         let id = format!("{}->{}:{:?}", &source, &target, kind);
-        
+
         Self {
             id,
             source_id: source,
@@ -314,6 +426,7 @@ impl Relationship {
             label: None,
             weight: 1,
             metadata: std::collections::HashMap::new(),
+            span: None,
             precision: None,
         }
     }
@@ -324,21 +437,89 @@ impl Relationship {
         self
     }
 
+    /// Builder: set where the edge was written (AN-024).
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+
     /// Builder: set resolution precision (AN-004).
     pub fn with_precision(mut self, precision: Precision) -> Self {
         self.precision = Some(precision);
         self
     }
-    
+
     /// Builder: set weight
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight;
         self
     }
-    
+
     /// Builder: add metadata
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RelationshipKind::{self, *};
+
+    /// `display_label` used to be one exhaustive match, so a new kind could
+    /// not be added without the compiler demanding a label. Splitting it to
+    /// keep the complexity gate happy gave that up; this takes it back.
+    /// A kind that reaches the fallback has been added and not named.
+    #[test]
+    fn every_kind_has_a_label() {
+        const ALL: &[RelationshipKind] = &[
+            Contains,
+            Includes,
+            Inherits,
+            Implements,
+            Imports,
+            Calls,
+            Instantiates,
+            UsesType,
+            UsesFn,
+            UsesValue,
+            References,
+            RendersFrom,
+            Interpolates,
+            ReadsFrom,
+            WritesTo,
+            Returns,
+            TakesParam,
+            DependsOn,
+            CommunicatesWith,
+            Provides,
+            Requires,
+            AssociatedWith,
+            ComposedOf,
+            Aggregates,
+        ];
+        for kind in ALL {
+            assert_ne!(
+                kind.display_label(),
+                "related to",
+                "{kind:?} reached the fallback — give it a label"
+            );
+        }
+    }
+
+    /// The new kind is coupling, and the folder drawings are built from
+    /// whatever `is_dependency` admits. Recording it and leaving it out of
+    /// that set would have changed nothing a reader can see.
+    #[test]
+    fn naming_a_function_counts_as_a_dependency() {
+        assert!(UsesFn.is_dependency());
+        assert!(!References.is_dependency());
+    }
+
+    /// Reading a constant another file declares is the same coupling as
+    /// naming a function it declares (AN-028), so it joins the same set.
+    #[test]
+    fn reading_an_imported_value_counts_as_a_dependency() {
+        assert!(UsesValue.is_dependency());
     }
 }

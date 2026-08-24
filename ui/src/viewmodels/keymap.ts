@@ -92,6 +92,7 @@ export type Command =
   | 'view.toggleMode' | 'view.level.entity' | 'view.level.file' | 'view.level.module'
   | 'view.autoFit' | 'view.spacing' | 'view.highlightDepth' | 'view.hoverMode'
   | 'view.labels.node' | 'view.labels.kind' | 'view.labels.link'
+  | 'view.structureOnly'
   // spec
   | 'spec.clear'
   // details
@@ -187,6 +188,10 @@ export const BINDINGS: readonly Binding[] = [
   { keys: 'n', scope: 'view', command: 'view.labels.node', label: 'Node labels' },
   { keys: 'k', scope: 'view', command: 'view.labels.kind', label: 'Kind labels' },
   { keys: 'b', scope: 'view', command: 'view.labels.link', label: 'Link labels' },
+  // `i` for internals — the one control that changes what a scope *is* when
+  // you open it, so it earns a key rather than a scroll into the Filters pane
+  // (UI-113).
+  { keys: 'i', scope: 'view', command: 'view.structureOnly', label: 'Internals' },
   { keys: 'c', scope: 'view', command: 'pane.collapse', label: 'Collapse' },
 
   // --- spec ---

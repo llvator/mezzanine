@@ -18,9 +18,10 @@
 
 import { derived, type Readable } from 'svelte/store';
 import * as d3 from 'd3';
-import type { D3Node, D3Link, GraphData, ViewMode, LevelOverrides, TriState } from '../types/graph';
+import type { D3Node, D3Link, FolderPicture, GraphData, ViewMode, LevelOverrides, TriState } from '../types/graph';
 import { isSpecNode } from '../types/graph';
 import { pathsClaim } from '../utils/refPaths';
+import { pickedHighlight } from '../utils/rowPicks';
 import {
   graphData,
   selectedNode,
@@ -43,12 +44,17 @@ import {
   showTemplateVars,
   searchHidesNonMatches,
   searchDimOpacity,
+  structureOnly,
+  shapePicture,
   type TreeDensity,
 } from '../stores/graph';
+import { bodyHidden, linkDrawable, linkTraversable } from './bodyScope';
+import { shapeEdgeVerdicts, shapePlacement, verdictFor } from './shapeView';
 import { searchMatchIds, searchNeighborIds } from './filterViewModel';
-import { diffActive, diffLevel, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges, diffChangedEdges, diffAddedEntityIds, diffDimOpacity, normalizeEntityId, type ChangeStatus } from '../stores/diff';
+import { diffActive, diffLevel, diffSeedFacet, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges, diffChangedEdges, diffAddedEntityIds, diffDimOpacity, diffContextOpacity, diffHeadIsWorking, normalizeEntityId, type ChangeStatus } from '../stores/diff';
 import type { ScopeChange } from './diffRollup';
-import { planDiffLevel, type DiffLevel, type LevelEdge } from './diffLevels';
+import { editKind, type DiffFacts } from './diffVerdict';
+import { planDiffLevel, splitEdits, type DiffLevel, type DiffSeedFacet, type EditKind, type LevelEdge } from './diffLevels';
 import { gateByDrawCeiling, type DrawOverflow } from './drawCeiling';
 import { rankHubs } from './hubs';
 import { demoteHubs, hubCount } from '../stores/settings';
@@ -57,9 +63,17 @@ import { splitViewOpen } from '../stores/panes';
 
 export interface DisplayPlan {
   /** 'tree' when viewMode === 'tree' AND a selection exists in the
-   *  current graph; otherwise 'force'. The View uses this to decide
-   *  between pinning nodes to tree positions vs. running the simulation. */
-  mode: 'force' | 'tree';
+   *  current graph, 'shape' when viewMode === 'shape' AND a folder picture
+   *  is in hand, otherwise 'force'. The View uses this to decide between
+   *  pinning nodes to computed positions vs. running the simulation.
+   *
+   *  'shape' and 'tree' share the whole pinning path — both are laid out
+   *  rather than simulated, and the only difference is where the positions
+   *  come from. What makes 'shape' its own mode rather than a second source
+   *  of tree positions is what it means: a tree is a reach around a
+   *  selection, a shape is a claim about one folder's structure, and the
+   *  edges carry a verdict in the second case and not the first. */
+  mode: 'force' | 'tree' | 'shape';
   /** Ids of nodes that should be visible in the current view. Includes
    *  filter, search, and selection-distance gating. */
   visibleNodeIds: Set<string>;
@@ -96,6 +110,19 @@ export interface DisplayPlan {
    *  hiding with extra steps. When both dim, the more visible value wins —
    *  the failure worth avoiding is "the node vanished". */
   dimOpacity: number;
+  /**
+   * The subset of `visibleNodeIds` a diff rung recruited rather than the seed
+   * (UI-112) — drawn, but drawn at `contextOpacity`.
+   *
+   * A *subset*, deliberately: every other consumer of the plan — the draw
+   * ceiling, the empty-canvas verdict, the layout — should keep treating
+   * these as the drawn nodes they are. The only thing this changes is how
+   * loudly they are drawn, which is why nothing but the View reads it.
+   */
+  contextNodeIds: Set<string>;
+  /** Opacity for `contextNodeIds`. 1 when no diff rung is recruiting, which
+   *  is the picture as it was before this existed. */
+  contextOpacity: number;
   /** Non-null when the plan wanted more nodes on screen than the canvas
    *  draws, in which case every visibility set above is empty and the View
    *  shows the overflow card instead.
@@ -163,8 +190,14 @@ interface ComputeArgs {
   searchHides: boolean;
   searchDim: number;
   diffDim: number;
+  /** How strongly the nodes a rung recruited are drawn against the edits
+   *  (UI-112). Only reaches the plan when the ladder is actually filtering. */
+  diffContext: number;
   /** How wide the diff draws. Only consulted when `diffFiltersOn`. */
   diffLevel: DiffLevel;
+  /** Which half of the change the ladder starts from (UI-109). `all` is the
+   *  whole seed, and the picture the ladder drew before this existed. */
+  diffSeedFacet: DiffSeedFacet;
   /** Master toggle — off means a diff can be loaded and coloured while the
    *  ladder has no effect on what is drawn. */
   diffFiltersOn: boolean;
@@ -178,6 +211,9 @@ interface ComputeArgs {
   /** Scope path → rolled-up change, for the collapsed levels where a node's
    *  `original_id` is a path rather than an entity id (UI-064). */
   diffScopes: Map<string, ScopeChange>;
+  /** Whether the diff's head is the tree being drawn. Decides what the diff's
+   *  *silence* about a file means — see `diffVerdict` (UI-104). */
+  diffHeadIsWorking: boolean;
   showGhosts: boolean;
   /** Independent toggle for `ghost_stdlib`-tagged ghosts. When false,
    *  those ghosts are hidden even if `showGhosts` is true. */
@@ -185,6 +221,20 @@ interface ComputeArgs {
   /** Toggle for the `template_var`-tagged ansible templating layer.
    *  When false (default), those nodes and their edges are hidden. */
   showTemplateVars: boolean;
+  /** Draw only what a file declares, not what its functions do (UI-113).
+   *  On by default. Reads the `body_of` stamp `liftBodies` put on every
+   *  entity enclosed by a callable. */
+  structureOnly: boolean;
+  /** `original_id` of the callable whose body is exempt from the filter —
+   *  the current selection, when there is one.
+   *
+   *  This is the gesture the whole filter is built around: a canvas opens
+   *  with declarations, and picking one thing to read opens that one thing.
+   *  It is a single equality because `body_of` names the *outermost*
+   *  enclosure, so a call five branch arms deep in the selected function
+   *  carries the same value its parameters do — one selection, one whole
+   *  body, no walk. */
+  exemptBody: string | null;
   /** Split view: the Elevator layer draws in its own pane, so it comes out
    *  of this one (ADR 0011). */
   splitView: boolean;
@@ -192,6 +242,10 @@ interface ComputeArgs {
    *  is active. `[]` is a real value meaning "claims nothing" — see
    *  `stores/crossFilter.ts`. */
   crossFilterPaths: string[] | null;
+  /** The folder picture, when the shape view is on AND one has arrived.
+   *  Null in every other case, including while a fetch is in flight — the
+   *  canvas keeps drawing what it had rather than blanking (UI-108). */
+  picture: FolderPicture | null;
 }
 
 function emptyPlan(): DisplayPlan {
@@ -207,6 +261,8 @@ function emptyPlan(): DisplayPlan {
     demotedHubIds: new Set(),
     dimmedNodeIds: new Set(),
     dimOpacity: 0,
+    contextNodeIds: new Set(),
+    contextOpacity: 1,
     overflow: null,
   };
 }
@@ -241,6 +297,11 @@ function nodePassesFilters(n: D3Node, args: ComputeArgs): FilterResult {
   if (args.crossFilterPaths && !pathsClaim(args.crossFilterPaths, n.file_path)) {
     return 'hidden';
   }
+  // A function's internals are not what the file declares. Hard, and above
+  // the kind filter, because the two are answering different questions: the
+  // kind checkboxes cannot tell a module's entry point from a closure three
+  // callbacks down, and this cannot tell a Branch from a Loop.
+  if (bodyHidden(n, args)) return 'hidden';
   // Hard filters — these truly hide the node
   if (!args.kinds.has(n.kind_raw)) return 'hidden';
   if (!args.langs.has(n.language)) return 'hidden';
@@ -259,65 +320,16 @@ function nodePassesFilters(n: D3Node, args: ComputeArgs): FilterResult {
   return 'visible';
 }
 
-/**
- * Does the diff call this node *edited*?
- *
- * Two ways to qualify, and the second is the one that is easy to lose:
- *
- * - the diff says it changed, at the source level. Impact-only movement
- *   (`fan_in`/`fan_out` shifting because something nearby changed) is not an
- *   edit — on most diffs the ripple outnumbers the real edits and drowns them.
- * - the diff never *looked*. A file created since the diff ran is absent from
- *   every map, and treating unknown as unchanged hides exactly the thing the
- *   reader opened a diff to see. `diffUnknown` draws that line.
- */
-function isEdit(n: D3Node, args: ComputeArgs): boolean {
-  const change = changeOf(n, args);
-  if (!change) return diffUnknown(n, args) === 'visible';
-  return change.status !== 'unchanged' && change.sourceChanged;
-}
-
-/**
- * What the diff says about a node, or null when it has nothing to say.
- *
- * Entity nodes are keyed by entity id. A collapsed File or Module node
- * carries its scope path in `original_id` instead, so the entity lookup
- * misses and the scope rollup answers (UI-064). Entity ids and scope paths
- * do not collide — an id carries `:line:name` — so trying them in this order
- * needs no discriminator on the node.
- */
-function changeOf(n: D3Node, args: ComputeArgs): ScopeChange | null {
-  const id = normalizeEntityId(n.original_id);
-  const status = args.diffStatuses.get(id);
-  if (status) {
-    return { status, sourceChanged: args.diffSourceChanged.get(id) ?? true };
-  }
-  return args.diffScopes.get(n.original_id) ?? null;
-}
-
-/**
- * Verdict for a node the diff never mentioned.
- *
- * Unknown is not unchanged, and conflating the two is how the interesting
- * nodes disappear: a file created since the diff ran is absent from every
- * map, and dimming it to `diffDimOpacity: 0` hides exactly the thing the
- * user opened a diff to see.
- *
- * The distinction that survives maintenance is whether the diff *looked*.
- * It reports on unchanged entities too, so its scope keys are the whole file
- * tree as of the moment it ran:
- *
- * - the node's file is in that tree ⇒ the diff considered the file and said
- *   nothing about this node, which means it is one of the kinds the diff
- *   deliberately skips (`Parameter`) or a ghost. Dim it, as before.
- * - the file is absent ⇒ the diff never saw it. Show it.
- *
- * Ghosts carry an empty `file_path` and so take the first branch, leaving
- * their visibility to `showGhosts` where it belongs.
- */
-function diffUnknown(n: D3Node, args: ComputeArgs): FilterResult {
-  if (n.file_path && !args.diffScopes.has(n.file_path)) return 'visible';
-  return 'dimmed';
+/** The diff lookups `diffVerdict` needs, gathered off `ComputeArgs`. Cheap —
+ *  four field reads, no copying — so it is built per call rather than
+ *  threaded through as a fifth shape. */
+function diffFactsOf(args: ComputeArgs): DiffFacts {
+  return {
+    statuses: args.diffStatuses,
+    sourceChanged: args.diffSourceChanged,
+    scopes: args.diffScopes,
+    headIsWorking: args.diffHeadIsWorking,
+  };
 }
 
 /**
@@ -361,6 +373,8 @@ function isChangedLink(
  *  every other filter. */
 interface DiffLevelResult {
   visible: Set<string>;
+  /** Of `visible`, what the rung recruited rather than the seed (UI-112). */
+  context: Set<string>;
   dimmed: Set<string>;
   /** Link keys the diff reported as new — the whole edge budget at `edits`
    *  and `rewiring`, and merely decorative at `neighbourhood`. */
@@ -394,14 +408,24 @@ function applyDiffLevel(
     levelEdges.push({ src, tgt, changed });
   }
 
+  // The seed, split by the facet on the way in (UI-109). Narrowing it here
+  // rather than after the ladder is what makes `new` + `neighbourhood` mean
+  // "what the new code plugs into": every rung grows the seed, so a seed of
+  // new entities recruits their context and keeps it. Filtering the drawn set
+  // instead would delete half of that context back out, and the far end of a
+  // changed edge has no facet of its own to be judged by.
   const byId = new Map(graph.nodes.map((n) => [n.id, n]));
-  const edits = new Set<string>();
+  const facts = diffFactsOf(args);
+  const edits = new Map<string, EditKind>();
   for (const id of candidates) {
     const n = byId.get(id);
-    if (n && isEdit(n, args)) edits.add(id);
+    if (!n) continue;
+    const kind = editKind(n, facts);
+    if (kind) edits.set(id, kind);
   }
 
-  const plan = planDiffLevel(args.diffLevel, candidates, edits, levelEdges);
+  const { seed, excluded } = splitEdits(args.diffSeedFacet, edits);
+  const plan = planDiffLevel(args.diffLevel, candidates, seed, levelEdges, excluded);
   return { ...plan, changedLinkKeys };
 }
 
@@ -441,9 +465,11 @@ function bfsDistances(graph: GraphData, start: string, args: ComputeArgs): Map<s
       const sameLevel: string[] = [];
       const consider = (link: D3Link, neighborId: string) => {
         if (distances.has(neighborId)) return;
+        if (!linkTraversable(link, args)) return;
         if (!resolveRelType(args.lo, lvl, link.kind_raw, args.rels)) return;
         const node = nodeById.get(neighborId);
         if (!node) return;
+        if (bodyHidden(node, args)) return;
         if (!resolveEntityType(args.lo, lvl, node.kind_raw, args.kinds)) return;
         const isGhost = node.tags?.includes('ghost');
         if (!isGhost && !args.files.has(node.file_path)) return;
@@ -547,11 +573,17 @@ function computeTreePositions(graph: GraphData, args: ComputeArgs): {
         if (visited.has(tgt)) {
           continue;
         }
+        if (!linkTraversable(l, args)) {
+          continue;
+        }
         if (!resolveRelType(args.lo, lvl, l.kind_raw, args.rels)) {
           continue;
         }
         const node = nodeById.get(tgt);
         if (!node) {
+          continue;
+        }
+        if (bodyHidden(node, args)) {
           continue;
         }
         if (!resolveEntityType(args.lo, lvl, node.kind_raw, args.kinds)) {
@@ -608,9 +640,11 @@ function computeTreePositions(graph: GraphData, args: ComputeArgs): {
       for (const l of inn.get(cur) ?? []) {
         const src = sourceIdOf(l);
         if (visited.has(src)) continue;
+        if (!linkTraversable(l, args)) continue;
         if (!resolveRelType(args.lo, lvl, l.kind_raw, args.rels)) continue;
         const node = nodeById.get(src);
         if (!node) continue;
+        if (bodyHidden(node, args)) continue;
         if (!resolveEntityType(args.lo, lvl, node.kind_raw, args.kinds)) continue;
         const isGhost = node.tags?.includes('ghost');
         if (!isGhost && !args.files.has(node.file_path)) continue;
@@ -892,6 +926,7 @@ function compute(args: ComputeArgs): DisplayPlan {
     // Add TakesParam edges
     for (const l of graph.links) {
       const s = sourceIdOf(l), t = targetIdOf(l);
+      if (l.lifted_from) continue;
       if (visibleNodeIds.has(s) && visibleNodeIds.has(t)) {
         if (l.kind_raw === 'TakesParam') {
           visibleLinkKeys.add(linkKey(s, t, l.kind_raw, l.order));
@@ -951,6 +986,7 @@ function compute(args: ComputeArgs): DisplayPlan {
     // connected to the class.
     for (const l of graph.links) {
       const s = sourceIdOf(l), t = targetIdOf(l);
+      if (l.lifted_from) continue;
       if (!visibleNodeIds.has(s) || !visibleNodeIds.has(t)) continue;
       if (l.kind_raw !== 'Contains') continue;
       // Only the class→field direction; other Contains (class→method)
@@ -964,15 +1000,106 @@ function compute(args: ComputeArgs): DisplayPlan {
     }
   };
 
+  // The shape view, before every filter below it.
+  //
+  // Nothing here narrows: `graphData` was already aggregated through the
+  // picture's own resolvers, so everything on the canvas is either a child
+  // of the folder or one of its one-hop neighbours, and the kind, language
+  // and file filters have nothing left to say about a set of nine circles
+  // the reader asked for by name. Running them anyway is how a reader who
+  // unticked `File` in some earlier scope opens a folder and sees nothing.
+  if (args.picture) {
+    const { positions } = shapePlacement(args.picture);
+    const byPath = new Map(graph.nodes.map((n) => [n.original_id, n]));
+    const shapePositions = new Map<string, { x: number; y: number }>();
+    for (const [path, pos] of positions) {
+      const node = byPath.get(path);
+      if (node) shapePositions.set(node.id, pos);
+    }
+    // A node the placement does not name would sit at the origin, under
+    // whatever is drawn there — so it is dropped rather than piled up.
+    const nodeIds = new Set(shapePositions.keys());
+    // Only the edges the picture has a reading for. Two outsiders that
+    // depend on each other are both on screen and the line between them is
+    // real, but it is not about this folder — the picture describes the
+    // child graph and the boundary traffic, and nothing else. Measured on
+    // `src/mcp`: 43 such lines against 31 that carry a verdict, so left in
+    // they would be most of the drawing, in a colour that means nothing,
+    // crossing the part that does. That is the entanglement this view
+    // exists to get out of.
+    const verdicts = shapeEdgeVerdicts(args.picture);
+    const pathOf = new Map(graph.nodes.map((n) => [n.id, n.original_id]));
+    const visibleLinkKeys = new Set<string>();
+    for (const l of graph.links) {
+      const s = sourceIdOf(l), t = targetIdOf(l);
+      if (!nodeIds.has(s) || !nodeIds.has(t)) continue;
+      if (!verdictFor(verdicts, pathOf.get(s) ?? '', pathOf.get(t) ?? '')) continue;
+      visibleLinkKeys.add(linkKey(s, t, l.kind_raw, l.order));
+    }
+    return {
+      ...emptyPlan(),
+      mode: 'shape',
+      visibleNodeIds: nodeIds,
+      visibleLinkKeys,
+      selectedId: selectionInGraph ? selected!.id : null,
+      treePositions: shapePositions,
+      searchMatched: args.searchMatched,
+      searchNeighbors: args.searchNeighbors,
+    };
+  }
+
   if (wantsTree) {
     const { positions, levels, nodeIds } = computeTreePositions(graph, args);
+    // The diff ladder, over the reach the tree just computed.
+    //
+    // It used to run in force mode alone, and `wantsTree` is
+    // `viewMode === 'tree' && selectionInGraph` — so in tree view the rungs
+    // worked until the reader selected something and silently stopped the
+    // moment they did. Same control, same click, opposite result, with the
+    // strip above the canvas still claiming the diff was filtering.
+    //
+    // The reach is the candidate set, exactly as `filterOk` is in force mode,
+    // so the ladder can only ever narrow what the tree already drew — a node
+    // outside the selection's hops cannot reappear because a changed edge
+    // points at it. The root is exempt: a tree is rooted at its selection, and
+    // dropping that node because it happens not to be an edit leaves a layout
+    // with nothing at the origin.
+    let treeVisible = nodeIds;
+    const treeDimmed = new Set<string>();
+    const treeContext = new Set<string>();
+    let treeChangedLinks: Set<string> | null = null;
+    if (args.diffIsActive && args.diffFiltersOn) {
+      const level = applyDiffLevel(graph, nodeIds, args);
+      treeVisible = level.visible;
+      treeVisible.add(selected!.id);
+      for (const id of level.dimmed) {
+        if (id !== selected!.id) treeDimmed.add(id);
+      }
+      // The root is exempt from the context weighting for the same reason it
+      // is exempt from the rung: a tree is rooted at its selection, and the
+      // one node the reader pointed at is not background whatever the diff
+      // says about it.
+      for (const id of level.context) {
+        if (id !== selected!.id) treeContext.add(id);
+      }
+      if (level.changedEdgesOnly) treeChangedLinks = level.changedLinkKeys;
+    }
     // Edge classification mirrors the old applyTreeLayout logic so the
     // direct / same-level / cross-level visibility toggles still apply.
     const nodeKind = new Map(graph.nodes.map((n) => [n.id, n.kind_raw]));
     const visibleLinkKeys = new Set<string>();
     for (const l of graph.links) {
       const s = sourceIdOf(l), t = targetIdOf(l);
-      if (!nodeIds.has(s) || !nodeIds.has(t)) {
+      if (!treeVisible.has(s) || !treeVisible.has(t)) {
+        continue;
+      }
+      if (!linkDrawable(l, treeVisible, args)) {
+        continue;
+      }
+      // Below `neighbourhood` an edge has to have moved to earn a line, the
+      // same rule force mode applies. Without it the tree drew every untouched
+      // call between two changed nodes and called that a diff.
+      if (treeChangedLinks && !treeChangedLinks.has(linkKey(s, t, l.kind_raw, l.order))) {
         continue;
       }
       const sLevel = levels.get(s)!;
@@ -996,12 +1123,12 @@ function compute(args: ComputeArgs): DisplayPlan {
       visibleLinkKeys.add(linkKey(s, t, l.kind_raw, l.order));
     }
     // Inject parameter nodes for the selected callable.
-    injectParams(nodeIds, visibleLinkKeys, positions, levels);
+    injectParams(treeVisible, visibleLinkKeys, positions, levels);
     // Inject class-field Variables as a left-side column for a class.
-    injectClassFields(nodeIds, visibleLinkKeys, positions, levels);
+    injectClassFields(treeVisible, visibleLinkKeys, positions, levels);
     return {
       mode: 'tree',
-      visibleNodeIds: nodeIds,
+      visibleNodeIds: treeVisible,
       visibleLinkKeys,
       selectedId: selected!.id,
       treePositions: positions,
@@ -1009,8 +1136,12 @@ function compute(args: ComputeArgs): DisplayPlan {
       searchMatched: args.searchMatched,
       searchNeighbors: args.searchNeighbors,
       demotedHubIds: new Set(),
-    dimmedNodeIds: new Set(),
-      dimOpacity: 0,
+      dimmedNodeIds: treeDimmed,
+      // The Rest slider has to reach here too, or the ladder's only setting in
+      // tree view is "gone" and there is no way to keep the rest as context.
+      dimOpacity: args.diffDim,
+      contextNodeIds: treeContext,
+      contextOpacity: treeContext.size > 0 ? args.diffContext : 1,
       overflow: null,
     };
   }
@@ -1027,10 +1158,12 @@ function compute(args: ComputeArgs): DisplayPlan {
   // The diff ladder narrows what survived the other filters, and says whether
   // untouched wiring may be drawn between what is left (UI-088).
   let changedLinkKeys: Set<string> | null = null;
+  let contextIds = new Set<string>();
   if (args.diffIsActive && args.diffFiltersOn) {
     const level = applyDiffLevel(graph, filterOk, args);
     for (const id of level.dimmed) dimmedIds.add(id);
     filterOk = level.visible;
+    contextIds = level.context;
     if (level.changedEdgesOnly) changedLinkKeys = level.changedLinkKeys;
   }
 
@@ -1044,6 +1177,24 @@ function compute(args: ComputeArgs): DisplayPlan {
       if (filterOk.has(id) || id === selected!.id) restricted.add(id);
     }
     visibleNodeIds = restricted;
+    // The dimmed set is subject to the selection too.
+    //
+    // It is built above from the *whole* graph, before the BFS exists, while
+    // `visibleNodeIds` is intersected with the reach here — so the two were
+    // answering the selection differently. The View draws anything dimmed once
+    // `dimOpacity > 0`, which meant raising the Rest slider on a focused canvas
+    // faded in the entire scope, most of it nowhere near the selection: a
+    // filter the reader had applied, reappearing through a control that only
+    // claims to change how visible the *rest of this view* is.
+    for (const id of [...dimmedIds]) {
+      if (!nodeDistances.has(id)) dimmedIds.delete(id);
+    }
+    // Same intersection for the context tier, for the plainer reason that a
+    // node the selection removed is not drawn at all: leaving it here would
+    // have the View weighting nodes that aren't on screen.
+    for (const id of [...contextIds]) {
+      if (!visibleNodeIds.has(id)) contextIds.delete(id);
+    }
   }
 
   // UI-056. Ranked over what is actually drawn, not over the repo: whether a
@@ -1060,6 +1211,7 @@ function compute(args: ComputeArgs): DisplayPlan {
   for (const l of graph.links) {
     const s = sourceIdOf(l), t = targetIdOf(l);
     if (!visibleNodeIds.has(s) || !visibleNodeIds.has(t)) continue;
+    if (!linkDrawable(l, visibleNodeIds, args)) continue;
     if (!args.rels.has(l.kind_raw)) continue;
     // Below `neighbourhood`, an edge has to have moved to earn a line. This
     // is the whole point of the ladder: three quarters of what the old view
@@ -1124,6 +1276,10 @@ function compute(args: ComputeArgs): DisplayPlan {
     dimOpacity: args.searchMatched.size > 0 && !args.searchHides
       ? Math.max(args.searchDim, args.diffDim)
       : args.diffDim,
+    contextNodeIds: contextIds,
+    // Nothing recruited, nothing to weight — and `1` keeps every other reason
+    // a node is drawn out of this tier's reach.
+    contextOpacity: contextIds.size > 0 ? args.diffContext : 1,
     overflow: null,
     };
 }
@@ -1136,14 +1292,14 @@ export const displayPlan: Readable<DisplayPlan> = derived(
     showDirectEdges, showCrossLevelEdges,
     searchMatchIds, searchNeighborIds,
     viewportWidth, treeDensity, treeMaxDepth,
-    diffActive, diffLevel, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges,
-    diffChangedEdges, diffAddedEntityIds,
+    diffActive, diffLevel, diffSeedFacet, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges,
+    diffChangedEdges, diffAddedEntityIds, diffHeadIsWorking,
     showGhostNodes, showBuiltinGhosts, showTemplateVars,
-    searchHidesNonMatches, searchDimOpacity, diffDimOpacity,
-    demoteHubs, hubCount,
-    splitViewOpen, crossFilterPaths,
+    searchHidesNonMatches, searchDimOpacity, diffDimOpacity, diffContextOpacity,
+    structureOnly, demoteHubs, hubCount,
+    splitViewOpen, crossFilterPaths, shapePicture,
   ],
-  ([$g, $sel, $vm, $kinds, $rels, $langs, $files, $genOut, $genIn, $lo, $sde, $scle, $sm, $sn, $vpW, $den, $dep, $diffAct, $diffLvl, $diffFilt, $diffStat, $diffSrc, $diffScopes, $diffEdges, $diffAdded, $ghosts, $builtinGhosts, $templateVars, $searchHides, $searchDim, $diffDim, $demoteHubs, $hubCount, $splitView, $crossPaths]) => {
+  ([$g, $sel, $vm, $kinds, $rels, $langs, $files, $genOut, $genIn, $lo, $sde, $scle, $sm, $sn, $vpW, $den, $dep, $diffAct, $diffLvl, $diffFacet, $diffFilt, $diffStat, $diffSrc, $diffScopes, $diffEdges, $diffAdded, $diffHeadWorking, $ghosts, $builtinGhosts, $templateVars, $searchHides, $searchDim, $diffDim, $diffContext, $structureOnly, $demoteHubs, $hubCount, $splitView, $crossPaths, $picture]) => {
     // The plan is always computed. The render gate is applied to its result
     // rather than in front of it (UI-061): every filter above narrows
     // `visibleNodeIds`, so gating on that count is what makes filtering a
@@ -1173,19 +1329,30 @@ export const displayPlan: Readable<DisplayPlan> = derived(
       // can be loaded and coloured with no filtering at all.
       diffFiltersOn: $diffFilt,
       diffLevel: $diffLvl,
+      diffSeedFacet: $diffFacet,
       diffStatuses: $diffStat,
       diffSourceChanged: $diffSrc,
       diffScopes: $diffScopes,
       diffAddedEdges: $diffEdges.added,
       diffAddedEntities: $diffAdded,
+      diffHeadIsWorking: $diffHeadWorking,
       showGhosts: $ghosts,
       showBuiltinGhosts: $builtinGhosts,
       showTemplateVars: $templateVars,
+      structureOnly: $structureOnly,
+      // The selection's own body is exempt. Read off the *store* rather than
+      // off the plan's `selectionInGraph`, because the two disagree in the one
+      // case that matters: a callable selected while the canvas is collapsed
+      // to files is not "in the graph", and its body is not on screen to be
+      // exempted either — so the value is harmless there and correct here.
+      exemptBody: $sel?.original_id ?? null,
       searchHides: $searchHides,
       searchDim: $searchDim,
       diffDim: $diffDim,
+      diffContext: $diffContext,
       splitView: $splitView,
       crossFilterPaths: $crossPaths,
+      picture: $vm === 'shape' ? $picture : null,
     }));
   },
 );
@@ -1232,7 +1399,48 @@ export const displaySearchMatches: Readable<D3Node[]> = derived(
   },
 );
 
-export const displaySearchMatchIds: Readable<Set<string>> = derived(
-  displaySearchMatches,
-  ($matches) => new Set($matches.map((n) => n.id)),
+// --- Picking within the display search ---
+//
+// The result list used to offer exactly one gesture: click a row, and the
+// node becomes `selectedNode`. That is a graph selection — it narrows the
+// canvas to the node's BFS reach, which changes `visibleNodeIds`, which is
+// what this search matches against. So choosing a result rewrote the list
+// it was chosen from, and a second choice replaced the first. There was no
+// way to say "these three, and leave the view alone".
+//
+// Picking is that way. It is a view-only overlay, like the highlight it
+// drives: it writes no filter, moves no camera and touches no selection, so
+// the list a reader is picking from holds still while they pick.
+export const displaySearchPicked = writable<Set<string>>(new Set());
+
+/** Tick or untick a run of rows in one write, so the canvas re-marks once
+ *  rather than once per row. */
+export function setDisplaySearchPicks(ids: string[], picked: boolean): void {
+  displaySearchPicked.update((s) => {
+    const next = new Set(s);
+    for (const id of ids) {
+      if (picked) next.add(id);
+      else next.delete(id);
+    }
+    return next;
+  });
+}
+
+export function clearDisplaySearchPicks(): void {
+  displaySearchPicked.set(new Set());
+}
+
+/** What the canvas marks: every match until the reader picks, then the
+ *  picks. See `pickedHighlight` for why an empty intersection stays empty. */
+export const displaySearchHighlightIds: Readable<Set<string>> = derived(
+  [displaySearchMatches, displaySearchPicked],
+  ([$matches, $picked]) => pickedHighlight($matches.map((n) => n.id), $picked),
 );
+
+// Emptying the box ends the search, and picks against a search nobody is
+// running would silently narrow the next one. Picks survive an *edit*,
+// though — the ids stay meaningful, and the intersection above drops the
+// ones the new term no longer matches.
+displaySearchTerm.subscribe((term) => {
+  if (term.trim() === '') clearDisplaySearchPicks();
+});

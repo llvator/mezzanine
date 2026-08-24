@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Regenerate the Repo Health table in README.md.
 
-Runs `nao analyze` on `src/`, computes a small set of summary metrics,
-and rewrites the sentinel-bracketed block in `README.md`.
+Runs `nao analyze` over `src/` **as staged**, computes a small set of
+summary metrics, and rewrites the sentinel-bracketed block in `README.md`.
 
-Idempotent: re-running on an unchanged tree produces a byte-identical
+Staged, not on disk: the table travels inside a commit and so has to
+describe that commit's tree. Measuring the working tree publishes numbers
+for code that is not being committed and may never be — see `staged_src`.
+Run by hand with nothing staged and it reports on `HEAD`, which is the
+same rule.
+
+Idempotent: re-running on an unchanged index produces a byte-identical
 README.md, so the pre-commit hook only stages a change when the metrics
 actually moved.
 
@@ -21,6 +27,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 START_SENTINEL = "<!-- repo-health:start -->"
@@ -124,13 +131,53 @@ def update_readme(readme_path: Path, new_block: str) -> bool:
     return True
 
 
-def run_nao(root: Path, output: Path) -> None:
-    """Run nao via cargo so cargo decides whether to rebuild."""
+def staged_src(root: Path, dest: Path) -> Path | None:
+    """Extract `src/` **as staged** into `dest`, or `None` if git can't.
+
+    The table has to describe the commit being made, which is the index —
+    not the working tree. They differ constantly: a commit touching one
+    file while an unrelated refactor sits unstaged next to it would
+    otherwise publish metrics for code that is not in the repository. That
+    happened three times in one afternoon, each time writing a figure into
+    a commit that matched neither its own tree nor `HEAD`.
+
+    `write-tree` fails on an unmerged index (mid-merge, mid-rebase), which
+    is the one case where falling back to the working tree is better than
+    refusing to commit.
+    """
+    tree = subprocess.run(
+        ["git", "write-tree"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if tree.returncode != 0:
+        return None
+    tar = dest / "staged.tar"
+    written = subprocess.run(
+        ["git", "archive", "--format=tar", "-o", str(tar), tree.stdout.strip(), "src"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if written.returncode != 0:
+        return None
+    subprocess.run(["tar", "-xf", str(tar), "-C", str(dest)], check=True)
+    return dest / "src"
+
+
+def run_nao(root: Path, target: Path, output: Path) -> None:
+    """Run nao via cargo so cargo decides whether to rebuild.
+
+    Built from the working tree, pointed at `target`. The binary should be
+    the newest one available; what it *measures* is the argument.
+    """
     with output.open("w") as f:
         subprocess.run(
             [
                 "cargo", "run", "--release", "--quiet", "--bin", "nao", "--",
-                "analyze", "-f", "json", "-l", "rust", "src/",
+                "analyze", "-f", "json", "-l", "rust", str(target),
             ],
             cwd=root,
             stdout=f,
@@ -146,7 +193,17 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "repo_health.json"
 
-    run_nao(root, tmp)
+    with tempfile.TemporaryDirectory(prefix="repo-health-") as staging:
+        target = staged_src(root, Path(staging))
+        if target is None:
+            print(
+                "note: index unreadable (mid-merge?) — measuring the working "
+                "tree instead, which may not match this commit.",
+                file=sys.stderr,
+            )
+            target = root / "src"
+        run_nao(root, target, tmp)
+
     metrics = collect_metrics(tmp)
     block = render(metrics)
     changed = update_readme(readme, block)

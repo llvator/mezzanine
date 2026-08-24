@@ -132,13 +132,20 @@ unused
     tmp.write("content/java/rules/bad.md", body);
 
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
-    assert_eq!(educator.rules().len(), 0, "unknown predicate must drop the rule");
+    assert_eq!(
+        educator.rules().len(),
+        0,
+        "unknown predicate must drop the rule"
+    );
     let errors: Vec<_> = educator
         .issues()
         .iter()
         .filter(|i| i.severity == LoadIssueSeverity::Error)
         .collect();
-    assert!(!errors.is_empty(), "issue list must report the unknown predicate");
+    assert!(
+        !errors.is_empty(),
+        "issue list must report the unknown predicate"
+    );
     let msg = &errors[0].message;
     assert!(
         msg.contains("matches"),
@@ -170,7 +177,11 @@ unused
     let issue = &educator.issues()[0];
     assert_eq!(issue.field.as_deref(), Some("applies-to"));
     assert!(
-        issue.suggestion.as_deref().unwrap_or("").contains("synchronized_statement"),
+        issue
+            .suggestion
+            .as_deref()
+            .unwrap_or("")
+            .contains("synchronized_statement"),
         "suggestion should point at the real kind, got: {:?}",
         issue.suggestion
     );
@@ -198,12 +209,10 @@ unused
 
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
     assert_eq!(educator.rules().len(), 0);
-    assert!(
-        educator
-            .issues()
-            .iter()
-            .any(|i| i.field.as_deref() == Some("match.not_a_real_attr"))
-    );
+    assert!(educator
+        .issues()
+        .iter()
+        .any(|i| i.field.as_deref() == Some("match.not_a_real_attr")));
 }
 
 #[test]
@@ -252,13 +261,10 @@ kind: gotcha
 
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
     assert_eq!(educator.rules().len(), 1, "rule must be kept");
-    assert!(
-        educator
-            .issues()
-            .iter()
-            .any(|i| i.severity == LoadIssueSeverity::Warning
-                && i.field.as_deref() == Some("body"))
-    );
+    assert!(educator
+        .issues()
+        .iter()
+        .any(|i| i.severity == LoadIssueSeverity::Warning && i.field.as_deref() == Some("body")));
 }
 
 /// Load the real `content/java/` corpus that ships in the repo. End-to-end
@@ -296,9 +302,7 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate_last(source, "==");
-    let resp = educator
-        .query_position(&file, line, col + 1)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col + 1).unwrap();
     assert!(
         resp.specific.iter().any(|r| r.rule_id == "boxed-equality"),
         "expected boxed-equality to fire, specific={:?}",
@@ -321,9 +325,7 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate_last(source, "==");
-    let resp = educator
-        .query_position(&file, line, col + 1)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col + 1).unwrap();
     assert!(
         !resp.specific.iter().any(|r| r.rule_id == "boxed-equality"),
         "primitive int compare must not fire boxed-equality"
@@ -344,11 +346,11 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "finalize() throws");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "finalize-deprecated"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "finalize-deprecated"),
         "expected finalize-deprecated to fire, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -365,11 +367,12 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "foo() {");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "finalize-deprecated"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "finalize-deprecated"),
         "must not fire on non-finalize methods"
     );
 }
@@ -394,7 +397,9 @@ public class C {
         .query_position(&file, line, col + "Arrays.".len() as u32)
         .unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "arrays-aslist-mutability"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "arrays-aslist-mutability"),
         "expected arrays-aslist-mutability to fire, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -413,11 +418,12 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "valueOf");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "arrays-aslist-mutability"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "arrays-aslist-mutability"),
         "must not fire on String.valueOf"
     );
 }
@@ -436,11 +442,11 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "List items");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "raw-types-warning"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "raw-types-warning"),
         "expected raw-types-warning to fire on bare List, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -460,11 +466,12 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "List<String>");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "raw-types-warning"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "raw-types-warning"),
         "must not fire on parameterised List<String>"
     );
 }
@@ -480,9 +487,7 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "synchronized");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
         resp.specific
             .iter()
@@ -503,11 +508,10 @@ public class C {
 "#;
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "void");
-    let resp = educator
-        .query_position(&file, line, col)
-        .unwrap();
+    let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific
+        !resp
+            .specific
             .iter()
             .any(|r| r.rule_id == "synchronized-method-on-this"),
         "must not fire on non-synchronized method"
@@ -530,7 +534,9 @@ public class Point {
     let (line, col) = locate(source, "class Point");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "equals-without-hashcode"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "equals-without-hashcode"),
         "expected equals-without-hashcode to fire, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -550,7 +556,10 @@ public class Point {
     let (line, col) = locate(source, "class Point");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "equals-without-hashcode"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "equals-without-hashcode"),
         "must not fire when both are present"
     );
 }
@@ -568,7 +577,9 @@ public class Config {
     let (line, col) = locate(source, "maxRetries");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "public-mutable-static-field"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "public-mutable-static-field"),
         "expected public-mutable-static-field, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -587,7 +598,10 @@ public class Config {
     let (line, col) = locate(source, "DEFAULT");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "public-mutable-static-field"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "public-mutable-static-field"),
         "must not fire on public static final"
     );
 }
@@ -629,7 +643,8 @@ public class C {
     let (line, col) = locate(source, "@Override");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific
+        !resp
+            .specific
             .iter()
             .any(|r| r.rule_id == "prefer-constructor-injection"),
         "must not fire on @Override"
@@ -649,7 +664,9 @@ public class C {
     let (line, col) = locate(source, "parse(String");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "checked-exception-over-use"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "checked-exception-over-use"),
         "expected checked-exception-over-use, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -668,7 +685,10 @@ public class C {
     let (line, col) = locate(source, "parse(String");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "checked-exception-over-use"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "checked-exception-over-use"),
         "must not fire when no throws clause"
     );
 }
@@ -692,7 +712,9 @@ public class C {
     let (line, col) = locate(source, "try {");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "try-with-resources-opportunity"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "try-with-resources-opportunity"),
         "expected try-with-resources-opportunity, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -715,7 +737,10 @@ public class C {
     let (line, col) = locate(source, "try (");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "try-with-resources-opportunity"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "try-with-resources-opportunity"),
         "must not fire on try-with-resources form"
     );
 }
@@ -729,7 +754,9 @@ fn legacy_date_time_fires() {
     let (line, col) = locate(source, "Date created");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "legacy-date-time"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "legacy-date-time"),
         "expected legacy-date-time, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -739,12 +766,16 @@ fn legacy_date_time_fires() {
 fn legacy_date_time_silent_on_java_time() {
     let educator = load_repo_corpus();
     let tmp = TmpDir::new("modern-date");
-    let source = "package com.example;\nimport java.time.Instant;\npublic class C { Instant created; }\n";
+    let source =
+        "package com.example;\nimport java.time.Instant;\npublic class C { Instant created; }\n";
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "Instant created");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "legacy-date-time"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "legacy-date-time"),
         "java.time.Instant must not fire legacy-date-time"
     );
 }
@@ -753,12 +784,15 @@ fn legacy_date_time_silent_on_java_time() {
 fn legacy_thread_safe_collections_fires() {
     let educator = load_repo_corpus();
     let tmp = TmpDir::new("legacy-vector");
-    let source = "package com.example;\nimport java.util.Vector;\npublic class C { Vector recent; }\n";
+    let source =
+        "package com.example;\nimport java.util.Vector;\npublic class C { Vector recent; }\n";
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "Vector recent");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "legacy-thread-safe-collections"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "legacy-thread-safe-collections"),
         "expected legacy-thread-safe-collections, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -773,7 +807,9 @@ fn prefer_interface_fires_on_concrete_variable() {
     let (line, col) = locate(source, "ArrayList<String>");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "prefer-interface-as-variable-type"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-interface-as-variable-type"),
         "expected prefer-interface-as-variable-type, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -783,12 +819,16 @@ fn prefer_interface_fires_on_concrete_variable() {
 fn prefer_interface_silent_on_interface_variable() {
     let educator = load_repo_corpus();
     let tmp = TmpDir::new("interface-already");
-    let source = "package com.example;\nimport java.util.List;\npublic class C { List<String> names; }\n";
+    let source =
+        "package com.example;\nimport java.util.List;\npublic class C { List<String> names; }\n";
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "List<String>");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "prefer-interface-as-variable-type"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-interface-as-variable-type"),
         "interface declarations must not fire prefer-interface-as-variable-type"
     );
 }
@@ -799,12 +839,16 @@ fn prefer_interface_silent_on_raw_concrete() {
     // prefer-interface-as-variable-type must not double-fire on the same case.
     let educator = load_repo_corpus();
     let tmp = TmpDir::new("raw-concrete");
-    let source = "package com.example;\nimport java.util.ArrayList;\npublic class C { ArrayList names; }\n";
+    let source =
+        "package com.example;\nimport java.util.ArrayList;\npublic class C { ArrayList names; }\n";
     let file = tmp.write("C.java", source);
     let (line, col) = locate(source, "ArrayList names");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "prefer-interface-as-variable-type"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-interface-as-variable-type"),
         "raw ArrayList (no <T>) must not fire prefer-interface (raw-types-warning handles it)"
     );
 }
@@ -824,7 +868,9 @@ public class C {
     let (line, col) = locate(source, "printStackTrace");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "exception-printstacktrace"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "exception-printstacktrace"),
         "expected exception-printstacktrace, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -850,7 +896,9 @@ public class C {
         .query_position(&file, line, col + "lock.".len() as u32)
         .unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "wait-notify-low-level"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "wait-notify-low-level"),
         "expected wait-notify-low-level, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -873,7 +921,9 @@ public class C {
     let (line, col) = locate(source, "synchronizedMap");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "prefer-concurrent-collections"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-concurrent-collections"),
         "expected prefer-concurrent-collections, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -966,7 +1016,9 @@ public interface R {
     let (line, col) = locate(source, "foo()");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "default-method-in-interface"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "default-method-in-interface"),
         "expected default-method-in-interface to fire, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -985,7 +1037,10 @@ public class C {
     let (line, col) = locate(source, "foo()");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "default-method-in-interface"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "default-method-in-interface"),
         "non-default method must not fire default-method-in-interface"
     );
 }
@@ -1005,7 +1060,9 @@ public class C {
     let (line, col) = locate(source, "println");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "system-out-println"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "system-out-println"),
         "expected system-out-println, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -1079,7 +1136,8 @@ public class C {
     let (line, col) = locate(source, "ArrayList<String>");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific
+        !resp
+            .specific
             .iter()
             .any(|r| r.rule_id == "prefer-diamond-over-guava-lists"),
         "constructor form must not fire prefer-diamond-over-guava-lists"
@@ -1104,7 +1162,8 @@ public class C {
         .query_position(&file, line, col + "ImmutableList.".len() as u32)
         .unwrap();
     assert!(
-        !resp.specific
+        !resp
+            .specific
             .iter()
             .any(|r| r.rule_id == "prefer-diamond-over-guava-lists"),
         "ImmutableList.of must not fire prefer-diamond-over-guava-lists \
@@ -1159,14 +1218,22 @@ level: beginner
 "#;
     tmp.write("content/java/lessons/bad.md", body);
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
-    assert_eq!(educator.lessons().len(), 0, "unknown kind must drop the lesson");
+    assert_eq!(
+        educator.lessons().len(),
+        0,
+        "unknown kind must drop the lesson"
+    );
     let issue = &educator
         .issues()
         .iter()
         .find(|i| i.field.as_deref() == Some("applies-to"))
         .expect("applies-to issue surfaced");
     assert!(
-        issue.suggestion.as_deref().unwrap_or("").contains("synchronized_statement"),
+        issue
+            .suggestion
+            .as_deref()
+            .unwrap_or("")
+            .contains("synchronized_statement"),
         "suggestion should point at the real kind, got: {:?}",
         issue.suggestion
     );
@@ -1187,14 +1254,15 @@ level: expert
 "#;
     tmp.write("content/java/lessons/oddlevel.md", body);
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
-    assert_eq!(educator.lessons().len(), 1, "lesson kept on warning-only issue");
-    assert!(
-        educator
-            .issues()
-            .iter()
-            .any(|i| i.severity == LoadIssueSeverity::Warning
-                && i.field.as_deref() == Some("level"))
+    assert_eq!(
+        educator.lessons().len(),
+        1,
+        "lesson kept on warning-only issue"
     );
+    assert!(educator
+        .issues()
+        .iter()
+        .any(|i| i.severity == LoadIssueSeverity::Warning && i.field.as_deref() == Some("level")));
 }
 
 #[test]
@@ -1203,7 +1271,11 @@ fn duplicate_lesson_ids_drop_both_copies() {
     tmp.write("content/java/lessons/a.md", TRY_LESSON);
     tmp.write("content/java/lessons/b.md", TRY_LESSON);
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
-    assert_eq!(educator.lessons().len(), 0, "both duplicates must be dropped");
+    assert_eq!(
+        educator.lessons().len(),
+        0,
+        "both duplicates must be dropped"
+    );
 }
 
 #[test]
@@ -1226,9 +1298,14 @@ public class C {
     let resp = educator.query_position(&file, line, col).unwrap();
 
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "try-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "try-fundamentals"),
         "expected try-fundamentals lesson, lessons={:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1261,7 +1338,11 @@ public class C {
     let (line, col) = locate(java_src, "int x");
     let resp = educator.query_position(&file, line, col).unwrap();
 
-    let count = resp.lessons.iter().filter(|l| l.lesson_id == "shared-lesson").count();
+    let count = resp
+        .lessons
+        .iter()
+        .filter(|l| l.lesson_id == "shared-lesson")
+        .count();
     assert_eq!(count, 1, "lesson must dedup across ancestor matches");
 }
 
@@ -1296,9 +1377,14 @@ public class Demo {
     let (line, col) = locate(source, "try {");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "try-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "try-statement-fundamentals"),
         "expected try-statement lesson from repo corpus, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1319,7 +1405,10 @@ public class C {
             .iter()
             .any(|l| l.lesson_id == "field-declaration-fundamentals"),
         "expected field-declaration-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1343,7 +1432,10 @@ public class C {
             .iter()
             .any(|l| l.lesson_id == "declared-type-fundamentals"),
         "expected declared-type-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1368,7 +1460,10 @@ public class C {
             .iter()
             .any(|l| l.lesson_id == "method-invocation-fundamentals"),
         "expected method-invocation-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1465,7 +1560,10 @@ public class C {
             .iter()
             .any(|l| l.lesson_id == "lambda-expression-fundamentals"),
         "expected lambda-expression-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1487,7 +1585,10 @@ public class C {
             .iter()
             .any(|l| l.lesson_id == "annotation-fundamentals"),
         "expected annotation-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1528,13 +1629,10 @@ why
 
     let educator = Educator::load(&tmp.0.join("content")).unwrap();
     assert_eq!(educator.rules().len(), 1, "rule must be kept");
-    assert!(
-        educator
-            .issues()
-            .iter()
-            .any(|i| i.severity == LoadIssueSeverity::Warning
-                && i.field.as_deref() == Some("kind"))
-    );
+    assert!(educator
+        .issues()
+        .iter()
+        .any(|i| i.severity == LoadIssueSeverity::Warning && i.field.as_deref() == Some("kind")));
 }
 
 #[test]
@@ -1605,7 +1703,11 @@ fn ancestor_stack_includes_class_and_method() {
 
     let resp = educator.query_position(&file, line, col).unwrap();
     let kinds: Vec<&str> = resp.stack.iter().map(|c| c.kind.as_str()).collect();
-    assert!(kinds.contains(&"synchronized_statement"), "kinds: {:?}", kinds);
+    assert!(
+        kinds.contains(&"synchronized_statement"),
+        "kinds: {:?}",
+        kinds
+    );
     assert!(kinds.contains(&"method_declaration"), "kinds: {:?}", kinds);
     assert!(kinds.contains(&"class_declaration"), "kinds: {:?}", kinds);
 }
@@ -1649,7 +1751,12 @@ public class C {
     let mut prev = (0u32, 0u32, String::new());
     for hit in &response.hits {
         let key = (hit.line, hit.col, hit.rule_id.clone());
-        assert!(key >= prev, "hits are not sorted: {:?} after {:?}", key, prev);
+        assert!(
+            key >= prev,
+            "hits are not sorted: {:?} after {:?}",
+            key,
+            prev
+        );
         prev = key;
     }
 
@@ -1677,9 +1784,7 @@ public class C {
 #[test]
 fn scan_non_java_returns_unknown() {
     let educator = Educator::empty();
-    let resp = educator
-        .scan_file(std::path::Path::new("foo.py"))
-        .unwrap();
+    let resp = educator.scan_file(std::path::Path::new("foo.py")).unwrap();
     assert_eq!(resp.language, "unknown");
     assert!(resp.hits.is_empty());
 }
@@ -1712,13 +1817,18 @@ fn java_catalog_on_disk_matches_registry() {
     // tells you which command to run.
     let specs = catalog::for_language("java").expect("java registered");
     let expected = catalog::render_catalog("java", specs);
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("content/java/construct-kinds.md");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content/java/construct-kinds.md");
     let actual = fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("could not read {}: {} — run `nao construct-kinds java`", path.display(), e)
+        panic!(
+            "could not read {}: {} — run `nao construct-kinds java`",
+            path.display(),
+            e
+        )
     });
     assert_eq!(
-        actual, expected,
+        actual,
+        expected,
         "{} is out of date — run `nao construct-kinds java` to regenerate",
         path.display(),
     );
@@ -1731,13 +1841,17 @@ fn java_index_on_disk_matches_renderer() {
     // without regenerating → this test names the exact command to run.
     let educator = load_repo_corpus();
     let expected = super::index::render_index(&educator, "java");
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("content/java/INDEX.md");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content/java/INDEX.md");
     let actual = fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("could not read {}: {} — run `nao educator-index java`", path.display(), e)
+        panic!(
+            "could not read {}: {} — run `nao educator-index java`",
+            path.display(),
+            e
+        )
     });
     assert_eq!(
-        actual, expected,
+        actual,
+        expected,
         "{} is out of date — run `nao educator-index java` to regenerate",
         path.display(),
     );
@@ -1812,9 +1926,14 @@ public class Service {
     let (line, col) = locate(source, "@Resource");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "annotation-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "annotation-fundamentals"),
         "expected annotation-fundamentals lesson to fire, lessons={:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1841,8 +1960,14 @@ public class C {
         .iter()
         .find(|i| i.kind == "annotation")
         .expect("@Override must surface as annotation");
-    assert_eq!(marker.attrs.get("name").map(String::as_str), Some("Override"));
-    assert_eq!(marker.attrs.get("is_marker").map(String::as_str), Some("true"));
+    assert_eq!(
+        marker.attrs.get("name").map(String::as_str),
+        Some("Override")
+    );
+    assert_eq!(
+        marker.attrs.get("is_marker").map(String::as_str),
+        Some("true")
+    );
 
     let (line_a, col_a) = locate(source, "@SuppressWarnings");
     let stack_a = educator.query_position(&file, line_a, col_a).unwrap().stack;
@@ -1850,8 +1975,14 @@ public class C {
         .iter()
         .find(|i| i.kind == "annotation")
         .expect("@SuppressWarnings must surface as annotation");
-    assert_eq!(annot.attrs.get("name").map(String::as_str), Some("SuppressWarnings"));
-    assert_eq!(annot.attrs.get("is_marker").map(String::as_str), Some("false"));
+    assert_eq!(
+        annot.attrs.get("name").map(String::as_str),
+        Some("SuppressWarnings")
+    );
+    assert_eq!(
+        annot.attrs.get("is_marker").map(String::as_str),
+        Some("false")
+    );
 }
 
 // ─── local_variable_declaration + primitive_type ─────────────────────────────
@@ -1905,7 +2036,10 @@ public class C {
         .iter()
         .find(|c| c.kind == "local_variable_declaration")
         .expect("local_variable_declaration in stack");
-    assert_eq!(decl.attrs.get("type_name").map(String::as_str), Some("boolean"));
+    assert_eq!(
+        decl.attrs.get("type_name").map(String::as_str),
+        Some("boolean")
+    );
     assert_eq!(decl.attrs.get("is_final").map(String::as_str), Some("true"));
 }
 
@@ -2037,7 +2171,10 @@ public class C {
         .find(|c| c.kind == "if_statement")
         .expect("if_statement in stack");
     assert_eq!(
-        if_node.attrs.get("consequence_is_block").map(String::as_str),
+        if_node
+            .attrs
+            .get("consequence_is_block")
+            .map(String::as_str),
         Some("true"),
     );
     assert_eq!(
@@ -2067,7 +2204,9 @@ public class C {
     let (line, col) = locate(source, "if (d == 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "if-without-braces"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "if-without-braces"),
         "expected if-without-braces to fire, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -2091,7 +2230,10 @@ public class C {
     let (line, col) = locate(source, "if (d == 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "if-without-braces"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "if-without-braces"),
         "braced if must not fire if-without-braces"
     );
 }
@@ -2150,7 +2292,9 @@ public class C {
     let (line, col) = locate(source, "if (x > 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "else-without-braces"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "else-without-braces"),
         "expected else-without-braces, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -2177,7 +2321,10 @@ public class C {
     let (line, col) = locate(source, "if (x > 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "else-without-braces"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "else-without-braces"),
         "else-if chain must not fire else-without-braces"
     );
 }
@@ -2202,7 +2349,9 @@ public class C {
     let (line, col) = locate(source, "if (order.isActive())");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "nested-if-could-be-and"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "nested-if-could-be-and"),
         "expected nested-if-could-be-and, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -2229,7 +2378,10 @@ public class C {
     let (line, col) = locate(source, "if (order.isActive())");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "nested-if-could-be-and"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "nested-if-could-be-and"),
         "merge changes semantics when outer has else — must not fire"
     );
 }
@@ -2255,7 +2407,10 @@ public class C {
     let (line, col) = locate(source, "if (order.isActive())");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "nested-if-could-be-and"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "nested-if-could-be-and"),
         "inner with else can't be merged via && — must not fire"
     );
 }
@@ -2287,7 +2442,10 @@ public class C {
         .find(|c| c.kind == "if_statement")
         .expect("if_statement in stack");
     assert_eq!(
-        if_node.attrs.get("condition_complexity").map(String::as_str),
+        if_node
+            .attrs
+            .get("condition_complexity")
+            .map(String::as_str),
         Some("simple"),
     );
 
@@ -2299,7 +2457,10 @@ public class C {
         .find(|c| c.kind == "if_statement")
         .expect("if_statement in stack");
     assert_eq!(
-        if_node.attrs.get("condition_complexity").map(String::as_str),
+        if_node
+            .attrs
+            .get("condition_complexity")
+            .map(String::as_str),
         Some("compound"),
     );
 
@@ -2311,7 +2472,10 @@ public class C {
         .find(|c| c.kind == "if_statement")
         .expect("if_statement in stack");
     assert_eq!(
-        if_node.attrs.get("condition_complexity").map(String::as_str),
+        if_node
+            .attrs
+            .get("condition_complexity")
+            .map(String::as_str),
         Some("long"),
     );
 }
@@ -2361,7 +2525,8 @@ public class C {
     let (line, col) = locate(source, "if (!forced");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific
+        !resp
+            .specific
             .iter()
             .any(|r| r.rule_id == "lift-boolean-into-explaining-variable"),
         "two-operand condition is below the long threshold — must not fire"
@@ -2387,7 +2552,9 @@ public class C {
     let (line, col) = locate(source, "if (x < 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "redundant-else-after-return"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "redundant-else-after-return"),
         "expected redundant-else-after-return, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -2412,7 +2579,9 @@ public class C {
     let (line, col) = locate(source, "if (order == null)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "redundant-else-after-return"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "redundant-else-after-return"),
         "expected redundant-else-after-return on throw, specific={:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -2439,7 +2608,10 @@ public class C {
     let (line, col) = locate(source, "if (x < 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "redundant-else-after-return"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "redundant-else-after-return"),
         "non-terminating then-branch must not fire redundant-else-after-return"
     );
 }
@@ -2461,9 +2633,14 @@ public class C {
     let (line, col) = locate(source, "if (x > 0)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "if-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "if-statement-fundamentals"),
         "expected if-statement-fundamentals lesson, lessons={:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2485,9 +2662,14 @@ public class C {
     let (line, col) = locate(source, "for (String");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "for-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "for-statement-fundamentals"),
         "expected for-statement-fundamentals lesson, lessons={:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2519,16 +2701,26 @@ public class C {
         .iter()
         .find(|c| c.kind == "switch_statement")
         .expect("switch_statement in stack");
-    assert_eq!(sw.attrs.get("case_style").map(String::as_str), Some("colon"));
-    assert_eq!(sw.attrs.get("has_default").map(String::as_str), Some("true"));
+    assert_eq!(
+        sw.attrs.get("case_style").map(String::as_str),
+        Some("colon")
+    );
+    assert_eq!(
+        sw.attrs.get("has_default").map(String::as_str),
+        Some("true")
+    );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "switch-classic-colon-style"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "switch-classic-colon-style"),
         "expected switch-classic-colon-style rule, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "switch-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "switch-statement-fundamentals"),
         "expected switch-statement-fundamentals lesson"
     );
 }
@@ -2555,9 +2747,15 @@ public class C {
         .iter()
         .find(|c| c.kind == "switch_statement")
         .expect("switch_statement in stack");
-    assert_eq!(sw.attrs.get("case_style").map(String::as_str), Some("arrow"));
+    assert_eq!(
+        sw.attrs.get("case_style").map(String::as_str),
+        Some("arrow")
+    );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "switch-classic-colon-style"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "switch-classic-colon-style"),
         "arrow-form switch must not trigger the classic-colon rule"
     );
 }
@@ -2588,17 +2786,23 @@ public class C {
         .find(|c| c.kind == "while_statement")
         .expect("while_statement in stack");
     assert_eq!(
-        wh.attrs.get("condition_is_literal_true").map(String::as_str),
+        wh.attrs
+            .get("condition_is_literal_true")
+            .map(String::as_str),
         Some("true"),
     );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "while-true-needs-clear-exit"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "while-true-needs-clear-exit"),
         "expected while-true-needs-clear-exit, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "while-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "while-statement-fundamentals"),
         "expected while-statement-fundamentals lesson"
     );
 }
@@ -2625,11 +2829,16 @@ public class C {
         .find(|c| c.kind == "while_statement")
         .expect("while_statement in stack");
     assert_eq!(
-        wh.attrs.get("condition_is_literal_true").map(String::as_str),
+        wh.attrs
+            .get("condition_is_literal_true")
+            .map(String::as_str),
         Some("false"),
     );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "while-true-needs-clear-exit"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "while-true-needs-clear-exit"),
         "loops with real conditions must not trigger the while(true) rule"
     );
 }
@@ -2661,12 +2870,16 @@ public class C {
     // `do-while-discouraged` has no `match:` clause — it teaches whenever a
     // do_statement is in scope, so the rule arrives via the General bucket.
     assert!(
-        resp.general.iter().any(|r| r.rule_id == "do-while-discouraged"),
+        resp.general
+            .iter()
+            .any(|r| r.rule_id == "do-while-discouraged"),
         "expected do-while-discouraged in general bucket, got: {:?}",
         resp.general.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "do-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "do-statement-fundamentals"),
         "expected do-statement-fundamentals lesson"
     );
 }
@@ -2693,15 +2906,25 @@ public class C {
         .iter()
         .find(|c| c.kind == "array_creation_expression")
         .expect("array_creation_expression in stack");
-    assert_eq!(arr.attrs.get("has_initializer").map(String::as_str), Some("true"));
-    assert_eq!(arr.attrs.get("element_type").map(String::as_str), Some("String"));
+    assert_eq!(
+        arr.attrs.get("has_initializer").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        arr.attrs.get("element_type").map(String::as_str),
+        Some("String")
+    );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "prefer-list-of-over-array-literal"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-list-of-over-array-literal"),
         "expected prefer-list-of-over-array-literal rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "array-creation-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "array-creation-fundamentals"),
         "expected array-creation-fundamentals lesson"
     );
 }
@@ -2725,9 +2948,15 @@ public class C {
         .iter()
         .find(|c| c.kind == "array_creation_expression")
         .expect("array_creation_expression in stack");
-    assert_eq!(arr.attrs.get("has_initializer").map(String::as_str), Some("false"));
+    assert_eq!(
+        arr.attrs.get("has_initializer").map(String::as_str),
+        Some("false")
+    );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "prefer-list-of-over-array-literal"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-list-of-over-array-literal"),
         "sized-only array must not trigger the List.of rule"
     );
 }
@@ -2754,15 +2983,25 @@ public class C {
         .find(|c| c.kind == "constructor_declaration")
         .expect("constructor_declaration in stack");
     assert_eq!(ctor.attrs.get("name").map(String::as_str), Some("C"));
-    assert_eq!(ctor.attrs.get("parameter_count").map(String::as_str), Some("6"));
-    assert_eq!(ctor.attrs.get("visibility").map(String::as_str), Some("public"));
+    assert_eq!(
+        ctor.attrs.get("parameter_count").map(String::as_str),
+        Some("6")
+    );
+    assert_eq!(
+        ctor.attrs.get("visibility").map(String::as_str),
+        Some("public")
+    );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "constructor-too-many-parameters"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "constructor-too-many-parameters"),
         "expected constructor-too-many-parameters rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "constructor-declaration-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "constructor-declaration-fundamentals"),
         "expected constructor-declaration-fundamentals lesson"
     );
 }
@@ -2788,9 +3027,15 @@ public class C {
         .iter()
         .find(|c| c.kind == "constructor_declaration")
         .expect("constructor_declaration in stack");
-    assert_eq!(ctor.attrs.get("delegates_to").map(String::as_str), Some("this"));
+    assert_eq!(
+        ctor.attrs.get("delegates_to").map(String::as_str),
+        Some("this")
+    );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "constructor-too-many-parameters"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "constructor-too-many-parameters"),
         "1-arg constructor must not trigger the many-params rule"
     );
 }
@@ -2823,11 +3068,15 @@ public interface I {
     );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "interface-default-method-heavy"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "interface-default-method-heavy"),
         "expected interface-default-method-heavy rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "interface-declaration-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "interface-declaration-fundamentals"),
         "expected interface-declaration-fundamentals lesson"
     );
 }
@@ -2854,7 +3103,10 @@ public interface I {
         Some("false"),
     );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "interface-default-method-heavy"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "interface-default-method-heavy"),
         "pure interface must not trigger the default-method-heavy rule"
     );
 }
@@ -2885,15 +3137,25 @@ public class C {
         .iter()
         .find(|c| c.kind == "instanceof_expression")
         .expect("instanceof_expression in stack");
-    assert_eq!(inst.attrs.get("is_pattern").map(String::as_str), Some("false"));
-    assert_eq!(inst.attrs.get("target_type").map(String::as_str), Some("String"));
+    assert_eq!(
+        inst.attrs.get("is_pattern").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        inst.attrs.get("target_type").map(String::as_str),
+        Some("String")
+    );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "prefer-pattern-instanceof"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-pattern-instanceof"),
         "expected prefer-pattern-instanceof rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "instanceof-expression-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "instanceof-expression-fundamentals"),
         "expected instanceof-expression-fundamentals lesson"
     );
 }
@@ -2920,9 +3182,15 @@ public class C {
         .iter()
         .find(|c| c.kind == "instanceof_expression")
         .expect("instanceof_expression in stack");
-    assert_eq!(inst.attrs.get("is_pattern").map(String::as_str), Some("true"));
+    assert_eq!(
+        inst.attrs.get("is_pattern").map(String::as_str),
+        Some("true")
+    );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "prefer-pattern-instanceof"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-pattern-instanceof"),
         "pattern form must not trigger the prefer-pattern rule"
     );
 }
@@ -2961,11 +3229,15 @@ public class C {
     );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "throw-generic-exception"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "throw-generic-exception"),
         "expected throw-generic-exception rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "throw-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "throw-statement-fundamentals"),
         "expected throw-statement-fundamentals lesson"
     );
 }
@@ -2996,7 +3268,10 @@ public class C {
         Some("IllegalArgumentException"),
     );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "throw-generic-exception"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "throw-generic-exception"),
         "specific exception must not trigger the generic-exception rule"
     );
 }
@@ -3028,14 +3303,21 @@ public class C {
         .find(|c| c.kind == "catch_clause")
         .expect("catch_clause in stack");
     assert_eq!(c.attrs.get("is_empty").map(String::as_str), Some("true"));
-    assert_eq!(c.attrs.get("is_multi_catch").map(String::as_str), Some("false"));
+    assert_eq!(
+        c.attrs.get("is_multi_catch").map(String::as_str),
+        Some("false")
+    );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "empty-catch-block"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "empty-catch-block"),
         "expected empty-catch-block rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "catch-clause-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "catch-clause-fundamentals"),
         "expected catch-clause-fundamentals lesson"
     );
 }
@@ -3067,7 +3349,10 @@ public class C {
         .expect("catch_clause in stack");
     assert_eq!(c.attrs.get("is_empty").map(String::as_str), Some("false"));
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "empty-catch-block"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "empty-catch-block"),
         "non-empty catch must not trigger the empty-catch rule"
     );
 }
@@ -3087,10 +3372,16 @@ fn text_block_recognised_and_lesson_fires() {
         .iter()
         .find(|c| c.kind == "text_block")
         .expect("text_block in stack");
-    let lc: u32 = tb.attrs.get("line_count").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let lc: u32 = tb
+        .attrs
+        .get("line_count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     assert!(lc >= 4, "expected >= 4 lines, got {}", lc);
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "text-block-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "text-block-fundamentals"),
         "expected text-block-fundamentals lesson"
     );
 }
@@ -3131,17 +3422,25 @@ public record Point(int x, int y) {}
         .find(|c| c.kind == "record_declaration")
         .expect("record_declaration in stack");
     assert_eq!(r.attrs.get("name").map(String::as_str), Some("Point"));
-    assert_eq!(r.attrs.get("component_count").map(String::as_str), Some("2"));
+    assert_eq!(
+        r.attrs.get("component_count").map(String::as_str),
+        Some("2")
+    );
     assert_eq!(
         r.attrs.get("has_instance_field").map(String::as_str),
         Some("false"),
     );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "record-with-instance-field"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "record-with-instance-field"),
         "header-only record must not trigger the rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "record-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "record-fundamentals"),
         "expected record-fundamentals lesson"
     );
 }
@@ -3187,7 +3486,9 @@ public class C {
     let (line, col) = locate(source, "private final Optional");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "optional-as-field-type"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "optional-as-field-type"),
         "expected optional-as-field-type, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -3209,7 +3510,10 @@ public class C {
     let (line, col) = locate(source, "private final String");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "optional-as-field-type"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "optional-as-field-type"),
         "non-Optional field must not trigger the rule"
     );
 }
@@ -3232,7 +3536,9 @@ public class C {
     let (line, col) = locate(source, "s -> s.toUpperCase");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "streams-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "streams-fundamentals"),
         "expected streams-fundamentals lesson"
     );
 }
@@ -3254,7 +3560,9 @@ public class C {
     let (line, col) = locate(source, "Collectors.toList()");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "prefer-toList-over-collectors-toList"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-toList-over-collectors-toList"),
         "expected prefer-toList-over-collectors-toList, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -3287,9 +3595,14 @@ public class C {
         mr.attrs.get("reference_kind").map(String::as_str),
         Some("static_or_unbound"),
     );
-    assert_eq!(mr.attrs.get("target_text").map(String::as_str), Some("length"));
+    assert_eq!(
+        mr.attrs.get("target_text").map(String::as_str),
+        Some("length")
+    );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "method-reference-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "method-reference-fundamentals"),
         "expected method-reference-fundamentals lesson"
     );
 }
@@ -3344,7 +3657,9 @@ public class C {
     let (line, col) = locate(source, "x -> {");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "lambda-block-body-extract-method"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "lambda-block-body-extract-method"),
         "expected lambda-block-body-extract-method, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -3367,7 +3682,10 @@ public class C {
     let (line, col) = locate(source, "x -> log(x)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "lambda-block-body-extract-method"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "lambda-block-body-extract-method"),
         "expression-body lambda must not trigger the extract-method rule"
     );
 }
@@ -3399,14 +3717,21 @@ public enum Status {
         .expect("enum_declaration in stack");
     assert_eq!(e.attrs.get("name").map(String::as_str), Some("Status"));
     assert_eq!(e.attrs.get("constant_count").map(String::as_str), Some("2"));
-    assert_eq!(e.attrs.get("has_mutable_field").map(String::as_str), Some("true"));
+    assert_eq!(
+        e.attrs.get("has_mutable_field").map(String::as_str),
+        Some("true")
+    );
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "enum-prefer-immutable-fields"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "enum-prefer-immutable-fields"),
         "expected enum-prefer-immutable-fields, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "enum-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "enum-fundamentals"),
         "expected enum-fundamentals lesson"
     );
 }
@@ -3439,7 +3764,10 @@ public enum Direction {
         Some("false"),
     );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "enum-prefer-immutable-fields"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "enum-prefer-immutable-fields"),
         "all-final-fields enum must not trigger the rule"
     );
 }
@@ -3467,16 +3795,26 @@ public class Box<T> {
     assert_eq!(tp.attrs.get("count").map(String::as_str), Some("1"));
     assert_eq!(tp.attrs.get("names").map(String::as_str), Some("T"));
     assert_eq!(
-        tp.attrs.get("has_non_conventional_name").map(String::as_str),
+        tp.attrs
+            .get("has_non_conventional_name")
+            .map(String::as_str),
         Some("false"),
     );
-    assert_eq!(tp.attrs.get("has_bounds").map(String::as_str), Some("false"));
+    assert_eq!(
+        tp.attrs.get("has_bounds").map(String::as_str),
+        Some("false")
+    );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "non-conventional-type-parameter-name"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "non-conventional-type-parameter-name"),
         "single-letter T must not trigger the naming rule"
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "generics-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "generics-fundamentals"),
         "expected generics-fundamentals lesson"
     );
 }
@@ -3501,11 +3839,15 @@ public class Cache<KeyType, ValueType> {
         .expect("type_parameters in stack");
     assert_eq!(tp.attrs.get("count").map(String::as_str), Some("2"));
     assert_eq!(
-        tp.attrs.get("has_non_conventional_name").map(String::as_str),
+        tp.attrs
+            .get("has_non_conventional_name")
+            .map(String::as_str),
         Some("true"),
     );
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "non-conventional-type-parameter-name"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "non-conventional-type-parameter-name"),
         "expected non-conventional-type-parameter-name rule"
     );
 }
@@ -3550,9 +3892,14 @@ public class C {
     let (line, col) = locate(source, "List<String> names");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "collections-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "collections-fundamentals"),
         "expected collections-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -3571,7 +3918,9 @@ public class C {
     let (line, col) = locate(source, "Collections.singletonList");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "prefer-list-of-over-singleton-list"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-list-of-over-singleton-list"),
         "expected rule, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
@@ -3591,7 +3940,10 @@ public class C {
     let (line, col) = locate(source, "List.of");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "prefer-list-of-over-singleton-list"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "prefer-list-of-over-singleton-list"),
         "List.of must not trigger the singleton-list rule"
     );
 }
@@ -3617,9 +3969,14 @@ public class C {
     let (line, col) = locate(source, "synchronized (lock)");
     let resp = educator.query_position(&file, line, col).unwrap();
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "synchronized-statement-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "synchronized-statement-fundamentals"),
         "expected synchronized-statement-fundamentals lesson, got: {:?}",
-        resp.lessons.iter().map(|l| &l.lesson_id).collect::<Vec<_>>()
+        resp.lessons
+            .iter()
+            .map(|l| &l.lesson_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -3648,12 +4005,16 @@ public class C {
     assert_eq!(t.attrs.get("is_nested").map(String::as_str), Some("true"));
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "nested-ternary-discouraged"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "nested-ternary-discouraged"),
         "expected nested-ternary-discouraged, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "ternary-expression-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "ternary-expression-fundamentals"),
         "expected ternary-expression-fundamentals lesson"
     );
 }
@@ -3679,7 +4040,10 @@ public class C {
         .expect("ternary_expression in stack");
     assert_eq!(t.attrs.get("is_nested").map(String::as_str), Some("false"));
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "nested-ternary-discouraged"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "nested-ternary-discouraged"),
         "single-level ternary must not trigger the nested-ternary rule"
     );
 }
@@ -3705,19 +4069,26 @@ public abstract class JsonHelpers {
         .iter()
         .find(|c| c.kind == "class_declaration")
         .expect("class_declaration in stack");
-    assert_eq!(cls.attrs.get("is_abstract").map(String::as_str), Some("true"));
+    assert_eq!(
+        cls.attrs.get("is_abstract").map(String::as_str),
+        Some("true")
+    );
     assert_eq!(
         cls.attrs.get("has_abstract_methods").map(String::as_str),
         Some("false"),
     );
 
     assert!(
-        resp.specific.iter().any(|r| r.rule_id == "abstract-class-without-abstract-methods"),
+        resp.specific
+            .iter()
+            .any(|r| r.rule_id == "abstract-class-without-abstract-methods"),
         "expected abstract-class-without-abstract-methods, got: {:?}",
         resp.specific.iter().map(|r| &r.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        resp.lessons.iter().any(|l| l.lesson_id == "class-inheritance-fundamentals"),
+        resp.lessons
+            .iter()
+            .any(|l| l.lesson_id == "class-inheritance-fundamentals"),
         "expected class-inheritance-fundamentals lesson"
     );
 }
@@ -3741,13 +4112,19 @@ public abstract class PaymentMethod {
         .iter()
         .find(|c| c.kind == "class_declaration")
         .expect("class_declaration in stack");
-    assert_eq!(cls.attrs.get("is_abstract").map(String::as_str), Some("true"));
+    assert_eq!(
+        cls.attrs.get("is_abstract").map(String::as_str),
+        Some("true")
+    );
     assert_eq!(
         cls.attrs.get("has_abstract_methods").map(String::as_str),
         Some("true"),
     );
     assert!(
-        !resp.specific.iter().any(|r| r.rule_id == "abstract-class-without-abstract-methods"),
+        !resp
+            .specific
+            .iter()
+            .any(|r| r.rule_id == "abstract-class-without-abstract-methods"),
         "abstract class with abstract methods must not trigger the rule"
     );
 }
@@ -3770,7 +4147,10 @@ public final class Manager extends Employee {
         .find(|c| c.kind == "class_declaration")
         .expect("class_declaration in stack");
     assert_eq!(cls.attrs.get("is_final").map(String::as_str), Some("true"));
-    assert_eq!(cls.attrs.get("is_abstract").map(String::as_str), Some("false"));
+    assert_eq!(
+        cls.attrs.get("is_abstract").map(String::as_str),
+        Some("false")
+    );
     assert_eq!(
         cls.attrs.get("extends_type").map(String::as_str),
         Some("Employee"),
@@ -3825,5 +4205,8 @@ public class C {
         .iter()
         .find(|c| c.kind == "catch_clause")
         .expect("catch_clause in stack");
-    assert_eq!(c.attrs.get("is_multi_catch").map(String::as_str), Some("true"));
+    assert_eq!(
+        c.attrs.get("is_multi_catch").map(String::as_str),
+        Some("true")
+    );
 }

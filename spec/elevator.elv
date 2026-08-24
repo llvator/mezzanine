@@ -40,10 +40,11 @@ f text_artifacts {
 }
 
 f spec_health {
-    d: "Correctness signals for a spec: checker, code-map, drift."
+    d: "Correctness signals for a spec: checker, code-map, drift — and the one repair that needs no judgement, applying the moves git already recorded."
     fu check
     fu code_map
     fu drift
+    fu fix_drift
 }
 
 fu f.text_artifacts.focus {
@@ -69,4 +70,9 @@ fu f.spec_health.code_map {
 fu f.spec_health.drift {
     d: "Anchor verification against --code-root: cr paths must resolve (error); identifier-shaped tokens from d: are grounded by text search in the claimed files (hint). No shape comparison — the abstraction is not a projection of the code tree."
     cr: "src/output/elevator_drift.rs"
+}
+
+fu f.spec_health.fix_drift {
+    d: "--drift --fix rewrites the dead cr paths git recorded a move for. Two gates: rename_log finds the commit that deleted the path then re-diffs it unrestricted, because a pathspec narrows the diff before rename detection and hides the pair; and the new path must exist. dir_rename demands unanimity across the files that left a directory. Anything unproven is reported, never applied — a same-basename candidate is offered for a human to confirm."
+    cr: "src/output/elevator_fix.rs"
 }

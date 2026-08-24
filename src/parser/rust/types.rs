@@ -19,13 +19,56 @@ use super::super::language_parser::ParseResult;
 /// on purpose: an unknown project type slipping through resolves to
 /// nothing and is dropped by the resolver, so false positives are cheap.
 const STD_TYPES: &[&str] = &[
-    "Self", "String", "Str", "Option", "Result", "Vec", "VecDeque", "Box",
-    "Rc", "Arc", "Cell", "RefCell", "RwLock", "Mutex", "HashMap", "HashSet",
-    "BTreeMap", "BTreeSet", "Cow", "Path", "PathBuf", "OsStr", "OsString",
-    "Instant", "Duration", "SystemTime", "Ordering", "PhantomData", "Pin",
-    "Future", "Iterator", "IntoIterator", "Default", "Clone", "Copy",
-    "Debug", "Display", "Send", "Sync", "Sized", "Fn", "FnMut", "FnOnce",
-    "AsRef", "AsMut", "From", "Into", "TryFrom", "TryInto", "ToString",
+    "Self",
+    "String",
+    "Str",
+    "Option",
+    "Result",
+    "Vec",
+    "VecDeque",
+    "Box",
+    "Rc",
+    "Arc",
+    "Cell",
+    "RefCell",
+    "RwLock",
+    "Mutex",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "BTreeSet",
+    "Cow",
+    "Path",
+    "PathBuf",
+    "OsStr",
+    "OsString",
+    "Instant",
+    "Duration",
+    "SystemTime",
+    "Ordering",
+    "PhantomData",
+    "Pin",
+    "Future",
+    "Iterator",
+    "IntoIterator",
+    "Default",
+    "Clone",
+    "Copy",
+    "Debug",
+    "Display",
+    "Send",
+    "Sync",
+    "Sized",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+    "AsRef",
+    "AsMut",
+    "From",
+    "Into",
+    "TryFrom",
+    "TryInto",
+    "ToString",
 ];
 
 /// Uppercase-initial identifier tokens in a type string, minus std names.
@@ -101,10 +144,7 @@ mod tests {
         );
         assert_eq!(named_types("&mut Vec<Config>"), vec!["Config"]);
         assert_eq!(named_types("u32"), Vec::<String>::new());
-        assert_eq!(
-            named_types("crate::models::CodeEntity"),
-            vec!["CodeEntity"]
-        );
+        assert_eq!(named_types("crate::models::CodeEntity"), vec!["CodeEntity"]);
         // Lifetimes and references never look like types.
         assert_eq!(named_types("&'a str"), Vec::<String>::new());
     }

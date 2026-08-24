@@ -24,7 +24,7 @@
  *   npm run test:pipeline
  */
 
-import type { DiffLevel } from './diffLevels';
+import type { DiffLevel, DiffSeedFacet } from './diffLevels';
 
 /**
  * The stages, in the order `displayPlan` applies them.
@@ -38,6 +38,7 @@ export type FilterStageId =
   | 'ghosts'
   | 'template-vars'
   | 'spec'
+  | 'structure'
   | 'kinds'
   | 'languages'
   | 'files'
@@ -54,6 +55,7 @@ export const STAGE_ORDER: readonly FilterStageId[] = [
   'ghosts',
   'template-vars',
   'spec',
+  'structure',
   'kinds',
   'languages',
   'files',
@@ -64,6 +66,57 @@ export const STAGE_ORDER: readonly FilterStageId[] = [
   'levels',
   'hubs',
 ];
+
+/**
+ * Which of the canvas's three drawing modes is on.
+ *
+ * The strip's one promise is that a chip means a filter is running, and that
+ * promise is mode-dependent: `displayPlan.compute` has three exits, and only
+ * the force one goes through the whole chain. The shape view returns straight
+ * after placement — it draws one folder the reader asked for by name, and
+ * narrowing it is not what any of these controls is for — while tree mode runs
+ * its filters inside the BFS and consults a subset.
+ *
+ * So the same store state means "this is filtering" in one mode and "this is
+ * sitting there doing nothing" in another. Without this input the strip
+ * announced `Diff · edits only` over a tree the ladder never touched, and
+ * offered a `×` that would change nothing — the exact failure UI-099 exists to
+ * remove, made worse by looking operable.
+ */
+export type CanvasView = 'force' | 'tree' | 'shape';
+
+/**
+ * The modes each stage actually bites in, read off `displayPlan.compute`.
+ *
+ * Tree mode re-implements its filtering inside `computeTreePositions` rather
+ * than calling `nodePassesFilters`, and that re-implementation covers kinds,
+ * relationship types, files and ghosts — not languages, not the templating
+ * layer, not the spec cross-filter, not a committed search, not hub demotion.
+ * The diff is in the list because `compute` now runs the ladder over the tree's
+ * reach; the rest are gaps, and until they close, silence is the honest report.
+ *
+ * Shape draws nothing but the folder picture, so no stage is listed for it.
+ */
+const RUNS_IN: Record<FilterStageId, readonly CanvasView[]> = {
+  ghosts: ['force', 'tree'],
+  'template-vars': ['force'],
+  spec: ['force'],
+  structure: ['force', 'tree'],
+  kinds: ['force', 'tree'],
+  languages: ['force'],
+  files: ['force', 'tree'],
+  search: ['force'],
+  diff: ['force', 'tree'],
+  focus: ['force', 'tree'],
+  relations: ['force', 'tree'],
+  levels: ['force', 'tree'],
+  hubs: ['force'],
+};
+
+/** Whether a stage narrows anything in the mode the canvas is currently in. */
+export function stageRuns(id: FilterStageId, view: CanvasView): boolean {
+  return RUNS_IN[id].includes(view);
+}
 
 export interface FilterStage {
   id: FilterStageId;
@@ -91,6 +144,9 @@ export interface HiddenSet {
 }
 
 export interface PipelineInput {
+  /** Which of the canvas's three drawing modes is on. Decides which stages
+   *  can be reported at all — see `RUNS_IN`. */
+  view: CanvasView;
   /** Entity kinds — `generalEntityTypes` against `allEntityTypes`. */
   kinds: HiddenSet;
   /** The panel's Relationships section: which edge kinds are drawn, and in
@@ -115,6 +171,21 @@ export interface PipelineInput {
     builtinsPresent: boolean;
   };
   templateVars: { hidden: boolean; present: boolean };
+  /**
+   * `structureOnly` (UI-113), with what it is currently costing.
+   *
+   * `hidden` counts the entities in the dataset that are inside a body, and a
+   * count of zero gets no chip: a Markdown graph, an Elevator spec and a SQL
+   * schema have no bodies at all, and a filter with nothing to filter would
+   * otherwise announce itself on every one of them.
+   *
+   * `open` names the callable whose body is exempt — the selection. It is on
+   * the chip because it is the half a reader is most likely to mistake for a
+   * bug: the canvas is hiding every function's internals *except* the ones
+   * belonging to the node they just clicked, and nothing else on screen says
+   * that is deliberate.
+   */
+  structure: { on: boolean; hidden: number; open: string | null };
   /** The spec pane's cross-filter. `null` when none is running. `paths: 0` is
    *  a real and important state — the focused entity declares no code — and is
    *  named rather than folded into "no filter" (see `stores/crossFilter.ts`). */
@@ -122,8 +193,10 @@ export interface PipelineInput {
   /** A *committed* search. Typing alone filters nothing and gets no chip. */
   search: { term: string; kept: number; hides: boolean } | null;
   /** The diff ladder, only when a diff is loaded *and* its master toggle is
-   *  on. A diff that only colours the graph is not filtering it. */
-  diff: { level: DiffLevel; dims: boolean } | null;
+   *  on. A diff that only colours the graph is not filtering it. `facet` is
+   *  the seed split (UI-109); at `all` it adds nothing to the chip, which is
+   *  the state a reader who never touched the control is in. */
+  diff: { level: DiffLevel; facet: DiffSeedFacet; dims: boolean } | null;
   /** A selection in the current graph: the canvas is its BFS reach. */
   focus: { name: string; depth: number; mode: 'force' | 'tree' } | null;
   /**
@@ -181,6 +254,24 @@ const DIFF_VALUE: Record<DiffLevel, string> = {
   neighbourhood: 'edits + one hop',
 };
 
+/** The seed split, as it reads on the chip. `all` is silent: it is the whole
+ *  seed, so naming it would claim a filter nobody applied. */
+const FACET_VALUE: Record<DiffSeedFacet, string> = {
+  all: '',
+  new: 'new',
+  existing: 'existing',
+};
+
+const FACET_DETAIL: Record<DiffSeedFacet, string> = {
+  all: '',
+  new:
+    'Started from the entities that did not exist on the base side — plus, on '
+    + 'a diff of the working tree, files created since it ran.',
+  existing:
+    'Started from the entities that already existed and were changed in place, '
+    + 'deletions among them. Anything brand new is left out.',
+};
+
 const DIFF_DETAIL: Record<DiffLevel, string> = {
   edits:
     'Only entities the diff calls edited — their own source moved — plus '
@@ -199,6 +290,12 @@ const DIFF_DETAIL: Record<DiffLevel, string> = {
  * Returns `[]` when nothing is. That is the common case and the strip draws
  * nothing for it: a permanent bar reading "no filters" is one more thing to
  * read past on the way to the graph.
+ *
+ * Stages the current view mode does not run are dropped at the end rather than
+ * guarded at each `if`. The stage bodies stay about *what the reader set*,
+ * which is one question, and `RUNS_IN` stays the single place that answers
+ * *where it applies* — so a mode gaining a filter is one line there, not a
+ * twelfth condition to keep in sync.
  */
 export function filterPipeline(input: PipelineInput): FilterStage[] {
   const stages: FilterStage[] = [];
@@ -263,6 +360,28 @@ export function filterPipeline(input: PipelineInput): FilterStage[] {
     });
   }
 
+  if (input.structure.on && input.structure.hidden > 0) {
+    const { hidden, open } = input.structure;
+    stages.push({
+      id: 'structure',
+      name: 'Structure',
+      value: open ? `bodies hidden · ${open} open` : 'bodies hidden',
+      detail:
+        `${hidden} ${plural(hidden, 'entity', 'entities')} that live inside a `
+        + 'function body — parameters, branch arms, loop bodies, closures — are '
+        + 'not drawn. What a file *declares* is: its functions and methods, its '
+        + 'types, their fields and properties.\n\nThe calls made inside those '
+        + 'bodies are still drawn, re-routed onto the function that makes them, '
+        + 'so nothing is lost by leaving this on.'
+        + (open
+          ? `\n\n${open} is selected, so its own body is open — that is what `
+            + 'selecting something does here.'
+          : '\n\nSelect a function to open its body.'),
+      clearHint: 'Draw function internals too',
+      dims: false,
+    });
+  }
+
   if (input.kinds.hidden.length > 0) {
     const n = input.kinds.hidden.length;
     stages.push({
@@ -321,14 +440,26 @@ export function filterPipeline(input: PipelineInput): FilterStage[] {
   }
 
   if (input.diff) {
+    // Two controls, one chip — they are one question ("what of the diff is on
+    // screen") and the facet is meaningless without the rung it seeds. The `×`
+    // is stepwise for the same reason `ghosts` is: the facet is the narrower
+    // and more surprising of the two, so it comes off first and the ladder
+    // survives to be cleared on a second click.
+    const facet = input.diff.facet;
+    const split = facet !== 'all';
     stages.push({
       id: 'diff',
       name: 'Diff',
-      value: DIFF_VALUE[input.diff.level],
+      value: split
+        ? `${FACET_VALUE[facet]} · ${DIFF_VALUE[input.diff.level]}`
+        : DIFF_VALUE[input.diff.level],
       detail:
-        `${DIFF_DETAIL[input.diff.level]}\n\nTurning this off keeps the diff `
+        (split ? `${FACET_DETAIL[facet]}\n\n` : '')
+        + `${DIFF_DETAIL[input.diff.level]}\n\nTurning this off keeps the diff `
         + 'colours and stops it filtering.',
-      clearHint: 'Stop filtering by the diff',
+      clearHint: split
+        ? 'Draw both new and existing changes'
+        : 'Stop filtering by the diff',
       dims: input.diff.dims,
     });
   }
@@ -433,7 +564,7 @@ export function filterPipeline(input: PipelineInput): FilterStage[] {
     });
   }
 
-  return stages;
+  return stages.filter((s) => stageRuns(s.id, input.view));
 }
 
 /** One line for a folded toolbar, or a screen reader: "3 filters: Kinds,

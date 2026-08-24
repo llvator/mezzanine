@@ -32,6 +32,7 @@
     MAX_RESULTS_SHOWN,
     type SearchResult,
   } from '../viewmodels/searchResults';
+  import { rowsForClick } from '../utils/rowPicks';
 
   /** Rows that carry a commit checkbox — the in-scope ones. An out-of-scope
    *  hit has no id in `graphData`, so committing it would filter the graph
@@ -62,10 +63,7 @@
    */
   function onCommitClick(e: MouseEvent & { currentTarget: HTMLInputElement }, i: number) {
     const checked = e.currentTarget.checked;
-    const rows =
-      e.shiftKey && commitAnchor >= 0 && commitAnchor < selectable.length
-        ? selectable.slice(Math.min(commitAnchor, i), Math.max(commitAnchor, i) + 1)
-        : [selectable[i]];
+    const rows = rowsForClick(selectable, commitAnchor, i, e.shiftKey);
     setCommittedMatches(rows.map((r) => r.node.id), checked);
     if (checked) {
       for (const r of rows) if (r.blocked?.reversible) unblock(r.blocked);

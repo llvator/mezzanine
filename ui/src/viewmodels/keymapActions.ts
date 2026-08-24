@@ -15,7 +15,7 @@ import { get } from 'svelte/store';
 import type { Command, PaneId } from './keymap';
 import {
   selectedNode, hoveredNode, hoverLocked, graphLevel, hoverDepth, hoverMode,
-  showLabels, showKindLabels, showLinkLabels, cycleTreeDensity,
+  showLabels, showKindLabels, showLinkLabels, structureOnly, cycleTreeDensity,
 } from '../stores/graph';
 import { autoLevel, drillIntoMarks } from '../stores/scope';
 // Also the import that registers the history's `onBeforeNavigate` hook — see
@@ -198,6 +198,7 @@ function runView(command: Command, ctx: KeymapContext): boolean {
     case 'view.labels.node': showLabels.update((v) => !v); return true;
     case 'view.labels.kind': showKindLabels.update((v) => !v); return true;
     case 'view.labels.link': showLinkLabels.update((v) => !v); return true;
+    case 'view.structureOnly': structureOnly.update((v) => !v); return true;
     default: return false;
   }
 }

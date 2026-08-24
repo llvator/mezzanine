@@ -64,10 +64,7 @@ fn nested_definitions_disallowed_top_level_only() {
     // pass, not by the parser, so we don't assert it here.
     assert!(has_rel(&r, &cat.id, &feat.id, RelationshipKind::Contains));
     // The definition's own description survives.
-    assert_eq!(
-        feat.documentation.as_deref(),
-        Some("Structured prompts.")
-    );
+    assert_eq!(feat.documentation.as_deref(), Some("Structured prompts."));
 }
 
 #[test]
@@ -111,9 +108,7 @@ fn fu_must_be_qualified_at_top_level() {
     let r = parse("fu creation");
     // Definition is still parsed but a warning surfaces.
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("must be qualified")),
+        r.warnings.iter().any(|w| w.contains("must be qualified")),
         "expected qualification warning, got {:?}",
         r.warnings
     );
@@ -123,9 +118,7 @@ fn fu_must_be_qualified_at_top_level() {
 fn category_must_be_bare_name() {
     let r = parse("c library.foo");
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("must be a bare name")),
+        r.warnings.iter().any(|w| w.contains("must be a bare name")),
         "expected bare-name warning, got {:?}",
         r.warnings
     );
@@ -204,8 +197,18 @@ fn kind_prefix_in_child_reference_is_stripped() {
     let bare = parse("c library { f protocol }");
     let p_target = "elevator::f.protocol";
     let b_target = "elevator::f.protocol";
-    assert!(has_rel(&prefixed, "elevator::c.library", p_target, RelationshipKind::Contains));
-    assert!(has_rel(&bare, "elevator::c.library", b_target, RelationshipKind::Contains));
+    assert!(has_rel(
+        &prefixed,
+        "elevator::c.library",
+        p_target,
+        RelationshipKind::Contains
+    ));
+    assert!(has_rel(
+        &bare,
+        "elevator::c.library",
+        b_target,
+        RelationshipKind::Contains
+    ));
 }
 
 #[test]
@@ -310,9 +313,7 @@ fn import_after_definition_is_warned() {
     "#;
     let r = parse(src);
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("must precede")),
+        r.warnings.iter().any(|w| w.contains("must precede")),
         "expected ordering warning, got {:?}",
         r.warnings
     );
@@ -357,12 +358,21 @@ fn cr_tagged_partitions_refs_by_layer() {
     let creation = find(&r, "elevator::fu.protocol.creation").expect("creation exists");
 
     // Generic cr: still works.
-    assert_eq!(crs_with_prefix(creation, "cr:"), vec!["shared/protocol.proto"]);
+    assert_eq!(
+        crs_with_prefix(creation, "cr:"),
+        vec!["shared/protocol.proto"]
+    );
     // Tagged cr.fe / cr.be land under their own prefixes.
-    assert_eq!(crs_with_prefix(creation, "cr.fe:"), vec!["frontend/protocol.tsx"]);
+    assert_eq!(
+        crs_with_prefix(creation, "cr.fe:"),
+        vec!["frontend/protocol.tsx"]
+    );
     assert_eq!(
         crs_with_prefix(creation, "cr.be:"),
-        vec!["backend/protocol/builder.rs", "backend/protocol/validator.rs"]
+        vec![
+            "backend/protocol/builder.rs",
+            "backend/protocol/validator.rs"
+        ]
     );
 }
 
@@ -410,7 +420,10 @@ fn extension_top_level_with_category_and_concept_children() {
     let r = parse(src);
     let ext = find(&r, "elevator::e.ui_kit").expect("extension exists");
     assert_eq!(ext.kind, EntityKind::Extension);
-    assert_eq!(ext.documentation.as_deref(), Some("Reusable component library."));
+    assert_eq!(
+        ext.documentation.as_deref(),
+        Some("Reusable component library.")
+    );
 
     // Containment edges from the Extension to its children.
     assert!(has_rel(
@@ -432,9 +445,7 @@ fn extension_dotted_name_is_warned() {
     // Extensions, like Categories and Features, must be bare names.
     let r = parse("e foo.bar");
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("must be a bare name")),
+        r.warnings.iter().any(|w| w.contains("must be a bare name")),
         "expected bare-name warning, got {:?}",
         r.warnings
     );
@@ -465,7 +476,10 @@ fn definition_span_covers_keyword_through_closing_brace() {
     assert_eq!((e.span.start.line, e.span.start.column), (1, 0));
     // Ends just past the `}` on line 3.
     assert_eq!((e.span.end.line, e.span.end.column), (3, 1));
-    assert_eq!(&src[e.span.start.offset..e.span.end.offset], e.source_code.as_deref().unwrap());
+    assert_eq!(
+        &src[e.span.start.offset..e.span.end.offset],
+        e.source_code.as_deref().unwrap()
+    );
 }
 
 #[test]
@@ -541,7 +555,9 @@ fn stray_character_costs_one_token_not_the_file() {
     assert!(find(&r, "elevator::f.one").is_some());
     assert!(find(&r, "elevator::f.two").is_some());
     assert!(
-        r.warnings.iter().any(|w| w.contains("unexpected character `@`")),
+        r.warnings
+            .iter()
+            .any(|w| w.contains("unexpected character `@`")),
         "expected a lex warning, got {:?}",
         r.warnings
     );
@@ -553,7 +569,10 @@ fn unterminated_string_does_not_zero_the_rest_of_the_file() {
     let r = parse(src);
     assert!(find(&r, "elevator::f.two").is_some());
     assert_eq!(
-        find(&r, "elevator::f.two").unwrap().documentation.as_deref(),
+        find(&r, "elevator::f.two")
+            .unwrap()
+            .documentation
+            .as_deref(),
         Some("kept")
     );
     assert!(
@@ -590,7 +609,10 @@ fn nested_definition_lands_its_body_on_the_child_not_the_parent() {
     // acquired protocol's description and protocol got none.
     let r = parse("c library {\n    f protocol {\n        d: \"belongs to protocol\"\n    }\n}");
     assert_eq!(
-        find(&r, "elevator::f.protocol").unwrap().documentation.as_deref(),
+        find(&r, "elevator::f.protocol")
+            .unwrap()
+            .documentation
+            .as_deref(),
         Some("belongs to protocol")
     );
     assert_eq!(find(&r, "elevator::c.library").unwrap().documentation, None);
@@ -602,7 +624,9 @@ fn nested_definition_lands_its_body_on_the_child_not_the_parent() {
         RelationshipKind::Contains
     ));
     assert!(
-        r.warnings.iter().any(|w| w.contains("definitions never nest")),
+        r.warnings
+            .iter()
+            .any(|w| w.contains("definitions never nest")),
         "got {:?}",
         r.warnings
     );
@@ -644,7 +668,10 @@ fn every_warning_names_a_line_and_column() {
 #[test]
 fn unexpected_body_keyword_warns_and_keeps_the_rest_of_the_body() {
     let r = parse("f a { bogus d: \"kept\" }");
-    assert!(r.warnings.iter().any(|w| w.contains("unexpected keyword `bogus`")));
+    assert!(r
+        .warnings
+        .iter()
+        .any(|w| w.contains("unexpected keyword `bogus`")));
     assert_eq!(
         find(&r, "elevator::f.a").unwrap().documentation.as_deref(),
         Some("kept")
@@ -703,7 +730,10 @@ fn duplicate_definition_warns_and_keeps_the_first() {
     let r = parse("f dup { d: \"first\" }\nf dup { d: \"second\" }");
     assert_eq!(r.entities.len(), 1);
     assert_eq!(
-        find(&r, "elevator::f.dup").unwrap().documentation.as_deref(),
+        find(&r, "elevator::f.dup")
+            .unwrap()
+            .documentation
+            .as_deref(),
         Some("first")
     );
     assert!(
@@ -718,8 +748,18 @@ fn a_duplicates_children_are_still_wired_up() {
     // The duplicate loses its entity, but dropping its children would
     // turn an authoring slip into a silently missing graph branch.
     let r = parse("c a { f one }\nc a { f two }");
-    assert!(has_rel(&r, "elevator::c.a", "elevator::f.one", RelationshipKind::Contains));
-    assert!(has_rel(&r, "elevator::c.a", "elevator::f.two", RelationshipKind::Contains));
+    assert!(has_rel(
+        &r,
+        "elevator::c.a",
+        "elevator::f.one",
+        RelationshipKind::Contains
+    ));
+    assert!(has_rel(
+        &r,
+        "elevator::c.a",
+        "elevator::f.two",
+        RelationshipKind::Contains
+    ));
 }
 
 #[test]
@@ -747,17 +787,26 @@ fn references_honours_an_explicit_concept_prefix() {
         f billing { references: concept.tax }
     "#;
     let r = parse(src);
-    assert!(r.relationships.iter().any(|rel| {
-        rel.source_id == "elevator::f.billing"
-            && rel.target_id == "elevator::concept.tax"
-            && rel.metadata.get("link").map(String::as_str) == Some("references")
-    }), "got {:?}", r.relationships);
+    assert!(
+        r.relationships.iter().any(|rel| {
+            rel.source_id == "elevator::f.billing"
+                && rel.target_id == "elevator::concept.tax"
+                && rel.metadata.get("link").map(String::as_str) == Some("references")
+        }),
+        "got {:?}",
+        r.relationships
+    );
 }
 
 #[test]
 fn references_still_defaults_to_feature_without_a_prefix() {
     let r = parse("f billing { references: conversation }");
-    assert!(has_link(&r, "elevator::f.billing", "elevator::f.conversation", "references"));
+    assert!(has_link(
+        &r,
+        "elevator::f.billing",
+        "elevator::f.conversation",
+        "references"
+    ));
 }
 
 #[test]

@@ -47,7 +47,8 @@ pub(super) fn resolve_wikilinks(
         match index.get(key) {
             Some(candidates) => {
                 if candidates.len() > 1 {
-                    rel.metadata.insert("ambiguous".to_string(), "true".to_string());
+                    rel.metadata
+                        .insert("ambiguous".to_string(), "true".to_string());
                 }
                 retarget(rel, candidates[0].clone());
             }
@@ -155,7 +156,12 @@ mod tests {
 
     /// A note as the parser would have emitted it.
     fn note(path: &str, title: &str, stem: &str) -> CodeEntity {
-        let mut e = CodeEntity::new(title, EntityKind::Note, PathBuf::from(path), Span::default());
+        let mut e = CodeEntity::new(
+            title,
+            EntityKind::Note,
+            PathBuf::from(path),
+            Span::default(),
+        );
         e.id = format!("md::note.{}", path);
         e.attributes.push(format!("stem:{}", stem));
         e
@@ -166,7 +172,11 @@ mod tests {
     }
 
     fn wiki_edge(from: &str, key: &str) -> Relationship {
-        Relationship::new(from, format!("md::wiki.{}", key), RelationshipKind::References)
+        Relationship::new(
+            from,
+            format!("md::wiki.{}", key),
+            RelationshipKind::References,
+        )
     }
 
     #[test]
@@ -187,11 +197,11 @@ mod tests {
 
     #[test]
     fn resolving_rebuilds_the_edge_id_so_two_edges_cannot_collide() {
-        let entities = corpus(vec![
-            note("a.md", "A", "a"),
-            note("b.md", "B", "b"),
-        ]);
-        let mut rels = vec![wiki_edge("md::note.x.md", "a"), wiki_edge("md::note.x.md", "b")];
+        let entities = corpus(vec![note("a.md", "A", "a"), note("b.md", "B", "b")]);
+        let mut rels = vec![
+            wiki_edge("md::note.x.md", "a"),
+            wiki_edge("md::note.x.md", "b"),
+        ];
         resolve_wikilinks(&entities, &mut rels);
         assert_ne!(rels[0].id, rels[1].id);
     }
@@ -212,7 +222,10 @@ mod tests {
         ]);
         let mut rels = vec![wiki_edge("md::note.a.md", "index")];
         resolve_wikilinks(&entities, &mut rels);
-        assert_eq!(rels[0].metadata.get("ambiguous").map(String::as_str), Some("true"));
+        assert_eq!(
+            rels[0].metadata.get("ambiguous").map(String::as_str),
+            Some("true")
+        );
         // Lexicographically first, so the pick is stable across runs.
         assert_eq!(rels[0].target_id, "md::note.one/index.md");
     }
@@ -315,7 +328,12 @@ mod tests {
 
     #[test]
     fn a_non_note_entity_is_not_touched() {
-        let mut code = CodeEntity::new("f", EntityKind::Function, PathBuf::from("/repo/a.rs"), Span::default());
+        let mut code = CodeEntity::new(
+            "f",
+            EntityKind::Function,
+            PathBuf::from("/repo/a.rs"),
+            Span::default(),
+        );
         code.attributes.push("mdref:/repo/src/x.rs".to_string());
         let mut entities = HashMap::from([(code.id.clone(), code.clone())]);
 

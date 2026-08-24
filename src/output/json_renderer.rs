@@ -13,7 +13,7 @@ impl Renderer for JsonRenderer {
     fn format(&self) -> OutputFormat {
         OutputFormat::Json
     }
-    
+
     fn render(&self, graph: &DependencyGraph, config: &Config) -> Result<String> {
         // Include Parameter entities so the UI can show method arguments
         // as graph nodes when a callable is focused. They're hidden by
@@ -33,9 +33,17 @@ impl Renderer for JsonRenderer {
         use crate::models::file_info::Language;
         let entity_language: std::collections::HashMap<&str, Language> = graph
             .entities()
-            .map(|e| (e.id.as_str(), Language::from_extension(
-                e.file_path.extension().and_then(|x| x.to_str()).unwrap_or(""),
-            )))
+            .map(|e| {
+                (
+                    e.id.as_str(),
+                    Language::from_extension(
+                        e.file_path
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or(""),
+                    ),
+                )
+            })
             .collect();
 
         // Include TakesParam relationships alongside the Parameter entities.
@@ -51,10 +59,12 @@ impl Renderer for JsonRenderer {
             .relationships()
             .filter(|r| {
                 // Drop Contains edges targeting parameters (TakesParam covers this).
-                if r.kind == RelationshipKind::Contains && param_ids.contains(r.target_id.as_str()) {
+                if r.kind == RelationshipKind::Contains && param_ids.contains(r.target_id.as_str())
+                {
                     return false;
                 }
-                entity_ids.contains(r.source_id.as_str()) && entity_ids.contains(r.target_id.as_str())
+                entity_ids.contains(r.source_id.as_str())
+                    && entity_ids.contains(r.target_id.as_str())
             })
             .map(|r| {
                 let lang = entity_language
@@ -156,6 +166,10 @@ struct JsonScopeMetrics {
     quality_warn: u32,
     quality_bad: u32,
     composite_score: f32,
+    /// How legible the picture this folder draws is. Absent for a file,
+    /// which draws none, so a code graph's file payload is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shape: Option<crate::models::FolderShape>,
 }
 
 impl JsonScopeMetrics {
@@ -185,6 +199,7 @@ impl JsonScopeMetrics {
             quality_warn: m.quality_warn,
             quality_bad: m.quality_bad,
             composite_score: m.composite_score,
+            shape: m.shape.clone(),
         }
     }
 }
@@ -333,12 +348,17 @@ impl JsonEntity {
                 wmc: e.metrics.wmc,
                 chain_depth: e.metrics.chain_depth,
                 pagerank: e.metrics.pagerank,
-                smells: e.metrics.smells.iter().map(|s| {
-                    serde_json::to_value(s)
-                        .ok()
-                        .and_then(|v| v.as_str().map(String::from))
-                        .unwrap_or_else(|| format!("{:?}", s).to_lowercase())
-                }).collect(),
+                smells: e
+                    .metrics
+                    .smells
+                    .iter()
+                    .map(|s| {
+                        serde_json::to_value(s)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| format!("{:?}", s).to_lowercase())
+                    })
+                    .collect(),
             },
         }
     }
@@ -570,7 +590,10 @@ impl JsonRenderer {
         // Direct rel count per path: intra-file for files, cross-file LCA for folders
         let mut direct_rel_count: HashMap<String, usize> = HashMap::new();
         for (file, _) in &entities_per_file {
-            direct_rel_count.insert(file.clone(), intra_file_rels.get(file).copied().unwrap_or(0));
+            direct_rel_count.insert(
+                file.clone(),
+                intra_file_rels.get(file).copied().unwrap_or(0),
+            );
         }
         for (a, b) in &cross_rels {
             let lca = lowest_common_ancestor(a, b);
@@ -611,12 +634,24 @@ impl JsonRenderer {
             let children = children_map.get(path).cloned().unwrap_or_default();
             for c in &children {
                 aggregate(
-                    c, children_map, entities_per_file, direct_rel_count, file_language,
-                    entity_agg, rel_agg, lang_agg,
+                    c,
+                    children_map,
+                    entities_per_file,
+                    direct_rel_count,
+                    file_language,
+                    entity_agg,
+                    rel_agg,
+                    lang_agg,
                 );
             }
-            let entity_sum: usize = children.iter().map(|c| entity_agg.get(c).copied().unwrap_or(0)).sum();
-            let rel_sum: usize = children.iter().map(|c| rel_agg.get(c).copied().unwrap_or(0)).sum();
+            let entity_sum: usize = children
+                .iter()
+                .map(|c| entity_agg.get(c).copied().unwrap_or(0))
+                .sum();
+            let rel_sum: usize = children
+                .iter()
+                .map(|c| rel_agg.get(c).copied().unwrap_or(0))
+                .sum();
             let mut langs: HashSet<String> = HashSet::new();
             for c in &children {
                 if let Some(child_langs) = lang_agg.get(c) {
@@ -697,7 +732,10 @@ impl JsonRenderer {
             {
                 continue;
             }
-            let has_detail = e.source_code.is_some() || !e.fields.is_empty() || !e.impl_blocks.is_empty() || e.documentation.is_some();
+            let has_detail = e.source_code.is_some()
+                || !e.fields.is_empty()
+                || !e.impl_blocks.is_empty()
+                || e.documentation.is_some();
             if !has_detail {
                 continue;
             }
@@ -754,7 +792,9 @@ impl JsonRenderer {
         for file in graph.file_metrics() {
             let abs = config.root_path.join(&file.path);
             let candidates = [abs, std::path::PathBuf::from(&file.path)];
-            let content = candidates.iter().find_map(|p| std::fs::read_to_string(p).ok());
+            let content = candidates
+                .iter()
+                .find_map(|p| std::fs::read_to_string(p).ok());
             let documentation = graph
                 .file_documentation(std::path::Path::new(&file.path))
                 .map(str::to_string);
@@ -807,11 +847,11 @@ fn lowest_common_ancestor(a: &str, b: &str) -> String {
 /// Simple timestamp without external chrono dependency
 fn chrono_lite_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    
+
     format!("{}", duration.as_secs())
 }
 
@@ -843,9 +883,12 @@ mod scope_metrics_payload_tests {
             entities: vec![a, b],
             relationships: vec![rel],
             files: Vec::new(),
+            import_sites: Vec::new(),
             warnings: Vec::new(),
         });
-        let json = JsonRenderer.render(&graph, &Config::default()).expect("render");
+        let json = JsonRenderer
+            .render(&graph, &Config::default())
+            .expect("render");
         serde_json::from_str(&json).expect("valid json")
     }
 

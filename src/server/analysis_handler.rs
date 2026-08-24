@@ -31,10 +31,12 @@ use super::types::{AnalysisScopeRequest, AnalysisScopeResponse, AnalysisScopeSta
 pub(crate) async fn analysis_scope_state_handler(
     State(state): State<AppState>,
 ) -> Result<Json<AnalysisScopeState>, (StatusCode, String)> {
-    let config = state
-        .config
-        .read()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {e}")))?;
+    let config = state.config.read().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Config lock poisoned: {e}"),
+        )
+    })?;
     let mut languages: Vec<String> = config
         .analysis
         .languages
@@ -67,9 +69,7 @@ pub(crate) async fn analysis_scope_handler(
     Json(req): Json<AnalysisScopeRequest>,
 ) -> Result<Json<AnalysisScopeResponse>, (StatusCode, String)> {
     // Normalize to None whenever the caller sent nothing or an empty list.
-    let requested: Option<Vec<String>> = req
-        .languages
-        .filter(|v| !v.is_empty());
+    let requested: Option<Vec<String>> = req.languages.filter(|v| !v.is_empty());
     let include_docs = req.include_docs;
 
     // Step 1 + 2: ask any in-flight analysis to abort, then acquire the
@@ -98,20 +98,21 @@ pub(crate) async fn analysis_scope_handler(
     // set. We don't mutate the existing `state.config` until the run
     // succeeds — that keeps readers (the live SSE clients, scope_handler)
     // observing the previous, valid scope.
-    let new_config = match build_config_with_scope(&state, &requested, include_docs, req.spec_dir.as_deref()) {
-        Ok(c) => c,
-        Err(msg) => {
-            let mut in_progress = state.analysis_in_progress.lock().await;
-            *in_progress = false;
-            return Ok(Json(AnalysisScopeResponse {
-                success: false,
-                languages: requested,
-                message: Some(msg),
-                entity_count: None,
-                relationship_count: None,
-            }));
-        }
-    };
+    let new_config =
+        match build_config_with_scope(&state, &requested, include_docs, req.spec_dir.as_deref()) {
+            Ok(c) => c,
+            Err(msg) => {
+                let mut in_progress = state.analysis_in_progress.lock().await;
+                *in_progress = false;
+                return Ok(Json(AnalysisScopeResponse {
+                    success: false,
+                    languages: requested,
+                    message: Some(msg),
+                    entity_count: None,
+                    relationship_count: None,
+                }));
+            }
+        };
 
     let result = run_analysis_blocking(
         new_config.clone(),

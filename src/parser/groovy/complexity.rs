@@ -199,7 +199,9 @@ fn opens_nesting(node: &Node, source: &str) -> bool {
 /// `if (…) { … }` is the exception: its parent is a `method_invocation`,
 /// but the braces are a block and the invocation already counted.
 fn is_closure_literal(node: &Node, source: &str) -> bool {
-    let Some(parent) = node.parent() else { return false };
+    let Some(parent) = node.parent() else {
+        return false;
+    };
     CLOSURE_VALUE_PARENTS.contains(&parent.kind())
         && flow_keyword_invocation(&parent, source).is_none()
 }

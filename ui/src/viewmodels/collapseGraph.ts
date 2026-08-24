@@ -19,8 +19,11 @@ import type { D3Node, D3Link, GraphData, GraphLevel, EntityMetrics, ScopeMetrics
 /** Shared empty set, so the default argument allocates nothing per call. */
 const EMPTY_EXPANSION: ReadonlySet<string> = new Set<string>();
 
-/** The directory holding a node's file. */
-function moduleOf(node: D3Node): string {
+/** The directory holding a node's file. Exported so `mixedGrain` resolves a
+ *  module the same way this does — the two deciding a scope differently is
+ *  the one bug a ring plan cannot survive, since the grain it picks and the
+ *  scope this collapses into would name different things. */
+export function moduleOf(node: D3Node): string {
   const i = node.file_path.lastIndexOf('/');
   return i >= 0 ? node.file_path.slice(0, i) : '';
 }
@@ -48,8 +51,24 @@ export function everyFileIsOneEntity(nodes: readonly D3Node[]): boolean {
 }
 
 /**
- * The scope a node collapses into — or the node itself, when its scope has
- * been expanded (UI-057).
+ * The grain ONE node is drawn at (UI-104).
+ *
+ * The level used to be a property of the picture: ask for Entity and every
+ * circle is an entity, the eight you came to read and the four hundred you
+ * did not. It was never quite that, though — UI-057's expansion already made
+ * the drawn graph mixed, one clicked scope at a time. This type is what that
+ * was underneath all along, said once: a function from a node to the grain it
+ * is drawn at, with `grainFromLevel` recovering the uniform case exactly.
+ *
+ * Everything downstream of `collapseGraph` already copes with a mixed result
+ * — the display plan, the filters and the selection cannot tell a rollup from
+ * an entity — so generalising here is where the whole feature is spent.
+ */
+export type GrainOf = (node: D3Node) => GraphLevel;
+
+/**
+ * Today's rule as a resolver: one level everywhere, with `expanded` opening
+ * exactly one level under it (UI-057).
  *
  * `expanded` holds *paths*, never ids. A path survives a level change and a
  * re-analysis; `sanitizeId` rewrites ids and `collapseGraph` builds fresh
@@ -59,17 +78,65 @@ export function everyFileIsOneEntity(nodes: readonly D3Node[]): boolean {
  * Expansion opens exactly one level: an expanded module renders as its
  * files, an expanded file as its entities. Anything more would make a single
  * gesture unpredictable — the reader would not know how much they were about
- * to add to the canvas.
+ * to add to the canvas. A ring plan (`mixedGrain.ts`) is the deliberate
+ * exception: it is not a gesture on one scope, so the reader is told what it
+ * will cost before it runs rather than after.
+ *
+ * A node with no file_path — a ghost — is never expanded, and takes the bare
+ * level so `scopeIdFor` drops it below Entity. That is not an optimisation:
+ * the root module's path is `''`, so an expanded root would otherwise test
+ * `expanded.has('')` against a ghost's empty file_path and promote thousands
+ * of external symbols onto the canvas.
  */
-function scopeIdFor(node: D3Node, level: GraphLevel, expanded: ReadonlySet<string>): string {
-  if (level === 'file') {
-    return expanded.has(node.file_path) ? node.id : node.file_path;
-  }
-  if (level === 'module') {
-    const mod = moduleOf(node);
-    return expanded.has(mod) ? node.file_path : mod;
-  }
-  return node.id;
+export function grainFromLevel(level: GraphLevel, expanded: ReadonlySet<string>): GrainOf {
+  return (node) => {
+    if (level === 'entity') return 'entity';
+    if (!node.file_path) return level;
+    if (level === 'file') return expanded.has(node.file_path) ? 'entity' : 'file';
+    return expanded.has(moduleOf(node)) ? 'file' : 'module';
+  };
+}
+
+/**
+ * Which scope a node collapses into — the answer `scopeIdFor` gives by
+ * default, made replaceable (UI-108).
+ *
+ * `GrainOf` says how *coarse* a node is drawn and the scope follows from it,
+ * which is enough for every uniform level and for a ring plan. It is not
+ * enough for a picture rooted at one folder: a file three directories down
+ * has to collapse into the immediate child of that folder holding it, and
+ * that is an ancestor `moduleOf` never names — it always answers the file's
+ * own parent.
+ *
+ * `null` drops the node from the canvas entirely, which is what makes this a
+ * filter as well as an aggregation: a resolver answering `null` for
+ * everything unrelated to a folder is how the shape view shows one folder
+ * and its neighbours and nothing else.
+ */
+export type ScopeOf = (node: D3Node, grain: GraphLevel) => string | null;
+
+/**
+ * The scope a node collapses into at its grain.
+ *
+ * `null` means the node belongs to no scope at this grain, which is only ever
+ * a ghost: an external or stdlib reference has no file, and a real graph
+ * carries thousands of them (6 598 against 13 615 real entities on this
+ * repo), so they cannot each become a circle at a collapsed level. They used
+ * to land on the `''` scope — the same key the repo ROOT directory has at
+ * module level — and the edge merge below dropped every edge touching it,
+ * testing `!srcScope` where it meant "no scope at all". A root-level file's
+ * relationships disappeared with them: in a doc graph the root holds the hub
+ * documents (README, CLAUDE.md, CONTEXT.md), so the reader who selected one
+ * got a Details pane with no Relationships section at all.
+ *
+ * Entity grain is answered before the file_path guard, because a ghost IS a
+ * circle at Entity level — it is only below Entity that it has nowhere to go.
+ */
+function scopeIdFor(node: D3Node, grain: GraphLevel): string | null {
+  if (grain === 'entity') return node.id;
+  if (!node.file_path) return null;
+  if (grain === 'file') return node.file_path;
+  return moduleOf(node);
 }
 
 /** True when this scope id is a single entity rather than a rollup — i.e.
@@ -133,8 +200,18 @@ export function collapseGraph(
   raw: GraphData,
   level: GraphLevel,
   expanded: ReadonlySet<string> = EMPTY_EXPANSION,
+  grainOf?: GrainOf,
+  scopeOf?: ScopeOf,
 ): GraphData {
-  if (level === 'entity') return raw;
+  // The uniform fast path, kept exactly: Entity level with no ring plan is
+  // the input graph, links and all. A ring plan has to be honoured even when
+  // it happens to answer Entity everywhere, because the caller — not this
+  // function — is the one that knows whether it does. A scope resolver
+  // disables it for the same reason, and additionally because such a
+  // resolver may be dropping nodes, which the fast path would not do.
+  if (!grainOf && !scopeOf && level === 'entity') return raw;
+  const grainFor = grainOf ?? grainFromLevel(level, expanded);
+  const scopeFor = scopeOf ?? scopeIdFor;
 
   const fileIndex = new Map((raw.files ?? []).map((f) => [f.path, f]));
   const moduleIndex = new Map((raw.modules ?? []).map((m) => [m.path, m]));
@@ -148,7 +225,9 @@ export function collapseGraph(
   const entityScopes = new Set<string>();
 
   for (const n of raw.nodes) {
-    const scopeId = scopeIdFor(n, level, expanded);
+    const grain = grainFor(n);
+    const scopeId = scopeFor(n, grain);
+    if (scopeId === null) continue;
     entityToScope.set(n.id, scopeId);
     if (isEntityScope(n, scopeId)) entityScopes.add(scopeId);
     if (nodes.has(scopeId)) continue;
@@ -162,8 +241,10 @@ export function collapseGraph(
 
     // A module expanded to files yields File nodes even though the requested
     // level is Module; a file expanded to entities is handled above. This is
-    // what makes the view *mixed* rather than uniform.
-    const isFileNode = level === 'file' || expanded.has(moduleOf(n));
+    // what makes the view *mixed* rather than uniform — and with a ring plan
+    // the grain is simply read off the node instead of being reconstructed
+    // from the level and the expansion set.
+    const isFileNode = grain === 'file';
     const { name, dir } = splitPath(scopeId);
     const id = sanitizeId(scopeId) || '_root_';
     const kindRaw = isFileNode ? 'File' : 'Module';
@@ -177,7 +258,12 @@ export function collapseGraph(
       kind: kindRaw.toLowerCase(),
       kind_raw: kindRaw,
       file_path: isFileNode ? scopeId : (dir ? `${dir}/${name || ''}` : name),
+      // A rollup is not a span in a file: it stands for every entity inside
+      // it, and the first line of the first one is not a fact about the
+      // scope. Both ends sit at 1 so anything reading a range gets an empty
+      // one rather than a confident wrong number.
       line: 1,
+      end_line: 1,
       visibility: 'Public',
       parent_id: null,
       parameters: [],
@@ -212,9 +298,17 @@ export function collapseGraph(
     const tgtEntity = typeof l.target === 'object' ? l.target.id : l.target;
     const srcScope = entityToScope.get(srcEntity);
     const tgtScope = entityToScope.get(tgtEntity);
-    if (!srcScope || !tgtScope || srcScope === tgtScope) continue;
+    // `undefined`, not falsy: `''` is the repo root, a scope like any other.
+    if (srcScope === undefined || tgtScope === undefined || srcScope === tgtScope) continue;
     const srcNode = nodes.get(srcScope)!;
     const tgtNode = nodes.get(tgtScope)!;
+
+    // A lifted twin (UI-113) says the same thing as the edge it was routed
+    // off, one node further out. That is new information at Entity grain,
+    // where the body it bypasses can be hidden — and double-counting at every
+    // grain above it, where the branch and its callable collapse into the
+    // same circle and the real edge is already in this rollup's weight.
+    if (l.lifted_from && !(entityScopes.has(srcScope) && entityScopes.has(tgtScope))) continue;
 
     // UI-058. Both ends expanded to entities means this is a real
     // entity-to-entity relationship that happens to be drawn on a mixed

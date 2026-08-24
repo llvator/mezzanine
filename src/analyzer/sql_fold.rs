@@ -153,7 +153,8 @@ impl FoldState {
         };
         table.former_names.push(from.to_string());
         table.name = to.to_string();
-        self.tables.insert((schema.to_string(), to.to_string()), table);
+        self.tables
+            .insert((schema.to_string(), to.to_string()), table);
 
         // Inbound foreign keys must follow the rename, or they dangle.
         for table in self.tables.values_mut() {

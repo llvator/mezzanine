@@ -144,17 +144,17 @@ fn detect_unused_concepts(result: &AnalysisResult, out: &mut Vec<Finding>) {
         if e.kind == EntityKind::Concept && !used.contains(e.id.as_str()) {
             out.push(Finding {
                 severity: Severity::Hint,
-                message: format!(
-                    "unused: @ {} has no `used_by:` consumers",
-                    e.qualified_name
-                ),
+                message: format!("unused: @ {} has no `used_by:` consumers", e.qualified_name),
             });
         }
     }
 }
 
 fn elevator_entities(result: &AnalysisResult) -> impl Iterator<Item = &CodeEntity> {
-    result.entities.iter().filter(|e| e.tags.contains("elevator"))
+    result
+        .entities
+        .iter()
+        .filter(|e| e.tags.contains("elevator"))
 }
 
 fn kind_marker(k: EntityKind) -> &'static str {

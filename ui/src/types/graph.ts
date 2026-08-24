@@ -99,6 +99,22 @@ export interface D3Node {
    * as `node.codeRefs ?? []`. UI-026. */
   codeRefs?: CodeRef[];
 
+  /**
+   * `original_id` of the callable whose *body* this entity lives in, or
+   * undefined when it is declared at the surface of its file (UI-113).
+   *
+   * Stamped by `liftBodies` from the `parent_id` ancestry, walking out
+   * through any number of branches and loops — so a call nested five arms
+   * deep in `parse()` carries `parse`, the same value its parameters do.
+   * Absent, never null, for a surface entity: a struct's field, an
+   * interface's property and an `impl` method all have parents and are all
+   * declarations, which is exactly the distinction `parent_id` cannot make.
+   *
+   * `original_id`, not `id`, so it compares directly against
+   * `selectedNode.original_id` — one equality reopens one callable's body.
+   */
+  body_of?: string;
+
   // D3 simulation properties (added at runtime)
   x?: number;
   y?: number;
@@ -138,6 +154,18 @@ export interface D3Link {
    *  separate from `binds_to` so the renderer can distinguish a fresh
    *  binding from an update. */
   rebinds_to?: string;
+
+  /**
+   * Ids this edge was re-routed off, when it is the lifted twin of an edge
+   * with an end inside a body (UI-113). Absent on every real edge.
+   *
+   * A call written inside an `if` hangs off the `Branch` node, not off the
+   * function — so hiding bodies would drop it. `liftBodies` adds a twin
+   * anchored at the enclosing callable and records the bypassed ends here,
+   * which is what lets the twin stand down again the moment the reader opens
+   * that body and the real edge becomes drawable.
+   */
+  lifted_from?: string[];
 }
 
 export interface GraphData {
@@ -182,6 +210,157 @@ export interface BackendThresholds {
   [key: string]: unknown;
 }
 
+/** The four organisation patterns a folder's drawn graph falls into,
+ *  worst first. Mirrors `ShapePattern` on the Rust side. */
+export type ShapePattern = 'cyclic' | 'tangled' | 'hierarchical' | 'fractal';
+
+/** How legible the picture a folder draws is.
+ *
+ *  Scored over what the canvas renders when collapsed to that folder — its
+ *  immediate children, each subfolder standing as one node. Every score
+ *  runs 0–1 with **higher meaning better**, the opposite of the refactor
+ *  pressure score beside it: the two answer different questions and must
+ *  not be read on one scale. Organisation, not code quality. */
+export interface FolderShape {
+  pattern: ShapePattern;
+  /** Weighted mean of whichever sub-scores below are defined. */
+  compliance: number;
+  /** Share of children outside any dependency loop. */
+  acyclicity: number;
+  /** Share of edges stepping exactly one level down. Absent when the
+   *  children have no edges between them — unmeasured, not perfect. */
+  layering?: number;
+  /** Share of the drawn edges that branch rather than merge — one arriving
+   *  at each child. Absent on the same condition `layering` is, the two
+   *  being ratios over the same edges.
+   *
+   *  Gates `fractal` and is deliberately NOT a term in `compliance`
+   *  (ADR 0013), so a folder can blend well and still be held back by it.
+   *  Reads against `layering` on the same scale and disagrees with it on
+   *  purpose: a shared helper steps one level cleanly and still merges. */
+  arborescence?: number;
+  /** Share of the traffic arriving from outside that lands on one file.
+   *  Absent when nothing outside depends on the folder. */
+  entry_concentration?: number;
+  /** Mean compliance of the subfolders inside. Absent when there are none. */
+  child_compliance?: number;
+  /** Immediate children, files and subfolders together. Reported, not scored. */
+  child_count: number;
+  /** Why this folder is not one tier higher. Absent only for `fractal`. */
+  blocker?: ShapeBlocker;
+}
+
+/** Which gate capped a folder's tier, and the measurement that failed it.
+ *  Mirrors `ShapeBlocker` on the Rust side, serialised as a tagged union.
+ *
+ *  Computed there rather than re-derived here on purpose: the thresholds
+ *  are configurable and live in `Thresholds`, so a second copy of the
+ *  comparisons in the panel would be a second answer waiting to disagree
+ *  with the tier it sits next to. */
+export type ShapeBlocker =
+  /** Children sit in a dependency loop; `value` is `acyclicity`. */
+  | { gate: 'cycles'; value: number }
+  /** Edges skip levels; `value` is `layering`. */
+  | { gate: 'layering'; value: number }
+  /** Children lean on the same sibling; `value` is `arborescence`. */
+  | { gate: 'merges'; value: number }
+  /** Outsiders reach in at many points; `value` is `entry_concentration`. */
+  | { gate: 'entry'; value: number }
+  /** A subfolder is itself below hierarchical; `value` is its pattern. */
+  | { gate: 'child_pattern'; value: ShapePattern }
+  /** Subfolders broadly out of order; `value` is `child_compliance`. */
+  | { gate: 'child_compliance'; value: number }
+  /** Children with no edges between them — nothing to be similar to. */
+  | { gate: 'unstructured' }
+  /** More children than a reader takes in at once; `value` is the count. */
+  | { gate: 'breadth'; value: number }
+  /** Every gate passed and the blend still fell short; `value` is `compliance`. */
+  | { gate: 'compliance'; value: number };
+
+/**
+ * The graph one folder draws, with a verdict on every part of it — the
+ * evidence behind its `FolderShape`. Mirrors `FolderPicture` on the Rust
+ * side, served by `GET /api/shape`.
+ *
+ * Produced by the pass that does the scoring rather than rebuilt here, for
+ * the reason `ShapeBlocker` is: a second derivation is a second answer, and
+ * this one would be free to draw a picture the number beside it denies.
+ */
+export interface FolderPicture {
+  folder: string;
+  /** Immediate children — files directly inside, each subfolder as one
+   *  node. Exactly what the canvas draws when collapsed here. */
+  children: PictureChild[];
+  /** Exactly the arrows the scores were computed over. `erased` sits
+   *  beside this list and deliberately not in it. */
+  edges: PictureEdge[];
+  /** The arrows the build erases — every import behind each of them is an
+   *  `import type` or a Python `if TYPE_CHECKING:` import, so none of them
+   *  is counted in any score (ADR 0026). Drawn all the same: the type is
+   *  still something a reader has to go and find. Absent on a picture
+   *  served by an older binary. */
+  erased?: ErasedEdge[];
+  /** One hop out, never transitively: the files elsewhere in the repo that
+   *  touch this folder, and nothing else. */
+  outside: OutsideEdge[];
+  /** The busiest file(s) depended on from outside — the folder's front
+   *  doors, and the numerator of `entry_concentration`. */
+  doors: string[];
+}
+
+export interface PictureChild {
+  path: string;
+  kind: 'file' | 'folder';
+  /** The row it draws on: longest path from a source. Children in one
+   *  dependency loop share a level, a loop having no order to lay out. */
+  level: number;
+  /** Dependencies arriving from outside the folder into this child. */
+  inbound: number;
+  is_door: boolean;
+}
+
+/** How an edge between two children reads. `step` is the shape you want;
+ *  the other two are what `layering` and `acyclicity` charge for. */
+export type EdgeVerdict = 'step' | 'skip' | 'back';
+
+export interface PictureEdge {
+  from: string;
+  to: string;
+  verdict: EdgeVerdict;
+}
+
+/** One discounted arrow. No verdict: `step`, `skip` and `back` are readings
+ *  of the levels, and the levels are assigned over the graph this arrow was
+ *  taken out of. */
+export interface ErasedEdge {
+  from: string;
+  to: string;
+}
+
+/** How a dependency crossing the folder's boundary reads. `exit` is never a
+ *  defect — depending outward is what a folder is for. */
+export type OutsideVerdict = 'entry' | 'breach' | 'exit';
+
+export interface OutsideEdge {
+  /** The file on the far side, wherever in the repo it lives. */
+  outside: string;
+  /** The file inside the folder at this end — what a breach names. */
+  inside: string;
+  /** The immediate child holding `inside` — the circle the line attaches
+   *  to, which for a nested file is not the same thing. */
+  child: string;
+  verdict: OutsideVerdict;
+}
+
+/** What `GET /api/shape` returns: the verdict and the graph it was
+ *  computed over, together, so no reader can pair one analysis's picture
+ *  with another's number. */
+export interface ShapeResponse {
+  path: string;
+  shape?: FolderShape;
+  picture: FolderPicture;
+}
+
 /** File- or module-level quality rollup (shape shared with Rust side). */
 export interface ScopeMetrics {
   path: string;
@@ -215,9 +394,21 @@ export interface ScopeMetrics {
   quality_bad?: number;
   /** Composite scope score computed by the backend. */
   composite_score?: number;
+  /** How legible a picture this folder draws. Modules only — a file has
+   *  no children to draw a graph of, so it never carries one. */
+  shape?: FolderShape;
 }
 
-export type ViewMode = 'graph' | 'tree';
+/**
+ * What the canvas is drawing.
+ *
+ * `graph` is the force simulation, `tree` the BFS spanning tree around a
+ * selection, and `shape` one folder's own graph laid out by level — the
+ * picture `FolderShape` scores, which neither of the other two draws:
+ * `graph` shows the whole hairball and `tree` treats every relationship as
+ * the same kind of thing, which is exactly the distinction shape is about.
+ */
+export type ViewMode = 'graph' | 'tree' | 'shape';
 
 /** Aggregation level for the graph view: show every entity, collapse to
  * one node per file, or collapse to one node per directory. */
@@ -372,6 +563,9 @@ export const LANGUAGE_COLORS: Record<string, string> = {
   Ruby: '#CC342D',
   Swift: '#F05138',
   Kotlin: '#A97BFF',
+  /** Dart — the language's own brand teal, well clear of Go's cyan
+   * so a repo with both reads correctly in the language filter. */
+  Dart: '#00B4AB',
   Scala: '#DC322F',
   PHP: '#4F5D95',
   /** Apache Groovy — official brand colour. Distinct from Java's

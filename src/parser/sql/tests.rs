@@ -117,7 +117,10 @@ fn table_level_foreign_key_emits_the_same_edge() {
 #[test]
 fn foreign_key_targets_resolve_across_files() {
     let s = fold_files(&[
-        ("001_users.sql", "CREATE TABLE users (user_id UUID PRIMARY KEY);"),
+        (
+            "001_users.sql",
+            "CREATE TABLE users (user_id UUID PRIMARY KEY);",
+        ),
         (
             "002_sessions.sql",
             "CREATE TABLE sessions (
@@ -305,7 +308,10 @@ fn spans_point_at_the_statement_that_declared_the_table() {
 fn add_column_in_a_later_migration_lands_on_the_table() {
     let s = fold_files(&[
         ("001_init.sql", "CREATE TABLE orders (id UUID PRIMARY KEY);"),
-        ("002_total.sql", "ALTER TABLE orders ADD COLUMN total NUMERIC;"),
+        (
+            "002_total.sql",
+            "ALTER TABLE orders ADD COLUMN total NUMERIC;",
+        ),
     ]);
 
     let orders = table(&s, "orders");
@@ -318,7 +324,10 @@ fn add_column_in_a_later_migration_lands_on_the_table() {
 fn filename_order_decides_not_discovery_order() {
     // Same two files, handed over in the wrong order.
     let s = fold_files(&[
-        ("002_total.sql", "ALTER TABLE orders ADD COLUMN total NUMERIC;"),
+        (
+            "002_total.sql",
+            "ALTER TABLE orders ADD COLUMN total NUMERIC;",
+        ),
         ("001_init.sql", "CREATE TABLE orders (id UUID PRIMARY KEY);"),
     ]);
 
@@ -332,7 +341,10 @@ fn filename_order_decides_not_discovery_order() {
 #[test]
 fn a_dropped_table_is_not_in_the_schema() {
     let s = fold_files(&[
-        ("001_init.sql", "CREATE TABLE tasks (id UUID); CREATE TABLE kept (id UUID);"),
+        (
+            "001_init.sql",
+            "CREATE TABLE tasks (id UUID); CREATE TABLE kept (id UUID);",
+        ),
         ("002_drop.sql", "DROP TABLE tasks;"),
     ]);
 
@@ -362,7 +374,10 @@ fn dropping_a_table_removes_foreign_keys_pointing_at_it() {
 fn a_renamed_table_appears_once_under_its_final_name() {
     let s = fold_files(&[
         ("001_init.sql", "CREATE TABLE feeds (id UUID PRIMARY KEY);"),
-        ("002_rename.sql", "ALTER TABLE feeds RENAME TO api_connectors;"),
+        (
+            "002_rename.sql",
+            "ALTER TABLE feeds RENAME TO api_connectors;",
+        ),
     ]);
 
     assert_eq!(names(&s), vec!["api_connectors"]);
@@ -382,7 +397,10 @@ fn foreign_keys_follow_a_renamed_target() {
             "CREATE TABLE feeds (id UUID PRIMARY KEY);
              CREATE TABLE rows (id UUID, feed_id UUID REFERENCES feeds(id));",
         ),
-        ("002_rename.sql", "ALTER TABLE feeds RENAME TO api_connectors;"),
+        (
+            "002_rename.sql",
+            "ALTER TABLE feeds RENAME TO api_connectors;",
+        ),
     ]);
 
     let live: Vec<&String> = s.entities.iter().map(|e| &e.id).collect();
@@ -397,12 +415,21 @@ fn foreign_keys_follow_a_renamed_target() {
 fn a_multi_hop_rename_chain_keeps_full_provenance() {
     let s = fold_files(&[
         ("001.sql", "CREATE TABLE feed_row_origins (id UUID);"),
-        ("002.sql", "ALTER TABLE feed_row_origins RENAME TO api_connector_row_origins;"),
-        ("003.sql", "ALTER TABLE api_connector_row_origins RENAME TO connector_row_origins;"),
+        (
+            "002.sql",
+            "ALTER TABLE feed_row_origins RENAME TO api_connector_row_origins;",
+        ),
+        (
+            "003.sql",
+            "ALTER TABLE api_connector_row_origins RENAME TO connector_row_origins;",
+        ),
     ]);
 
     assert_eq!(names(&s), vec!["connector_row_origins"]);
-    let doc = table(&s, "connector_row_origins").documentation.clone().unwrap();
+    let doc = table(&s, "connector_row_origins")
+        .documentation
+        .clone()
+        .unwrap();
     assert!(doc.contains("feed_row_origins"), "{doc}");
     assert!(doc.contains("api_connector_row_origins"), "{doc}");
 }
@@ -432,7 +459,10 @@ fn a_renamed_column_keeps_its_position_and_its_foreign_key() {
             "CREATE TABLE users (id UUID PRIMARY KEY);
              CREATE TABLE posts (id UUID, author UUID REFERENCES users(id), body TEXT);",
         ),
-        ("002.sql", "ALTER TABLE posts RENAME COLUMN author TO author_id;"),
+        (
+            "002.sql",
+            "ALTER TABLE posts RENAME COLUMN author TO author_id;",
+        ),
     ]);
 
     let posts = table(&s, "posts");
@@ -454,7 +484,10 @@ fn drop_constraint_removes_an_inline_foreign_key() {
             "CREATE TABLE users (id UUID PRIMARY KEY);
              CREATE TABLE posts (id UUID, author UUID REFERENCES users(id));",
         ),
-        ("002.sql", "ALTER TABLE posts DROP CONSTRAINT posts_author_fkey;"),
+        (
+            "002.sql",
+            "ALTER TABLE posts DROP CONSTRAINT posts_author_fkey;",
+        ),
     ]);
 
     assert!(
@@ -511,7 +544,10 @@ fn a_table_dropped_then_recreated_is_live_again() {
 /// counted, because the same signal catches genuine ordering bugs.
 #[test]
 fn altering_an_uncreated_table_is_tolerated_and_counted() {
-    let s = fold_files(&[("001.sql", "ALTER TABLE auth.users ADD COLUMN nickname TEXT;")]);
+    let s = fold_files(&[(
+        "001.sql",
+        "ALTER TABLE auth.users ADD COLUMN nickname TEXT;",
+    )]);
 
     assert_eq!(s.alters_on_unknown_tables, 1);
     assert_eq!(table(&s, "users").id, table_id("auth", "users"));

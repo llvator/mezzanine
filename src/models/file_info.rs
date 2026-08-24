@@ -8,16 +8,16 @@ use std::path::{Path, PathBuf};
 pub struct FileInfo {
     /// Absolute path to the file
     pub path: PathBuf,
-    
+
     /// Detected programming language
     pub language: Language,
-    
+
     /// File size in bytes
     pub size: u64,
-    
+
     /// Number of lines
     pub line_count: usize,
-    
+
     /// SHA256 hash of contents (for caching)
     pub content_hash: Option<String>,
 
@@ -48,6 +48,11 @@ pub enum Language {
     Ruby,
     Swift,
     Kotlin,
+    /// Dart (`.dart`). Parsed by `tree-sitter-dart`, pinned to the last
+    /// grammar release built at an ABI our tree-sitter can load — which
+    /// predates Dart 3, so the class modifiers it never learned are
+    /// blanked out of the source before parsing. See `parser/dart/dart3`.
+    Dart,
     Scala,
     PHP,
     Groovy,
@@ -134,6 +139,7 @@ impl Language {
             "rb" => Language::Ruby,
             "swift" => Language::Swift,
             "kt" | "kts" => Language::Kotlin,
+            "dart" => Language::Dart,
             "scala" | "sc" => Language::Scala,
             "php" => Language::PHP,
             "groovy" | "gradle" => Language::Groovy,
@@ -145,7 +151,7 @@ impl Language {
             _ => Language::Unknown,
         }
     }
-    
+
     /// Detect language from a path's extension alone.
     ///
     /// `parser::detect_language` is the entry point for deciding how a file
@@ -171,6 +177,7 @@ impl Language {
             Language::Ruby => &["rb"],
             Language::Swift => &["swift"],
             Language::Kotlin => &["kt", "kts"],
+            Language::Dart => &["dart"],
             Language::Scala => &["scala", "sc"],
             Language::PHP => &["php"],
             Language::Groovy => &["groovy", "gradle"],
@@ -185,7 +192,7 @@ impl Language {
             Language::Unknown => &[],
         }
     }
-    
+
     /// Parse a language from its human-readable name (case-insensitive).
     /// Accepts both full names ("rust", "python") and short aliases ("rs", "py").
     pub fn from_name(s: &str) -> Option<Self> {
@@ -206,6 +213,7 @@ impl Language {
             "ruby" | "rb" => Some(Language::Ruby),
             "swift" => Some(Language::Swift),
             "kotlin" | "kt" => Some(Language::Kotlin),
+            "dart" => Some(Language::Dart),
             "scala" => Some(Language::Scala),
             "php" => Some(Language::PHP),
             "groovy" => Some(Language::Groovy),
@@ -243,6 +251,7 @@ impl Language {
             Language::Ruby => "ruby",
             Language::Swift => "swift",
             Language::Kotlin => "kotlin",
+            Language::Dart => "dart",
             Language::Scala => "scala",
             Language::PHP => "php",
             Language::Groovy => "groovy",
@@ -323,6 +332,7 @@ impl Language {
             Language::Ruby => "Ruby",
             Language::Swift => "Swift",
             Language::Kotlin => "Kotlin",
+            Language::Dart => "Dart",
             Language::Scala => "Scala",
             Language::PHP => "PHP",
             Language::Groovy => "Groovy",
@@ -350,7 +360,11 @@ pub struct Position {
 
 impl Position {
     pub fn new(line: usize, column: usize, offset: usize) -> Self {
-        Self { line, column, offset }
+        Self {
+            line,
+            column,
+            offset,
+        }
     }
 }
 
@@ -367,7 +381,7 @@ impl Span {
     pub fn new(start: Position, end: Position) -> Self {
         Self { start, end }
     }
-    
+
     /// Create a span from line/column pairs
     pub fn from_positions(
         start_line: usize,
@@ -380,7 +394,7 @@ impl Span {
             end: Position::new(end_line, end_col, 0),
         }
     }
-    
+
     /// Check if this span contains a position
     pub fn contains(&self, pos: Position) -> bool {
         if pos.line < self.start.line || pos.line > self.end.line {
@@ -394,7 +408,7 @@ impl Span {
         }
         true
     }
-    
+
     /// Get the number of lines this span covers
     pub fn line_count(&self) -> usize {
         self.end.line - self.start.line + 1
@@ -421,6 +435,7 @@ mod tests {
         Language::Ruby,
         Language::Swift,
         Language::Kotlin,
+        Language::Dart,
         Language::Scala,
         Language::PHP,
         Language::Groovy,
@@ -444,9 +459,10 @@ mod tests {
     /// job to force.
     #[test]
     fn the_ui_language_list_matches_the_enum() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/utils/languageScope.ts"),
-        )
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ui/src/utils/languageScope.ts"
+        ))
         .expect("the UI language list must exist; move this test if the path changes");
 
         let body = source
@@ -459,11 +475,15 @@ mod tests {
 
         let listed: Vec<String> = body
             .split(',')
-            .filter_map(|s| s.trim().strip_prefix('\'')?.strip_suffix('\'').map(str::to_string))
+            .filter_map(|s| {
+                s.trim()
+                    .strip_prefix('\'')?
+                    .strip_suffix('\'')
+                    .map(str::to_string)
+            })
             .collect();
 
-        let listed: std::collections::BTreeSet<&str> =
-            listed.iter().map(String::as_str).collect();
+        let listed: std::collections::BTreeSet<&str> = listed.iter().map(String::as_str).collect();
         let expected: std::collections::BTreeSet<&str> =
             ALL.iter().map(|l| l.filter_name()).collect();
 

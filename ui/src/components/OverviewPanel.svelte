@@ -31,6 +31,11 @@
    *  same contract `CanvasToolbar` works under. */
   export let graphView: GraphView | undefined = undefined;
 
+  /** How far above the canvas floor to sit, in px. The bottom strip below
+   *  grows and wraps with the controls it carries, so the clearance is
+   *  measured by `App` rather than guessed at here. */
+  export let bottomInset = 60;
+
   /** Fixed, and small. A resizable overview is a second thing to manage in
    *  the corner of the screen, and the panel has no detail that more pixels
    *  would reveal — it is deliberately a picture with no labels in it. */
@@ -89,7 +94,8 @@
   }
 </script>
 
-<div class="overview" class:collapsed={!$overviewOpen} data-probe="overview-panel">
+<div class="overview" class:collapsed={!$overviewOpen} data-probe="overview-panel"
+  style="bottom: {bottomInset}px">
   <button
     type="button"
     class="overview-handle"
@@ -151,11 +157,14 @@
      toward the centre — and taking a column instead would shrink the very
      view this exists to help the reader hold.
 
-     The bottom inset clears `.mode-bar-bottom`, which occupies the same
-     corner at `bottom: 20px` and stands 31px tall. At 12px this panel covered
-     the live-status and endpoint chips completely — a status indicator that
-     is invisible is worse than absent, because the page still looks like it
-     is reporting one. The probe's `clears-the-bottom-bar` check asserts the
+     The bottom inset clears `.canvas-bottom-bar`, which occupies the same
+     corner and carries the live-status and endpoint chips. At 12px this panel
+     covered them completely — a status indicator that is invisible is worse
+     than absent, because the page still looks like it is reporting one. The
+     inset is no longer a constant: the strip grows with the controls the diff
+     badge carries and wraps on a narrow window, so `App` measures it and
+     passes the clearance in. The 60px here is only the value before the first
+     measurement lands. The probe's `clears-the-bottom-bar` check asserts the
      zero overlap, so the two cannot drift back into each other. */
   .overview {
     position: absolute;

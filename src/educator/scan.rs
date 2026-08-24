@@ -10,42 +10,13 @@
 //! Both reuse the same per-language extractor and the same predicate
 //! evaluator — the only difference is the AST traversal.
 
+use super::corpus::Educator;
 use super::predicate;
 use super::rules::Rule;
-use super::Educator;
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tree_sitter::Node;
-
-/// Recursively collect every `.md` file under `root`, sorted by full path so
-/// the load order is stable across runs. Shared by [`super::rules::load_all`]
-/// and [`super::lessons::load_all`] so semantic-category subfolders
-/// (`rules/control-flow/`, `lessons/oop/`, …) work for both kinds of content
-/// with identical traversal semantics.
-pub(super) fn walk_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    walk_markdown_files_inner(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn walk_markdown_files_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?;
-    for entry in entries {
-        let path = match entry {
-            Ok(e) => e.path(),
-            Err(_) => continue,
-        };
-        if path.is_dir() {
-            walk_markdown_files_inner(&path, out)?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("md") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanHit {
@@ -88,8 +59,8 @@ pub fn scan_file(educator: &Educator, file: &Path) -> Result<ScanResponse> {
         _ => return Ok(ScanResponse::empty("unknown")),
     };
 
-    let source = std::fs::read_to_string(file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let source =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
 
     let mut parser = tree_sitter::Parser::new();
     parser

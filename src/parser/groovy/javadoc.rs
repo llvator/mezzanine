@@ -27,10 +27,7 @@ pub(super) fn extract_javadoc(node: &Node, source: &str) -> Option<String> {
         return None;
     }
 
-    let inner = text
-        .trim_start_matches("/**")
-        .trim_end_matches("*/")
-        .trim();
+    let inner = text.trim_start_matches("/**").trim_end_matches("*/").trim();
     let lines: Vec<String> = inner
         .lines()
         .map(|l| {

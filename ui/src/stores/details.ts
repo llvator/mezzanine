@@ -1,4 +1,5 @@
 import { writable, get } from 'svelte/store';
+import type { Readable } from 'svelte/store';
 import type { D3Field } from '../types/graph';
 import { apiUrl } from '../vscodeAdapter';
 
@@ -31,6 +32,18 @@ async function fetchDetailsFile(): Promise<DetailsMap> {
 export function ensureDetailsLoaded(): Promise<DetailsMap> {
   return ensureLoaded();
 }
+
+/**
+ * The same map as a read-only store, for the consumer that wants every
+ * entity's source rather than the selected one — `diffChurnIndex` line-diffs
+ * the whole changed set at once.
+ *
+ * Subscribe-only: `ensureDetailsLoaded` stays the single door that fetches,
+ * so a second reader cannot start a second request for the one file everyone
+ * shares. `null` until that resolves, which a derived consumer reads as "not
+ * measurable yet" rather than "empty".
+ */
+export const detailsMap: Readable<DetailsMap | null> = { subscribe: detailsCache.subscribe };
 
 function ensureLoaded(): Promise<DetailsMap> {
   const cached = get(detailsCache);

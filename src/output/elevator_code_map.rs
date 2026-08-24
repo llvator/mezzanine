@@ -24,7 +24,11 @@ pub fn render(result: &AnalysisResult) -> String {
     let mut by_path: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut total_refs = 0usize;
 
-    for entity in result.entities.iter().filter(|e| e.tags.contains("elevator")) {
+    for entity in result
+        .entities
+        .iter()
+        .filter(|e| e.tags.contains("elevator"))
+    {
         for attr in &entity.attributes {
             let Some((kind, path)) = parse_cr_attr(attr) else {
                 continue;

@@ -24,6 +24,55 @@ A named anti-pattern signal (God Class, Dispatcher, Feature Envy, Shotgun Surger
 The set of Entities the Quality panel's numbers describe, chosen explicitly by the reader: the whole analysis scope, the scope tree selection, what the canvas is currently drawing (post-filter), the current selection, the file open in the editor, or the files a diff changed. One population governs the whole panel — summary, scatters, entity rows, and the file and module rollups — so two figures in it always count the same Entities. Distinct from **scope**, which decides what is loaded and analysed, and from the **Files** visual filter, which decides what the canvas draws and deliberately leaves the population alone (ADR 0010).
 _Avoid_: Analysis scope (that is the tree), filter, selection.
 
+**Folder shape**:
+How readable the picture one folder draws is, scored over exactly what the canvas renders when collapsed to it — its immediate children, with each subfolder standing as a single node (ADR 0012). An *organisation* measure, not a code-quality one: it feeds no composite score, and its sub-scores run 0–1 with **higher meaning better**, the reverse of every other number beside it. Reported for folders only — a file has no children and so draws no graph.
+_Avoid_: Folder quality, structure score, modularity (all three invite reading it on the refactor-pressure scale it deliberately stays off).
+
+**Shape pattern**:
+Which of four tiers a **Folder shape** lands in, each the one below it plus one property: **Cyclic** (children depend on each other in a loop, so the drawing has no reading order), **Tangled** (acyclic, but edges jump levels instead of stepping down one at a time), **Hierarchical** (a clean layered DAG), **Fractal** (hierarchical, branching rather than merging, reached from outside through few doors, and made of children that hold the same shape). `Fractal` is recursive by construction — it is a claim about self-similarity across zoom levels, which is why a folder cannot earn it while sitting on top of a tangle.
+_Avoid_: Grade, rating, health (they suggest a continuum; these are four different diagnoses with four different fixes).
+
+**Own-drawing gate**:
+A **Shape pattern** gate a reader can settle by looking at the folder's own
+picture — `Cycles`, `Layering`, `Merges`, `Breadth`, `Unstructured` — as against
+one answered only by its subfolders, its callers or the blend (`ChildPattern`,
+`ChildCompliance`, `Entry`, `Compliance`). The split decides *work order*, not
+severity: the ladder is recursive, so a folder held back by a tangled subfolder
+cannot move until that subfolder does, and `quality` lists the own-drawing ones
+first and deepest-first because clearing a deep one can clear a parent's child
+gate too (ADR 0023). `Entry` sits on the far side despite being fixable, since
+the work is in the callers and is not visible in the drawing being shown.
+_Avoid_: Blocking gate, local gate, actionable (the last invites reading the far
+group as unactionable, which `Entry` disproves).
+
+**Arborescence** (branching):
+The share of a folder's drawn edges that would survive in a spanning forest — one arriving at each child. Everything beyond the first edge reaching a child is a *merge*: two siblings leaning on the same third one. Gates `Fractal` and is deliberately outside `compliance` (ADR 0013), so a folder can blend well and still be held back by it. Reads against **Layering** on the same scale and disagrees with it on purpose — a shared helper steps one level cleanly and still converges, so layering scores it 1.00 and this scores it 0.50, and both are correct.
+_Avoid_: Tree-ness (which is what Layering was defined *against*), fan-in, coupling.
+
+**Folder picture**:
+The evidence behind a **Folder shape**: the same collapsed child graph the verdict is computed over, kept rather than discarded, with each child's level and each edge's **Edge verdict** marked on it, plus the one-hop traffic across the folder's boundary. Produced by the scoring pass itself, never rebuilt alongside it — a second derivation would be free to draw a picture the number denies. Computed for one folder on request, where the four scalars are cheap enough to carry for every folder.
+_Avoid_: Subgraph, snapshot, folder graph.
+
+**Edge verdict**:
+How one line in a **Folder picture** reads. Inside the folder: `step` (down exactly one level — the shape you want), `skip` (jumps a level, which is what `layering` charges for), `back` (inside a loop, which is what `acyclicity` charges for). Across its boundary: `entry` (arrives at a **Door**), `breach` (reaches past one into the interior), `exit` (leaves, which is never a defect — depending outward is what a folder is for). In the shape view an edge's *colour* means this and not its relationship kind, the one place that palette is overridden.
+_Avoid_: Edge type, severity, violation kind.
+
+**Door**:
+A file inside a folder that takes the most dependencies from outside it — the numerator of **Entry concentration**, and what an outsider is supposed to arrive at. Every file tied at the maximum is a door, since choosing one of a tie would paint an honest tie as a **Breach**. Identified by measurement, never by name: `mod.rs` conventions do not survive the language boundary.
+_Avoid_: Entry point (which in nao means a program entry), facade, public API.
+
+**Breach**:
+A dependency from outside a folder landing on a file that is not one of its **Doors** — an outsider reaching past the front door into the interior. What holds `entry_concentration` down, and what the shape view draws so the specific outside file and inside file can both be named. Distinct from an `exit`, which crosses the same boundary the other way and is not a defect.
+_Avoid_: Violation, leak, encapsulation break.
+
+**Layering**:
+The sub-score standing in for legibility: the share of a folder's child-graph edges that step exactly one level down, where a level is the longest path from a source. Deliberately *not* tree-ness — several files leaning on one shared helper is the healthy reuse shape and must not read as a tangle, whereas an edge skipping past the middle layer is exactly what a reader has to hold in their head while following the rest.
+_Avoid_: Treeness, planarity, crossings.
+
+**Entry concentration**:
+Of the dependencies arriving at a folder from outside it, the share landing on its single most-depended-on file — how many doors the folder has. High means it is an honest single node when the canvas collapses it; low means outsiders pierce it at many points and the collapsed drawing is hiding traffic. Measured as concentration rather than as "does traffic go through `mod.rs`", because entry-file conventions do not survive the language boundary.
+_Avoid_: Encapsulation, public surface, facade compliance.
+
 ### SQL schema
 
 **Effective Schema**:
@@ -148,6 +197,8 @@ _Avoid_: Camera, frame, window.
 - A **Feature** or **Functionality** appears on zero or more **UI Pages** (via `where:`)
 - A **Feature** or **Functionality** may reference another **Feature** (via `references:`) for cross-links the hierarchy doesn't capture
 - A **Saved view** holds one scope, one **Spec selection** and one set of visual filters; it never holds a **Population**, which the Quality panel chooses independently and which no view restores
+- A **Folder shape** is computed from the same dependency **Relationships** the coupling numbers use, and answers a different question of them: those ask how hard the code is to change, this asks whether its drawing can be followed. Neither reaches the other's score
+- A folder's **Shape pattern** is capped by its subfolders' — a parent cannot reach `Fractal` while any child sits below `Hierarchical`, which is what makes the measure recursive rather than one level's opinion
 - The **Overview panel** reports the camera a **Saved view** deliberately omits: the view decides *what* the canvas draws, the panel says *where in it* the reader is standing, and neither can answer the other's question
 - Any spec entity declares zero or more **Code references**; the **Cross-filter** reads them rolled up over the `Contains`-subtree, while the reverse lookup ("who claims this file") reads only an entity's own — rolled up, every **Category** would claim most of the repo
 

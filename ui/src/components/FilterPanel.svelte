@@ -1,7 +1,7 @@
 <script lang="ts">
   import ColorChip from './ColorChip.svelte';
   import { NODE_COLORS, LINK_COLORS, LANGUAGE_COLORS } from '../types/graph';
-  import { showGhostNodes, showBuiltinGhosts } from '../stores/graph';
+  import { showGhostNodes, showBuiltinGhosts, structureOnly } from '../stores/graph';
   import {
     generalEntityTypes, generalRelTypes, generalOutgoing, generalIncoming,
     generalLanguages, allLanguages,
@@ -16,14 +16,30 @@
   } from '../viewmodels/filterViewModel';
   // Display-search machinery now lives in displayPlan.ts (see comment in
   // filterViewModel.ts) — import directly to avoid a startup-time module cycle.
-  import { displaySearchTerm, displaySearchMatches, displayPlan } from '../viewmodels/displayPlan';
-  import { selectedNode, graphData, graphLevel, expandedScopes, collapseAllScopes } from '../stores/graph';
+  import { displayPlan } from '../viewmodels/displayPlan';
+  import { selectedNode, graphData, graphLevel, expandedScopes, collapseAllScopes, viewMode, shapePicture } from '../stores/graph';
+  import {
+    SHAPE_EDGE_COLORS,
+    SHAPE_VERDICT_ORDER,
+    VERDICT_TEXT,
+    isViolation,
+  } from '../viewmodels/shapeView';
   import { searchFocusRequest } from '../stores/keymap';
   import { get } from 'svelte/store';
   import { tick } from 'svelte';
   import type { D3Node, TriState } from '../types/graph';
+
+  /** What `structureOnly` is holding back, and whose body is currently open.
+   *  Counted off the drawn graph so the control can say nothing on a dataset
+   *  with no bodies in it — a schema, a spec, a folder of notes. UI-113. */
+  $: bodyEntities = $graphData.nodes.filter((n) => n.body_of !== undefined).length;
+  $: openBody =
+    $selectedNode && $graphData.nodes.some((n) => n.body_of === $selectedNode!.original_id)
+      ? $selectedNode.name
+      : null;
   import FileTree from './FileTree.svelte';
   import EntitySearchResults from './EntitySearchResults.svelte';
+  import DisplaySearchResults from './DisplaySearchResults.svelte';
   import { visibleSearchResults } from '../viewmodels/searchResults';
   import ScopeTree from './ScopeTree.svelte';
   import RootPathPicker from './RootPathPicker.svelte';
@@ -32,9 +48,13 @@
   import SavedViewsSection from './SavedViewsSection.svelte';
   import { serveMode, activeRepo, backToPicker } from '../stores/serveMode';
   import { nodeEncoding, availableSizeChannels } from '../stores/encoding';
-  import { sizeChannel, colorChannel, folderCohesion, showFolderHulls, hullDepth, HULL_DEPTHS, HULL_DEPTH_LABELS, demoteHubs, hubCount } from '../stores/settings';
+  import { sizeChannel, colorChannel, sizeCurve, sizeBoost, sizeBins, folderCohesion, showFolderHulls, hullDepth, HULL_DEPTHS, hullDepthLabels, groupGrain, demoteHubs, hubCount } from '../stores/settings';
+  import { SIZE_CURVES, SIZE_BOOST_MIN, SIZE_BOOST_MAX, SIZE_BINS_MIN, SIZE_BINS_MAX, SIZE_BINS_OFF } from '../viewmodels/sizeCurve';
   import { HUB_COUNTS, hubNames } from '../viewmodels/hubs';
-  import { COHESION_LEVELS, COHESION_LABELS } from '../utils/forceCohesion';
+  import {
+    COHESION_LEVELS, COHESION_LABELS,
+    GROUP_GRAINS, GROUP_GRAIN_LABELS, groupGrainFor, type GroupGrain,
+  } from '../utils/forceCohesion';
   import { NO_DATA_FILL, NO_DATA_FILL_OPACITY, COLOR_CHANNELS, R_MAX } from '../viewmodels/nodeEncoding';
 
   /** Names of the currently demoted hubs (UI-056), read off the plan rather
@@ -42,12 +62,44 @@
    *  and a second ranking could disagree with the first. */
   $: demotedNames = hubNames($graphData.nodes, [...$displayPlan.demotedHubIds]);
 
+  /** The grain the canvas is actually grouping by (UI-103), which is the
+   *  reader's choice only at Entity level. Everything the panel *says* — the
+   *  hull checkbox's noun, the tier labels — follows this rather than the
+   *  stored choice, or the sidebar would describe a grouping the canvas is
+   *  not drawing. The pressed button still follows the choice, because that
+   *  is what the reader picked and what returning to Entity level restores. */
+  $: grainInForce = groupGrainFor($graphLevel, $groupGrain);
+  $: depthLabels = hullDepthLabels(grainInForce);
+
+  function grainTitle(grain: GroupGrain): string {
+    if (grain === 'folder') return 'A region is the directory holding the file — the same grouping Module level aggregates by';
+    return $graphLevel === 'entity'
+      ? 'A region is the file itself, so a region’s traffic says whether that file is cohesive'
+      : 'Files group entities, so this applies at Entity level only — at this level every node already is a file or coarser';
+  }
+
   /** Legend dots are drawn to scale with the canvas, shrunk to fit the
    *  sidebar: the largest stop gets a 22px radius, and every other stop the
    *  same factor. Three true-size dots would need ~180px of the ~220px of
    *  content width the panel has, and would make the legend the tallest
-   *  block in it. */
-  const LEGEND_DOT_SCALE = 22 / R_MAX;
+   *  block in it.
+   *
+   *  The denominator is the encoding's own top radius, not the `R_MAX`
+   *  constant — since UI-106 the canvas range is a multiple of that constant,
+   *  and a fixed denominator would let a ×3 legend overflow the panel while
+   *  claiming to be to scale. Turning the scale up therefore keeps the
+   *  largest dot at 22px and shrinks the smaller ones, which is exactly the
+   *  discrimination it buys on the canvas. */
+  $: legendDotScale = 22 / ($nodeEncoding.sizeLegend?.rMax ?? R_MAX);
+
+  /** Group counts the picker offers. Two is the floor a "group" means
+   *  anything at (big and small); above eight the classes are back to being
+   *  finer than the eye separates, which is the continuous scale with extra
+   *  steps. */
+  const binChoices = Array.from(
+    { length: SIZE_BINS_MAX - SIZE_BINS_MIN + 1 },
+    (_, i) => SIZE_BINS_MIN + i,
+  );
 
   /** Keep the size channel valid when the aggregation level changes under it:
    *  switching to File while size is WMC would otherwise leave a selected-but-
@@ -74,10 +126,6 @@
   let entitiesOpen = true;
   let relationshipsOpen = true;
   let searchScopeOpen = false;
-
-  // Cap the results list so large pattern matches don't drop hundreds of
-  // DOM nodes into the sidebar. The graph still highlights all of them.
-  const MAX_RESULTS_SHOWN = 50;
 
   let searchInputEl: HTMLInputElement | undefined;
   let activeResult = -1;
@@ -349,9 +397,33 @@
       >{COHESION_LABELS[lvl]}</button>
     {/each}
   </div>
+  <!-- UI-103. Which level of the declared tree is a group. Sits with cohesion
+       rather than with the hulls because it changes what the FORCE groups by,
+       not only which outlines get drawn — the outlines follow it, they do not
+       own it.
+
+       Entity level only. The button stays enabled and dims elsewhere,
+       following the aggregation control (UI-090): at File level every node
+       already is a file, so every file region would hold one member and draw
+       nothing, and a reader who cannot press the control back through has
+       been told less than one who can. -->
+  <div class="seg-group" role="group" aria-label="Which level of the tree is a group">
+    {#each GROUP_GRAINS as grain}
+      <button
+        type="button"
+        class="seg-btn"
+        class:active={$groupGrain === grain}
+        class:grain-inert={grain !== grainInForce && $groupGrain === grain}
+        aria-pressed={$groupGrain === grain}
+        data-probe="group-grain-{grain}"
+        title={grainTitle(grain)}
+        on:click={() => groupGrain.set(grain)}
+      >{GROUP_GRAIN_LABELS[grain]}</button>
+    {/each}
+  </div>
   <label class="checkbox-item">
     <input type="checkbox" bind:checked={$showFolderHulls} data-probe="hulls-toggle" />
-    <span>Outline and name each folder</span>
+    <span>Outline and name each {grainInForce === 'file' ? 'file' : 'folder'}</span>
   </label>
   <!-- UI-070. How much of the folder tree gets an outline. A separate control
        from the toggle rather than four states of one, because "should there be
@@ -368,7 +440,7 @@
           aria-pressed={$hullDepth === d}
           data-probe="hull-depth-{d}"
           on:click={() => hullDepth.set(d)}
-        >{HULL_DEPTH_LABELS[d]}</button>
+        >{depthLabels[d]}</button>
       {/each}
     </div>
   {/if}
@@ -516,49 +588,34 @@
          landed. -->
     <EntitySearchResults />
 
-    <!-- Display search: "Ctrl+F within the current view". Only highlights,
-         never filters. Useful for locating a specific entity inside an
-         already-scoped view without reshaping the graph. -->
-    <div class="sub-title">
-      <span class="search-label search-label-view">Search in view</span>
-      <span class="search-hint">— highlight only, no filtering</span>
-    </div>
-    <div class="filter-group">
-      <input type="text" bind:value={$displaySearchTerm} placeholder="Search visible entities..." />
-    </div>
+    <!-- The within-view search, its result list and the picks made in it.
+         Extracted alongside `EntitySearchResults` and for the same reason:
+         query UI belongs in its own component, and this list grew a second
+         gesture (pick, as distinct from select) in UI-101. -->
+    <DisplaySearchResults />
 
-    {#if $displaySearchTerm.trim()}
-      <div class="search-results search-results-display">
-        <div class="search-results-header">
-          {#if $displaySearchMatches.length === 0}
-            <span class="no-match">No matches in current view</span>
+    <!-- Grain: declarations, or declarations and their insides. Above the
+         kind checkboxes because that is where it applies, and because it is
+         the control that makes most of them unnecessary — the reader who
+         reaches for "untick Parameter, Branch, Loop" wants this instead, and
+         gets to keep the calls made inside those branches. UI-113. -->
+    {#if bodyEntities > 0}
+      <div class="sub-title">Grain</div>
+      <div class="checkbox-group">
+        <label class="checkbox-item">
+          <input type="checkbox" checked={$structureOnly}
+            on:change={(e) => structureOnly.set(e.currentTarget.checked)} />
+          <ColorChip color="#7E57C2" label="Structure only (hide function internals)" />
+        </label>
+        <div class="search-hint" style="padding-left: 22px;">
+          {#if $structureOnly}
+            {bodyEntities} inside a body, not drawn.
+            {openBody ? `${openBody} is selected, so its own body is open.` : 'Select a function to open its body.'}
           {:else}
-            <span class="match-count" style="color: #4DD0E1">
-              {$displaySearchMatches.length} match{$displaySearchMatches.length === 1 ? '' : 'es'} in view
-            </span>
-            {#if $displaySearchMatches.length > MAX_RESULTS_SHOWN}
-              <span class="truncated">(showing first {MAX_RESULTS_SHOWN})</span>
-            {/if}
+            Parameters, branch arms and loop bodies are drawn alongside what
+            each file declares.
           {/if}
         </div>
-        {#if $displaySearchMatches.length > 0}
-          <ul class="search-results-list">
-            {#each $displaySearchMatches.slice(0, MAX_RESULTS_SHOWN) as match (match.id)}
-              <li
-                class="search-result-item"
-                class:active={$selectedNode?.id === match.id}
-                on:click={() => selectMatch(match)}
-                title="{match.qualified_name} — {match.file_path}:{match.line}"
-              >
-                <span class="result-kind"><i class="kind-dot" style="background: {NODE_COLORS[match.kind_raw] || 'var(--text-muted)'}"></i>
-                  {match.kind}
-                </span>
-                <span class="result-name">{match.name}</span>
-                <span class="result-path">{match.file_path}</span>
-              </li>
-            {/each}
-          </ul>
-        {/if}
       </div>
     {/if}
 
@@ -723,8 +780,8 @@
        measured at three rows, failing that ticket's probe. Here the control
        and the legend that explains it are one block, which is where a reader
        looks to answer "what does this circle mean?" anyway. -->
-  {#if !$nodeEncoding.kindOnly}
-    <div class="encode-controls">
+  <div class="encode-controls">
+    {#if !$nodeEncoding.kindOnly}
       <label class="encode-field">
         <span class="encode-prefix">Size</span>
         <select class="encode-select" bind:value={$sizeChannel} aria-label="Metric driving node size">
@@ -741,30 +798,122 @@
           {/each}
         </select>
       </label>
-    </div>
-  {/if}
+      <!-- UI-106 — the two size controls. Disabled rather than hidden when
+           the current channel has no value domain to shape (`Entity kind`,
+           or a metric with no rollup at this level): a control that vanishes
+           when you switch channel reads as a bug, and the reason it can't
+           apply is worth stating once in a tooltip. -->
+      <label class="encode-field">
+        <span class="encode-prefix">Curve</span>
+        <select
+          class="encode-select"
+          bind:value={$sizeCurve}
+          disabled={!$nodeEncoding.sizeLegend}
+          aria-label="How the metric maps onto node size"
+          title={$nodeEncoding.sizeLegend
+            ? 'How the value range is spread over the size range'
+            : 'Needs a metric size channel — kind sizing has no range to shape'}
+        >
+          {#each SIZE_CURVES as c}
+            <option value={c.id}>{c.label}</option>
+          {/each}
+        </select>
+      </label>
+      <!-- UI-110 — how many size classes the ramp collapses to. Continuous
+           is a real option and the default, not a zero: it discards nothing,
+           and grouping trades within-group differences for an answerable
+           "which group is this in". Same disabled rule as the curve. -->
+      <label class="encode-field">
+        <span class="encode-prefix">Groups</span>
+        <select
+          class="encode-select"
+          bind:value={$sizeBins}
+          disabled={!$nodeEncoding.sizeLegend}
+          aria-label="How many size groups node sizes snap to"
+          title={$nodeEncoding.sizeLegend
+            ? 'Snap every node to one of N sizes; the boundaries follow the curve'
+            : 'Needs a metric size channel — kind sizing has no range to group'}
+        >
+          <option value={SIZE_BINS_OFF}>Continuous</option>
+          {#each binChoices as n}
+            <option value={n}>{n} groups</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
+    <!-- Offered even on a metric-free graph, where it is the only size
+         control that still means something. -->
+    <label class="encode-field">
+      <span class="encode-prefix">Scale</span>
+      <span class="encode-slider">
+        <input
+          type="range"
+          min={SIZE_BOOST_MIN}
+          max={SIZE_BOOST_MAX}
+          step="0.1"
+          bind:value={$sizeBoost}
+          aria-label="Node size scale"
+          title="Widens the gap between the smallest and the largest node"
+        />
+        <span class="encode-scale-value">{$sizeBoost.toFixed(1)}×</span>
+      </span>
+    </label>
+  </div>
 
   {#if $nodeEncoding.sizeLegend}
     <div class="sub-title">Size — {$nodeEncoding.sizeLegend.label}</div>
-    <div class="size-ramp">
-      {#each $nodeEncoding.sizeLegend.stops as stop}
-        <div class="size-stop">
-          <!-- Canvas radii shrunk by ONE shared factor, not clamped per dot.
-               `Math.min(r, 17)` capped every stop that mattered — the ramp's
-               radii run past 17 well before the midpoint — so all three dots
-               rendered at an identical 34px and the legend contradicted the
-               very channel it was explaining. Scaling keeps the ratio (and
-               so the area comparison) exactly the canvas's. -->
-          <span
-            class="size-dot"
-            style="width: {stop.radius * LEGEND_DOT_SCALE * 2}px; height: {stop.radius * LEGEND_DOT_SCALE * 2}px"
-          ></span>
-          <span class="size-value">{stop.value.toLocaleString()}</span>
-        </div>
-      {/each}
-    </div>
+    {#if $nodeEncoding.sizeLegend.bins === SIZE_BINS_OFF}
+      <!-- Continuous: three samples off a smooth ramp, laid out along a row
+           because their sizes are the comparison being made. -->
+      <div class="size-ramp">
+        {#each $nodeEncoding.sizeLegend.stops as stop}
+          <div class="size-stop">
+            <!-- Canvas radii shrunk by ONE shared factor, not clamped per dot.
+                 `Math.min(r, 17)` capped every stop that mattered — the ramp's
+                 radii run past 17 well before the midpoint — so all three dots
+                 rendered at an identical 34px and the legend contradicted the
+                 very channel it was explaining. Scaling keeps the ratio (and
+                 so the area comparison) exactly the canvas's. -->
+            <span
+              class="size-dot"
+              style="width: {stop.radius * legendDotScale * 2}px; height: {stop.radius * legendDotScale * 2}px"
+            ></span>
+            <span class="size-value">{stop.value.toLocaleString()}</span>
+          </div>
+        {/each}
+      </div>
+    {:else}
+      <!-- Grouped: a row per class, stacked like the severity ramp rather
+           than laid out along a row. Eight dots side by side do not fit
+           ~220px of panel at any honest scale, and a class needs its value
+           band next to it — which is a line of text, not a caption. -->
+      <div class="size-groups">
+        {#each $nodeEncoding.sizeLegend.stops as stop}
+          <div class="size-group">
+            <span class="size-group-dot">
+              <span
+                class="size-dot"
+                style="width: {stop.radius * legendDotScale * 2}px; height: {stop.radius * legendDotScale * 2}px"
+              ></span>
+            </span>
+            <span class="size-value">
+              {#if stop.to === null}
+                &gt; {(stop.from ?? 0).toLocaleString()}
+              {:else if (stop.from ?? 0) === 0}
+                ≤ {(stop.to ?? 0).toLocaleString()}
+              {:else}
+                {(stop.from ?? 0).toLocaleString()}–{(stop.to ?? 0).toLocaleString()}
+              {/if}
+            </span>
+          </div>
+        {/each}
+      </div>
+    {/if}
     <div class="legend-note">
-      {$nodeEncoding.sizeLegend.unit} · area scales with the value
+      {$nodeEncoding.sizeLegend.unit} · {$nodeEncoding.sizeLegend.hint}{
+        $nodeEncoding.sizeLegend.bins === SIZE_BINS_OFF
+          ? ''
+          : `, in ${$nodeEncoding.sizeLegend.bins} groups`}
     </div>
   {/if}
 
@@ -802,6 +951,30 @@
       {/each}
     </div>
   {/if}
+
+  <!-- UI-108 — in the shape view an edge's colour means its VERDICT, not its
+       relationship kind. That contradicts the Relationship Types block above,
+       so the legend has to say which reading is live or it is explaining an
+       encoding that is not on screen. Only rendered in that mode, for the
+       same reason: a permanent key for six readings that do not apply is
+       noise everywhere else. -->
+  {#if $viewMode === 'shape' && $shapePicture}
+    <div class="sub-title">Edges — how each one reads</div>
+    <div class="legend">
+      {#each SHAPE_VERDICT_ORDER as verdict}
+        <div class="legend-item" title={VERDICT_TEXT[verdict]}>
+          <div class="legend-color" style="background: {SHAPE_EDGE_COLORS[verdict]}"></div>
+          <span class:shape-violation={isViolation(verdict)}>{verdict}</span>
+        </div>
+      {/each}
+    </div>
+    <div class="legend-note">
+      Colour is the verdict here, not the relationship kind — every edge in
+      this view is a merged dependency, so the kind palette would paint the
+      whole picture one colour. Rows are levels: a dependency should step
+      down exactly one.
+    </div>
+  {/if}
 </div>
 {/if}
 
@@ -813,21 +986,16 @@
   .ts-g { color: var(--text-disabled); }
   .ts-on, .ts-off { color: var(--text-secondary); font-weight: 700; }
 
-  /* Palette swatch beside themed text — see ColorChip for the reasoning. */
-  .kind-dot {
-    display: inline-block;
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    margin-right: 4px;
-    box-shadow: 0 0 0 1px var(--border-subtle);
-  }
-  .result-kind { color: var(--text-muted); }
-
   /* Were #FFD54F and #4DD0E1 — 1.41:1 and 1.84:1 on the light theme's white
      panel. The two searches still read as different things via weight and
-     the accent, not via low-contrast hues. */
+     the accent, not via low-contrast hues. The view search's own label
+     moved to DisplaySearchResults.svelte with its list. */
   .search-label { color: var(--accent); font-weight: 600; }
-  .search-label-view { color: var(--text-secondary); }
+
+  /* The three readings worth acting on carry weight as well as hue, so the
+     key survives the light theme and a reader who cannot separate the
+     oranges from the greys. */
+  .shape-violation { font-weight: 700; }
 
   /* Section header rendered as a button so it is keyboard-operable; the
      wrapper keeps the <h2> for document outline without owning the click. */
@@ -999,6 +1167,15 @@
     color: var(--text);
     font-weight: 600;
   }
+  /* UI-103. A grain the current level cannot honour still shows as the
+     reader's choice — it is restored the moment they return to Entity level
+     — but italicised so the canvas and the sidebar are not silently
+     disagreeing. Same treatment as UI-090's redundant level button, and for
+     the same reason: say it, do not disable it. */
+  .seg-btn.grain-inert {
+    font-style: italic;
+    opacity: 0.6;
+  }
 
   .filter-section { margin-bottom: 20px; }
 
@@ -1065,55 +1242,8 @@
 
   .edge-kind-item input[type="checkbox"] { cursor: pointer; margin: 0; }
 
-  .search-label { font-weight: 600; }
   .search-hint { color: var(--text-disabled); font-weight: 400; font-size: 0.7rem; margin-left: 4px; }
 
-  .search-results {
-    margin: 8px 0 12px;
-    border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
-    border-radius: 4px;
-    background: color-mix(in srgb, var(--bg-body) 50%, transparent);
-  }
-
-  .search-results-display {
-    border-color: rgba(77, 208, 225, 0.3);
-    background: rgba(77, 208, 225, 0.04);
-  }
-
-  .search-results-header {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    padding: 6px 10px;
-    font-size: 0.75rem;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-  }
-
-  .match-count { color: #FFD54F; font-weight: 600; }
-  .no-match { color: var(--text-dim); font-style: italic; }
-  .truncated { color: var(--text-disabled); font-size: 0.7rem; }
-
-  .search-results-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    max-height: 220px;
-    overflow-y: auto;
-  }
-
-  .search-result-item {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
-    cursor: pointer;
-    font-size: 0.8rem;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 20%, transparent);
-  }
-
-  .search-result-item:last-child { border-bottom: none; }
-  .search-result-item:hover { background: color-mix(in srgb, var(--bg-hover) 40%, transparent); }
-  .search-result-item.active { background: color-mix(in srgb, var(--accent) 25%, transparent); }
   .search-scope { margin: 4px 0 10px; }
   .search-scope-toggle {
     background: transparent;
@@ -1152,29 +1282,6 @@
     cursor: pointer;
   }
   .scope-clear-btn:hover { background: rgba(255, 213, 79, 0.12); }
-
-  .result-kind {
-    font-size: 0.65rem;
-    text-transform: uppercase;
-    flex-shrink: 0;
-    min-width: 56px;
-  }
-
-  .result-name {
-    color: var(--text);
-    flex-shrink: 0;
-    font-family: 'Monaco', 'Menlo', monospace;
-  }
-
-  .result-path {
-    color: var(--text-disabled);
-    font-size: 0.7rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-    text-align: right;
-  }
 
   .sub-title {
     font-size: 0.8rem;
@@ -1341,6 +1448,42 @@
     cursor: pointer;
   }
   .encode-select:hover { background: var(--bg-hover); }
+  /* A curve with no value domain to shape still occupies its row — see the
+     comment at the control. It has to *look* unavailable, not just refuse
+     the click. */
+  .encode-select:disabled {
+    color: var(--text-disabled);
+    cursor: not-allowed;
+    opacity: 0.7;
+  }
+  .encode-select:disabled:hover { background: var(--bg-surface); }
+
+  /* Same 132px budget as the selects above, for the same reason: the sidebar
+     sizes to its content, so every control in this block has to declare a
+     definite width or the panel grows to fit the widest one. */
+  .encode-slider {
+    flex: 0 0 auto;
+    width: 132px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .encode-slider input[type='range'] {
+    flex: 1 1 auto;
+    min-width: 0;
+    /* The one property that themes a native range track and thumb without
+       rebuilding the control out of divs. */
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .encode-scale-value {
+    flex: 0 0 auto;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+  }
 
   .legend-note {
     margin-top: 5px;
@@ -1376,6 +1519,31 @@
     font-size: 0.7rem;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* Grouped legend (UI-110): one row per size class, stacked. */
+  .size-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  .size-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* A fixed-width column for the dot, so every band label starts at the same
+     x whatever its class's radius is — a ragged left edge on the numbers
+     makes eight rows unreadable, and the dots are already ordered by size. */
+  .size-group-dot {
+    flex: 0 0 auto;
+    width: 46px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
   }
 
   .severity-ramp {

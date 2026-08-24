@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, Mutex, RwLock};

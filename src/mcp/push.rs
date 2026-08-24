@@ -28,7 +28,7 @@ use anyhow::{bail, Result};
 use crate::diff;
 use crate::graph::DependencyGraph;
 use crate::mcp::tools;
-use crate::models::{CodeEntity, SmellKind};
+use crate::models::{CodeEntity, FolderShape, OutsideVerdict, ShapePattern, SmellKind};
 
 /// A combined `cyclomatic + max_nesting` increase below this is treated
 /// as metric noise, never a finding — the "not every ±1 wiggle" floor.
@@ -82,6 +82,11 @@ pub struct DiffArtifacts {
     pub head_graph: DependencyGraph,
     pub result: diff::DiffResult,
     pub changed: Vec<String>,
+    /// Where each side was analysed. The base lives in a throwaway
+    /// worktree, so the two graphs spell the same file differently and
+    /// anything joining them by path has to strip its own root first.
+    pub base_root: PathBuf,
+    pub head_root: PathBuf,
 }
 
 /// Analyze `base_ref` (via a throwaway worktree) and the working tree,
@@ -99,17 +104,40 @@ pub fn build_artifacts(
         bail!("Cannot resolve git ref '{}'", base_ref);
     }
 
+    // One scope for both sides, settled from the working tree — the base
+    // checkout carries the `.nao/settings.json` committed at `base_ref`, and
+    // two sides that exclude different files report the difference as
+    // structural change.
+    let scope = diff::build_analysis_config(root, include_tests, languages);
+
     let base_dir = std::env::temp_dir().join(format!("nao-push-base-{}", from_sha));
     diff::create_worktree(root, &base_dir, base_ref)?;
-    let base = diff::analyze_at(&base_dir, include_tests, languages, &format!("base ({})", from_sha));
+    let base = diff::analyze_with(
+        diff::rooted_at(&scope, &base_dir),
+        &format!("base ({})", from_sha),
+    );
     diff::remove_worktree(root, &base_dir);
     let (base_graph, _) = base?;
 
-    let (head_graph, _) = diff::analyze_at(root, include_tests, languages, "working tree")?;
-    let result = diff::compute_diff(&base_graph, &head_graph, &base_dir, root, &from_sha, "working");
+    let (head_graph, _) = diff::analyze_with(scope, "working tree")?;
+    let result = diff::compute_diff(
+        &base_graph,
+        &head_graph,
+        &base_dir,
+        root,
+        &from_sha,
+        "working",
+    );
     let changed = diff::changed_files(root, base_ref);
 
-    Ok(DiffArtifacts { base_graph, head_graph, result, changed })
+    Ok(DiffArtifacts {
+        base_graph,
+        head_graph,
+        result,
+        changed,
+        base_root: base_dir,
+        head_root: root.to_path_buf(),
+    })
 }
 
 fn fingerprint(tag: &str, d: &diff::EntityDiff, detail: &str) -> String {
@@ -120,13 +148,24 @@ fn fingerprint(tag: &str, d: &diff::EntityDiff, detail: &str) -> String {
 }
 
 /// Collect structural regressions from a diff: new smells, new cycles,
-/// and complexity jumps above the floor. Filtered to `min` severity and
-/// up, sorted worst-first then by fingerprint for deterministic output.
+/// complexity jumps above the floor, and folders that fell a shape tier.
+/// Filtered to `min` severity and up, sorted worst-first then by
+/// fingerprint for deterministic output.
+///
+/// The first three are per-entity and read off the diff rows; the fourth
+/// is per-folder and is joined by path instead, because a folder can lose
+/// its shape to an edge added in a file it does not contain.
 pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
-    let head_by_id: HashMap<&str, &CodeEntity> =
-        a.head_graph.entities().map(|e| (e.id.as_str(), e)).collect();
-    let base_by_id: HashMap<&str, &CodeEntity> =
-        a.base_graph.entities().map(|e| (e.id.as_str(), e)).collect();
+    let head_by_id: HashMap<&str, &CodeEntity> = a
+        .head_graph
+        .entities()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    let base_by_id: HashMap<&str, &CodeEntity> = a
+        .base_graph
+        .entities()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
 
     let mut out: Vec<Finding> = Vec::new();
     for d in &a.result.entities {
@@ -139,17 +178,27 @@ pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
         if !tools::is_listed(head) {
             continue;
         }
-        let base = d.base_entity_id.as_deref().and_then(|id| base_by_id.get(id).copied());
+        let base = d
+            .base_entity_id
+            .as_deref()
+            .and_then(|id| base_by_id.get(id).copied());
 
         // New smells: present on head, absent on base.
-        let base_smells: HashSet<SmellKind> =
-            base.map(|e| e.metrics.smells.iter().copied().collect()).unwrap_or_default();
+        let base_smells: HashSet<SmellKind> = base
+            .map(|e| e.metrics.smells.iter().copied().collect())
+            .unwrap_or_default();
         for s in &head.metrics.smells {
             if !base_smells.contains(s) {
                 out.push(Finding {
                     fingerprint: fingerprint("smell", d, s.label()),
                     severity: Severity::Medium,
-                    line: format!("new smell: {} on {} {} — {}", s.label(), d.kind, d.name, d.file_path),
+                    line: format!(
+                        "new smell: {} on {} {} — {}",
+                        s.label(),
+                        d.kind,
+                        d.name,
+                        d.file_path
+                    ),
                 });
             }
         }
@@ -182,14 +231,190 @@ pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
             out.push(Finding {
                 fingerprint: fingerprint("cx", d, ""),
                 severity,
-                line: format!("complexity +{}: {} {} — {}", cx as i64, d.kind, d.name, d.file_path),
+                line: format!(
+                    "complexity +{}: {} {} — {}",
+                    cx as i64, d.kind, d.name, d.file_path
+                ),
             });
         }
     }
 
+    out.extend(shape_findings(a));
     out.retain(|f| f.severity >= min);
-    out.sort_by(|x, y| y.severity.cmp(&x.severity).then_with(|| x.fingerprint.cmp(&y.fingerprint)));
+    out.sort_by(|x, y| {
+        y.severity
+            .cmp(&x.severity)
+            .then_with(|| x.fingerprint.cmp(&y.fingerprint))
+    });
     out
+}
+
+// ------------------------------------------------------------------
+//  Folder shape
+// ------------------------------------------------------------------
+
+/// How many falls get an edge named. `folder_picture` rescans the whole
+/// graph on every call and this spends two per fall, so the work is
+/// bounded rather than proportional to how bad a session went — and the
+/// ten-line cap means the rest would not be printed anyway.
+const MAX_ATTRIBUTED_FALLS: usize = 5;
+
+/// Folder-shape falls, each with the change to who-depends-on-what that
+/// best explains it.
+///
+/// The one finding here that is not about an entity, and the reason it
+/// has to exist: shape is a property of a *folder*, computed from the
+/// whole repo's graph. An import added in one file can drop a sibling
+/// folder a tier by reaching past its door, and every other finding in
+/// this module fires on the entity that changed. The folder that got
+/// worse may hold none of the changed files — which is exactly why
+/// nothing else catches it, and why an agent that has just reached into
+/// a folder it was not working in hears about it here or not at all.
+///
+/// Falls only. A folder that was tangled before the edit and is still
+/// tangled is not news, and reporting standing shape every time an agent
+/// stops would bury the findings that are.
+fn shape_findings(a: &DiffArtifacts) -> Vec<Finding> {
+    let base = shapes_by_folder(&a.base_graph, &a.base_root);
+    let head = shapes_by_folder(&a.head_graph, &a.head_root);
+
+    let mut falls: Vec<(&String, ShapePattern, &FolderShape)> = head
+        .iter()
+        .filter_map(|(folder, now)| {
+            let was = base.get(folder)?.pattern;
+            (now.pattern < was).then_some((folder, was, now))
+        })
+        .collect();
+    // Worst landing first, then the longest drop, then path so two
+    // identical runs order identically (AN-002). This is the order
+    // attribution is spent in, so it decides which falls get an edge
+    // named when a session breaks more than five folders.
+    falls.sort_by(|x, y| {
+        x.2.pattern
+            .cmp(&y.2.pattern)
+            .then(y.1.cmp(&x.1))
+            .then(x.0.cmp(y.0))
+    });
+
+    falls
+        .iter()
+        .enumerate()
+        .map(|(rank, (folder, was, now))| Finding {
+            // Keyed on the transition, not just the folder: a folder that
+            // falls again, further, is a new thing to say rather than one
+            // the session has already reported.
+            fingerprint: format!("shape|{}|{}→{}", folder, was.label(), now.pattern.label()),
+            // A loop is the one rung nothing above it can be worked on
+            // until it clears, so landing there outranks any other fall.
+            severity: if now.pattern == ShapePattern::Cyclic {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            line: format!(
+                "folder shape fell: {} {} → {}, now held back by {}{}",
+                if folder.is_empty() { "(root)" } else { folder },
+                was.label(),
+                now.pattern.label(),
+                now.blocker
+                    .map_or_else(|| "nothing".to_string(), |b| b.summary()),
+                (rank < MAX_ATTRIBUTED_FALLS)
+                    .then(|| shape_cause(a, folder))
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
+        })
+        .collect()
+}
+
+fn shapes_by_folder(graph: &DependencyGraph, root: &Path) -> BTreeMap<String, FolderShape> {
+    graph
+        .module_metrics()
+        .iter()
+        .filter_map(|m| {
+            let shape = m.metrics.shape.as_ref()?;
+            Some((tools::rel_path(Path::new(&m.path), root), shape.clone()))
+        })
+        .collect()
+}
+
+/// The drawn edges of one folder's picture, split by whether they stay
+/// inside it. Exits are dropped: depending outward is what a folder is
+/// for, and one appearing or disappearing never moved this folder's
+/// tier.
+struct Crossings {
+    inside: BTreeSet<(String, String)>,
+    inbound: BTreeSet<(String, String)>,
+}
+
+fn picture_edges(graph: &DependencyGraph, root: &Path, folder: &str) -> Option<Crossings> {
+    let picture = graph
+        .folder_picture(&root.join(folder).display().to_string())?
+        .relative_to(root);
+    Some(Crossings {
+        inside: picture
+            .edges
+            .iter()
+            .map(|e| (trim(&e.from, folder), trim(&e.to, folder)))
+            .collect(),
+        inbound: picture
+            .outside
+            .iter()
+            .filter(|o| o.verdict != OutsideVerdict::Exit)
+            .map(|o| (o.outside.clone(), trim(&o.inside, folder)))
+            .collect(),
+    })
+}
+
+/// The change to who-depends-on-what that best explains a fall, as a
+/// trailing phrase. `None` when either picture cannot be drawn, in which
+/// case the finding still names the tier and the gate.
+///
+/// Added edges lead because they are both the common cause and the
+/// fixable one. A removal can lower a tier too — cutting the only edge
+/// reaching a child leaves it parentless, which `arborescence` charges
+/// for (ADR 0022) — so it is named when nothing was added, rather than
+/// leaving the tier looking like it moved on its own.
+fn shape_cause(a: &DiffArtifacts, folder: &str) -> Option<String> {
+    let head = picture_edges(&a.head_graph, &a.head_root, folder)?;
+    let base = picture_edges(&a.base_graph, &a.base_root, folder)?;
+    let added: Vec<&(String, String)> = head.inside.difference(&base.inside).collect();
+    if !added.is_empty() {
+        return Some(named("new edge", &added));
+    }
+    let reaching: Vec<&(String, String)> = head.inbound.difference(&base.inbound).collect();
+    if !reaching.is_empty() {
+        return Some(named("new dependency in", &reaching));
+    }
+    let gone: Vec<&(String, String)> = base.inside.difference(&head.inside).collect();
+    if !gone.is_empty() {
+        return Some(named("edge removed", &gone));
+    }
+    None
+}
+
+/// At most two edges named. The hook prints ten lines in total, and one
+/// finding must not spend three of them.
+fn named(verb: &str, edges: &[&(String, String)]) -> String {
+    let shown: Vec<String> = edges
+        .iter()
+        .take(2)
+        .map(|(from, to)| format!("{from} → {to}"))
+        .collect();
+    let more = match edges.len().saturating_sub(2) {
+        0 => String::new(),
+        n => format!(" (+{n} more)"),
+    };
+    format!(" — {verb} {}{}", shown.join(", "), more)
+}
+
+/// Paths inside the folder read better without the folder's own name on
+/// the front: the line has already said which folder fell.
+fn trim(path: &str, folder: &str) -> String {
+    Path::new(path)
+        .strip_prefix(folder)
+        .map(|rest| rest.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Session state: fingerprint → the finding's one-line rendering at the
@@ -241,7 +466,10 @@ fn diff_against_state(
     let (emitted, overflow): (Vec<&(String, String, bool)>, bool) = if candidates.len() <= cap {
         (candidates.iter().collect(), false)
     } else {
-        (candidates.iter().take(cap.saturating_sub(1)).collect(), true)
+        (
+            candidates.iter().take(cap.saturating_sub(1)).collect(),
+            true,
+        )
     };
 
     let mut lines: Vec<String> = emitted.iter().map(|(_, l, _)| l.clone()).collect();
@@ -297,7 +525,11 @@ fn save_state(path: &Path, state: &SessionState) {
     match serde_json::to_string_pretty(state) {
         Ok(body) => {
             if let Err(e) = std::fs::write(path, body) {
-                eprintln!("nao: could not persist self-review state to {}: {}", path.display(), e);
+                eprintln!(
+                    "nao: could not persist self-review state to {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
         Err(e) => eprintln!("nao: could not serialize self-review state: {}", e),
@@ -362,6 +594,7 @@ pub fn pr_report(
         &artifacts.head_graph,
         base_ref,
         &artifacts.changed,
+        (&artifacts.base_root, &artifacts.head_root),
     ));
     Ok(out)
 }
@@ -371,7 +604,140 @@ mod tests {
     use super::*;
 
     fn f(fp: &str, sev: Severity, line: &str) -> Finding {
-        Finding { fingerprint: fp.to_string(), severity: sev, line: line.to_string() }
+        Finding {
+            fingerprint: fp.to_string(),
+            severity: sev,
+            line: line.to_string(),
+        }
+    }
+
+    /// A temp tree whose path must not contain "test": `analyze_at` with
+    /// `include_tests: false` drops entities under a test-looking path,
+    /// and a fixture filtered away scores no shape at all.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "nao-push-shape-{}-{}-{}",
+                name,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TmpDir(path)
+        }
+
+        fn write(&self, rel: &str, body: &str) {
+            let full = self.0.join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, body).unwrap();
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn artifacts_of(base: &TmpDir, head: &TmpDir) -> DiffArtifacts {
+        let (base_graph, _) = diff::analyze_at(&base.0, false, &None, "base").unwrap();
+        let (head_graph, _) = diff::analyze_at(&head.0, false, &None, "head").unwrap();
+        let result = diff::compute_diff(&base_graph, &head_graph, &base.0, &head.0, "base", "head");
+        DiffArtifacts {
+            base_graph,
+            head_graph,
+            result,
+            changed: Vec::new(),
+            base_root: base.0.clone(),
+            head_root: head.0.clone(),
+        }
+    }
+
+    /// A chain of three files, then one edge closing it into a loop.
+    fn chain_then_loop() -> (TmpDir, TmpDir) {
+        let base = TmpDir::new("base");
+        let head = TmpDir::new("head");
+        for dir in [&base, &head] {
+            dir.write("src/pkg/mod.rs", "pub mod a;\npub mod b;\npub mod c;\n");
+            dir.write(
+                "src/pkg/a.rs",
+                "use super::b::from_b;\npub fn from_a() -> i32 { from_b() }\n",
+            );
+            dir.write(
+                "src/pkg/b.rs",
+                "use super::c::from_c;\npub fn from_b() -> i32 { from_c() }\n",
+            );
+        }
+        base.write("src/pkg/c.rs", "pub fn from_c() -> i32 { 1 }\n");
+        // The single difference between the two trees.
+        head.write(
+            "src/pkg/c.rs",
+            "use super::a::from_a;\npub fn from_c() -> i32 { from_a() }\n",
+        );
+        (base, head)
+    }
+
+    #[test]
+    fn a_folder_that_gained_a_loop_is_reported_with_the_edge_that_closed_it() {
+        let (base, head) = chain_then_loop();
+        let found = shape_findings(&artifacts_of(&base, &head));
+        let pkg = found
+            .iter()
+            .find(|f| f.line.contains("src/pkg "))
+            .unwrap_or_else(|| panic!("no finding for src/pkg in {found:#?}"));
+        assert_eq!(
+            pkg.severity,
+            Severity::High,
+            "landing on cyclic is the rung nothing above it can be worked on"
+        );
+        assert!(pkg.line.contains("→ cyclic"), "{}", pkg.line);
+        assert!(
+            pkg.line.contains("c.rs → a.rs"),
+            "the edge that closed the loop has to be named: {}",
+            pkg.line
+        );
+    }
+
+    /// The fingerprint carries the transition, so the session state can
+    /// tell "fell again, further" from "already reported".
+    #[test]
+    fn the_fingerprint_names_the_transition_not_just_the_folder() {
+        let (base, head) = chain_then_loop();
+        let found = shape_findings(&artifacts_of(&base, &head));
+        let pkg = found.iter().find(|f| f.line.contains("src/pkg ")).unwrap();
+        assert!(pkg.fingerprint.starts_with("shape|src/pkg|"), "{}", pkg.fingerprint);
+        assert!(pkg.fingerprint.ends_with("→cyclic"), "{}", pkg.fingerprint);
+    }
+
+    /// Silence is the contract. An unchanged tree must produce no shape
+    /// finding at all — a folder that was tangled before the edit and is
+    /// still tangled is not news, and printing standing shape on every
+    /// stop would bury the findings that are.
+    #[test]
+    fn an_unchanged_tree_reports_no_shape_finding() {
+        let (base, _) = chain_then_loop();
+        let same = TmpDir::new("same");
+        for rel in ["src/pkg/mod.rs", "src/pkg/a.rs", "src/pkg/b.rs", "src/pkg/c.rs"] {
+            same.write(rel, &std::fs::read_to_string(base.0.join(rel)).unwrap());
+        }
+        let found = shape_findings(&artifacts_of(&base, &same));
+        assert!(found.is_empty(), "identical trees must be silent: {found:#?}");
+    }
+
+    /// A tier that *rises* is not a finding. The hook reports
+    /// regressions; an improvement reaching it would spend one of ten
+    /// lines telling an agent its work went well.
+    #[test]
+    fn a_folder_that_improved_is_not_a_finding() {
+        let (base, head) = chain_then_loop();
+        // Swapped: the loop is the base and the chain is the head.
+        let found = shape_findings(&artifacts_of(&head, &base));
+        assert!(found.is_empty(), "an improvement is not a regression: {found:#?}");
     }
 
     #[test]
@@ -383,10 +749,17 @@ mod tests {
 
     #[test]
     fn finding_reported_once_then_silent_on_repeat() {
-        let current = vec![f("cx|Function|foo|src/a.rs|", Severity::High, "complexity +12: Function foo — src/a.rs")];
+        let current = vec![f(
+            "cx|Function|foo|src/a.rs|",
+            Severity::High,
+            "complexity +12: Function foo — src/a.rs",
+        )];
         // First run: new finding is printed, enters state.
         let (out1, state1) = diff_against_state(&current, &SessionState::new(), DEFAULT_LINE_CAP);
-        assert!(out1.contains("⚠ complexity +12"), "first run must print it:\n{out1}");
+        assert!(
+            out1.contains("⚠ complexity +12"),
+            "first run must print it:\n{out1}"
+        );
         assert!(state1.contains_key("cx|Function|foo|src/a.rs|"));
         // Second run, same finding still present: silent.
         let (out2, state2) = diff_against_state(&current, &state1, DEFAULT_LINE_CAP);
@@ -396,13 +769,18 @@ mod tests {
 
     #[test]
     fn resolved_finding_prints_once() {
-        let seen: SessionState =
-            [("cycle|Struct|Bar|src/b.rs|".to_string(), "new cycle: Struct Bar — src/b.rs".to_string())]
-                .into_iter()
-                .collect();
+        let seen: SessionState = [(
+            "cycle|Struct|Bar|src/b.rs|".to_string(),
+            "new cycle: Struct Bar — src/b.rs".to_string(),
+        )]
+        .into_iter()
+        .collect();
         // Finding gone from current → one resolved line, dropped from state.
         let (out, next) = diff_against_state(&[], &seen, DEFAULT_LINE_CAP);
-        assert!(out.contains("✓ resolved: new cycle: Struct Bar"), "resolved line missing:\n{out}");
+        assert!(
+            out.contains("✓ resolved: new cycle: Struct Bar"),
+            "resolved line missing:\n{out}"
+        );
         assert!(next.is_empty(), "resolved finding must leave state");
         // Next run: nothing to say.
         let (out2, _) = diff_against_state(&[], &next, DEFAULT_LINE_CAP);
@@ -412,15 +790,28 @@ mod tests {
     #[test]
     fn output_never_exceeds_cap_and_points_to_assess_change() {
         let current: Vec<Finding> = (0..20)
-            .map(|i| f(&format!("cx|Function|f{i:02}|src/a.rs|"), Severity::High, &format!("complexity +{}: f{i}", 20 - i)))
+            .map(|i| {
+                f(
+                    &format!("cx|Function|f{i:02}|src/a.rs|"),
+                    Severity::High,
+                    &format!("complexity +{}: f{i}", 20 - i),
+                )
+            })
             .collect();
         let cap = 10;
         let (out, next) = diff_against_state(&current, &SessionState::new(), cap);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), cap, "must cap at exactly {cap} lines");
-        assert!(lines.last().unwrap().contains("assess_change"), "overflow must point to assess_change");
+        assert!(
+            lines.last().unwrap().contains("assess_change"),
+            "overflow must point to assess_change"
+        );
         // Only the emitted (cap-1) findings enter state; the rest resurface.
-        assert_eq!(next.len(), cap - 1, "un-emitted findings must not be marked seen");
+        assert_eq!(
+            next.len(),
+            cap - 1,
+            "un-emitted findings must not be marked seen"
+        );
     }
 
     #[test]

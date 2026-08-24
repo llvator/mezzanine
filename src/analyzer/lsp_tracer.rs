@@ -144,8 +144,11 @@ fn run(
         .map(|(i, site)| {
             let abs = &abs_files[i];
             let lines = files.get(abs)?;
-            let character =
-                encode_col(lines.get(site.line as usize).map(String::as_str), site.col, encoding);
+            let character = encode_col(
+                lines.get(site.line as usize).map(String::as_str),
+                site.col,
+                encoding,
+            );
             Some((path_to_uri(abs), site.line, character))
         })
         .collect();
@@ -164,7 +167,9 @@ fn run(
     // Pipeline all definition requests, then drain answers.
     let mut req_to_site: HashMap<i64, usize> = HashMap::new();
     for (i, query) in queries.iter().enumerate() {
-        let Some((uri, line, character)) = query else { continue };
+        let Some((uri, line, character)) = query else {
+            continue;
+        };
         let id = client
             .request(
                 "textDocument/definition",
@@ -176,7 +181,11 @@ fn run(
             .map_err(|e| format!("definition request failed: {e}"))?;
         req_to_site.insert(id, i);
     }
-    let answers = client.collect_responses(&req_to_site.keys().copied().collect::<HashSet<_>>(), deadline, idle);
+    let answers = client.collect_responses(
+        &req_to_site.keys().copied().collect::<HashSet<_>>(),
+        deadline,
+        idle,
+    );
 
     client.shutdown();
 
@@ -185,8 +194,12 @@ fn run(
     let mut resolved = 0usize;
     let mut non_null = 0usize;
     for (id, result) in &answers {
-        let Some(&site_i) = req_to_site.get(id) else { continue };
-        let Some((tgt_file, tgt_line)) = first_location(result) else { continue };
+        let Some(&site_i) = req_to_site.get(id) else {
+            continue;
+        };
+        let Some((tgt_file, tgt_line)) = first_location(result) else {
+            continue;
+        };
         non_null += 1;
         if let Some(entity_id) = entity_at(entities, &tgt_file, tgt_line) {
             upgrades.insert(sites[site_i].rel_idx, entity_id);
@@ -282,12 +295,22 @@ impl LspClient {
             }
         });
 
-        Ok(Self { child, stdin, rx, next_id: 1 })
+        Ok(Self {
+            child,
+            stdin,
+            rx,
+            next_id: 1,
+        })
     }
 
     /// Send `initialize`, wait for its response (negotiating the position
     /// encoding), then send `initialized`. Returns the agreed encoding.
-    fn initialize(&mut self, root: &Path, deadline: Instant, idle: Duration) -> Result<Encoding, String> {
+    fn initialize(
+        &mut self,
+        root: &Path,
+        deadline: Instant,
+        idle: Duration,
+    ) -> Result<Encoding, String> {
         let id = self
             .request(
                 "initialize",
@@ -315,7 +338,11 @@ impl LspClient {
                     .pointer("/result/capabilities/positionEncoding")
                     .and_then(Value::as_str)
                 {
-                    encoding = if enc == "utf-8" { Encoding::Utf8 } else { Encoding::Utf16 };
+                    encoding = if enc == "utf-8" {
+                        Encoding::Utf8
+                    } else {
+                        Encoding::Utf16
+                    };
                 }
                 return true;
             }
@@ -549,7 +576,8 @@ fn first_location(result: &Value) -> Option<(PathBuf, u32)> {
     } else {
         (
             loc.get("targetUri")?,
-            loc.get("targetSelectionRange").or_else(|| loc.get("targetRange"))?,
+            loc.get("targetSelectionRange")
+                .or_else(|| loc.get("targetRange"))?,
         )
     };
     let path = uri_to_path(uri.as_str()?)?;
@@ -691,8 +719,9 @@ pub fn run_alpha(a: &Alpha) -> u32 { a.ping() }
         let lib = dir.join("src/lib.rs");
         std::fs::write(&lib, src).unwrap();
 
-        let result = crate::parser::parse_content(&lib, src, crate::models::file_info::Language::Rust)
-            .expect("parse fixture");
+        let result =
+            crate::parser::parse_content(&lib, src, crate::models::file_info::Language::Rust)
+                .expect("parse fixture");
         let entities: Vec<CodeEntity> = result.entities.clone();
 
         // The single `a.ping()` call, with its captured position.
@@ -703,15 +732,23 @@ pub fn run_alpha(a: &Alpha) -> u32 { a.ping() }
             .find_map(|(i, r)| {
                 let l = r.metadata.get("lsp_line")?.parse().ok()?;
                 let c = r.metadata.get("lsp_col")?.parse().ok()?;
-                Some((i, CallSite { rel_idx: i, file: lib.clone(), line: l, col: c }))
+                Some((
+                    i,
+                    CallSite {
+                        rel_idx: i,
+                        file: lib.clone(),
+                        line: l,
+                        col: c,
+                    },
+                ))
             })
             .expect("a call site with a captured position");
 
         // Bounded budget so a loaded machine (e.g. an IDE rust-analyzer
         // re-indexing in parallel) can't hang the suite.
         let deadline = Instant::now() + Duration::from_secs(60);
-        let upgrades = run(&dir, &entities, &[site], deadline, Duration::from_secs(30))
-            .expect("tracer run");
+        let upgrades =
+            run(&dir, &entities, &[site], deadline, Duration::from_secs(30)).expect("tracer run");
         let _ = std::fs::remove_dir_all(&dir);
 
         // Skip (don't fail) if RA couldn't resolve in the budget — that's an
@@ -719,7 +756,9 @@ pub fn run_alpha(a: &Alpha) -> u32 { a.ping() }
         // is resolving to the *wrong* type, which only a present-but-wrong
         // mapping can trigger.
         let Some(target_id) = upgrades.get(&rel_idx) else {
-            eprintln!("skipping assertion: rust-analyzer did not resolve within budget (machine load?)");
+            eprintln!(
+                "skipping assertion: rust-analyzer did not resolve within budget (machine load?)"
+            );
             return;
         };
         let resolved = entities
@@ -753,7 +792,8 @@ pub fn run_alpha(a: &Alpha) -> u32 { a.ping() }
 
     #[test]
     fn first_location_handles_all_shapes() {
-        let loc = json!({ "uri": "file:///x.rs", "range": { "start": { "line": 7, "character": 2 } } });
+        let loc =
+            json!({ "uri": "file:///x.rs", "range": { "start": { "line": 7, "character": 2 } } });
         assert_eq!(first_location(&loc), Some((PathBuf::from("/x.rs"), 7)));
         let arr = json!([loc]);
         assert_eq!(first_location(&arr), Some((PathBuf::from("/x.rs"), 7)));

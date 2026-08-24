@@ -39,7 +39,16 @@
     "test:mirror": "node --experimental-strip-types --test scripts/mirror.test.ts",
     "test:scatter": "node --experimental-strip-types --test scripts/scatter-points.test.ts",
     "test:pipeline": "node --experimental-strip-types --test scripts/filter-pipeline.test.ts",
-    "test": "npm run test:fuzzy && npm run test:scope && npm run test:grouping && npm run test:ceiling && npm run test:diff && npm run test:arrivals && npm run test:empty && npm run test:degree && npm run test:search && npm run test:keymap && npm run test:refpaths && npm run test:children && npm run test:spec-graph && npm run test:linkgeom && npm run test:langscope && npm run test:quality-population && npm run test:overview && npm run test:marks && npm run test:saved-views && npm run test:linediff && npm run test:difflevels && npm run test:coupling && npm run test:levelshape && npm run test:history && npm run test:crumbs && npm run test:traffic && npm run test:panes && npm run test:mirror && npm run test:scatter && npm run test:pipeline"
+    "test:picks": "node --experimental-strip-types --test scripts/row-picks.test.ts",
+    "test:notescope": "node --experimental-strip-types --test scripts/note-scope.test.ts",
+    "test:shape-view": "node --experimental-strip-types --test scripts/shape-view.test.ts",
+    "test:collapseroot": "node --experimental-strip-types --test scripts/collapse-root.test.ts",
+    "test:churn": "node --experimental-strip-types --test scripts/diff-churn.test.ts",
+    "test:verdict": "node --experimental-strip-types --test scripts/diff-verdict.test.ts",
+    "test:rings": "node --experimental-strip-types --test scripts/mixed-grain.test.ts",
+    "test:bodies": "node --experimental-strip-types --test scripts/body-scope.test.ts",
+    "test:sizecurve": "node --experimental-strip-types --test scripts/size-curve.test.ts",
+    "test": "npm run test:fuzzy && npm run test:scope && npm run test:grouping && npm run test:ceiling && npm run test:diff && npm run test:arrivals && npm run test:empty && npm run test:degree && npm run test:search && npm run test:keymap && npm run test:refpaths && npm run test:children && npm run test:spec-graph && npm run test:linkgeom && npm run test:langscope && npm run test:quality-population && npm run test:overview && npm run test:marks && npm run test:saved-views && npm run test:linediff && npm run test:difflevels && npm run test:coupling && npm run test:levelshape && npm run test:history && npm run test:crumbs && npm run test:traffic && npm run test:panes && npm run test:mirror && npm run test:scatter && npm run test:pipeline && npm run test:picks && npm run test:notescope && npm run test:collapseroot && npm run test:churn && npm run test:verdict && npm run test:rings && npm run test:sizecurve && npm run test:bodies"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.0.0",

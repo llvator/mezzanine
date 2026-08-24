@@ -64,6 +64,7 @@ fn server_for(dir: &TmpDir) -> McpServer {
         graph_cache: std::sync::Mutex::new(HashMap::new()),
         base_cache: std::sync::Mutex::new(HashMap::new()),
         generation: Arc::new(AtomicU64::new(0)),
+        shape_baselines: Default::default(),
     }
 }
 
@@ -123,14 +124,32 @@ fn folder_selects_the_branch_that_claims_it_and_nothing_beside_it() {
     let dir = project("folder");
     let out = slice_for(&dir, json!({"path": "src/protocol"}));
 
-    assert!(out.contains("f protocol"), "claiming Feature missing:\n{out}");
-    assert!(out.contains("fu f.protocol.creation"), "descendant missing:\n{out}");
+    assert!(
+        out.contains("f protocol"),
+        "claiming Feature missing:\n{out}"
+    );
+    assert!(
+        out.contains("fu f.protocol.creation"),
+        "descendant missing:\n{out}"
+    );
     // Concept the branch uses comes along; the sibling branch does not.
-    assert!(out.contains("concept validation"), "used Concept missing:\n{out}");
-    assert!(!out.contains("f storage"), "sibling branch leaked in:\n{out}");
+    assert!(
+        out.contains("concept validation"),
+        "used Concept missing:\n{out}"
+    );
+    assert!(
+        !out.contains("f storage"),
+        "sibling branch leaked in:\n{out}"
+    );
     // The Category above is context, so the slice says where it sits.
-    assert!(out.contains("c library"), "ancestor context missing:\n{out}");
-    assert!(out.contains("# context"), "ancestor not marked as context:\n{out}");
+    assert!(
+        out.contains("c library"),
+        "ancestor context missing:\n{out}"
+    );
+    assert!(
+        out.contains("# context"),
+        "ancestor not marked as context:\n{out}"
+    );
 }
 
 #[test]
@@ -138,12 +157,21 @@ fn a_file_with_no_claim_falls_back_to_the_narrowest_claim_above_it() {
     let dir = project("fallback");
     let out = slice_for(&dir, json!({"path": "src/storage/save.rs"}));
 
-    assert!(out.contains("no claim inside"), "fallback not explained:\n{out}");
+    assert!(
+        out.contains("no claim inside"),
+        "fallback not explained:\n{out}"
+    );
     assert!(out.contains("src/storage"), "wrong enclosing claim:\n{out}");
-    assert!(out.contains("f storage"), "enclosing Feature missing:\n{out}");
+    assert!(
+        out.contains("f storage"),
+        "enclosing Feature missing:\n{out}"
+    );
     // `c library` claims `src/` too, but it is wider — it may only
     // appear as context, never as the seed.
-    assert!(!out.contains("f protocol"), "narrowest claim not preferred:\n{out}");
+    assert!(
+        !out.contains("f protocol"),
+        "narrowest claim not preferred:\n{out}"
+    );
 }
 
 /// `c library` claims `src/storage/` too, so it ties with `f storage`
@@ -154,9 +182,18 @@ fn a_tie_between_a_category_and_its_own_feature_goes_to_the_feature() {
     let dir = project("tie");
     let out = slice_for(&dir, json!({"path": "src/storage/save.rs"}));
 
-    assert!(out.contains("Seeded from:\n  f storage"), "Category seeded the slice:\n{out}");
-    assert!(out.contains("# context"), "Category should still place the slice:\n{out}");
-    assert!(!out.contains("f protocol"), "sibling branch came along:\n{out}");
+    assert!(
+        out.contains("Seeded from:\n  f storage"),
+        "Category seeded the slice:\n{out}"
+    );
+    assert!(
+        out.contains("# context"),
+        "Category should still place the slice:\n{out}"
+    );
+    assert!(
+        !out.contains("f protocol"),
+        "sibling branch came along:\n{out}"
+    );
 }
 
 #[test]
@@ -164,8 +201,14 @@ fn an_exact_file_claim_beats_the_folder_claim_above_it() {
     let dir = project("exact-file");
     let out = slice_for(&dir, json!({"path": "src/protocol/create.rs"}));
 
-    assert!(!out.contains("no claim inside"), "should not have fallen back:\n{out}");
-    assert!(out.contains("fu f.protocol.creation"), "claiming Functionality missing:\n{out}");
+    assert!(
+        !out.contains("no claim inside"),
+        "should not have fallen back:\n{out}"
+    );
+    assert!(
+        out.contains("fu f.protocol.creation"),
+        "claiming Functionality missing:\n{out}"
+    );
 }
 
 #[test]
@@ -184,14 +227,20 @@ fn a_project_without_a_spec_says_so() {
     let dir = TmpDir::new("no-spec");
     dir.write("src/main.rs", "fn main() {}\n");
     let err = spec_slice(&server_for(&dir), &json!({"path": "src"})).unwrap_err();
-    assert!(err.to_string().contains("No Elevator"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("No Elevator"),
+        "unexpected error: {err:#}"
+    );
 }
 
 #[test]
 fn path_is_required() {
     let dir = project("no-path");
     let err = spec_slice(&server_for(&dir), &json!({})).unwrap_err();
-    assert!(err.to_string().contains("needs a `path`"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("needs a `path`"),
+        "unexpected error: {err:#}"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -205,9 +254,15 @@ fn written_slice_is_a_standalone_spec_that_passes_check() {
         &dir,
         json!({"path": "src/protocol", "out": "tickets/T-1/spec-slice.elv"}),
     );
-    assert!(out.contains("→ tickets/T-1/spec-slice.elv"), "target not reported:\n{out}");
+    assert!(
+        out.contains("→ tickets/T-1/spec-slice.elv"),
+        "target not reported:\n{out}"
+    );
     // The response is provenance, not the body: the file is the artifact.
-    assert!(!out.contains("d: \"Create a protocol.\""), "body leaked into response:\n{out}");
+    assert!(
+        !out.contains("d: \"Create a protocol.\""),
+        "body leaked into response:\n{out}"
+    );
 
     let text = dir.read("tickets/T-1/spec-slice.elv");
     assert!(text.contains("f protocol"), "slice body missing:\n{text}");
@@ -220,7 +275,9 @@ fn written_slice_is_a_standalone_spec_that_passes_check() {
         .analysis
         .languages
         .insert(crate::models::file_info::Language::Elevator);
-    let result = crate::Analyzer::new(config).analyze().expect("re-analysis succeeds");
+    let result = crate::Analyzer::new(config)
+        .analyze()
+        .expect("re-analysis succeeds");
     let errors: Vec<String> = crate::output::elevator_check::check(&result)
         .into_iter()
         .filter(|f| matches!(f.severity, crate::output::elevator_check::Severity::Error))
@@ -239,14 +296,19 @@ fn an_existing_file_is_never_replaced_without_being_asked() {
         &json!({"path": "src/protocol", "out": "tickets/T-1/spec-slice.elv"}),
     )
     .unwrap_err();
-    assert!(err.to_string().contains("overwrite=true"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("overwrite=true"),
+        "unexpected error: {err:#}"
+    );
     assert_eq!(dir.read("tickets/T-1/spec-slice.elv"), "# hand-written\n");
 
     slice_for(
         &dir,
         json!({"path": "src/protocol", "out": "tickets/T-1/spec-slice.elv", "overwrite": true}),
     );
-    assert!(dir.read("tickets/T-1/spec-slice.elv").contains("f protocol"));
+    assert!(dir
+        .read("tickets/T-1/spec-slice.elv")
+        .contains("f protocol"));
 }
 
 #[test]
@@ -255,10 +317,16 @@ fn writes_cannot_leave_the_project_root() {
     let server = server_for(&dir);
 
     let err = resolve_out(&server, "../outside.elv", &json!({})).unwrap_err();
-    assert!(err.to_string().contains("escapes it"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("escapes it"),
+        "unexpected error: {err:#}"
+    );
 
     let err = resolve_out(&server, "/tmp/outside.elv", &json!({})).unwrap_err();
-    assert!(err.to_string().contains("absolute"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("absolute"),
+        "unexpected error: {err:#}"
+    );
 
     // A `..` that stays inside is fine — it normalizes back in.
     let ok = resolve_out(&server, "tickets/../notes/slice.elv", &json!({})).unwrap();
@@ -274,12 +342,21 @@ fn target_paths_normalize_to_the_form_cr_uses() {
     let dir = project("normalize");
     let server = server_for(&dir);
 
-    assert_eq!(target_folder(&server, &json!({"path": "./src/protocol/"})).unwrap(), "src/protocol");
+    assert_eq!(
+        target_folder(&server, &json!({"path": "./src/protocol/"})).unwrap(),
+        "src/protocol"
+    );
     let absolute = server.root.join("src/protocol").display().to_string();
-    assert_eq!(target_folder(&server, &json!({"path": absolute})).unwrap(), "src/protocol");
+    assert_eq!(
+        target_folder(&server, &json!({"path": absolute})).unwrap(),
+        "src/protocol"
+    );
 
     let err = target_folder(&server, &json!({"path": "."})).unwrap_err();
-    assert!(err.to_string().contains("project root"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("project root"),
+        "unexpected error: {err:#}"
+    );
 }
 
 #[test]

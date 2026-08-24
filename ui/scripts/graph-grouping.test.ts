@@ -25,16 +25,28 @@ import assert from 'node:assert/strict';
 
 import {
   folderKeyOf, cohesionStrengthFor, forceFolderCohesion,
-  ancestorChainOf, tierWeightFor,
+  ancestorChainOf, tierWeightFor, folderTierDepth,
+  fileKeyOf, groupKeyOf, groupChainOf, groupGrainFor,
   COHESION_STRENGTH, COHESION_LEVELS,
 } from '../src/utils/forceCohesion.ts';
-import { makeSeeder, wedgeKeyOf } from '../src/utils/layoutSeed.ts';
+import { makeSeeder, wedgeKeyOf, fileWedgeKeyOf } from '../src/utils/layoutSeed.ts';
 import { computeFolderHulls, labelBoxOf, MIN_HULL_MEMBERS } from '../src/viewmodels/folderHulls.ts';
 import { regionsAtPoint, tightestRegion, sameRegions } from '../src/viewmodels/regionsAtPoint.ts';
 import { groupMemberIds } from '../src/viewmodels/hoverHighlight.ts';
 import { rankHubs, hubNames } from '../src/viewmodels/hubs.ts';
 import { collapseGraph } from '../src/viewmodels/collapseGraph.ts';
-import type { D3Node } from '../src/types/graph.ts';
+import {
+  linkFolderWeights, folderKinship, folderTreeDistance,
+  KIN_DISTANCE, STRANGER_DISTANCE, STRANGER_STRENGTH,
+} from '../src/utils/linkFolderWeights.ts';
+import type { D3Link, D3Node } from '../src/types/graph.ts';
+
+/** The real d3 forces, for the UI-102 settle. Every other test here runs
+ *  hand-written arithmetic, deliberately — but the thing being asserted at
+ *  the bottom of this file is that a *d3* link force and the cohesion force
+ *  reach a particular truce, and reimplementing d3's tick to prove that would
+ *  be asserting against a copy of the code under test. */
+import * as d3 from 'd3-force';
 
 /** Minimal node: the two fields both modules read, plus somewhere for d3 to
  *  write. Cast once here rather than at every call site. */
@@ -238,6 +250,55 @@ test('the node\'s own folder keeps its full weight whatever it covers', () => {
   // UI-052's promise. A scope narrowed to one folder must keep cohering the
   // way it always did rather than losing it to a rule about ancestors.
   assert.equal(tierWeightFor(0, 100, 100), 1);
+});
+
+// ── the folder tier at file grain (UI-113) ─────────────────────────────
+
+test('folder grain is unchanged by the folder exemption', () => {
+  // The whole safety argument: at folder grain the folder IS depth 0, the
+  // early return fires first, and `folderDepth` can never be reached. Every
+  // assertion above therefore still describes the shipped force.
+  for (const [d, size] of [[1, 20], [2, 20], [1, 90], [3, 5]] as const) {
+    assert.equal(tierWeightFor(d, size, 100), tierWeightFor(d, size, 100, 0));
+  }
+});
+
+test('at file grain the folder is not charged the ancestor decay', () => {
+  // The bug UI-113 fixes. The folder sits at depth 1 because `groupChainOf`
+  // prepended the file, and it was collecting a discount meant for the
+  // subtree above it while still being a group the node is directly in.
+  const asAncestor = tierWeightFor(1, 25, 100);
+  const asOwnFolder = tierWeightFor(1, 25, 100, 1);
+  assert.ok(asOwnFolder > asAncestor, `${asOwnFolder} vs ${asAncestor}`);
+  // Exactly the decay removed, and nothing else: the coverage term stays.
+  assert.equal(asOwnFolder, 1 - 25 / 100);
+});
+
+test('the exempt folder still pays the coverage discount', () => {
+  // The two rules answer different questions and only one of them was wrong.
+  // A folder holding the whole drawn set has the graph's centroid whatever
+  // depth the grain puts it at, so it is still worth nothing.
+  assert.equal(tierWeightFor(1, 100, 100, 1), 0);
+  assert.ok(tierWeightFor(1, 25, 100, 1) > tierWeightFor(1, 90, 100, 1));
+});
+
+test('the exemption lands on one tier, not on everything below it', () => {
+  // A grandparent at file grain is depth 2 and is still an ancestor.
+  const parent = tierWeightFor(1, 20, 100, 1);
+  const grandparent = tierWeightFor(2, 20, 100, 1);
+  assert.ok(parent > grandparent, `${parent} vs ${grandparent}`);
+  assert.equal(grandparent, tierWeightFor(2, 20, 100, 0));
+});
+
+test('folderTierDepth matches where groupChainOf puts the folder', () => {
+  // The pairing that must not drift: whatever tier the chain gives the
+  // folder is the tier the weighting exempts. Asserted against the chain
+  // itself rather than against a literal, so a change to either is caught.
+  const n = node('a', 'ui/src/stores/graph.ts');
+  for (const grain of ['folder', 'file'] as const) {
+    const chain = groupChainOf(n, grain);
+    assert.equal(chain[folderTierDepth(grain)], 'ui/src/stores');
+  }
 });
 
 // ── the force, over an ancestor chain (UI-069) ──────────────────────────
@@ -445,6 +506,137 @@ test('a node with no pullable tier is left alone', () => {
   assert.equal(sim(b).vx, 0);
 });
 
+// ── group grain (UI-103) ────────────────────────────────────────────────
+
+test('the folder grain is the pre-UI-103 chain, delegated not reimplemented', () => {
+  // The whole safety argument for the grain: folder grain must be the same
+  // answer `ancestorChainOf` already gave, or every measurement, screenshot
+  // and tuned setting that predates UI-103 quietly stops describing the
+  // shipped picture.
+  const n = node('a', 'ui/src/stores/graph.ts');
+  assert.deepEqual(groupChainOf(n, 'folder'), ancestorChainOf(folderKeyOf(n)!));
+  assert.deepEqual(groupChainOf(n, 'folder'), ['ui/src/stores', 'ui/src', 'ui']);
+});
+
+test('the file grain puts the file below its folder', () => {
+  assert.deepEqual(groupChainOf(node('a', 'ui/src/stores/graph.ts'), 'file'), [
+    'ui/src/stores/graph.ts', 'ui/src/stores', 'ui/src', 'ui',
+  ]);
+});
+
+test('the file is an extra tier, not one taken from the folders', () => {
+  // Both grains reach the same distance up the tree at the same limit. A file
+  // that cost a folder tier would silently shorten the ancestor reach a
+  // reader has tuned, and the layout would change for a reason nothing names.
+  const n = node('a', 'a/b/c/d/e.ts');
+  const folders = groupChainOf(n, 'folder', 3);
+  const files = groupChainOf(n, 'file', 3);
+  assert.deepEqual(folders, ['a/b/c/d', 'a/b/c', 'a/b']);
+  assert.deepEqual(files, ['a/b/c/d/e.ts', ...folders]);
+});
+
+test('the same file spelled two ways is one region', () => {
+  // AN-015 one level down. Raw, `./ui/src/stores/graph.ts` and
+  // `ui/src/stores/graph.ts` are two regions with two centroids for one file
+  // — the defect `folderKeyOf` already fixes for the directory.
+  assert.equal(fileKeyOf(node('a', './ui/src/stores/graph.ts')), 'ui/src/stores/graph.ts');
+  assert.equal(fileKeyOf(node('b', 'ui/src/stores/graph.ts')), 'ui/src/stores/graph.ts');
+  assert.deepEqual(
+    groupChainOf(node('a', './pkg/one.ts'), 'file'),
+    groupChainOf(node('b', 'pkg/one.ts'), 'file'),
+  );
+});
+
+test('a repo-root file is its own region inside the root group', () => {
+  assert.deepEqual(groupChainOf(node('a', 'vite.config.ts'), 'file'), ['vite.config.ts', '']);
+  assert.deepEqual(groupChainOf(node('a', './vite.config.ts'), 'file'), ['vite.config.ts', '']);
+});
+
+test('a ghost is in no group at either grain', () => {
+  // Not negotiable: a shared key would collect every unrelated stdlib
+  // reference into one phantom region. `folderHulls`, `regionTraffic` and
+  // `hoverHighlight` each document the same exemption.
+  assert.equal(fileKeyOf(node('g', '')), null);
+  assert.equal(groupKeyOf(node('g', ''), 'file'), null);
+  assert.equal(groupKeyOf(node('g', ''), 'folder'), null);
+  assert.deepEqual(groupChainOf(node('g', ''), 'file'), []);
+  assert.deepEqual(groupChainOf(node('g', ''), 'folder'), []);
+});
+
+test('the innermost key is what the grain says it is', () => {
+  const n = node('a', 'ui/src/stores/graph.ts');
+  assert.equal(groupKeyOf(n, 'folder'), 'ui/src/stores');
+  assert.equal(groupKeyOf(n, 'file'), 'ui/src/stores/graph.ts');
+  assert.equal(groupKeyOf(n, 'file'), groupChainOf(n, 'file')[0]);
+  assert.equal(groupKeyOf(n, 'folder'), groupChainOf(n, 'folder')[0]);
+});
+
+test('file grain is an entity-level reading and collapses elsewhere', () => {
+  // At file level every node already *is* a file, so every file region would
+  // hold one member and draw nothing; at module level the force is inert.
+  assert.equal(groupGrainFor('entity', 'file'), 'file');
+  assert.equal(groupGrainFor('file', 'file'), 'folder');
+  assert.equal(groupGrainFor('module', 'file'), 'folder');
+  assert.equal(groupGrainFor('entity', 'folder'), 'folder');
+});
+
+test('at file grain the file centroid wins, where the folder had nothing to say', () => {
+  // Two files of two entities each, in one folder. At folder grain all four
+  // pull toward one centroid at x=250, so `a2` (x=100) is pulled right. At
+  // file grain `a2` belongs to `p/one.ts`, whose centroid is x=50, and it is
+  // pulled *left* instead. The reversal is the feature: same nodes, same
+  // positions, and a grouping the folder could not express.
+  const at = (grain: 'folder' | 'file') => {
+    const a1 = node('a1', 'p/one.ts', 0, 0);
+    const a2 = node('a2', 'p/one.ts', 100, 0);
+    const nodes = [a1, a2, node('b1', 'p/two.ts', 400, 0), node('b2', 'p/two.ts', 500, 0)];
+    const force = forceFolderCohesion((n) => groupChainOf(n, grain)).strength(0.5);
+    force.initialize(nodes);
+    force(1);
+    return sim(a2).vx;
+  };
+  assert.ok(at('folder') > 0, `folder grain: ${at('folder')}`);
+  assert.ok(at('file') < 0, `file grain: ${at('file')}`);
+});
+
+test('a file holding one entity needs no special case', () => {
+  // Its tier has one member, so `initialize` drops it before normalising and
+  // hands the whole share to the folder — which is exactly the pull the node
+  // gets at folder grain. The "lone file in a folder of its own" rule, one
+  // level down, for free.
+  const at = (grain: 'folder' | 'file') => {
+    const solo = node('solo', 'p/solo.ts', 0, 0);
+    const nodes = [
+      solo,
+      node('b1', 'p/two.ts', 300, 0),
+      node('b2', 'p/two.ts', 300, 0),
+      node('f1', 'q/one.ts', -900, 0),
+      node('f2', 'q/two.ts', -900, 0),
+    ];
+    const force = forceFolderCohesion((n) => groupChainOf(n, grain)).strength(0.5);
+    force.initialize(nodes);
+    force(1);
+    return sim(solo).vx;
+  };
+  assert.ok(at('folder') > 0, `folder grain: ${at('folder')}`);
+  assert.equal(at('file'), at('folder'));
+});
+
+test('the force defaults to the folder grain', () => {
+  // A caller with no opinion gets the pre-UI-103 force exactly, which is what
+  // keeps every settle assertion above measuring what it used to.
+  const tick = (chainOf?: (n: D3Node) => string[]) => {
+    const nodes = [node('a', 'p/sub/one.ts', 0, 0), node('b', 'p/sub/two.ts', 100, 0)];
+    const force = chainOf ? forceFolderCohesion(chainOf) : forceFolderCohesion();
+    force.strength(0.5);
+    force.initialize(nodes);
+    force(1);
+    return nodes.map((n) => sim(n).vx);
+  };
+  assert.deepEqual(tick(), tick((n) => groupChainOf(n, 'folder')));
+  assert.ok(tick()[0] > 0, 'the default force is inert, so this proves nothing');
+});
+
 // ── makeSeeder ──────────────────────────────────────────────────────────
 
 test('the wedge key is the folder, with ghosts and root files kept apart', () => {
@@ -597,6 +789,56 @@ test('two demoted files with the same name are told apart', () => {
   ] as unknown as D3Node[];
   assert.deepEqual(hubNames(nodes, ['a', 'b', 'c']),
     ['stores/graph.ts', 'types/graph.ts', 'scope.ts']);
+});
+
+// ── file wedges (UI-103) ────────────────────────────────────────────────
+
+test('the file wedge key is the file, normalised the one way', () => {
+  assert.equal(fileWedgeKeyOf(node('a', 'ui/src/stores/graph.ts')), 'ui/src/stores/graph.ts');
+  assert.equal(fileWedgeKeyOf(node('b', './ui/src/stores/graph.ts')), 'ui/src/stores/graph.ts');
+  assert.equal(fileWedgeKeyOf(node('g', '')), ' ghost');
+});
+
+test('a root-level file keeps the reserved arc, with its own wedge in it', () => {
+  // Left as a bare filename it would sort among the top-level directories.
+  // The force still groups root files by the `''` tier, so the seed would be
+  // scattering across the circle exactly what the force then drags back.
+  const a = fileWedgeKeyOf(node('a', 'vite.config.ts'));
+  const b = fileWedgeKeyOf(node('b', './svelte.config.js'));
+  assert.ok(a.startsWith(' root/'), a);
+  assert.ok(b.startsWith(' root/'), b);
+  assert.notEqual(a, b);
+  // Still after ghosts and before every real path, so the reserved arc holds.
+  assert.ok(' ghost' < a && a < 'ui/src/stores/graph.ts');
+});
+
+test('file wedges keep a folder’s files in one arc', () => {
+  // Lexicographic order over full paths is still depth-first order over the
+  // tree, which is the property the whole seeder rests on — a subtree takes
+  // one arc with no tree walk. Sorting the keys must not interleave a file
+  // from another folder between two of this folder's.
+  const keys = [
+    'ui/src/stores/graph.ts', 'ui/src/components/GraphView.svelte',
+    'ui/src/stores/settings.ts', 'src/parser/mod.rs',
+  ].map((p) => fileWedgeKeyOf(node(p, p))).sort();
+  const storesAt = keys.map((k, i) => (k.startsWith('ui/src/stores/') ? i : -1)).filter((i) => i >= 0);
+  assert.deepEqual(storesAt, [storesAt[0], storesAt[0] + 1], `interleaved: ${keys.join(', ')}`);
+});
+
+test('the seeder takes the key function, and the default is the folder', () => {
+  const nodes = [
+    node('a', 'p/one.ts'), node('b', 'p/two.ts'), node('c', 'q/three.ts'),
+  ];
+  const byDefault = makeSeeder(nodes, 1600, 1000);
+  const byFolder = makeSeeder(nodes, 1600, 1000, wedgeKeyOf);
+  const byFile = makeSeeder(nodes, 1600, 1000, fileWedgeKeyOf);
+  // The default must be the folder key, or every seeding assertion above
+  // silently starts measuring a grain nobody asked for.
+  assert.deepEqual(byDefault.position(nodes[0]), byFolder.position(nodes[0]));
+  // And the file key has to actually reach the allocation: `p` is one wedge
+  // holding two nodes at folder grain and two wedges of one at file grain, so
+  // the same node cannot land in the same place.
+  assert.notDeepEqual(byFolder.position(nodes[0]), byFile.position(nodes[0]));
 });
 
 // ── groupMemberIds (UI-054) ─────────────────────────────────────────────
@@ -963,6 +1205,24 @@ test('a parent holding exactly one region is not drawn twice', () => {
   assert.ok(hulls.some((h) => h.path === 'F1/SF11'));
 });
 
+test('a folder holding one file does not draw that file’s outline twice', () => {
+  // The file-grain form of the rule above, and the reason file grain needs no
+  // new guard: `p` holds exactly what `p/one.ts` holds, so the existing
+  // redundancy test marks it and the reader gets one ring, not two rings and
+  // the job of working out which name goes with which.
+  const oneFile = Array.from({ length: 5 }, (_, i) =>
+    node(`a${i}`, 'p/one.ts', i * 50, (i % 2) * 30));
+  const elsewhere = Array.from({ length: 5 }, (_, i) =>
+    node(`b${i}`, 'q/two.ts', 3000 + i * 50, (i % 2) * 30));
+  const hulls = computeFolderHulls([...oneFile, ...elsewhere], {
+    radiusOf: () => 10,
+    keysOf: (n: D3Node) => groupChainOf(n, 'file', Infinity),
+    tiers: 2,
+  });
+  assert.ok(hulls.some((h) => h.path === 'p/one.ts'), 'the file region was not drawn');
+  assert.ok(!hulls.some((h) => h.path === 'p'), 'the folder redrew its only file');
+});
+
 test('regions are painted outside-in, so no parent buries a child', () => {
   const hulls = computeFolderHulls(twoSubtrees(), nestedOpts(2));
   const at = (p: string) => hulls.findIndex((h) => h.path === p);
@@ -1157,4 +1417,283 @@ test('expanding nothing is byte-for-byte the old behaviour', () => {
   const b = collapseGraph(mixedGraph(), 'module', new Set());
   assert.deepEqual(a.nodes.map((n) => n.original_id), b.nodes.map((n) => n.original_id));
   assert.deepEqual(a.links.length, b.links.length);
+});
+
+// ── folder-aware link weights (UI-102) ─────────────────────────────────
+
+/** A link whose ends are already node objects — the shape d3 hands the
+ *  strength and distance accessors, since `forceLink.initialize` resolves ids
+ *  before it calls either. */
+function link(source: D3Node, target: D3Node): D3Link {
+  return { source, target, kind: 'calls', kind_raw: 'Calls', incoming_kind: 'called by', order: null } as unknown as D3Link;
+}
+
+const weights = () => linkFolderWeights(folderKeyOf);
+
+test('the tree distance between two folders is what you walk, not what you share', () => {
+  assert.equal(folderTreeDistance('ui/src/stores', 'ui/src/stores'), 0);
+  // Siblings are two edges apart wherever they sit. The depth-normalised
+  // form this replaced scored these two differently, which was the bug.
+  assert.equal(folderTreeDistance('ui/src/stores', 'ui/src/components'), 2);
+  assert.equal(folderTreeDistance('a', 'b'), 2);
+  // Parent to child is one, not two: you only walk down.
+  assert.equal(folderTreeDistance('ui', 'ui/src'), 1);
+  assert.equal(folderTreeDistance('ui/src/stores', 'docs/adr'), 5);
+  // The repo root is a real folder and one level above a top-level one.
+  assert.equal(folderTreeDistance('', 'ui'), 1);
+  assert.equal(folderTreeDistance('', ''), 0);
+});
+
+test('a ghost is infinitely far from everything, including another ghost', () => {
+  // `folderKeyOf` returns null for them, and giving two unrelated stdlib
+  // references a shared home is the mistake forceCohesion already refuses.
+  assert.equal(folderTreeDistance(null, 'ui/src'), Infinity);
+  assert.equal(folderTreeDistance(null, null), Infinity);
+  assert.equal(folderKinship(null, null), 0);
+});
+
+test('kinship decays with distance up the tree and never inverts', () => {
+  const same = folderKinship('ui/src/stores', 'ui/src/stores');
+  const sibling = folderKinship('ui/src/stores', 'ui/src/components');
+  const cousin = folderKinship('ui/src/stores', 'ui/scripts');
+  const stranger = folderKinship('ui/src/stores', 'docs/adr');
+  assert.equal(same, 1);
+  assert.ok(same > sibling && sibling > cousin && cousin > stranger,
+    `kinship is not monotone: ${same} ${sibling} ${cousin} ${stranger}`);
+  assert.ok(stranger > 0, 'an unrelated pair still has a floor above zero');
+});
+
+test('a same-folder edge is exactly the pre-UI-102 force', () => {
+  // The claim that makes this change safe to compare against every grouping
+  // measurement taken before it: intra-folder layout does not move.
+  const w = weights();
+  const a = node('a', 'pkg/sub/a.ts');
+  const b = node('b', 'pkg/sub/b.ts');
+  const links = [link(a, b)];
+  assert.equal(w.distance(links[0]), KIN_DISTANCE);
+  assert.equal(KIN_DISTANCE, 120, 'the old uniform distance was 120');
+  // Two nodes, one edge each: d3's default is 1 / min(1, 1).
+  assert.equal(w.strength(links[0], 0, links), 1);
+});
+
+test('a crossing edge rests further out and pulls less', () => {
+  const w = weights();
+  const a = node('a', 'alpha/a.ts');
+  const b = node('b', 'beta/b.ts');
+  const links = [link(a, b)];
+  assert.ok(w.distance(links[0]) > KIN_DISTANCE);
+  assert.ok(w.distance(links[0]) <= STRANGER_DISTANCE);
+  assert.ok(w.strength(links[0], 0, links) < 1);
+  assert.ok(w.strength(links[0], 0, links) >= STRANGER_STRENGTH);
+});
+
+test("d3's degree normalisation survives being scaled", () => {
+  // Supplying a `.strength()` accessor discards d3's default silently, and a
+  // flat strength makes a hub receive the same full correction from each of
+  // its edges. The default has to be reproduced, not replaced.
+  const w = weights();
+  const hub = node('hub', 'pkg/sub/hub.ts');
+  const leaves = Array.from({ length: 6 }, (_, i) => node(`leaf${i}`, 'pkg/sub/l.ts'));
+  const links = leaves.map((l) => link(hub, l));
+  // min(deg(hub) = 6, deg(leaf) = 1) is 1, so a leaf keeps full strength…
+  assert.equal(w.strength(links[0], 0, links), 1);
+  // …while an edge between two well-connected nodes is divided down.
+  const h2 = node('hub2', 'pkg/sub/hub2.ts');
+  const both = [...leaves.map((l) => link(hub, l)), ...leaves.map((l) => link(h2, l))];
+  const crossbar = link(hub, h2);
+  const withBar = [...both, crossbar];
+  assert.equal(w.strength(crossbar, withBar.length - 1, withBar), 1 / 7);
+});
+
+test('the degree count follows a swapped link set', () => {
+  // The incremental path calls `linkForce.links(next)` on every filter
+  // toggle, and d3 re-runs the accessors against the new array. A count
+  // cached from the old one would price every edge off a stale graph.
+  const w = weights();
+  const hub = node('hub', 'pkg/sub/hub.ts');
+  const leaves = Array.from({ length: 4 }, (_, i) => node(`leaf${i}`, 'pkg/sub/l.ts'));
+  const dense = leaves.map((l) => link(hub, l));
+  const bar = link(hub, leaves[0]);
+  const denseWithBar = [...dense, bar, link(leaves[0], leaves[1])];
+  const before = w.strength(bar, dense.length, denseWithBar);
+  const sparse = [bar];
+  const after = w.strength(bar, 0, sparse);
+  assert.notEqual(before, after);
+  assert.equal(after, 1, 'against a one-link set both ends have degree 1');
+});
+
+/**
+ * Settle a world under the forces GraphView actually runs — link, charge,
+ * collision, the weak centring pair and cohesion — with the link force
+ * configured either the old way or the new one.
+ *
+ * This is the harness the suite was missing, and the reason UI-102 could ship
+ * unnoticed under a green build: `settle()` above runs cohesion *alone*, so
+ * every existing grouping assertion measures the folder force against an
+ * empty field. The failure being fixed here is entirely an argument between
+ * two forces, and nothing in the suite let those two forces argue.
+ */
+function settleAgainstLinks(nodes: D3Node[], links: D3Link[], folderAware: boolean): void {
+  const w = weights();
+  const linkForce = d3.forceLink<D3Node, D3Link>(links).id((d) => d.id);
+  if (folderAware) linkForce.distance(w.distance).strength(w.strength);
+  else linkForce.distance(KIN_DISTANCE);   // the pre-UI-102 uniform force
+  d3.forceSimulation<D3Node>(nodes)
+    .force('link', linkForce)
+    .force('charge', d3.forceManyBody().strength(-400))
+    .force('x', d3.forceX(0).strength(0.05))
+    .force('y', d3.forceY(0).strength(0.05))
+    .force('collision', d3.forceCollide().radius(20))
+    .force('cohesion', forceFolderCohesion().strength(COHESION_STRENGTH.low))
+    .stop()
+    .tick(600);
+}
+
+/**
+ * Four sibling folders on a ring, each a star of ten, and one leaf per folder
+ * holding a single edge into the next folder's hub.
+ *
+ * Four rather than two, because with two folders the only place a node can be
+ * towed *to* is the only other thing on the canvas, and every measurement
+ * collapses into how far apart those two sit. Stars rather than chains,
+ * because a chain of ten has no centre and its own members average further
+ * from the centroid than a strayed node does — a world where the metric
+ * cannot see the effect it exists to measure.
+ *
+ * The strays are leaves and their foreign neighbour is a hub, because d3
+ * biases a link's correction onto the lower-degree end. That asymmetry is
+ * exactly what lets one edge overrule cohesion, so a world without it would
+ * be testing a failure nobody reported.
+ *
+ * This is the world the constants in `linkFolderWeights` were measured on.
+ */
+const RING_FOLDERS = 4, RING_MEMBERS = 10;
+
+interface RingWorld { nodes: D3Node[]; links: D3Link[]; folders: D3Node[][]; strays: Set<D3Node>; }
+
+function ringWorld(folderOf: (f: number) => string = (f) => `pkg/f${f}`): RingWorld {
+  const folders: D3Node[][] = [];
+  const links: D3Link[] = [];
+  for (let f = 0; f < RING_FOLDERS; f++) {
+    const angle = (f / RING_FOLDERS) * Math.PI * 2;
+    const cx = Math.cos(angle) * 400, cy = Math.sin(angle) * 400;
+    const members = Array.from({ length: RING_MEMBERS }, (_, i) =>
+      node(`F${f}N${i}`, `${folderOf(f)}/n${i}.ts`, cx + (i % 5) * 25 - 50, cy + Math.floor(i / 5) * 25 - 25));
+    for (let i = 1; i < RING_MEMBERS; i++) links.push(link(members[0], members[i]));
+    folders.push(members);
+  }
+  const strays = new Set<D3Node>();
+  for (let f = 0; f < RING_FOLDERS; f++) {
+    const stray = folders[f][1];
+    strays.add(stray);
+    links.push(link(stray, folders[(f + 1) % RING_FOLDERS][0]));
+  }
+  return { nodes: folders.flat(), links, folders, strays };
+}
+
+/**
+ * Mean distance to the own-folder centroid for nodes **with** a crossing
+ * edge, over the same for nodes without one — the unit-suite twin of the
+ * probe's `strayRatio`.
+ *
+ * A ratio rather than a distance, because the absolute number moves with
+ * cohesion strength, charge and node count, and none of those are what is
+ * being asserted. 1.0 means a crossing edge costs a node nothing.
+ */
+function strayRatio(w: RingWorld): number {
+  let sSum = 0, sN = 0, pSum = 0, pN = 0;
+  for (const members of w.folders) {
+    const cx = members.reduce((s, n) => s + n.x!, 0) / members.length;
+    const cy = members.reduce((s, n) => s + n.y!, 0) / members.length;
+    for (const n of members) {
+      const d = Math.hypot(n.x! - cx, n.y! - cy);
+      if (w.strays.has(n)) { sSum += d; sN++; } else { pSum += d; pN++; }
+    }
+  }
+  return (sSum / sN) / (pSum / pN);
+}
+
+test('a crossing edge no longer tows a node out of its folder', () => {
+  // The report UI-102 came from, as a number, at the shipped default
+  // cohesion strength — `folderCohesion` defaults to `low`, and a fix that
+  // only showed at `high` would not be a fix for what was reported.
+  const before = ringWorld();
+  settleAgainstLinks(before.nodes, before.links, false);
+  const after = ringWorld();
+  settleAgainstLinks(after.nodes, after.links, true);
+
+  const was = strayRatio(before);
+  const now = strayRatio(after);
+  assert.ok(was > 1.5, `the world does not reproduce the failure: strays only ${was.toFixed(2)}x out`);
+  assert.ok(now < was * 0.85, `stray ratio ${was.toFixed(2)} -> ${now.toFixed(2)}`);
+});
+
+test('the folders are tightened, not merely pushed apart', () => {
+  // The trap this measurement has to avoid. Lengthening crossing edges
+  // spreads the canvas, and a stray ratio can improve purely because every
+  // folder grew. Intra-folder distance as a share of all-pairs distance is
+  // scale-invariant, so it can only improve if folders really are tighter
+  // relative to the whole — the same quantity the probe's `cohesionRatio`
+  // reports on a real repo.
+  const share = (w: RingWorld): number => {
+    const ns = w.nodes;
+    let iS = 0, iN = 0, aS = 0, aN = 0;
+    for (let i = 0; i < ns.length; i++) {
+      for (let j = i + 1; j < ns.length; j++) {
+        const d = Math.hypot(ns[i].x! - ns[j].x!, ns[i].y! - ns[j].y!);
+        aS += d; aN++;
+        if (folderKeyOf(ns[i]) === folderKeyOf(ns[j])) { iS += d; iN++; }
+      }
+    }
+    return (iS / iN) / (aS / aN);
+  };
+  const before = ringWorld(); settleAgainstLinks(before.nodes, before.links, false);
+  const after = ringWorld(); settleAgainstLinks(after.nodes, after.links, true);
+  assert.ok(share(after) < share(before),
+    `folder tightness went the wrong way: ${share(before).toFixed(3)} -> ${share(after).toFixed(3)}`);
+});
+
+test('an edge out of the subtree is weakened harder than one inside it', () => {
+  // The claim that makes kinship continuous rather than a boolean. Same
+  // world, same geometry, only the paths differ: four folders under one
+  // parent, versus four unrelated top-level folders. The second set has
+  // further to decay, so its strays must come home at least as well.
+  const siblings = ringWorld(); settleAgainstLinks(siblings.nodes, siblings.links, true);
+  const strangers = ringWorld((f) => `f${f}`); settleAgainstLinks(strangers.nodes, strangers.links, true);
+  assert.ok(strayRatio(strangers) <= strayRatio(siblings) + 0.05,
+    `unrelated folders held on worse than siblings: ${strayRatio(strangers).toFixed(2)} vs ${strayRatio(siblings).toFixed(2)}`);
+});
+
+test('a graph with no crossing edges settles identically', () => {
+  // The safety claim. If the new accessors moved a single-folder world at
+  // all, every measurement taken before UI-102 would be incomparable with
+  // every measurement taken after it.
+  const world = () => {
+    const ns = Array.from({ length: 8 }, (_, i) => node(`n${i}`, 'pkg/only/f.ts', i * 30 - 100, i * 20 - 80));
+    const ls = ns.slice(1).map((n) => link(ns[0], n));
+    return { ns, ls };
+  };
+  const a = world(); settleAgainstLinks(a.ns, a.ls, false);
+  const b = world(); settleAgainstLinks(b.ns, b.ls, true);
+  for (let i = 0; i < a.ns.length; i++) {
+    assert.ok(Math.abs(a.ns[i].x! - b.ns[i].x!) < 1e-9 && Math.abs(a.ns[i].y! - b.ns[i].y!) < 1e-9,
+      `node ${i} moved: (${a.ns[i].x}, ${a.ns[i].y}) vs (${b.ns[i].x}, ${b.ns[i].y})`);
+  }
+});
+
+test('the graph still hangs together', () => {
+  // The counterweight to every assertion above. Charge is -400 and the only
+  // other restraint is the 0.05 centring pair, so a crossing edge worth
+  // nothing lets the subtrees drift until auto-fit hits its zoom floor —
+  // UI-022's failure, reached from the other direction. Measured, the canvas
+  // grows about a fifth; the guard is set well outside that so it catches a
+  // runaway rather than re-asserting the tuning.
+  const spanOf = (w: RingWorld) => {
+    const xs = w.nodes.map((n) => n.x!), ys = w.nodes.map((n) => n.y!);
+    return Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+  };
+  const before = ringWorld(); settleAgainstLinks(before.nodes, before.links, false);
+  const after = ringWorld(); settleAgainstLinks(after.nodes, after.links, true);
+  assert.ok(spanOf(after) < spanOf(before) * 1.5,
+    `the graph flew apart: ${Math.round(spanOf(before))}px -> ${Math.round(spanOf(after))}px`);
 });

@@ -73,5 +73,9 @@ fn clean_docstring(raw: &str) -> Option<String> {
         .collect();
 
     let result = dedented.join("\n").trim().to_string();
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }

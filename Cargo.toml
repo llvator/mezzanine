@@ -1,6 +1,6 @@
 [package]
 name = "nao"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "Visualize code relationships, dependencies, and quality metrics"
 authors = ["Nao Team"]
@@ -30,6 +30,12 @@ tree-sitter-kotlin = "0.3"
 # `LanguageFn::into_raw` accessor and transmutes the result, avoiding
 # the need to bump every other parser to a new tree-sitter version.
 tree-sitter-groovy = "0.1"
+# Dart has no crates.io entry here on purpose. Every published
+# `tree-sitter-dart` carrying Dart 3 is built at grammar ABI 15, which our
+# tree-sitter 0.22 rejects outright, and the newest ABI-14 release predates
+# Dart 3 entirely. So the grammar is vendored at `vendor/tree-sitter-dart/`,
+# regenerated from upstream at ABI 14 and compiled by `build.rs`. That
+# directory's README carries the full reasoning.
 
 # SQL DDL (SQL-001). Not tree-sitter: `.sql` schemas are parsed for topology,
 # not for control flow, and sqlparser yields a typed DDL AST rather than a tree
@@ -93,6 +99,8 @@ rayon = "1.10"
 # generation is derived rather than hand-bumped — see the script's header.
 # Same hash the store uses at runtime, so the two agree by construction.
 [build-dependencies]
+# Compiles the vendored Dart grammar (see vendor/tree-sitter-dart/README.md).
+cc = "1.0"
 blake3 = "1.5"
 
 # `ServiceExt::oneshot` drives a `Router` in-process, so the CORS and token

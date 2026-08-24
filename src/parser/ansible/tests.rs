@@ -141,7 +141,10 @@ fn var_file_emits_group_set_and_entries() {
         K8S_VARS,
     );
 
-    assert_eq!(ids_of(&r, EntityKind::HostGroup), vec!["ansible::group.acme_portal"]);
+    assert_eq!(
+        ids_of(&r, EntityKind::HostGroup),
+        vec!["ansible::group.acme_portal"]
+    );
 
     let mut sets = ids_of(&r, EntityKind::DeploymentSet);
     sets.sort();
@@ -266,7 +269,10 @@ fn template_extracts_each_k8s_resource() {
         .flat_map(|e| e.attributes.iter())
         .filter_map(|a| a.strip_prefix("k8s_name:").map(str::to_string))
         .collect();
-    assert_eq!(names, vec!["acme-portal-ds-config", "acme-portal-ds-secret"]);
+    assert_eq!(
+        names,
+        vec!["acme-portal-ds-config", "acme-portal-ds-secret"]
+    );
 }
 
 #[test]
@@ -280,7 +286,10 @@ fn template_resource_contained_by_template_file() {
             && rel.source_id == "ansible::tpl.acme-portal-k8s/acme-portal-ds-config.yml.j2"
             && rel.target_id == "ansible::res.ConfigMap.acme-portal-ds-config"
     });
-    assert!(has, "template should Contain its first resource (name-based id)");
+    assert!(
+        has,
+        "template should Contain its first resource (name-based id)"
+    );
 }
 
 const DEPLOYMENT: &str = r#"apiVersion: apps/v1
@@ -323,12 +332,24 @@ fn deployment_emits_reference_edges() {
 
     let src = "ansible::res.Deployment.acme-portal-maintenance".to_string();
     // imagePullSecrets + envFrom.secretRef -> two Secret refs
-    assert!(refs.contains(&(src.clone(), "ansible::res.Secret.a12-secrets-dockerconfigjson".into())));
-    assert!(refs.contains(&(src.clone(), "ansible::res.Secret.acme-portal-secrets".into())));
+    assert!(refs.contains(&(
+        src.clone(),
+        "ansible::res.Secret.a12-secrets-dockerconfigjson".into()
+    )));
+    assert!(refs.contains(&(
+        src.clone(),
+        "ansible::res.Secret.acme-portal-secrets".into()
+    )));
     // envFrom.configMapRef -> ConfigMap ref
-    assert!(refs.contains(&(src.clone(), "ansible::res.ConfigMap.acme-portal-nginx-configmap".into())));
+    assert!(refs.contains(&(
+        src.clone(),
+        "ansible::res.ConfigMap.acme-portal-nginx-configmap".into()
+    )));
     // volumes.persistentVolumeClaim.claimName -> PVC ref
-    assert!(refs.contains(&(src, "ansible::res.PersistentVolumeClaim.acme-portal-gclogs-pvc".into())));
+    assert!(refs.contains(&(
+        src,
+        "ansible::res.PersistentVolumeClaim.acme-portal-gclogs-pvc".into()
+    )));
 }
 
 #[test]
@@ -345,7 +366,10 @@ fn deployment_captures_attributes() {
     let attr = |k: &str| dep.attributes.iter().find_map(|a| a.strip_prefix(k));
     assert_eq!(attr("k8s_namespace:"), Some("acme-portal"));
     assert_eq!(attr("k8s_replicas:"), Some("2"));
-    assert_eq!(attr("k8s_image:"), Some("registry.example/maintenance-page:1.2.3"));
+    assert_eq!(
+        attr("k8s_image:"),
+        Some("registry.example/maintenance-page:1.2.3")
+    );
 }
 
 #[test]
@@ -395,7 +419,9 @@ spec:
 fn classifies_playbook() {
     assert_eq!(
         classify(Path::new("playbooks/deploy.yml")),
-        FileRole::Playbook { rel: "deploy".into() }
+        FileRole::Playbook {
+            rel: "deploy".into()
+        }
     );
     assert_eq!(
         classify(Path::new(
@@ -435,7 +461,10 @@ const PLAYBOOK: &str = r#"
 #[test]
 fn playbook_emits_playbook_role_and_include_edges() {
     let r = parse("playbooks/deploy.yml", PLAYBOOK);
-    assert_eq!(ids_of(&r, EntityKind::Playbook), vec!["ansible::playbook.deploy"]);
+    assert_eq!(
+        ids_of(&r, EntityKind::Playbook),
+        vec!["ansible::playbook.deploy"]
+    );
 
     // Two distinct roles (k8s_deployment used twice → deduped).
     let mut roles = ids_of(&r, EntityKind::Role);
@@ -474,7 +503,12 @@ fn playbook_requires_the_host_vars_from_when_and_vars() {
     assert!(requires.contains(&(pb.clone(), "ansible::var.k8s_pre_deployments".into())));
     assert!(requires.contains(&(pb.clone(), "ansible::var.k8s_post_deployments".into())));
     assert!(requires.contains(&(pb, "ansible::var.helm_deployment_charts".into())));
-    assert_eq!(requires.len(), 3, "expected 3 unique requires, got {:?}", requires);
+    assert_eq!(
+        requires.len(),
+        3,
+        "expected 3 unique requires, got {:?}",
+        requires
+    );
 }
 
 #[test]
@@ -592,7 +626,9 @@ spec:
     assert!(interp.contains(&"ansible::var.hostlist".to_string()));
     // `lookup` (a function) and the quoted string literals must NOT be
     // treated as variables.
-    assert!(!interp.iter().any(|t| t.ends_with(".env") || t.ends_with(".PORT") || t.ends_with(".lookup")));
+    assert!(!interp
+        .iter()
+        .any(|t| t.ends_with(".env") || t.ends_with(".PORT") || t.ends_with(".lookup")));
 }
 
 #[test]

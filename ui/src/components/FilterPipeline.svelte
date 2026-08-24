@@ -27,14 +27,14 @@
     hiddenLanguages, hiddenFiles,
     showGhostNodes, showBuiltinGhosts, showTemplateVars,
     showDirectEdges, showCrossLevelEdges, levelOverrides, treeMaxDepth,
-    searchHidesNonMatches, selectedNode, graphData, viewMode,
+    searchHidesNonMatches, selectedNode, graphData, structureOnly,
   } from '../stores/graph';
   import { isSpecNode } from '../types/graph';
   import {
     searchTerm, committedSearchIds, setAllLanguages, clearHiddenFiles,
   } from '../viewmodels/filterViewModel';
   import { crossFilterPaths, specSelectedNodes, clearSpecFocus } from '../stores/crossFilter';
-  import { diffActive, diffFiltersEnabled, diffLevel, diffDimOpacity } from '../stores/diff';
+  import { diffActive, diffFiltersEnabled, diffLevel, diffSeedFacet, diffDimOpacity } from '../stores/diff';
   import { demoteHubs, hubCount } from '../stores/settings';
   import { splitViewOpen, sidebarTab } from '../stores/panes';
   import { focusPane } from '../stores/keymap';
@@ -42,14 +42,38 @@
     filterPipeline, effectiveDepth, pipelineSummary,
     type FilterStage, type FilterStageId,
   } from '../viewmodels/filterPipeline';
+  import { displayPlan } from '../viewmodels/displayPlan';
+
+  /**
+   * Which mode the canvas is *actually* drawing in — the plan's own answer,
+   * not the `viewMode` store's.
+   *
+   * The two disagree in the states that matter here. `shape` with no picture
+   * in hand yet draws a force graph, and `tree` with nothing selected does
+   * too, because a tree has to be rooted at something. Reading the store would
+   * make the strip go quiet about filters that are running in both.
+   */
+  $: view = $displayPlan.mode;
 
   /** A selection only filters when it is a node of *this* graph. A spec entity
    *  clicked in the split view sets the global selection without narrowing the
    *  code canvas — the cross-filter it applied is the filter, and it has its
    *  own chip. Same test `displayPlan` makes before it runs the BFS. */
   $: specSelected = $splitViewOpen && !!$selectedNode && isSpecNode($selectedNode);
+  /** The shape view returns from `displayPlan` before the selection reach is
+   *  ever computed: what is on screen there is one folder's drawn graph,
+   *  chosen by the reader, and a selection inside it narrows nothing. Left
+   *  unguarded the strip announced "Focus mod.rs · 1 hop" over a picture no
+   *  focus had touched — which is precisely the lie it was built to prevent
+   *  (UI-108), and worse than silence because it offers a `×` that would
+   *  change nothing.
+   *
+   *  `RUNS_IN` would drop the chip anyway; this stays because the same flag
+   *  drives `directional` in the viewmodel, and a focus nobody has means the
+   *  direction and level rules have no BFS to steer. */
   $: focused =
-    $selectedNode && !specSelected && $graphData.nodes.some((n) => n.id === $selectedNode!.id)
+    view !== 'shape'
+    && $selectedNode && !specSelected && $graphData.nodes.some((n) => n.id === $selectedNode!.id)
       ? $selectedNode
       : null;
 
@@ -58,6 +82,20 @@
   $: hasGhosts = $graphData.nodes.some((n) => n.tags?.includes('ghost'));
   $: hasBuiltinGhosts = $graphData.nodes.some((n) => n.tags?.includes('ghost_stdlib'));
   $: hasTemplateVars = $graphData.nodes.some((n) => n.tags?.includes('template_var'));
+
+  /** How much `structureOnly` is holding back, counted against the graph on
+   *  screen. Zero on a document, spec or schema graph — nothing there has a
+   *  body — and the chip stays away rather than naming a filter with nothing
+   *  to filter. */
+  $: bodyEntities = $graphData.nodes.filter((n) => n.body_of !== undefined).length;
+  /** The one callable whose body is exempt: the selection, and only when its
+   *  own internals are the ones on screen. A File rollup or a spec entity has
+   *  no body to open, and naming it on the chip would promise a state the
+   *  canvas is not in. */
+  $: openBody =
+    $selectedNode && $graphData.nodes.some((n) => n.body_of === $selectedNode!.original_id)
+      ? $selectedNode.name
+      : null;
 
   /** Exclusions counted against the *current* dataset. `hiddenFiles` remembers
    *  files from scopes the reader has left, on purpose (UI-047), and counting
@@ -79,6 +117,7 @@
   }, 0);
 
   $: stages = filterPipeline({
+    view,
     kinds: {
       hidden: $allEntityTypes.filter((t) => !$generalEntityTypes.has(t)),
       total: $allEntityTypes.length,
@@ -98,6 +137,7 @@
       builtinsPresent: hasBuiltinGhosts,
     },
     templateVars: { hidden: !$showTemplateVars, present: hasTemplateVars },
+    structure: { on: $structureOnly, hidden: bodyEntities, open: openBody },
     spec: $crossFilterPaths === null
       ? null
       : { entities: $specSelectedNodes.map((n) => n.name), paths: $crossFilterPaths.length },
@@ -111,13 +151,13 @@
     // A diff that is only colouring the graph is not filtering it, and the
     // master toggle is what tells the two apart.
     diff: $diffActive && $diffFiltersEnabled
-      ? { level: $diffLevel, dims: $diffDimOpacity > 0 }
+      ? { level: $diffLevel, facet: $diffSeedFacet, dims: $diffDimOpacity > 0 }
       : null,
     focus: focused
       ? {
           name: focused.name,
           depth: effectiveDepth($levelOverrides, $treeMaxDepth),
-          mode: $viewMode === 'tree' ? 'tree' : 'force',
+          mode: view === 'tree' ? 'tree' : 'force',
         }
       : null,
     levels: {
@@ -146,14 +186,21 @@
     },
     'template-vars': () => showTemplateVars.set(true),
     spec: () => clearSpecFocus(),
+    structure: () => structureOnly.set(false),
     kinds: () => generalEntityTypes.set(new Set(get(allEntityTypes))),
     languages: () => setAllLanguages(true),
     files: () => clearHiddenFiles(),
     // Clearing the box is what drops the commit — `filterViewModel` enforces
     // that, so there is one path out of a search rather than two.
     search: () => searchTerm.set(''),
-    // Off, not unloaded: the colours and the Details pane's diff stay.
-    diff: () => diffFiltersEnabled.set(false),
+    // Stepwise, like `ghosts`. A seed split to one half is the narrower and
+    // less expected of the two diff controls, so the first click widens it
+    // back to the whole change; only then does the second turn the filtering
+    // off — off, not unloaded: the colours and the Details pane's diff stay.
+    diff: () => {
+      if (get(diffSeedFacet) !== 'all') diffSeedFacet.set('all');
+      else diffFiltersEnabled.set(false);
+    },
     focus: () => selectedNode.set(null),
     relations: () => {
       generalRelTypes.set(new Set(get(allRelTypes)));

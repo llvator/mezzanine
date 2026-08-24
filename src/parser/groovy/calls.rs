@@ -10,10 +10,10 @@
 
 use super::super::language_parser::{node_text, node_to_span, ParseResult};
 use super::fields::has_field_annotation;
-use super::helpers::flow_keyword_invocation;
 use super::flow::{
     emit_branch_entity, emit_case_arm_entity, emit_loop_entity, emit_try_arm_entity,
 };
+use super::helpers::flow_keyword_invocation;
 use super::stdlib::is_stdlib_method;
 use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, Visibility};
 use std::path::Path;
@@ -193,12 +193,10 @@ fn walk_method_invocation_children(
     }
 }
 
-fn handle_method_invocation(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
-    let Some(name_node) = node.child_by_field_name("name") else { return };
+fn handle_method_invocation(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
     let method_name = node_text(&name_node, ctx.source).to_string();
     if method_name.is_empty() {
         return;
@@ -211,11 +209,7 @@ fn handle_method_invocation(
         .child_by_field_name("object")
         .map(|obj| node_text(&obj, ctx.source).to_string());
     let callee = qualify_callee(receiver_text.as_deref(), &method_name, ctx.parent_class);
-    let mut rel = Relationship::new(
-        ctx.caller_id.to_string(),
-        callee,
-        RelationshipKind::Calls,
-    );
+    let mut rel = Relationship::new(ctx.caller_id.to_string(), callee, RelationshipKind::Calls);
     rel.metadata
         .insert("order".to_string(), ctx.call_order.to_string());
     if let Some(b) = current_branch {
@@ -224,12 +218,10 @@ fn handle_method_invocation(
     ctx.result.add_relationship(rel);
 }
 
-fn handle_object_creation(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
-    let Some(type_node) = node.child_by_field_name("type") else { return };
+fn handle_object_creation(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
     let type_name = node_text(&type_node, ctx.source).to_string();
     *ctx.call_order += 1;
     let mut rel = Relationship::new(
@@ -276,12 +268,21 @@ fn handle_degraded_flow(
     if let Some(args) = node.child_by_field_name("arguments") {
         extract_calls(&args, ctx, current_branch);
     }
-    let Some(body) = node.child_by_field_name("body") else { return };
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
     match keyword {
         "while" | "for" => {
             *ctx.loop_counter += 1;
             let path = loop_path(current_branch, *ctx.loop_counter);
-            emit_loop_entity(ctx.caller_id, current_branch, &path, &body, ctx.path, ctx.result);
+            emit_loop_entity(
+                ctx.caller_id,
+                current_branch,
+                &path,
+                &body,
+                ctx.path,
+                ctx.result,
+            );
             extract_calls(&body, ctx, Some(&path));
         }
         "if" => emit_arm(&body, ctx, current_branch),
@@ -335,7 +336,14 @@ fn emit_if_arm(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>)
 fn emit_arm(body: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     *ctx.arm_counter += 1;
     let path = branch_path(current_branch, *ctx.arm_counter);
-    emit_branch_entity(ctx.caller_id, current_branch, &path, body, ctx.path, ctx.result);
+    emit_branch_entity(
+        ctx.caller_id,
+        current_branch,
+        &path,
+        body,
+        ctx.path,
+        ctx.result,
+    );
     extract_calls(body, ctx, Some(&path));
 }
 
@@ -346,11 +354,7 @@ fn emit_arm(body: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
 /// Caught exception types travel as documentation + `caught:<type>`
 /// attribute, with multi-catch (`catch (Foo | Bar e)`) joined by ` | `
 /// to mirror PY-001's tuple rendering.
-fn handle_try_statement(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_try_statement(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     if let Some(body) = node.child_by_field_name("body") {
         *ctx.arm_counter += 1;
         let path = branch_path(current_branch, *ctx.arm_counter);
@@ -377,13 +381,11 @@ fn handle_try_statement(
     }
 }
 
-fn handle_catch_clause(
-    clause: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_catch_clause(clause: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     let caught = caught_types_text(clause, ctx.source);
-    let Some(body) = clause.child_by_field_name("body") else { return };
+    let Some(body) = clause.child_by_field_name("body") else {
+        return;
+    };
     *ctx.arm_counter += 1;
     let path = branch_path(current_branch, *ctx.arm_counter);
     emit_try_arm_entity(
@@ -399,11 +401,7 @@ fn handle_catch_clause(
     extract_calls(&body, ctx, Some(&path));
 }
 
-fn handle_finally_clause(
-    clause: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_finally_clause(clause: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     // tree-sitter-groovy exposes the finally block as the trailing
     // `block` named child rather than via a `body` field.
     let mut named_cursor = clause.walk();
@@ -445,15 +443,13 @@ fn handle_finally_clause(
 /// The subject expression stays in `current_branch` — it runs once
 /// before any arm and is part of the outer flow, mirroring how
 /// Python's `match SUBJECT:` keeps the subject outside.
-fn handle_switch_expression(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_switch_expression(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     if let Some(cond) = node.child_by_field_name("condition") {
         extract_calls(&cond, ctx, current_branch);
     }
-    let Some(body) = node.child_by_field_name("body") else { return };
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
     let mut group_cursor = body.walk();
     for group in body.children(&mut group_cursor) {
         if group.kind() != "switch_block_statement_group" {
@@ -468,11 +464,7 @@ fn handle_switch_expression(
 /// `current_branch`. Empty groups (multi-label fall-through, e.g. a
 /// bare `case 1:` whose body lives in the next group) still produce
 /// arm entities so the decision tree shows the label was intentional.
-fn handle_switch_group(
-    group: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_switch_group(group: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     let mut last_arm_path: Option<String> = None;
     let mut cursor = group.walk();
     for child in group.children(&mut cursor) {
@@ -521,16 +513,19 @@ fn switch_label_pattern(label: &Node, source: &str) -> Option<String> {
 /// iterable expression's calls (`for (row in queryForList(sql))`)
 /// group under the loop, mirroring Python's `for ... in iter:`
 /// handling at [python/calls.rs:242](../python/calls.rs#L242).
-fn handle_enhanced_for(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_enhanced_for(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     *ctx.loop_counter += 1;
     let path = loop_path(current_branch, *ctx.loop_counter);
     let body = node.child_by_field_name("body");
     if let Some(body) = body {
-        emit_loop_entity(ctx.caller_id, current_branch, &path, &body, ctx.path, ctx.result);
+        emit_loop_entity(
+            ctx.caller_id,
+            current_branch,
+            &path,
+            &body,
+            ctx.path,
+            ctx.result,
+        );
     }
     if let Some(value) = node.child_by_field_name("value") {
         extract_calls(&value, ctx, Some(&path));
@@ -543,16 +538,19 @@ fn handle_enhanced_for(
 /// Classic `for (init; cond; update) { body }`. All three header
 /// expressions run as part of the loop's iteration cycle, so they
 /// recurse with `current_branch` set to the loop path.
-fn handle_classic_for(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_classic_for(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     *ctx.loop_counter += 1;
     let path = loop_path(current_branch, *ctx.loop_counter);
     let body = node.child_by_field_name("body");
     if let Some(body) = body {
-        emit_loop_entity(ctx.caller_id, current_branch, &path, &body, ctx.path, ctx.result);
+        emit_loop_entity(
+            ctx.caller_id,
+            current_branch,
+            &path,
+            &body,
+            ctx.path,
+            ctx.result,
+        );
     }
     for field in ["init", "condition", "update"] {
         if let Some(part) = node.child_by_field_name(field) {
@@ -571,7 +569,14 @@ fn handle_while(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>
     let path = loop_path(current_branch, *ctx.loop_counter);
     let body = node.child_by_field_name("body");
     if let Some(body) = body {
-        emit_loop_entity(ctx.caller_id, current_branch, &path, &body, ctx.path, ctx.result);
+        emit_loop_entity(
+            ctx.caller_id,
+            current_branch,
+            &path,
+            &body,
+            ctx.path,
+            ctx.result,
+        );
     }
     if let Some(cond) = node.child_by_field_name("condition") {
         extract_calls(&cond, ctx, Some(&path));
@@ -606,11 +611,7 @@ fn handle_do_while(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&s
 /// up split across `expression_statement` children with no detectable
 /// link. Calls inside still reach the graph via the default ERROR
 /// recursion; they just don't carry the `null_safe` tag.
-fn handle_ternary_expression(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
+fn handle_ternary_expression(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     let is_elvis = node
         .child_by_field_name("consequence")
         .is_some_and(|c| c.is_missing());
@@ -686,12 +687,10 @@ fn caught_types_text(clause: &Node, source: &str) -> Option<String> {
 /// promoted to graph nodes so the reader can see what a callable
 /// computes, not just what it calls. The first write registers the
 /// entity; subsequent writes only emit additional edges.
-fn handle_local_write(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
-    let Some((name, span)) = local_write_target(node, ctx.source) else { return };
+fn handle_local_write(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let Some((name, span)) = local_write_target(node, ctx.source) else {
+        return;
+    };
     if name.is_empty() || name == "this" {
         return;
     }
@@ -747,12 +746,10 @@ fn local_write_target(node: &Node, source: &str) -> Option<(String, crate::model
 /// (`other.x`) are left untouched: the resolver can't tell whether
 /// they refer to a state field without type inference, and dropping
 /// them in as `Reads` would produce noise.
-fn handle_field_read(
-    node: &Node,
-    ctx: &mut CallCtx<'_>,
-    current_branch: Option<&str>,
-) {
-    let Some(field) = node.child_by_field_name("field") else { return };
+fn handle_field_read(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let Some(field) = node.child_by_field_name("field") else {
+        return;
+    };
     let field_name = node_text(&field, ctx.source).to_string();
     if field_name.is_empty() {
         return;

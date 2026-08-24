@@ -15,17 +15,11 @@ use std::path::Path;
 
 fn parse(src: &str) -> ParseResult {
     let parser = GroovyParser::new();
-    parser
-        .parse(Path::new("test.groovy"), src)
-        .expect("parse")
+    parser.parse(Path::new("test.groovy"), src).expect("parse")
 }
 
 fn entities_named<'a>(result: &'a ParseResult, name: &str) -> Vec<&'a CodeEntity> {
-    result
-        .entities
-        .iter()
-        .filter(|e| e.name == name)
-        .collect()
+    result.entities.iter().filter(|e| e.name == name).collect()
 }
 
 fn try_arms(result: &ParseResult) -> Vec<&CodeEntity> {
@@ -42,9 +36,15 @@ fn try_arms(result: &ParseResult) -> Vec<&CodeEntity> {
 fn class_with_method_emits_class_and_method_entities() {
     let src = "class A { void m() { foo() } }";
     let result = parse(src);
-    let class = entities_named(&result, "A").into_iter().next().expect("class A");
+    let class = entities_named(&result, "A")
+        .into_iter()
+        .next()
+        .expect("class A");
     assert_eq!(class.kind, EntityKind::Class);
-    let method = entities_named(&result, "m").into_iter().next().expect("method m");
+    let method = entities_named(&result, "m")
+        .into_iter()
+        .next()
+        .expect("method m");
     assert_eq!(method.kind, EntityKind::Method);
     assert_eq!(method.parent_id.as_deref(), Some(class.id.as_str()));
 }
@@ -100,7 +100,10 @@ fn class_only_file_skips_script_container() {
     let src = "class A {}";
     let result = parse(src);
     assert!(
-        !result.entities.iter().any(|e| e.tags.contains("groovy_script")),
+        !result
+            .entities
+            .iter()
+            .any(|e| e.tags.contains("groovy_script")),
         "class-only files should not get a script container"
     );
 }
@@ -118,7 +121,12 @@ class A {
 "#;
     let result = parse(src);
     let arms = try_arms(&result);
-    assert_eq!(arms.len(), 2, "expected try body + catch arms, got {}", arms.len());
+    assert_eq!(
+        arms.len(),
+        2,
+        "expected try body + catch arms, got {}",
+        arms.len()
+    );
     assert!(arms.iter().any(|e| e.tags.contains("try_body_arm")));
     let catch = arms.iter().find(|e| e.tags.contains("catch_arm")).unwrap();
     assert_eq!(catch.documentation.as_deref(), Some("caught: Exception"));
@@ -396,7 +404,10 @@ class A {
 fn at_field_emits_module_state_variable() {
     let src = "@Field final String x = 'a'\n";
     let result = parse(src);
-    let field = entities_named(&result, "x").into_iter().next().expect("@Field x");
+    let field = entities_named(&result, "x")
+        .into_iter()
+        .next()
+        .expect("@Field x");
     assert_eq!(field.kind, EntityKind::Variable);
     assert!(field.tags.contains("module_state"));
     assert!(field.attributes.iter().any(|a| a == "final"));
@@ -419,14 +430,21 @@ fn at_field_writes_to_edge_from_script_container() {
         .filter(|r| r.kind == RelationshipKind::WritesTo)
         .filter(|r| r.source_id == script.id && r.target_id == field.id)
         .collect();
-    assert_eq!(writes.len(), 1, "expected one WritesTo from script to @Field");
+    assert_eq!(
+        writes.len(),
+        1,
+        "expected one WritesTo from script to @Field"
+    );
 }
 
 #[test]
 fn fully_qualified_field_annotation_recognized() {
     let src = "@groovy.transform.Field final String x = 'a'\n";
     let result = parse(src);
-    let field = entities_named(&result, "x").into_iter().next().expect("@Field x");
+    let field = entities_named(&result, "x")
+        .into_iter()
+        .next()
+        .expect("@Field x");
     assert!(field.tags.contains("module_state"));
 }
 
@@ -447,9 +465,13 @@ fn non_field_top_level_local_stays_local() {
 
 #[test]
 fn at_field_get_bean_initializer_records_bean_name() {
-    let src = "@Field final HybrisJdbcTemplate t = Registry.applicationContext.getBean('jdbcTemplate')\n";
+    let src =
+        "@Field final HybrisJdbcTemplate t = Registry.applicationContext.getBean('jdbcTemplate')\n";
     let result = parse(src);
-    let field = entities_named(&result, "t").into_iter().next().expect("@Field t");
+    let field = entities_named(&result, "t")
+        .into_iter()
+        .next()
+        .expect("@Field t");
     assert!(
         field.attributes.iter().any(|a| a == "bean:jdbcTemplate"),
         "expected bean:jdbcTemplate attribute, got {:?}",
@@ -491,7 +513,9 @@ class A {
     assert!(docs.contains(&"pattern: 2"));
     // The default label has no pattern, so it carries no `pattern:`
     // attribute or documentation — but it still appears as an arm.
-    assert!(arms.iter().any(|e| e.attributes.iter().all(|a| !a.starts_with("pattern:"))));
+    assert!(arms
+        .iter()
+        .any(|e| e.attributes.iter().all(|a| !a.starts_with("pattern:"))));
 }
 
 #[test]
@@ -509,8 +533,12 @@ class A {
     let result = parse(src);
     let arms = case_arms(&result);
     assert_eq!(arms.len(), 2);
-    assert!(arms.iter().any(|e| e.attributes.iter().any(|a| a == "pattern:String")));
-    assert!(arms.iter().any(|e| e.attributes.iter().any(|a| a == "pattern:Integer")));
+    assert!(arms
+        .iter()
+        .any(|e| e.attributes.iter().any(|a| a == "pattern:String")));
+    assert!(arms
+        .iter()
+        .any(|e| e.attributes.iter().any(|a| a == "pattern:Integer")));
 }
 
 #[test]
@@ -527,7 +555,11 @@ class A {
     let result = parse(src);
     let arm = case_arms(&result).into_iter().next().expect("range arm");
     let doc = arm.documentation.as_deref().unwrap_or("");
-    assert!(doc.contains("1") && doc.contains("10"), "range pattern survives: {:?}", doc);
+    assert!(
+        doc.contains("1") && doc.contains("10"),
+        "range pattern survives: {:?}",
+        doc
+    );
 }
 
 #[test]
@@ -607,7 +639,12 @@ class A {
 "#;
     let result = parse(src);
     let arms = case_arms(&result);
-    assert_eq!(arms.len(), 2, "one arm per `case` label, got {}", arms.len());
+    assert_eq!(
+        arms.len(),
+        2,
+        "one arm per `case` label, got {}",
+        arms.len()
+    );
     let case_two = arms
         .iter()
         .find(|e| e.attributes.iter().any(|a| a == "pattern:2"))
@@ -641,13 +678,11 @@ class A {
 }
 "#;
     let result = parse(src);
-    let inner = case_arms(&result)
-        .into_iter()
-        .find(|e| {
-            e.attributes
-                .iter()
-                .any(|a| a == "pattern:'a'" || a == "pattern:\"a\"")
-        });
+    let inner = case_arms(&result).into_iter().find(|e| {
+        e.attributes
+            .iter()
+            .any(|a| a == "pattern:'a'" || a == "pattern:\"a\"")
+    });
     let inner = inner.expect("inner pattern-a arm");
     assert!(
         inner.id.contains("::branch::c1.c2") || inner.id.contains("::branch::c1.c1"),
@@ -944,8 +979,14 @@ class A {
         .iter()
         .find(|r| r.target_id.ends_with("fallback"))
         .expect("fallback recorded");
-    assert_eq!(primary.metadata.get("null_safe").map(|s| s.as_str()), Some("true"));
-    assert_eq!(fallback.metadata.get("null_safe").map(|s| s.as_str()), Some("true"));
+    assert_eq!(
+        primary.metadata.get("null_safe").map(|s| s.as_str()),
+        Some("true")
+    );
+    assert_eq!(
+        fallback.metadata.get("null_safe").map(|s| s.as_str()),
+        Some("true")
+    );
 }
 
 #[test]
@@ -1113,7 +1154,10 @@ fn a_bodyless_method_is_measured_rather_than_left_unset() {
 
 #[test]
 fn short_circuit_operators_each_add_a_path() {
-    let m = metrics_of(&parse("class A { void m() { if (a && b || c) { foo() } } }"), "m");
+    let m = metrics_of(
+        &parse("class A { void m() { if (a && b || c) { foo() } } }"),
+        "m",
+    );
     assert_eq!(m.cyclomatic, Some(4), "base + if + && + ||");
 }
 
@@ -1121,7 +1165,10 @@ fn short_circuit_operators_each_add_a_path() {
 fn elvis_counts_as_a_branch() {
     // Groovy's `?:` parses as a ternary with a missing consequence, so it
     // rides on the ternary increment rather than needing its own.
-    let m = metrics_of(&parse("class A { void m(a) { def r = a ?: fallback(); } }"), "m");
+    let m = metrics_of(
+        &parse("class A { void m(a) { def r = a ?: fallback(); } }"),
+        "m",
+    );
     assert_eq!(m.cyclomatic, Some(2));
 }
 
@@ -1130,16 +1177,31 @@ fn a_braced_arm_is_a_block_not_a_closure() {
     // The grammar spells both `{ … }` forms `closure`. If an `if` arm were
     // counted as a closure, its cognitive cost would be charged twice.
     let m = metrics_of(&parse("class A { void m() { if (a) { foo() } } }"), "m");
-    assert_eq!(m.cognitive_complexity, Some(1), "the `if` alone, not if + closure");
+    assert_eq!(
+        m.cognitive_complexity,
+        Some(1),
+        "the `if` alone, not if + closure"
+    );
 }
 
 #[test]
 fn a_closure_argument_nests_without_branching() {
     // Closures are the dominant Groovy idiom: they open a nesting scope
     // (Java's `lambda_expression` rule) but add nothing to cyclomatic.
-    let m = metrics_of(&parse("class A { void m() { run { if (a) { foo() } } } }"), "m");
-    assert_eq!(m.cyclomatic, Some(2), "the `if` only — the closure does not branch");
-    assert_eq!(m.cognitive_complexity, Some(3), "closure (+1) + if nested inside it (+2)");
+    let m = metrics_of(
+        &parse("class A { void m() { run { if (a) { foo() } } } }"),
+        "m",
+    );
+    assert_eq!(
+        m.cyclomatic,
+        Some(2),
+        "the `if` only — the closure does not branch"
+    );
+    assert_eq!(
+        m.cognitive_complexity,
+        Some(3),
+        "closure (+1) + if nested inside it (+2)"
+    );
 }
 
 #[test]
@@ -1166,7 +1228,11 @@ fn a_class_in_a_script_is_not_folded_into_the_script() {
         .iter()
         .find(|e| e.tags.contains("groovy_script"))
         .expect("script container");
-    assert_eq!(script.metrics.cyclomatic, Some(1), "the class's `if` is not the script's");
+    assert_eq!(
+        script.metrics.cyclomatic,
+        Some(1),
+        "the class's `if` is not the script's"
+    );
     assert_eq!(metrics_of(&result, "m").cyclomatic, Some(2));
 }
 
@@ -1200,7 +1266,10 @@ fn if_inside_a_parameterized_closure_is_a_branch_not_a_call() {
 #[test]
 fn def_is_not_recorded_as_a_return_type() {
     let result = parse("class A { def compute() { return 1 } }");
-    let method = entities_named(&result, "compute").into_iter().next().expect("method");
+    let method = entities_named(&result, "compute")
+        .into_iter()
+        .next()
+        .expect("method");
     assert_eq!(method.return_type, None, "`def` is the absence of a type");
 }
 
@@ -1208,16 +1277,25 @@ fn def_is_not_recorded_as_a_return_type() {
 fn a_declared_return_type_is_still_recorded() {
     // The skip must be keyword-specific, not "Groovy has no types".
     let result = parse("class A { Release deploy() { return null } }");
-    let method = entities_named(&result, "deploy").into_iter().next().expect("method");
+    let method = entities_named(&result, "deploy")
+        .into_iter()
+        .next()
+        .expect("method");
     assert_eq!(method.return_type.as_deref(), Some("Release"));
 }
 
 #[test]
 fn a_def_field_and_a_def_parameter_record_no_type() {
     let result = parse("class A { def cache\n void m(def raw) { } }");
-    let field = entities_named(&result, "cache").into_iter().next().expect("field");
+    let field = entities_named(&result, "cache")
+        .into_iter()
+        .next()
+        .expect("field");
     assert_eq!(field.return_type, None);
-    let method = entities_named(&result, "m").into_iter().next().expect("method");
+    let method = entities_named(&result, "m")
+        .into_iter()
+        .next()
+        .expect("method");
     assert_eq!(method.parameters[0].type_name, None);
 }
 
@@ -1252,14 +1330,23 @@ fn a_signature_emits_uses_type_edges_for_its_named_types() {
 #[test]
 fn a_field_type_emits_a_uses_type_edge() {
     let result = parse("class A { ArtifactRepository repo\n def cache }");
-    assert_eq!(uses_type_targets(&result, "repo"), vec!["ArtifactRepository"]);
-    assert!(uses_type_targets(&result, "cache").is_empty(), "`def` has no type");
+    assert_eq!(
+        uses_type_targets(&result, "repo"),
+        vec!["ArtifactRepository"]
+    );
+    assert!(
+        uses_type_targets(&result, "cache").is_empty(),
+        "`def` has no type"
+    );
 }
 
 #[test]
 fn script_scope_field_state_emits_uses_type_edges() {
     let result = parse("import groovy.transform.Field\n@Field HybrisJdbcTemplate template\n");
-    assert_eq!(uses_type_targets(&result, "template"), vec!["HybrisJdbcTemplate"]);
+    assert_eq!(
+        uses_type_targets(&result, "template"),
+        vec!["HybrisJdbcTemplate"]
+    );
 }
 
 #[test]
@@ -1273,7 +1360,10 @@ fn a_self_referential_field_emits_no_edge() {
 #[test]
 fn a_class_records_its_supertypes() {
     let result = parse("class Deployer extends BaseDeployer implements Auditable, Closeable { }");
-    let class = entities_named(&result, "Deployer").into_iter().next().expect("class");
+    let class = entities_named(&result, "Deployer")
+        .into_iter()
+        .next()
+        .expect("class");
     assert_eq!(class.extends, vec!["BaseDeployer"]);
     assert_eq!(class.implements, vec!["Auditable", "Closeable"]);
 }
@@ -1281,13 +1371,19 @@ fn a_class_records_its_supertypes() {
 #[test]
 fn a_package_declaration_qualifies_its_containers() {
     let result = parse("package com.acme.deploy\nclass Deployer { }");
-    let class = entities_named(&result, "Deployer").into_iter().next().expect("class");
+    let class = entities_named(&result, "Deployer")
+        .into_iter()
+        .next()
+        .expect("class");
     assert_eq!(class.qualified_name, "com.acme.deploy.Deployer");
 }
 
 #[test]
 fn a_class_without_a_package_keeps_its_bare_name() {
     let result = parse("class Deployer { }");
-    let class = entities_named(&result, "Deployer").into_iter().next().expect("class");
+    let class = entities_named(&result, "Deployer")
+        .into_iter()
+        .next()
+        .expect("class");
     assert_eq!(class.qualified_name, "Deployer");
 }

@@ -10,9 +10,7 @@ use std::path::Path;
 
 fn parse(src: &str) -> ParseResult {
     let parser = ImpexParser::new();
-    parser
-        .parse(Path::new("test.impex"), src)
-        .expect("parse")
+    parser.parse(Path::new("test.impex"), src).expect("parse")
 }
 
 fn writes_to(result: &ParseResult) -> Vec<&crate::models::Relationship> {
@@ -124,13 +122,12 @@ INSERT_UPDATE Foo; code; value
 
 #[test]
 fn reference_column_emits_type_to_type_edge() {
-    let src = "INSERT_UPDATE UnitMapping; code[unique=true]; unit(code); country(isocode)[unique=true]\n";
+    let src =
+        "INSERT_UPDATE UnitMapping; code[unique=true]; unit(code); country(isocode)[unique=true]\n";
     let result = parse(src);
     let fk_edges: Vec<_> = references(&result)
         .into_iter()
-        .filter(|r| {
-            r.metadata.get("from").map(|s| s.as_str()) == Some("impex_reference_column")
-        })
+        .filter(|r| r.metadata.get("from").map(|s| s.as_str()) == Some("impex_reference_column"))
         .collect();
     assert_eq!(fk_edges.len(), 2);
     let unit_edge = fk_edges
@@ -175,9 +172,7 @@ fn non_reference_column_emits_no_fk() {
     let result = parse(src);
     let fk_edges: Vec<_> = references(&result)
         .into_iter()
-        .filter(|r| {
-            r.metadata.get("from").map(|s| s.as_str()) == Some("impex_reference_column")
-        })
+        .filter(|r| r.metadata.get("from").map(|s| s.as_str()) == Some("impex_reference_column"))
         .collect();
     assert!(fk_edges.is_empty());
 }

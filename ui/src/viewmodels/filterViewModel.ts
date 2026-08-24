@@ -27,6 +27,7 @@ import {
   hiddenFiles,
   levelOverrides,
 } from '../stores/graph';
+import { liftBodies } from './bodyScope';
 import { parseQuery, scoreQuery, violatesNegation } from '../utils/fuzzyPath';
 import { scoreEntity } from '../utils/entityScore';
 
@@ -91,7 +92,14 @@ function seedFromGraph(data: GraphData): void {
  * owned part of the reconciliation.
  */
 export function publishGraph(data: GraphData): void {
-  rawEntityGraph.set(data);
+  // `liftBodies` runs here, once per dataset, because `parent_id` is an
+  // entity-level fact: every consumer below this line either aggregates the
+  // graph (and has no ancestry left to read) or re-derives on a selection
+  // (and must not rebuild the graph under it). It only ever adds — a
+  // `body_of` stamp and the lifted twin of an edge that would be lost with
+  // the body it hangs off — so a reader with the filter off sees the dataset
+  // exactly as the analyzer sent it. UI-113.
+  rawEntityGraph.set(liftBodies(data));
 }
 
 // Single reconciliation point for every graph change. Fires whenever
@@ -362,13 +370,15 @@ export function clearCommittedMatches(): void {
 // Second-level search that matches only among entities *currently on screen*
 // (after all filters, entity-search, and selection-distance have been
 // applied). It highlights in cyan but does not change visibility — so the
-// user can see "where in this view is X" without reshaping the graph.
+// user can see "where in this view is X" without reshaping the graph. Rows
+// in its result list can be picked (UI-101), which narrows the highlight to
+// the picked ones and, deliberately, changes nothing else.
 
 // All display-search state (term + match derivations) lives in displayPlan.ts
 // — keeping it there means filterViewModel has zero imports from
 // displayPlan, which keeps the module graph acyclic. Components import
-// displaySearchTerm / displaySearchMatches / displaySearchMatchIds directly
-// from `./displayPlan`.
+// displaySearchTerm / displaySearchMatches / displaySearchHighlightIds
+// directly from `./displayPlan`.
 
 // --- Set toggles: centralize the "update a Set<string> in a store" boilerplate ---
 function toggleInSet<T>(

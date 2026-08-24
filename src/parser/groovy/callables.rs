@@ -25,7 +25,9 @@ pub(super) fn handle_callable(
     ctx: &mut ExtractCtx<'_>,
     parse: fn(&Node, &str, &Path, Option<&str>) -> Option<CodeEntity>,
 ) {
-    let Some(entity) = parse(node, ctx.source, ctx.path, parent_id) else { return };
+    let Some(entity) = parse(node, ctx.source, ctx.path, parent_id) else {
+        return;
+    };
     let caller_id = entity.id.clone();
     let caller_name = entity.name.clone();
     let parent_class_name = parent_id.and_then(|pid| {
@@ -36,7 +38,9 @@ pub(super) fn handle_callable(
             .map(|e| e.name.clone())
     });
     ctx.result.add_entity(entity);
-    let Some(body) = node.child_by_field_name("body") else { return };
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
     let mut call_order = 0u32;
     let mut arm_counter = 0u32;
     let mut loop_counter = 0u32;

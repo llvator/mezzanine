@@ -32,6 +32,15 @@ export interface ViewState {
   scope: ScopeRule[];
   level: GraphLevel;
   autoLevel: boolean;
+  /** UI-104. The scope the rings are centred on, or null for one grain
+   *  everywhere. In here rather than beside `folderCohesion` because it
+   *  decides WHICH entities reach the canvas — the line this codec draws —
+   *  and a view that restored the level but not the rings would put the
+   *  reader's focus back at whatever grain the rest of the graph is at. A
+   *  path, so it survives the level change it causes. */
+  ringFocus: string | null;
+  /** Hops from the focus that stay at Entity grain. */
+  ringReach: number;
   entityTypes: string[];
   relTypes: string[];
   outgoing: boolean;
@@ -44,6 +53,11 @@ export interface ViewState {
   showGhosts: boolean;
   showBuiltinGhosts: boolean;
   showTemplateVars: boolean;
+  /** UI-113 — declarations only, or declarations and their insides. Squarely
+   *  on the "which entities reach the canvas" side of this codec's line, and
+   *  the one field most likely to make two saved views of the same scope look
+   *  like different repositories. */
+  structureOnly: boolean;
   /** Spec cross-filter — entity ids, ADR 0011. */
   spec: string[];
   searchTerm: string;
@@ -71,6 +85,8 @@ export function emptyState(): ViewState {
     scope: [],
     level: 'entity',
     autoLevel: true,
+    ringFocus: null,
+    ringReach: 1,
     entityTypes: [],
     relTypes: [],
     outgoing: true,
@@ -81,6 +97,7 @@ export function emptyState(): ViewState {
     showGhosts: true,
     showBuiltinGhosts: false,
     showTemplateVars: false,
+    structureOnly: true,
     spec: [],
     searchTerm: '',
     searchIds: [],
@@ -158,6 +175,13 @@ export function normalizeState(raw: unknown): ViewState {
       ? (level as GraphLevel)
       : base.level,
     autoLevel: bool(raw.autoLevel, base.autoLevel),
+    // A hand-edited `''` is not a focus on the repo root, it is an empty
+    // string someone left behind — and as a ring focus the two are the
+    // opposite of each other, since `''` seeds every entity in the repo.
+    ringFocus: typeof raw.ringFocus === 'string' && raw.ringFocus !== '' ? raw.ringFocus : base.ringFocus,
+    ringReach: typeof raw.ringReach === 'number' && Number.isFinite(raw.ringReach)
+      ? Math.max(0, Math.min(4, Math.floor(raw.ringReach)))
+      : base.ringReach,
     entityTypes: strings(raw.entityTypes),
     relTypes: strings(raw.relTypes),
     outgoing: bool(raw.outgoing, base.outgoing),
@@ -168,6 +192,7 @@ export function normalizeState(raw: unknown): ViewState {
     showGhosts: bool(raw.showGhosts, base.showGhosts),
     showBuiltinGhosts: bool(raw.showBuiltinGhosts, base.showBuiltinGhosts),
     showTemplateVars: bool(raw.showTemplateVars, base.showTemplateVars),
+    structureOnly: bool(raw.structureOnly, base.structureOnly),
     spec: strings(raw.spec),
     searchTerm: typeof raw.searchTerm === 'string' ? raw.searchTerm : '',
     searchIds: strings(raw.searchIds),
@@ -309,7 +334,11 @@ export function stateSummary(state: ViewState): string {
   if (includes.length === 0) parts.push('no scope');
   else if (includes.length === 1) parts.push(includes[0].pattern === '' ? 'whole repo' : includes[0].pattern);
   else parts.push(`${includes.length} paths`);
+  // With a focus the level names only the OUTER grain, so printing it alone
+  // would describe a picture the view does not hold — the row would read
+  // `module` for a view whose whole point is the entities in the middle.
   parts.push(state.autoLevel ? `${state.level} (auto)` : state.level);
+  if (state.ringFocus !== null) parts.push(`focus ${state.ringFocus} +${state.ringReach}`);
   if (state.hiddenFiles.length) parts.push(`${state.hiddenFiles.length} files hidden`);
   if (state.hiddenLanguages.length) parts.push(`${state.hiddenLanguages.length} langs hidden`);
   if (state.spec.length) parts.push(`spec ×${state.spec.length}`);

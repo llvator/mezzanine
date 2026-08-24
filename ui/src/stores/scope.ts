@@ -8,6 +8,7 @@ import {
 } from '../utils/scopeRules';
 import type { ScopeRule } from '../utils/scopeRules';
 import { livePaths } from '../viewmodels/markSet';
+import { noteLinkNeighbours } from '../viewmodels/noteScope';
 import { clearMarks, markedPaths, pruneMarks } from './marks';
 
 export type { ScopeRule } from '../utils/scopeRules';
@@ -341,6 +342,12 @@ function filterToSelection(full: GraphData, rules: ScopeRule[]): GraphData {
         realNodes.push(other);
       }
     }
+  }
+  // Markdown closure: a note IS its file, so file scoping cuts every link it
+  // has. One hop, notes only — see `viewmodels/noteScope.ts`.
+  for (const note of noteLinkNeighbours(full, included)) {
+    included.add(note.id);
+    realNodes.push(note);
   }
   const realIds = new Set(realNodes.map((n) => n.id));
   // Second pass: ghosts attached to at least one in-scope real entity.

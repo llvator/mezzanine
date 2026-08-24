@@ -86,7 +86,10 @@ fn write_settings(root: &Path, force: bool) -> Result<()> {
         );
     }
 
-    let body = settings_body(&languages, detect_spec_dir(root, &files));
+    // Against the directory the file lands in, not the one that was walked:
+    // `spec_dir` is read back relative to the repo root (CFG-012), so
+    // `nao init src` must write `src/spec` rather than `spec`.
+    let body = settings_body(&languages, detect_spec_dir(&settings::repo_root(root), &files));
     std::fs::create_dir_all(settings::repo_dir(root))
         .with_context(|| format!("creating {}", settings::repo_dir(root).display()))?;
     std::fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
@@ -123,7 +126,10 @@ fn detect_languages(files: &[PathBuf]) -> Vec<Language> {
         .collect();
     // Descending by count, then by name so the file is reproducible when two
     // languages tie.
-    kept.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.filter_name().cmp(b.0.filter_name())));
+    kept.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.filter_name().cmp(b.0.filter_name()))
+    });
     kept.into_iter().map(|(language, _)| language).collect()
 }
 
@@ -140,11 +146,19 @@ fn earns_a_place(language: Language, share: f64) -> bool {
 /// spec — get no key, which is the default: every `.elv` under the root is
 /// the spec. Naming one of two directories would quietly delete the other
 /// from the graph.
+///
+/// `root` is the repo root the settings file will be written to, which is
+/// what the key is resolved against on the way back in.
 fn detect_spec_dir(root: &Path, files: &[PathBuf]) -> Option<PathBuf> {
     let mut dirs = files
         .iter()
         .filter(|f| crate::parser::detect_language(f) == Language::Elevator)
-        .map(|f| f.strip_prefix(root).unwrap_or(f).parent().map(Path::to_path_buf));
+        .map(|f| {
+            f.strip_prefix(root)
+                .unwrap_or(f)
+                .parent()
+                .map(Path::to_path_buf)
+        });
 
     let first = dirs.next()??;
     let all_agree = dirs.all(|dir| dir.as_deref() == Some(first.as_path()));
@@ -159,7 +173,10 @@ fn settings_body(languages: &[Language], spec_dir: Option<PathBuf>) -> String {
     if let Some(dir) = spec_dir {
         body["spec_dir"] = json!(dir.to_string_lossy());
     }
-    format!("{}\n", serde_json::to_string_pretty(&body).unwrap_or_default())
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    )
 }
 
 fn indent(body: &str) -> String {
@@ -177,7 +194,9 @@ fn indent(body: &str) -> String {
 const TASKS_PATH: [&str; 2] = [".vscode", "tasks.json"];
 
 fn write_tasks(root: &Path, force: bool) -> Result<()> {
-    let path = TASKS_PATH.iter().fold(root.to_path_buf(), |p, part| p.join(part));
+    let path = TASKS_PATH
+        .iter()
+        .fold(root.to_path_buf(), |p, part| p.join(part));
     let port = settings::load(root).port.unwrap_or(settings::DEFAULT_PORT);
     let tasks = nao_tasks(port);
 
@@ -209,7 +228,10 @@ fn write_tasks(root: &Path, force: bool) -> Result<()> {
 /// stopped it — the command still fails, because nothing was written.
 fn offer_tasks_by_hand(error: anyhow::Error, tasks: &[Value]) -> anyhow::Error {
     let body = serde_json::to_string_pretty(&tasks).unwrap_or_default();
-    eprintln!("   Add these to the `tasks` array by hand:\n{}", indent(&body));
+    eprintln!(
+        "   Add these to the `tasks` array by hand:\n{}",
+        indent(&body)
+    );
     error
 }
 
@@ -439,8 +461,16 @@ mod tests {
         let once = merge_tasks(text, nao_tasks(3000), Path::new("t.json"), false)
             .unwrap()
             .unwrap();
-        let again = merge_tasks(&once.to_string(), nao_tasks(3000), Path::new("t.json"), false);
-        assert!(again.unwrap().is_none(), "a second init duplicated the tasks");
+        let again = merge_tasks(
+            &once.to_string(),
+            nao_tasks(3000),
+            Path::new("t.json"),
+            false,
+        );
+        assert!(
+            again.unwrap().is_none(),
+            "a second init duplicated the tasks"
+        );
     }
 
     /// `--force` is how a reader picks up a changed task body without
@@ -456,7 +486,11 @@ mod tests {
             .iter()
             .filter(|t| t["label"] == "Nao: Start web UI")
             .collect();
-        assert_eq!(start.len(), 1, "the stale task survived alongside the new one");
+        assert_eq!(
+            start.len(),
+            1,
+            "the stale task survived alongside the new one"
+        );
         assert_eq!(start[0]["command"], "nao");
     }
 
@@ -472,14 +506,21 @@ mod tests {
     #[test]
     fn every_generated_task_is_labelled_and_matcher_bearing() {
         for task in nao_tasks(3100) {
-            assert!(task["label"].as_str().is_some_and(|l| l.starts_with("Nao: ")));
-            assert!(!task["problemMatcher"].is_null(), "{task} would hang the task runner");
+            assert!(task["label"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("Nao: ")));
+            assert!(
+                !task["problemMatcher"].is_null(),
+                "{task} would hang the task runner"
+            );
         }
     }
 
     #[test]
     fn the_tasks_agree_on_the_port() {
         let tasks = nao_tasks(3100);
-        assert!(tasks.iter().any(|t| t.to_string().contains("localhost:3100")));
+        assert!(tasks
+            .iter()
+            .any(|t| t.to_string().contains("localhost:3100")));
     }
 }

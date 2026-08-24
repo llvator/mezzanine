@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use crate::output::{self, JsonRenderer};
 
 use super::state::AppState;
-use super::types::{CommitInfo, RootPathResponse};
+use super::types::{CommitInfo, RootPathResponse, StagedFile, StashInfo};
 
 /// SSE handler: clients subscribe to reload events.
 pub(crate) async fn sse_handler(
@@ -100,10 +100,188 @@ pub(crate) fn git_commits(
     Ok(commits)
 }
 
-/// GET /api/root — get current analyzed root path.
-pub(crate) async fn get_root_handler(
+/// GET /api/stashes — list the repository's stash entries.
+pub(crate) async fn stashes_handler(
     State(state): State<AppState>,
-) -> Json<RootPathResponse> {
+) -> Result<Json<Vec<StashInfo>>, (StatusCode, String)> {
+    let repo_root = state.repo_root.read().await.clone();
+    Ok(Json(git_stashes(&repo_root)?))
+}
+
+/// The fields `parse_stash_lines` expects, newest stash first.
+///
+/// `%P` and `%p` are the full and abbreviated parent lists; the first entry
+/// of each is the commit the stash was taken on. `%gd` would give the
+/// `stash@{N}` selector directly and is deliberately not asked for: with
+/// `--date=short` set for `%ad` it renders as `stash@{2026-08-12}` instead,
+/// one flag quietly changing the meaning of an unrelated placeholder.
+const STASH_FORMAT: &str = "%H|%h|%P|%p|%s|%an|%ad";
+
+/// Read the repository's stash entries. Shared by watch-mode `/api/stashes`
+/// and serve-mode `/api/repos/{slug}/stashes`, the way `git_commits` is.
+///
+/// A repository with no stashes answers with an empty list and a success —
+/// that is the common case, and a 500 there would read to the picker as the
+/// server being broken rather than as there being nothing to show.
+pub(crate) fn git_stashes(
+    repo_root: &std::path::Path,
+) -> Result<Vec<StashInfo>, (StatusCode, String)> {
+    let output = Command::new("git")
+        .args([
+            "stash",
+            "list",
+            &format!("--format={}", STASH_FORMAT),
+            "--date=short",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to run git: {}", e),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Not a git repository or git command failed".to_string(),
+        ));
+    }
+
+    Ok(parse_stash_lines(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// GET /api/staged — the repo-relative paths currently in the index, with the
+/// status letter git gives each one.
+///
+/// Separate from `POST /api/diff` because the diff is expensive — a worktree
+/// checkout and a full analysis — and this is two git calls. The picker can
+/// show what would be compared, and say that nothing is staged, without paying
+/// for the comparison to find out.
+pub(crate) async fn staged_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<StagedFile>>, (StatusCode, String)> {
+    let repo_root = state.repo_root.read().await.clone();
+    Ok(Json(git_staged(&repo_root)?))
+}
+
+/// The index against HEAD, as `<status>\t<path>` rows.
+///
+/// `--cached` is the whole point: `git diff --name-status` alone answers about
+/// the working tree, which is the comparison "Current Changes" already offers.
+///
+/// An empty list is a success. Nothing staged is the ordinary state of a
+/// repository, and a 500 there would read to the picker as the server being
+/// broken rather than as there being nothing to show — the same call the stash
+/// list makes.
+pub(crate) fn git_staged(
+    repo_root: &std::path::Path,
+) -> Result<Vec<StagedFile>, (StatusCode, String)> {
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-status", "-z"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to run git: {}", e),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Not a git repository or git command failed".to_string(),
+        ));
+    }
+
+    Ok(parse_staged_records(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Parse `git diff --cached --name-status -z` output.
+///
+/// `-z` rather than lines, because a path may contain anything a filesystem
+/// allows — including a newline, which line splitting would turn into two
+/// half-paths. It also stops git from quoting and escaping non-ASCII names, so
+/// what arrives is the path as it is on disk.
+///
+/// Records alternate status then path, except for a rename or copy, whose
+/// status carries a similarity score and is followed by *two* paths — old then
+/// new. The new one is what the diff will report, so the old is read and
+/// dropped; taking it as the next status instead is what would desynchronise
+/// every row after the first rename.
+fn parse_staged_records(stdout: &str) -> Vec<StagedFile> {
+    let mut records = stdout.split('\0').filter(|r| !r.is_empty());
+    let mut files = Vec::new();
+    while let Some(status) = records.next() {
+        let Some(path) = records.next() else { break };
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let path = if renamed {
+            // The second path is the destination, and the first was the source.
+            match records.next() {
+                Some(dest) => dest,
+                None => break,
+            }
+        } else {
+            path
+        };
+        files.push(StagedFile {
+            status: status.chars().next().unwrap_or('?').to_string(),
+            path: path.to_string(),
+        });
+    }
+    files
+}
+
+/// Parse `git stash list --format=STASH_FORMAT` output.
+///
+/// Split from both ends rather than once across: a stash subject is
+/// `WIP on <branch>: <sha> <that commit's subject>`, and a commit subject is
+/// free text that may itself contain the separator. The four fixed fields are
+/// taken from the left and the two from the right, which leaves whatever is
+/// between them as the message intact.
+///
+/// A row that does not carry every field is dropped. Nothing downstream can
+/// use a stash whose commit or base is unknown, and a half-filled row in the
+/// picker would offer a comparison that cannot be computed.
+fn parse_stash_lines(stdout: &str) -> Vec<StashInfo> {
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let head: Vec<&str> = line.splitn(5, '|').collect();
+            let [hash, short_hash, parents, short_parents, rest] = head[..] else {
+                return None;
+            };
+            let tail: Vec<&str> = rest.rsplitn(3, '|').collect();
+            let [date, author, message] = tail[..] else {
+                return None;
+            };
+            // First parent only. The second is the stashed index and the
+            // third the untracked files; neither is the tree this was
+            // branched from.
+            let base_hash = parents.split_whitespace().next()?;
+            let base_short = short_parents.split_whitespace().next()?;
+            Some(StashInfo {
+                hash: hash.to_string(),
+                short_hash: short_hash.to_string(),
+                selector: format!("stash@{{{}}}", i),
+                base_hash: base_hash.to_string(),
+                base_short: base_short.to_string(),
+                message: message.to_string(),
+                author: author.to_string(),
+                date: date.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// GET /api/root — get current analyzed root path.
+pub(crate) async fn get_root_handler(State(state): State<AppState>) -> Json<RootPathResponse> {
     let path = state.repo_root.read().await.display().to_string();
     Json(RootPathResponse {
         path,
@@ -230,4 +408,112 @@ pub(crate) async fn details_handler(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         json,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `%H|%h|%P|%p|%s|%an|%ad` for a stash taken with `-u`: three parents,
+    /// the first being the commit it was taken on.
+    const UNTRACKED: &str = "ec157e23ecc|ec157e2|d55c05b74a8 c58de026286 8d47fba789a|d55c05b c58de02 8d47fba|WIP on main: d55c05b c2|Ada|2026-08-12";
+
+    fn one(line: &str) -> StashInfo {
+        let mut rows = parse_stash_lines(line);
+        assert_eq!(rows.len(), 1, "expected exactly one parsed row");
+        rows.pop().unwrap()
+    }
+
+    #[test]
+    fn base_is_the_first_parent() {
+        let s = one(UNTRACKED);
+        assert_eq!(s.hash, "ec157e23ecc");
+        // Not the second (stashed index) or third (untracked files).
+        assert_eq!(s.base_hash, "d55c05b74a8");
+        assert_eq!(s.base_short, "d55c05b");
+    }
+
+    #[test]
+    fn selector_numbers_by_position() {
+        let rows = parse_stash_lines(&format!("{}\n{}", UNTRACKED, UNTRACKED));
+        assert_eq!(rows[0].selector, "stash@{0}");
+        assert_eq!(rows[1].selector, "stash@{1}");
+    }
+
+    /// The subject embeds a commit subject, which is free text. Splitting
+    /// once across the row would hand the tail of the message to `author`.
+    #[test]
+    fn message_may_contain_the_separator() {
+        let s = one("aaa|aaa|bbb ccc|bbb ccc|WIP on main: bbb fix a|b parsing|Ada|2026-08-12");
+        assert_eq!(s.message, "WIP on main: bbb fix a|b parsing");
+        assert_eq!(s.author, "Ada");
+        assert_eq!(s.date, "2026-08-12");
+    }
+
+    #[test]
+    fn rows_missing_fields_are_dropped() {
+        assert!(parse_stash_lines("aaa|aaa|bbb").is_empty());
+        // Every field present but no parent: a stash on a root commit cannot
+        // name the tree it came from, so there is nothing to compare against.
+        assert!(parse_stash_lines("aaa|aaa|||WIP on main: x|Ada|2026-08-12").is_empty());
+    }
+
+    #[test]
+    fn no_stashes_is_no_rows_not_an_error() {
+        assert!(parse_stash_lines("").is_empty());
+        assert!(parse_stash_lines("\n\n").is_empty());
+    }
+
+    // --------------------------------------------------------------
+    //  The index listing (UI-111)
+    // --------------------------------------------------------------
+
+    #[test]
+    fn staged_records_are_status_then_path() {
+        let rows = parse_staged_records("M\0src/a.rs\0A\0src/b.rs\0D\0src/c.rs\0");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].status, "M");
+        assert_eq!(rows[0].path, "src/a.rs");
+        assert_eq!(rows[2].status, "D");
+        assert_eq!(rows[2].path, "src/c.rs");
+    }
+
+    /// A rename is three records, not two. Reading the source path as the next
+    /// row's status is what desynchronises every row after the first rename —
+    /// the failure is not the rename itself but everything below it.
+    #[test]
+    fn a_rename_carries_two_paths_and_the_destination_wins() {
+        let rows = parse_staged_records("R100\0src/old.rs\0src/new.rs\0M\0src/after.rs\0");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].status, "R");
+        assert_eq!(
+            rows[0].path, "src/new.rs",
+            "the destination is what the diff will report"
+        );
+        // The row after the rename is where a mis-count would show.
+        assert_eq!(rows[1].status, "M");
+        assert_eq!(rows[1].path, "src/after.rs");
+    }
+
+    /// The reason for `-z`. A path may contain a newline, and line splitting
+    /// would turn one file into two half-paths that name nothing.
+    #[test]
+    fn a_path_may_contain_a_newline() {
+        let rows = parse_staged_records("M\0src/we\nird.rs\0");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "src/we\nird.rs");
+    }
+
+    #[test]
+    fn nothing_staged_is_no_rows_not_an_error() {
+        assert!(parse_staged_records("").is_empty());
+    }
+
+    /// git does not emit a status with no path, but a truncated read is not
+    /// worth a panic or a row naming an empty file.
+    #[test]
+    fn a_dangling_status_is_dropped() {
+        assert!(parse_staged_records("M\0").is_empty());
+        assert_eq!(parse_staged_records("M\0a.rs\0R100\0old.rs\0").len(), 1);
+    }
 }

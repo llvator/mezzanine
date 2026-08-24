@@ -24,6 +24,7 @@ import type { D3Node } from '../types/graph';
 // Explicit `.ts` on the value imports: `scripts/search-results.test.ts` loads
 // this module under `node --test` type stripping, which resolves no extensions.
 import { isSpecNode } from '../types/graph.ts';
+import { bodyHidden } from '../viewmodels/bodyScope.ts';
 import { pathsClaim } from './refPaths.ts';
 
 /** The filter state a node is judged against. Mirrors the fields of
@@ -42,6 +43,10 @@ export interface FilterSnapshot {
   /** Paths the focused spec entity claims, or null when no cross-filter is
    *  running. `[]` means "claims nothing" and blocks everything. */
   crossFilterPaths: string[] | null;
+  /** UI-113 — the canvas is drawing declarations only. */
+  structureOnly: boolean;
+  /** The one callable whose body is exempt: the selection's `original_id`. */
+  exemptBody: string | null;
 }
 
 /** Which control is holding the node back, and the value to hand the action
@@ -52,6 +57,7 @@ export type BlockKind =
   | 'template-var'
   | 'spec-layer'
   | 'cross-filter'
+  | 'internals'
   | 'kind'
   | 'language'
   | 'file'
@@ -111,6 +117,18 @@ export function classifyBlock(n: D3Node, snap: FilterSnapshot): BlockReason | nu
   }
   if (snap.crossFilterPaths && !pathsClaim(snap.crossFilterPaths, n.file_path)) {
     return { kind: 'cross-filter', value: '', label: 'hidden: spec filter', reversible: true };
+  }
+  // Above the kind badge, matching `nodePassesFilters`. A Branch found by a
+  // search is not held back by the `Branch` checkbox — that box is ticked —
+  // and badging it "hidden: branch filter" would send the reader to a control
+  // that is already showing everything it can.
+  if (bodyHidden(n, snap)) {
+    return {
+      kind: 'internals',
+      value: n.body_of ?? '',
+      label: 'inside a function body',
+      reversible: true,
+    };
   }
   if (!snap.kinds.has(n.kind_raw)) {
     return { kind: 'kind', value: n.kind_raw, label: `hidden: ${n.kind} filter`, reversible: true };

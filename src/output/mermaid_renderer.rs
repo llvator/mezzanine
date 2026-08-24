@@ -58,7 +58,10 @@ fn render_nodes_grouped(out: &mut String, graph: &DependencyGraph, config: &Conf
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        file_groups.entry(file_key).or_default().push(entity.id.clone());
+        file_groups
+            .entry(file_key)
+            .or_default()
+            .push(entity.id.clone());
     }
     for (file_name, entity_ids) in &file_groups {
         let subgraph_id = sanitize_id(file_name);
@@ -82,7 +85,12 @@ fn render_nodes_flat(out: &mut String, graph: &DependencyGraph, config: &Config)
     Ok(())
 }
 
-fn write_node(out: &mut String, entity: &crate::models::CodeEntity, config: &Config, indent: &str) -> Result<()> {
+fn write_node(
+    out: &mut String,
+    entity: &crate::models::CodeEntity,
+    config: &Config,
+    indent: &str,
+) -> Result<()> {
     let node_id = sanitize_id(&entity.id);
     let label = format_entity_label(entity, config);
     let shape = entity_shape(entity.kind);
@@ -105,19 +113,44 @@ fn render_relationships(out: &mut String, graph: &DependencyGraph) -> Result<()>
 
 /// Mermaid style class definitions — one per entity kind.
 const KIND_STYLES: &[(&[EntityKind], &str, &str)] = &[
-    (&[EntityKind::Class], "classStyle", "fill:#E3F2FD,stroke:#1976D2"),
-    (&[EntityKind::AbstractClass], "abstractClassStyle", "fill:#BBDEFB,stroke:#1565C0,stroke-dasharray:5 5"),
-    (&[EntityKind::Struct], "structStyle", "fill:#E8F5E9,stroke:#388E3C"),
-    (&[EntityKind::Interface], "interfaceStyle", "fill:#FFF3E0,stroke:#F57C00"),
-    (&[EntityKind::Function, EntityKind::Method], "functionStyle", "fill:#FFFDE7,stroke:#FBC02D"),
-    (&[EntityKind::Module], "moduleStyle", "fill:#ECEFF1,stroke:#607D8B"),
+    (
+        &[EntityKind::Class],
+        "classStyle",
+        "fill:#E3F2FD,stroke:#1976D2",
+    ),
+    (
+        &[EntityKind::AbstractClass],
+        "abstractClassStyle",
+        "fill:#BBDEFB,stroke:#1565C0,stroke-dasharray:5 5",
+    ),
+    (
+        &[EntityKind::Struct],
+        "structStyle",
+        "fill:#E8F5E9,stroke:#388E3C",
+    ),
+    (
+        &[EntityKind::Interface],
+        "interfaceStyle",
+        "fill:#FFF3E0,stroke:#F57C00",
+    ),
+    (
+        &[EntityKind::Function, EntityKind::Method],
+        "functionStyle",
+        "fill:#FFFDE7,stroke:#FBC02D",
+    ),
+    (
+        &[EntityKind::Module],
+        "moduleStyle",
+        "fill:#ECEFF1,stroke:#607D8B",
+    ),
 ];
 
 fn render_styles(out: &mut String, graph: &DependencyGraph) -> Result<()> {
     writeln!(out)?;
     writeln!(out, "    %% Styling")?;
     for &(kinds, class_name, style) in KIND_STYLES {
-        let nodes: Vec<String> = graph.entities()
+        let nodes: Vec<String> = graph
+            .entities()
             .filter(|e| kinds.contains(&e.kind))
             .map(|e| sanitize_id(&e.id))
             .collect();
@@ -131,7 +164,7 @@ fn render_styles(out: &mut String, graph: &DependencyGraph) -> Result<()> {
 
 fn format_entity_label(entity: &crate::models::CodeEntity, config: &Config) -> String {
     let mut label = String::new();
-    
+
     // Icon based on kind
     let icon = match entity.kind {
         EntityKind::Class => "📦",
@@ -145,22 +178,23 @@ fn format_entity_label(entity: &crate::models::CodeEntity, config: &Config) -> S
         EntityKind::File => "📄",
         _ => "",
     };
-    
+
     label.push_str(icon);
     label.push(' ');
-    
+
     // Name
     if config.display.show_qualified_names {
         label.push_str(&entity.qualified_name);
     } else {
         label.push_str(&entity.name);
     }
-    
+
     // Parameters for functions (simplified)
-    if config.display.show_parameters && entity.kind.is_callable() && !entity.parameters.is_empty() {
+    if config.display.show_parameters && entity.kind.is_callable() && !entity.parameters.is_empty()
+    {
         label.push_str("(...)");
     }
-    
+
     label
 }
 
@@ -174,7 +208,12 @@ fn sanitize_id(id: &str) -> String {
         }
     }
     // Ensure it starts with a letter
-    if result.chars().next().map(|c| c.is_numeric()).unwrap_or(true) {
+    if result
+        .chars()
+        .next()
+        .map(|c| c.is_numeric())
+        .unwrap_or(true)
+    {
         result.insert(0, 'n');
     }
     result
@@ -184,9 +223,11 @@ fn entity_shape(kind: EntityKind) -> impl Fn(&str) -> String {
     move |label: &str| {
         let escaped = label.replace('"', "'");
         match kind {
-            EntityKind::Class | EntityKind::AbstractClass | EntityKind::Struct => format!("[\"{}\"]", escaped),
+            EntityKind::Class | EntityKind::AbstractClass | EntityKind::Struct => {
+                format!("[\"{}\"]", escaped)
+            }
             EntityKind::Interface => format!("([\"{}\"]", escaped),
-            EntityKind::Enum => format!("{{{{\"{}\"}}}}"  , escaped),
+            EntityKind::Enum => format!("{{{{\"{}\"}}}}", escaped),
             EntityKind::Function | EntityKind::Method => format!("[/\"{}\"/]", escaped),
             EntityKind::Module => format!("[[\"{}\"]]", escaped),
             _ => format!("[\"{}\"]", escaped),

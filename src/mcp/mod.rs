@@ -11,9 +11,20 @@
 //! the tree and the message loop fits in this file. Protocol JSON goes
 //! to stdout exclusively; all diagnostics go to stderr.
 
+mod baseline;
+mod format;
 pub mod push;
+mod recipes;
+mod reshape;
 mod slice;
 mod tools;
+
+/// What an entity listing shows: no ghosts, no parameters, no fields.
+///
+/// Re-exported because `nao check` grades the same entities the listings
+/// show, and answering "what counts as an entity here" a second time is how
+/// two surfaces of one tool come to disagree (CHK-001).
+pub(crate) use tools::is_listed;
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -24,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::config::Config;
 use crate::graph::DependencyGraph;
 
 /// Protocol revisions this server can speak. `initialize` echoes the
@@ -32,10 +44,28 @@ use crate::graph::DependencyGraph;
 const SUPPORTED_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 /// A cached analysis, valid only while `gen` matches the server's
-/// current generation (the watcher bumps it on source changes).
+/// current generation (the watcher bumps it on source changes) and
+/// `scope` matches the scope the next call resolves to.
 pub struct CachedGraph {
     pub graph: Arc<DependencyGraph>,
     pub gen: u64,
+    /// The scope this graph was analysed under — see [`scope_id`].
+    pub scope: String,
+}
+
+impl CachedGraph {
+    /// Whether this entry still answers for what a call resolved to.
+    ///
+    /// Two conditions rather than one because an analysis goes stale for
+    /// two reasons and the watcher only sees the first: it bumps the
+    /// generation on *source* changes, so a `.nao/settings.json` edited
+    /// between two calls leaves it untouched. Serving a hit on the
+    /// generation alone would answer under the scope in force when the
+    /// entry was stored while the response footer named the current one
+    /// — the one disagreement that footer exists to make impossible.
+    fn serves(&self, generation: u64, scope: &str) -> bool {
+        self.gen == generation && self.scope == scope
+    }
 }
 
 pub struct McpServer {
@@ -52,12 +82,66 @@ pub struct McpServer {
     pub base_cache: Mutex<HashMap<(String, bool), (Arc<DependencyGraph>, PathBuf)>>,
     /// Bumped by the watcher thread on every relevant source change.
     pub generation: Arc<AtomicU64>,
+    /// What `reshape` last reported per folder — see
+    /// [`baseline::ShapeBaselines`], which owns both the record and the
+    /// reason the server is the one holding it.
+    pub(crate) shape_baselines: baseline::ShapeBaselines,
+}
+
+impl McpServer {
+    /// The scope this server is answering under *right now*.
+    ///
+    /// Re-read rather than remembered, because `.nao/settings.json` is
+    /// re-read on every analysis: a value captured at startup would name
+    /// the file as it stood when the process began and quietly disagree
+    /// with the analysis it was printed beside. `include_tests` and
+    /// `languages` come off the command line and cannot move, and that is
+    /// the point — they are in the digest so a reader comparing two
+    /// sessions can see that they differ.
+    pub(crate) fn scope_id(&self) -> String {
+        scope_id(&crate::diff::build_analysis_config(
+            &self.root,
+            self.include_tests,
+            &self.languages,
+        ))
+    }
+}
+
+/// The scope an answer was produced under, short enough to sit in a footer.
+///
+/// A digest of [`crate::diff::scope_fingerprint`] rather than a second
+/// notion of scope: that string already changes whenever anything about
+/// what an analysis *includes* changes, and it is already the key a cached
+/// base analysis is stored under — so two answers printing the same six
+/// characters were produced under the same configuration, or there is a
+/// bug worth finding. Six hex characters because this is read by a person
+/// noticing a change, not compared by a machine.
+pub(crate) fn scope_id(config: &Config) -> String {
+    let digest = blake3::hash(crate::diff::scope_fingerprint(config).as_bytes()).to_hex();
+    digest[..6].to_string()
+}
+
+/// What produced this answer, appended to every tool response (CFG-014).
+///
+/// Two facts, because the two ways a long-running server goes stale are
+/// not detectable the same way. A scope change the server can see, so the
+/// digest moves on its own. A replaced binary it cannot see at all — the
+/// process goes on running the code it was started with — so the version
+/// is printed for the *reader*, who can compare it against the one they
+/// just installed. That asymmetry is why this is a footer rather than a
+/// reload.
+fn scope_footer(server: &McpServer) -> String {
+    format!(
+        "\n\n_scope {} · nao {}_",
+        server.scope_id(),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 pub fn run(root: PathBuf, include_tests: bool, languages: Option<Vec<String>>) -> Result<()> {
-    let root = root.canonicalize().map_err(|e| {
-        anyhow::anyhow!("Cannot resolve root path {}: {}", root.display(), e)
-    })?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("Cannot resolve root path {}: {}", root.display(), e))?;
     eprintln!("nao MCP server on stdio — root: {}", root.display());
 
     let generation = Arc::new(AtomicU64::new(0));
@@ -70,6 +154,7 @@ pub fn run(root: PathBuf, include_tests: bool, languages: Option<Vec<String>>) -
         graph_cache: Mutex::new(HashMap::new()),
         base_cache: Mutex::new(HashMap::new()),
         generation,
+        shape_baselines: baseline::ShapeBaselines::default(),
     };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -226,29 +311,43 @@ const TOOLS: &[(&str, ToolFn)] = &[
     ("dead_code", tools::dead_code),
     ("assess_change", tools::assess_change),
     ("spec_slice", slice::spec_slice),
+    ("reshape", reshape::reshape),
 ];
 
 fn handle_tools_call(server: &McpServer, id: Value, params: &Value) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     let Some((_, run)) = TOOLS.iter().find(|(n, _)| *n == name) else {
         return error_response(id, -32602, &format!("Unknown tool: {}", name));
     };
     let result = run(server, &args);
+    // On the failure branch too: "Path not found" is exactly what an
+    // exclude pattern added to the settings file produces, and that
+    // answer needs to name its scope more than a successful one does.
+    let footer = scope_footer(server);
 
     // Per MCP, tool execution failures are reported inside the result
     // (isError: true) so the model can see and react to them; only
     // protocol-level problems use JSON-RPC errors.
     match result {
-        Ok(text) => ok_response(id, json!({
-            "content": [{ "type": "text", "text": text }],
-            "isError": false,
-        })),
-        Err(e) => ok_response(id, json!({
-            "content": [{ "type": "text", "text": format!("Error: {:#}", e) }],
-            "isError": true,
-        })),
+        Ok(text) => ok_response(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": text + &footer }],
+                "isError": false,
+            }),
+        ),
+        Err(e) => ok_response(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": format!("Error: {:#}{}", e, footer) }],
+                "isError": true,
+            }),
+        ),
     }
 }
 
@@ -311,8 +410,10 @@ fn tool_definitions() -> Value {
             "name": "quality",
             "description": "Code-quality assessment of a folder: detected smells (God Class, \
                 Dispatcher, Feature Envy, Shotgun Surgery, Data Bag), the top complexity/coupling \
-                offenders ranked by refactor pressure, and dependency cycles. Use this to judge \
-                the health of an area or to find refactoring targets.",
+                offenders ranked by refactor pressure, dependency cycles, and folder shape — how \
+                readable the dependency graph each folder draws is (cyclic / tangled / \
+                hierarchical / fractal). Use this to judge the health of an area, to find \
+                refactoring targets, or to find where the code's organisation has drifted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -463,7 +564,9 @@ fn tool_definitions() -> Value {
             "name": "dead_code",
             "description": "Entities nothing in the project references — fan-in 0 — grouped by \
                 file with a per-file count. Tests, entry points (`main`, Python dunders, \
-                trait/interface members reached through the abstraction) and public API are \
+                trait/interface members reached through the abstraction), members of a class \
+                whose base type is outside the analyzed tree (a framework lifecycle hook the \
+                host calls) and public API are \
                 excluded, because for those \"no dependent\" is not evidence of death; so are \
                 names the source mentions anywhere else, which catches calls made inside macro \
                 bodies and other references no graph can hold. The header states how many of \
@@ -538,6 +641,36 @@ fn tool_definitions() -> Value {
             // fenced to the project root and never overwrites unless
             // asked, so it is additive rather than destructive.
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "reshape",
+            "description": "How to improve one folder's architecture, as a concrete instruction. \
+                Returns the graph the folder draws — its immediate children with their levels, \
+                every dependency between them marked as stepping down a level / skipping one / \
+                closing a loop, which files outsiders reach in through, and which reach past \
+                them — then names the single change that would move it up one tier of \
+                cyclic → tangled → hierarchical → fractal, classified into the situation it \
+                actually is: a redundant path that one removal clears, a shared data contract \
+                to leave alone, or a level too wide to read. Call it again after making the \
+                change — it keeps the drawing it showed you and opens with what really moved, \
+                so a tier that rose while no dependency changed is reported rather than \
+                claimed. Use it after `quality` flags a \
+                folder's shape, when asked to restructure or reorganise an area, or when a \
+                graph of the code is too tangled to follow. Answers 'what exactly do I change \
+                here', where `quality` answers 'where is it worst'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Folder to reshape, relative to the project root, e.g. `src/parser`. Omit for the repository root. A file has no children and so draws no graph."
+                    }
+                },
+                "additionalProperties": false
+            },
+            // Reads the tree and reports; the restructuring is the caller's
+            // to carry out.
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
         }
     ])
 }
@@ -562,5 +695,49 @@ mod tests {
         advertised.sort();
         dispatched.sort();
         assert_eq!(advertised, dispatched);
+    }
+
+    /// The digest is of what an analysis *includes*, so a settings change
+    /// that narrows the scope moves it. If it did not, the footer would
+    /// print the same six characters across a configuration change and be
+    /// worse than no footer — a reassurance instead of a signal.
+    #[test]
+    fn the_scope_digest_moves_with_what_the_analysis_includes() {
+        let mut config = Config::for_path(Path::new("."));
+        let before = scope_id(&config);
+        assert_eq!(before.len(), 6, "a footer digest has to fit on the line");
+        config.analysis.exclude_patterns.push("**/*.never".to_string());
+        assert_ne!(before, scope_id(&config));
+    }
+
+    /// Every tool response names the configuration that produced it —
+    /// the failure branch included, since "Path not found" is exactly
+    /// what an exclude pattern added to the settings file produces
+    /// (CFG-014).
+    #[test]
+    fn a_tool_response_names_the_scope_and_version_that_produced_it() {
+        let server = McpServer {
+            root: std::env::temp_dir().canonicalize().unwrap(),
+            include_tests: false,
+            languages: None,
+            graph_cache: Mutex::new(HashMap::new()),
+            base_cache: Mutex::new(HashMap::new()),
+            generation: Arc::new(AtomicU64::new(0)),
+            shape_baselines: Default::default(),
+        };
+        let call = json!({ "name": "map", "arguments": { "path": "no-such-folder-here" } });
+        let response = handle_tools_call(&server, json!(1), &call);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a tool response carries text");
+        assert_eq!(response["result"]["isError"], json!(true));
+        assert!(
+            text.ends_with(&format!(
+                "_scope {} · nao {}_",
+                server.scope_id(),
+                env!("CARGO_PKG_VERSION")
+            )),
+            "the answer does not say what produced it:\n{text}"
+        );
     }
 }

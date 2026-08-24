@@ -1,14 +1,14 @@
 //! File system walker for discovering source files.
 
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_EXCLUDE_PATTERNS};
 use crate::models::file_info::Language;
 use anyhow::Result;
 use glob::Pattern;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::Cancelled;
 
@@ -32,11 +32,136 @@ enum Admit {
     SpecOnly,
 }
 
+/// One configured glob, kept with what it takes to report on it.
+///
+/// A bare [`Pattern`] cannot say how it was spelled — `Pattern` has no
+/// accessor for its source — and cannot say whether anyone chose it. Both
+/// are needed the moment a walk has to describe a pattern back to whoever
+/// wrote it (CFG-015).
+struct Glob {
+    pattern: Pattern,
+    /// As the author spelled it, so a diagnostic quotes back the string they
+    /// can search their settings file for.
+    spelling: String,
+    /// A shipped default rather than something somebody wrote. Exempt from
+    /// the zero-match report — see [`DEFAULT_EXCLUDE_PATTERNS`].
+    shipped: bool,
+}
+
+impl Glob {
+    /// Compile one configured list, naming whatever it has to drop.
+    ///
+    /// Globs written in a settings file have already been checked by
+    /// `Settings::clear_malformed_globs`, which can name the file each came
+    /// from and is the better diagnostic. This is the backstop for a list
+    /// that reached a [`Config`] some other way: it says the same thing
+    /// minus the filename, rather than discarding the entry in silence the
+    /// way `Pattern::new(p).ok()` used to.
+    fn compile(key: &str, spellings: &[String], shipped: &[&str]) -> Vec<Glob> {
+        spellings
+            .iter()
+            .filter_map(|spelling| match Pattern::new(spelling) {
+                Ok(pattern) => Some(Glob {
+                    pattern,
+                    spelling: spelling.clone(),
+                    shipped: shipped.contains(&spelling.as_str()),
+                }),
+                Err(e) => {
+                    eprintln!("   ⚠ {key}: `{spelling}` is not a valid glob ({e}) — ignoring it.");
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// What a configured glob is matched against: the walked path, restated
+/// relative to the repo root.
+///
+/// Not the string the walk happens to be carrying. That one starts `./src/`
+/// for `nao analyze .`, `src/` for `nao analyze src` and `/home/…/src/` for
+/// an absolute root, so `src/contracts.d.ts` — the spelling an author would
+/// write down, the one their editor and their `git status` both use — was the
+/// one spelling that could never match, and the base was discoverable only by
+/// experiment (CFG-013).
+///
+/// The *repo* root rather than the analyzed root, because that is where the
+/// settings file holding the patterns is read from (CFG-012). The file and
+/// the patterns inside it then agree about what "the repo" means, and one
+/// spelling works from any subdirectory. Outside a checkout
+/// [`crate::settings::repo_root`] answers with the analyzed root, so a loose
+/// directory keeps the behaviour it had.
+///
+/// What this deliberately does *not* change is that `*` crosses `/`:
+/// `Pattern::matches` uses default options, where `require_literal_separator`
+/// is false, so `*.d.ts` matches `src/a.d.ts`. It is not the better
+/// semantics — it makes `**` decorative — but every pattern that works today
+/// relies on it, and a filter that quietly stops filtering is the failure
+/// this ticket is about. Both halves are written down in the settings schema.
+struct PatternBase {
+    /// The repo root, absolute. `None` when a relative root had no working
+    /// directory to resolve against — a process whose cwd has been deleted —
+    /// which leaves every path spelled as the walk found it.
+    root: Option<PathBuf>,
+    /// The directory the walk's relative paths are relative to. Read once:
+    /// `current_dir` is a syscall, and this question is asked per file.
+    cwd: Option<PathBuf>,
+}
+
+impl PatternBase {
+    /// The base for an analyzed root, resolved against the process working
+    /// directory.
+    fn of(analyzed_root: &Path) -> Self {
+        Self::rooted(analyzed_root, std::env::current_dir().ok())
+    }
+
+    /// Split from [`Self::of`] so a test can ask the three invocations of one
+    /// repo — `.`, `src`, and the absolute path to `src` — what they make of
+    /// the same file. The alternative is `set_current_dir`, which is
+    /// process-wide and racy under a threaded test runner.
+    fn rooted(analyzed_root: &Path, cwd: Option<PathBuf>) -> Self {
+        let root = Self::absolute(analyzed_root, cwd.as_deref())
+            // Asked absolutely, so `repo_root` answers absolutely, and
+            // without consulting an environment this already read.
+            .map(|absolute| crate::settings::repo_root(&absolute));
+        Self { root, cwd }
+    }
+
+    /// `path` made absolute without touching the filesystem — the file may
+    /// have just been deleted, and resolving symlinks would answer for a
+    /// directory nobody named.
+    fn absolute(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+        match path.is_absolute() {
+            true => Some(path.to_path_buf()),
+            false => cwd.map(|cwd| cwd.join(path)),
+        }
+    }
+
+    /// `path` as a pattern sees it.
+    ///
+    /// Left as the walk spelled it for a path outside the repo: the spec
+    /// directory of `--spec-dir ../docs` has no repo-relative spelling, and
+    /// one built out of `..` would match nothing anybody wrote.
+    fn spell(&self, path: &Path) -> String {
+        let relative = self
+            .root
+            .as_deref()
+            .zip(Self::absolute(path, self.cwd.as_deref()))
+            .and_then(|(root, absolute)| Some(absolute.strip_prefix(root).ok()?.to_path_buf()));
+        match relative {
+            Some(relative) => relative.to_string_lossy().into_owned(),
+            None => path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
 /// Walks the file system to discover source code files.
 pub struct FileWalker<'a> {
     config: &'a Config,
-    exclude_patterns: Vec<Pattern>,
-    include_patterns: Vec<Pattern>,
+    exclude_patterns: Vec<Glob>,
+    include_patterns: Vec<Glob>,
+    /// The base every pattern is matched against — see [`PatternBase`].
+    base: PatternBase,
     /// The resolved [`Config::spec_root`], once it has been confirmed to
     /// exist. `None` means "every `.elv` under the root is the spec" — the
     /// default, and also what a `spec_dir` pointing at nothing falls back
@@ -46,24 +171,22 @@ pub struct FileWalker<'a> {
 
 impl<'a> FileWalker<'a> {
     pub fn new(config: &'a Config) -> Self {
-        let exclude_patterns = config
-            .analysis
-            .exclude_patterns
-            .iter()
-            .filter_map(|p| Pattern::new(p).ok())
-            .collect();
-
-        let include_patterns = config
-            .analysis
-            .include_patterns
-            .iter()
-            .filter_map(|p| Pattern::new(p).ok())
-            .collect();
+        let exclude_patterns = Glob::compile(
+            "exclude_patterns",
+            &config.analysis.exclude_patterns,
+            DEFAULT_EXCLUDE_PATTERNS,
+        );
+        // Nothing ships an include pattern: the default is "include
+        // everything", spelled as an empty list. So every entry here is one
+        // somebody wrote, and every one of them is worth reporting on.
+        let include_patterns =
+            Glob::compile("include_patterns", &config.analysis.include_patterns, &[]);
 
         Self {
             config,
             exclude_patterns,
             include_patterns,
+            base: PatternBase::of(&config.root_path),
             spec_root: resolve_spec_root(config),
         }
     }
@@ -101,16 +224,47 @@ impl<'a> FileWalker<'a> {
     /// Empty when there is no such directory, so the caller can always
     /// concatenate.
     pub fn walk_spec_with_cancel(&self, cancel: &Arc<AtomicBool>) -> Result<Vec<PathBuf>> {
-        match self.spec_root.as_ref().filter(|_| self.config.spec_is_outside_root()) {
+        match self
+            .spec_root
+            .as_ref()
+            .filter(|_| self.config.spec_is_outside_root())
+        {
             Some(dir) => self.collect(&dir.clone(), cancel, Admit::SpecOnly),
             None => Ok(Vec::new()),
         }
     }
 
-    /// The walk itself, shared by both entry points.
+    /// The walk itself, shared by both entry points, with whatever the tally
+    /// has to say said on stderr.
+    ///
+    /// stderr and never stdout: `nao mcp` puts protocol JSON on stdout, and a
+    /// diagnostic there is a parse error rather than a warning.
     fn collect(&self, root: &Path, cancel: &Arc<AtomicBool>, admit: Admit) -> Result<Vec<PathBuf>> {
+        let (files, unmatched) = self.collect_counting(root, cancel, admit)?;
+        for line in unmatched {
+            eprintln!("   ⚠ {line}");
+        }
+        Ok(files)
+    }
+
+    /// The walk, plus one line per configured pattern it never matched.
+    ///
+    /// Split from [`Self::collect`] so a test can read the report instead of
+    /// scraping stderr — the report is the feature, and a feature nothing can
+    /// assert on is one nothing pins.
+    fn collect_counting(
+        &self,
+        root: &Path,
+        cancel: &Arc<AtomicBool>,
+        admit: Admit,
+    ) -> Result<(Vec<PathBuf>, Vec<String>)> {
         let mut files = Vec::new();
-        let noun = if admit == Admit::SpecOnly { "spec" } else { "source" };
+        let mut tally = Tally::new(self, admit);
+        let noun = if admit == Admit::SpecOnly {
+            "spec"
+        } else {
+            "source"
+        };
 
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
@@ -142,11 +296,28 @@ impl<'a> FileWalker<'a> {
                 Err(_) => continue, // Skip unreadable entries silently
             };
             let path = entry.path();
+            // Free — the walk read this off the directory entry already —
+            // where `path.is_file()` would stat every path a second time,
+            // including all the ones the excludes are about to drop.
+            let is_file = entry.file_type().is_some_and(|t| t.is_file());
+
+            // Spelled once and handed to everything that matches on it, so
+            // the tally cannot count a pattern the filters read differently.
+            let spelled = self.base.spell(path);
+
+            // Before the filters, not after: a pattern's whole job is to
+            // remove files, so the ones it removed are exactly the ones that
+            // prove it works.
+            if is_file {
+                tally.record(&spelled);
+            }
 
             // Apply nao-specific exclude patterns (additive to .gitignore).
-            if self.should_skip_dir(path) { continue; }
+            if self.should_skip_dir(path, &spelled) {
+                continue;
+            }
 
-            if path.is_file() && self.should_include_file(path) && self.admits(path, admit) {
+            if is_file && self.should_include_file(path, &spelled) && self.admits(path, admit) {
                 files.push(path.to_path_buf());
                 spinner.set_message(format!("Discovered {} {noun} files...", files.len()));
             }
@@ -154,7 +325,7 @@ impl<'a> FileWalker<'a> {
         }
 
         spinner.finish_with_message(format!("Discovered {} {noun} files", files.len()));
-        Ok(files)
+        Ok((files, tally.zero_matches()))
     }
 
     /// Whether a walk under this config would parse `path`.
@@ -176,7 +347,7 @@ impl<'a> FileWalker<'a> {
     /// been deleted as readily as for one that exists.
     pub fn would_analyze(&self, path: &Path) -> bool {
         !self.under_hidden_dir(path)
-            && self.should_include_file(path)
+            && self.should_include_file(path, &self.base.spell(path))
             && self.admits(path, Admit::Everything)
     }
 
@@ -212,18 +383,19 @@ impl<'a> FileWalker<'a> {
             _ => true,
         }
     }
-    
-    /// Check if a directory should be skipped
-    fn should_skip_dir(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        
+
+    /// Check if a directory should be skipped. `spelled` is `path` as a
+    /// pattern sees it — see [`PatternBase`].
+    fn should_skip_dir(&self, path: &Path, spelled: &str) -> bool {
         // Check exclude patterns
-        for pattern in &self.exclude_patterns {
-            if pattern.matches(&path_str) {
-                return true;
-            }
+        if self
+            .exclude_patterns
+            .iter()
+            .any(|g| g.pattern.matches(spelled))
+        {
+            return true;
         }
-        
+
         // Skip hidden directories
         if let Some(name) = path.file_name() {
             let name = name.to_string_lossy();
@@ -231,12 +403,13 @@ impl<'a> FileWalker<'a> {
                 return true;
             }
         }
-        
+
         false
     }
-    
-    /// Check if a file should be included in analysis
-    fn should_include_file(&self, path: &Path) -> bool {
+
+    /// Check if a file should be included in analysis. `spelled` is `path`
+    /// as a pattern sees it — see [`PatternBase`].
+    fn should_include_file(&self, path: &Path, spelled: &str) -> bool {
         // Path-aware detection: ansible-deploy files are recognised by
         // repo layout, everything else by extension.
         let language = crate::parser::detect_language(path);
@@ -252,7 +425,7 @@ impl<'a> FileWalker<'a> {
         if !self.config.analysis.accepts_language(language) {
             return false;
         }
-        
+
         // Check test files — except Elevator specs and Markdown docs.
         // `.elv` files are domain specs, not code, and legitimately live at
         // paths like `my-spec/` or `spec.elv` that the substring heuristic
@@ -266,25 +439,116 @@ impl<'a> FileWalker<'a> {
         {
             return false;
         }
-        
-        let path_str = path.to_string_lossy();
-        
+
         // Check exclude patterns
-        for pattern in &self.exclude_patterns {
-            if pattern.matches(&path_str) {
-                return false;
-            }
+        if self
+            .exclude_patterns
+            .iter()
+            .any(|g| g.pattern.matches(spelled))
+        {
+            return false;
         }
-        
+
         // Check include patterns (if any specified, file must match at least one)
         if !self.include_patterns.is_empty() {
-            let matches_any = self.include_patterns.iter().any(|p| p.matches(&path_str));
+            let matches_any = self
+                .include_patterns
+                .iter()
+                .any(|g| g.pattern.matches(spelled));
             if !matches_any {
                 return false;
             }
         }
-        
+
         true
+    }
+}
+
+/// How many files each written-down pattern matched, across one walk.
+///
+/// A pattern that excludes nothing produces exactly the same graph as one
+/// that is doing its job, so the only way to tell a typo from a working rule
+/// used to be counting entities before and after. This counts instead
+/// (CFG-015).
+///
+/// Counted here rather than inside the matchers, for two reasons. The
+/// matchers stop at the first pattern that settles the answer, so a pattern
+/// they never *reached* is not a pattern that matched nothing. And
+/// [`FileWalker::would_analyze`] asks them about paths that are not part of
+/// any walk, which would inflate a tally kept there.
+///
+/// The walk is a single loop over one iterator, so a plain `usize` per
+/// pattern is enough: no lock ever enters the match.
+struct Tally<'a> {
+    counted: Vec<Counted<'a>>,
+}
+
+/// One pattern a report could name, and its running total.
+struct Counted<'a> {
+    /// The settings key it was written under, which is the half of the
+    /// diagnostic that says where to go and fix it.
+    key: &'static str,
+    glob: &'a Glob,
+    files: usize,
+}
+
+impl<'a> Tally<'a> {
+    /// Only the patterns a report could name: somebody wrote them, so a zero
+    /// is news. Empty in the ordinary repo that configures none, which is
+    /// what keeps [`Self::record`] free there.
+    fn new(walker: &'a FileWalker, admit: Admit) -> Self {
+        // A spec walk admits `.elv` files alone, so every code pattern would
+        // look inert in it. Only the walk that answers for the whole tree is
+        // entitled to say a pattern matched nothing.
+        if admit != Admit::Everything {
+            return Self {
+                counted: Vec::new(),
+            };
+        }
+        let counted = [
+            ("exclude_patterns", &walker.exclude_patterns),
+            ("include_patterns", &walker.include_patterns),
+        ]
+        .into_iter()
+        .flat_map(|(key, globs)| {
+            globs
+                .iter()
+                .filter(|glob| !glob.shipped)
+                .map(move |glob| Counted {
+                    key,
+                    glob,
+                    files: 0,
+                })
+        })
+        .collect();
+        Self { counted }
+    }
+
+    /// `spelled` is the walked path as a pattern sees it, computed by the
+    /// walk and passed in rather than recomputed: a tally that spelled a path
+    /// differently from the filters would report a working pattern as inert.
+    fn record(&mut self, spelled: &str) {
+        if self.counted.is_empty() {
+            return;
+        }
+        for counted in &mut self.counted {
+            counted.files += usize::from(counted.glob.pattern.matches(spelled));
+        }
+    }
+
+    /// One line per pattern the walk never matched, in the order they were
+    /// configured.
+    fn zero_matches(&self) -> Vec<String> {
+        self.counted
+            .iter()
+            .filter(|counted| counted.files == 0)
+            .map(|counted| {
+                format!(
+                    "{}: \"{}\" matched 0 files — check the spelling.",
+                    counted.key, counted.glob.spelling
+                )
+            })
+            .collect()
     }
 }
 
@@ -468,7 +732,11 @@ mod tests {
         // Both answers have to appear, or the two agreeing says nothing: a
         // walk that found none of the fixture — a broken root, a fixture that
         // never got written — agrees with a predicate that rejects everything.
-        assert!(admitted > 0 && admitted < WATCHED.len(), "{admitted} of {} admitted", WATCHED.len());
+        assert!(
+            admitted > 0 && admitted < WATCHED.len(),
+            "{admitted} of {} admitted",
+            WATCHED.len()
+        );
     }
 
     fn repo_of_every_kind(tag: &str) -> TmpDir {
@@ -504,6 +772,187 @@ mod tests {
             widen(&mut config);
             assert_predicate_matches_walk(&dir, &config);
         }
+    }
+
+    /// The walk's zero-match report, which stderr would otherwise be the
+    /// only way to read.
+    fn walk_report(config: &Config) -> Vec<String> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        FileWalker::new(config)
+            .collect_counting(&config.root_path, &cancel, Admit::Everything)
+            .unwrap()
+            .1
+    }
+
+    /// The distinction the tally exists for: a pattern that is working and a
+    /// pattern that is a typo produce identical graphs, so the report is the
+    /// only thing that can tell them apart.
+    #[test]
+    fn only_the_pattern_that_matched_nothing_is_reported() {
+        let dir = repo_of_every_kind("zero-match");
+        let mut config = Config::for_path(&dir.0);
+        config
+            .analysis
+            .exclude_patterns
+            .push("**/main.rs".to_string());
+        config
+            .analysis
+            .exclude_patterns
+            .push("**/*.d.ts".to_string());
+        assert_eq!(
+            walk_report(&config),
+            vec![r#"exclude_patterns: "**/*.d.ts" matched 0 files — check the spelling."#]
+        );
+    }
+
+    /// Every shipped default is inert in most repos by design. Warning about
+    /// them on every run in every repo is how a reader learns to skip the
+    /// line that matters.
+    #[test]
+    fn the_shipped_defaults_are_exempt() {
+        let dir = repo_of_every_kind("defaults-exempt");
+        // Six of the seven match nothing here — there is no `node_modules`,
+        // no `vendor`, no `dist`.
+        assert_eq!(walk_report(&Config::for_path(&dir.0)), Vec::<String>::new());
+    }
+
+    /// The same mechanism, and the worse failure: an include pattern that
+    /// matches nothing does not narrow the analysis, it empties it.
+    #[test]
+    fn an_include_pattern_that_matched_nothing_is_reported() {
+        let dir = repo_of_every_kind("zero-match-include");
+        let mut config = Config::for_path(&dir.0);
+        // Repo-relative and still matching nothing: this fixture has no
+        // `lib/`. Before CFG-013 a repo-relative include pattern matched
+        // nothing *whatever* it named, which is what made this test's
+        // original `src/**/*.rs` an accidental pass.
+        config
+            .analysis
+            .include_patterns
+            .push("lib/**/*.rs".to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (files, report) = FileWalker::new(&config)
+            .collect_counting(&config.root_path, &cancel, Admit::Everything)
+            .unwrap();
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(
+            report,
+            vec![r#"include_patterns: "lib/**/*.rs" matched 0 files — check the spelling."#]
+        );
+    }
+
+    /// The other half, and the reason the test above had to change: an
+    /// include pattern spelled the way an author would write it now selects
+    /// the files it names instead of emptying the analysis (CFG-013).
+    #[test]
+    fn a_repo_relative_include_pattern_selects_its_files() {
+        let dir = repo_of_every_kind("include-repo-relative");
+        let mut config = Config::for_path(&dir.0);
+        config
+            .analysis
+            .include_patterns
+            .push("src/**/*.rs".to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (files, report) = FileWalker::new(&config)
+            .collect_counting(&config.root_path, &cancel, Admit::Everything)
+            .unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            vec!["main.rs".to_string()],
+        );
+        assert_eq!(report, Vec::<String>::new());
+    }
+
+    /// A repo with a checkout at its root, so `repo_root` has something to
+    /// find and the analyzed root and the repo root can differ.
+    fn checkout_with_a_generated_file(tag: &str) -> TmpDir {
+        let dir = TmpDir::new(tag);
+        fs::create_dir_all(dir.0.join(".git")).unwrap();
+        dir.write("src/main.rs", "fn main() {}\n");
+        dir.write("src/contracts.d.ts", "export type Id = string;\n");
+        dir
+    }
+
+    /// The bug CFG-013 is: `src/contracts.d.ts` is the spelling an author
+    /// reads off their editor, and it was the one spelling that could never
+    /// work. It now works, and works the same from the repo root and from
+    /// inside the subdirectory it names.
+    #[test]
+    fn a_repo_relative_pattern_excludes_from_any_analyzed_root() {
+        let dir = checkout_with_a_generated_file("repo-relative");
+        for root in [dir.0.clone(), dir.0.join("src")] {
+            let mut config = Config::for_path(&root);
+            config
+                .analysis
+                .exclude_patterns
+                .push("src/contracts.d.ts".to_string());
+            let names = walked_names(&config);
+            assert!(
+                !names.contains(&"contracts.d.ts".to_string()),
+                "analyzing {}: {names:?}",
+                root.display()
+            );
+            assert!(names.contains(&"main.rs".to_string()), "{names:?}");
+        }
+    }
+
+    /// The third invocation, and the two the walk cannot be asked without
+    /// `set_current_dir`. All three name the same file, so all three have to
+    /// hand a pattern the same string.
+    #[test]
+    fn every_invocation_of_one_repo_spells_a_file_the_same_way() {
+        let dir = checkout_with_a_generated_file("invocations");
+        let inside = Some(dir.0.clone());
+        // `nao analyze .`, whose walk carries `./src/contracts.d.ts`.
+        let dot = PatternBase::rooted(Path::new("."), inside.clone());
+        assert_eq!(
+            dot.spell(Path::new("./src/contracts.d.ts")),
+            "src/contracts.d.ts"
+        );
+        // `nao analyze src`, whose walk carries `src/contracts.d.ts`.
+        let sub = PatternBase::rooted(Path::new("src"), inside);
+        assert_eq!(
+            sub.spell(Path::new("src/contracts.d.ts")),
+            "src/contracts.d.ts"
+        );
+        // `nao analyze /abs/repo/src`, from a working directory that has
+        // nothing to do with the repo.
+        let absolute = PatternBase::rooted(&dir.0.join("src"), Some(PathBuf::from("/")));
+        assert_eq!(
+            absolute.spell(&dir.0.join("src/contracts.d.ts")),
+            "src/contracts.d.ts"
+        );
+    }
+
+    /// A path with no repo-relative spelling — the spec directory of
+    /// `--spec-dir ../docs` — keeps the one the walk gave it. A base built
+    /// out of `..` would match nothing anybody wrote.
+    #[test]
+    fn a_path_outside_the_repo_keeps_the_spelling_the_walk_gave_it() {
+        let dir = checkout_with_a_generated_file("outside");
+        let base = PatternBase::rooted(&dir.0, Some(PathBuf::from("/")));
+        let outside = Path::new("/elsewhere/docs/domain/api.elv");
+        assert_eq!(base.spell(outside), outside.to_string_lossy());
+    }
+
+    /// The regression the base change has to survive: every shipped default
+    /// is `**/`-anchored and excluded these before, so no repo needs
+    /// migrating and no default moves.
+    #[test]
+    fn the_shipped_defaults_exclude_what_they_always_excluded() {
+        let dir = TmpDir::new("defaults-hold");
+        fs::create_dir_all(dir.0.join(".git")).unwrap();
+        dir.write("src/main.rs", "fn main() {}\n");
+        dir.write("node_modules/dep/index.js", "module.exports = {};\n");
+        dir.write("target/debug/build.rs", "fn built() {}\n");
+        dir.write("vendor/dep/lib.py", "def vendored():\n    pass\n");
+        dir.write("dist/bundle.js", "console.log(1);\n");
+        dir.write("build/out.go", "package main\n");
+        assert_eq!(walked_names(&Config::for_path(&dir.0)), vec!["main.rs"]);
     }
 
     /// A path that isn't there is a typo, and a typo must not read as "this

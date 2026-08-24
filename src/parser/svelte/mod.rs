@@ -491,7 +491,10 @@ mod tests {
                    </script>\n\
                    <Card label={definiteArticle(word)} />\n\
                    <p>{definiteArticle(word)}</p>";
-        assert_eq!(markup_refs(&parse(src)), vec![("definiteArticle".into(), 2)]);
+        assert_eq!(
+            markup_refs(&parse(src)),
+            vec![("definiteArticle".into(), 2)]
+        );
     }
 
     #[test]

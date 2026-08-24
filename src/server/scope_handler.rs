@@ -74,25 +74,77 @@ fn collect_scope_manual(
 /// Traversal rules for the "refactor" mode.
 fn refactor_rules() -> Vec<TraversalRule> {
     vec![
-        TraversalRule { kind: RelationshipKind::Calls,        direction: Direction::Incoming, reason: "Callers" },
-        TraversalRule { kind: RelationshipKind::Calls,        direction: Direction::Outgoing, reason: "Callees" },
-        TraversalRule { kind: RelationshipKind::UsesType,     direction: Direction::Outgoing, reason: "Types" },
-        TraversalRule { kind: RelationshipKind::Returns,      direction: Direction::Outgoing, reason: "Types" },
-        TraversalRule { kind: RelationshipKind::Instantiates, direction: Direction::Outgoing, reason: "Types" },
-        TraversalRule { kind: RelationshipKind::Implements,   direction: Direction::Outgoing, reason: "Traits/Interfaces" },
-        TraversalRule { kind: RelationshipKind::Inherits,     direction: Direction::Outgoing, reason: "Base Classes" },
+        TraversalRule {
+            kind: RelationshipKind::Calls,
+            direction: Direction::Incoming,
+            reason: "Callers",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Calls,
+            direction: Direction::Outgoing,
+            reason: "Callees",
+        },
+        TraversalRule {
+            kind: RelationshipKind::UsesType,
+            direction: Direction::Outgoing,
+            reason: "Types",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Returns,
+            direction: Direction::Outgoing,
+            reason: "Types",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Instantiates,
+            direction: Direction::Outgoing,
+            reason: "Types",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Implements,
+            direction: Direction::Outgoing,
+            reason: "Traits/Interfaces",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Inherits,
+            direction: Direction::Outgoing,
+            reason: "Base Classes",
+        },
     ]
 }
 
 /// Traversal rules for the "understand" mode.
 fn understand_rules() -> Vec<TraversalRule> {
     vec![
-        TraversalRule { kind: RelationshipKind::Calls,        direction: Direction::Outgoing, reason: "Callees" },
-        TraversalRule { kind: RelationshipKind::UsesType,     direction: Direction::Outgoing, reason: "Types" },
-        TraversalRule { kind: RelationshipKind::Returns,      direction: Direction::Outgoing, reason: "Types" },
-        TraversalRule { kind: RelationshipKind::Instantiates, direction: Direction::Outgoing, reason: "Types" },
-        TraversalRule { kind: RelationshipKind::Implements,   direction: Direction::Outgoing, reason: "Traits/Interfaces" },
-        TraversalRule { kind: RelationshipKind::Imports,      direction: Direction::Outgoing, reason: "Imports" },
+        TraversalRule {
+            kind: RelationshipKind::Calls,
+            direction: Direction::Outgoing,
+            reason: "Callees",
+        },
+        TraversalRule {
+            kind: RelationshipKind::UsesType,
+            direction: Direction::Outgoing,
+            reason: "Types",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Returns,
+            direction: Direction::Outgoing,
+            reason: "Types",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Instantiates,
+            direction: Direction::Outgoing,
+            reason: "Types",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Implements,
+            direction: Direction::Outgoing,
+            reason: "Traits/Interfaces",
+        },
+        TraversalRule {
+            kind: RelationshipKind::Imports,
+            direction: Direction::Outgoing,
+            reason: "Imports",
+        },
     ]
 }
 
@@ -120,7 +172,11 @@ fn collect_scope_directed(
         }
     }
 
-    let rules = if is_refactor { refactor_rules() } else { understand_rules() };
+    let rules = if is_refactor {
+        refactor_rules()
+    } else {
+        understand_rules()
+    };
     for rule in &rules {
         for (related, _) in graph.related_by_kind(entity_id, rule.kind, rule.direction) {
             add_to_scope(scope, &related.id, rule.reason);
@@ -172,7 +228,9 @@ fn build_scope_entities(
     let mut source_parts: Vec<String> = Vec::new();
 
     for (id, reasons) in ordered {
-        let Some(e) = graph.get_entity(id) else { continue };
+        let Some(e) = graph.get_entity(id) else {
+            continue;
+        };
         let fp = e
             .file_path
             .strip_prefix(root_path)
@@ -265,7 +323,10 @@ pub(super) fn collect_scope(
     req: &ScopeRequest,
 ) -> Result<ScopeAssembly, (StatusCode, String)> {
     let entity = graph.get_entity(&req.entity_id).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, format!("Entity not found: {}", req.entity_id))
+        (
+            StatusCode::NOT_FOUND,
+            format!("Entity not found: {}", req.entity_id),
+        )
     })?;
 
     let mut scope: ScopeMap = HashMap::new();
@@ -298,7 +359,12 @@ pub(super) fn collect_scope(
 
     let excluded: HashSet<String> = req.excluded_files.iter().cloned().collect();
     Ok(build_scope_entities(
-        graph, scope, &req.entity_id, root_path, &excluded, prompt_context,
+        graph,
+        scope,
+        &req.entity_id,
+        root_path,
+        &excluded,
+        prompt_context,
     ))
 }
 
@@ -310,7 +376,8 @@ pub(super) fn finish_scope(assembly: ScopeAssembly, repo_root: &Path) -> ScopeRe
     let token_count_files = full_files.len() / 4;
 
     let paths_export = assembly.files.join("\n");
-    let ranges_export: String = assembly.entities
+    let ranges_export: String = assembly
+        .entities
         .iter()
         .map(|e| format!("{}:{}-{}", e.file_path, e.line, e.end_line))
         .collect::<Vec<_>>()
@@ -325,9 +392,9 @@ pub(super) fn finish_scope(assembly: ScopeAssembly, repo_root: &Path) -> ScopeRe
         // its rendered block is the head of the context — that is what the
         // hybrid mode keeps in full.
         let target_source = assembly.entities.first().and_then(|e| {
-            e.source_code.as_ref().map(|src| {
-                format!("// {}:{}-{}\n{}", e.file_path, e.line, e.end_line, src)
-            })
+            e.source_code
+                .as_ref()
+                .map(|src| format!("// {}:{}-{}\n{}", e.file_path, e.line, e.end_line, src))
         });
         let body = refactor_prompt::context_body(
             assembly.prompt_context,
@@ -363,10 +430,16 @@ pub(crate) async fn scope_handler(
     // is dropped before any .await points.
     let assembly = {
         let graph = state.graph.read().map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Graph lock poisoned: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Graph lock poisoned: {}", e),
+            )
         })?;
         let config = state.config.read().map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Config lock poisoned: {}", e),
+            )
         })?;
         collect_scope(&graph, &config.root_path, &req)?
     }; // graph lock dropped here

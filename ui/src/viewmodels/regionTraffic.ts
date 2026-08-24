@@ -158,10 +158,18 @@ export function membershipText(t: RegionTraffic | undefined, fallback: number): 
   return t.drawn === t.total ? String(t.total) : `${t.drawn} of ${t.total}`;
 }
 
-/** Why a row's membership reads the way it does. */
-export function membershipTitle(t: RegionTraffic | undefined): string {
-  if (!t) return 'Nodes from this folder currently drawn';
-  if (t.drawn === t.total) return `All ${t.total} of this folder's nodes in scope are drawn`;
+/**
+ * Why a row's membership reads the way it does.
+ *
+ * The noun is the caller's, because a region is a folder or a file depending
+ * on the grain (UI-103) and a tooltip that says "folder" over a file's row is
+ * a claim about the tree that the tree does not make. Defaulted rather than
+ * required: every existing caller means a folder, and the parameter exists so
+ * the file-grain caller cannot silently inherit the wrong word.
+ */
+export function membershipTitle(t: RegionTraffic | undefined, noun = 'folder'): string {
+  if (!t) return `Nodes from this ${noun} currently drawn`;
+  if (t.drawn === t.total) return `All ${t.total} of this ${noun}'s nodes in scope are drawn`;
   const hidden = t.total - t.drawn;
   return `${t.drawn} drawn, ${hidden} hidden by a filter — this region is filtered, not sparse`;
 }

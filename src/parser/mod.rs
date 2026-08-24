@@ -1,38 +1,39 @@
 //! Code parsing using tree-sitter for multi-language support.
 
-pub mod language_parser;
-mod rust;
-mod python;
-mod java;
-mod kotlin;
-mod typescript;
-mod svelte;
+mod ansible;
+mod dart;
+mod elevator;
+mod generic_parser;
+mod go;
 mod groovy;
 mod impex;
-mod elevator;
-mod ansible;
+mod java;
+mod kotlin;
+pub mod language_parser;
 pub(crate) mod markdown;
+mod python;
+mod rust;
+pub(crate) mod rust_type_names;
 pub(crate) mod sql;
-mod generic_parser;
+mod svelte;
+mod typescript;
 
-pub use language_parser::{LanguageParser, ParseResult};
-pub use rust::RustParser;
-/// Normalise a written-out Rust type to the bare name the entity index is
-/// keyed by. Shared with the analyzer's cross-file field index (AN-012), which
-/// reads the same declared types off entities instead of off the tree.
-pub(crate) use rust::inference::base_type_name as rust_base_type_name;
-pub use python::PythonParser;
-pub use java::JavaParser;
-pub use kotlin::KotlinParser;
-pub use typescript::TypeScriptParser;
-pub use svelte::SvelteParser;
+pub use ansible::AnsibleParser;
+pub use dart::DartParser;
+pub use elevator::ElevatorParser;
+pub use generic_parser::GenericParser;
+pub use go::GoParser;
 pub use groovy::GroovyParser;
 pub use impex::ImpexParser;
-pub use elevator::ElevatorParser;
-pub use ansible::AnsibleParser;
+pub use java::JavaParser;
+pub use kotlin::KotlinParser;
+pub use language_parser::{LanguageParser, ParseResult};
 pub use markdown::MarkdownParser;
+pub use python::PythonParser;
+pub use rust::RustParser;
 pub use sql::SqlParser;
-pub use generic_parser::GenericParser;
+pub use svelte::SvelteParser;
+pub use typescript::TypeScriptParser;
 
 use crate::models::file_info::Language;
 use anyhow::Result;
@@ -60,7 +61,9 @@ pub fn get_parser(language: Language) -> Box<dyn LanguageParser> {
         Language::Rust => Box::new(RustParser::new()),
         Language::Python => Box::new(PythonParser::new()),
         Language::Java => Box::new(JavaParser::new()),
+        Language::Go => Box::new(GoParser::new()),
         Language::Kotlin => Box::new(KotlinParser::new()),
+        Language::Dart => Box::new(DartParser::new()),
         Language::TypeScript => Box::new(TypeScriptParser::new()),
         Language::Svelte => Box::new(SvelteParser::new()),
         Language::Groovy => Box::new(GroovyParser::new()),

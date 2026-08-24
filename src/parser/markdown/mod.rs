@@ -66,7 +66,9 @@
 
 use super::language_parser::{LanguageParser, ParseResult};
 use crate::models::file_info::Language;
-use crate::models::{CodeEntity, EntityKind, Position, Relationship, RelationshipKind, Span, Visibility};
+use crate::models::{
+    CodeEntity, EntityKind, Position, Relationship, RelationshipKind, Span, Visibility,
+};
 use anyhow::Result;
 use std::path::{Component, Path, PathBuf};
 
@@ -225,7 +227,11 @@ fn classify(link: &Link, from: &Path) -> Target {
         let name = link.target.rsplit('/').next().unwrap_or(&link.target);
         let name = name.strip_suffix(".md").unwrap_or(name);
         let key = wiki_key(name);
-        return if key.is_empty() { Target::Ignored } else { Target::Wiki(key) };
+        return if key.is_empty() {
+            Target::Ignored
+        } else {
+            Target::Wiki(key)
+        };
     }
 
     if is_external(&link.target) {
@@ -260,7 +266,10 @@ fn is_external(target: &str) -> bool {
 
 fn is_markdown(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .as_deref(),
         Some("md") | Some("markdown")
     )
 }
@@ -355,7 +364,9 @@ fn mask_inline_code(line: &str) -> String {
 
 /// Replace every character except newlines with a space.
 fn blank(line: &str) -> String {
-    line.chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect()
+    line.chars()
+        .map(|c| if c == '\n' { '\n' } else { ' ' })
+        .collect()
 }
 
 /// Line count of a leading `---` frontmatter block, or 0 when there is
@@ -456,7 +467,11 @@ fn scan_wiki_links(line: &str, offset: usize, links: &mut Vec<Link>) {
         let (target, anchor) = split_anchor(target);
         if !target.trim().is_empty() {
             links.push(Link {
-                form: if embed { LinkForm::Embed } else { LinkForm::Wiki },
+                form: if embed {
+                    LinkForm::Embed
+                } else {
+                    LinkForm::Wiki
+                },
                 target: target.trim().to_string(),
                 anchor,
                 line: offset,

@@ -123,7 +123,10 @@ mod tests {
     fn column_with_modifier() {
         let c = parse_column("code[unique=true]").unwrap();
         assert_eq!(c.name, "code");
-        assert_eq!(c.modifiers, vec![("unique".to_string(), "true".to_string())]);
+        assert_eq!(
+            c.modifiers,
+            vec![("unique".to_string(), "true".to_string())]
+        );
     }
 
     #[test]
@@ -146,8 +149,14 @@ mod tests {
     fn reference_column_with_modifier() {
         let c = parse_column("country(isocode)[unique=true]").unwrap();
         assert_eq!(c.name, "country");
-        assert_eq!(c.target_attrs.as_deref(), Some(&["isocode".to_string()][..]));
-        assert_eq!(c.modifiers, vec![("unique".to_string(), "true".to_string())]);
+        assert_eq!(
+            c.target_attrs.as_deref(),
+            Some(&["isocode".to_string()][..])
+        );
+        assert_eq!(
+            c.modifiers,
+            vec![("unique".to_string(), "true".to_string())]
+        );
     }
 
     #[test]
@@ -160,6 +169,9 @@ mod tests {
     #[test]
     fn modifier_value_with_quoted_comma() {
         let c = parse_column("code[default=\"a,b\"]").unwrap();
-        assert_eq!(c.modifiers, vec![("default".to_string(), "a,b".to_string())]);
+        assert_eq!(
+            c.modifiers,
+            vec![("default".to_string(), "a,b".to_string())]
+        );
     }
 }

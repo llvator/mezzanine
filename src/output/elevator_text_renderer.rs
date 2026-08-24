@@ -73,10 +73,7 @@ pub(crate) fn render_elevator_text(graph: &DependencyGraph, root: Option<&str>) 
         return "(no Elevator entities in this project)\n".to_string();
     }
 
-    let by_id: HashMap<String, &CodeEntity> = entities
-        .iter()
-        .map(|e| (e.id.clone(), *e))
-        .collect();
+    let by_id: HashMap<String, &CodeEntity> = entities.iter().map(|e| (e.id.clone(), *e)).collect();
 
     // Walk relationships once into per-source maps. Edges are
     // de-duplicated by (source, target) pair: when the analysis spans
@@ -114,11 +111,7 @@ pub(crate) fn render_elevator_text(graph: &DependencyGraph, root: Option<&str>) 
                 }
             }
             RelationshipKind::References => {
-                let link = rel
-                    .metadata
-                    .get("link")
-                    .map(String::as_str)
-                    .unwrap_or("");
+                let link = rel.metadata.get("link").map(String::as_str).unwrap_or("");
                 match link {
                     "where" => {
                         if where_seen.insert(pair.clone()) {
@@ -274,10 +267,7 @@ pub(crate) fn render_focus(graph: &DependencyGraph, target_arg: &str) -> String 
     if entities.is_empty() {
         return "(no Elevator entities in this project)\n".to_string();
     }
-    let by_id: HashMap<String, &CodeEntity> = entities
-        .iter()
-        .map(|e| (e.id.clone(), *e))
-        .collect();
+    let by_id: HashMap<String, &CodeEntity> = entities.iter().map(|e| (e.id.clone(), *e)).collect();
 
     let target_id = match resolve_root(target_arg, &entities, &by_id) {
         Some(id) => id,
@@ -337,7 +327,11 @@ pub(crate) fn render_focus(graph: &DependencyGraph, target_arg: &str) -> String 
     // 4. Concepts whose `used_by:` touches anything in the path or
     //    the target's subtree. These are the cross-cutting concerns
     //    the LLM needs to know apply here.
-    let touched: HashSet<String> = path.iter().cloned().chain(descendants.iter().cloned()).collect();
+    let touched: HashSet<String> = path
+        .iter()
+        .cloned()
+        .chain(descendants.iter().cloned())
+        .collect();
     let mut relevant_concepts: Vec<&CodeEntity> = entities
         .iter()
         .copied()
@@ -354,7 +348,12 @@ pub(crate) fn render_focus(graph: &DependencyGraph, target_arg: &str) -> String 
     // 5. Render.
     let mut out = String::new();
     let target = by_id.get(&target_id).copied().unwrap();
-    let _ = writeln!(out, "# Focus: {} {}", kind_marker(target.kind), target.qualified_name);
+    let _ = writeln!(
+        out,
+        "# Focus: {} {}",
+        kind_marker(target.kind),
+        target.qualified_name
+    );
     let _ = writeln!(
         out,
         "> ancestors, siblings, target subtree, and cross-cutting concepts"
@@ -494,7 +493,15 @@ fn render_focus_subtree(
     child_ids.sort();
     child_ids.dedup();
     for child_id in child_ids {
-        render_focus_subtree(&child_id, depth + 1, children, by_id, where_targets, references, out);
+        render_focus_subtree(
+            &child_id,
+            depth + 1,
+            children,
+            by_id,
+            where_targets,
+            references,
+            out,
+        );
     }
 }
 
@@ -787,9 +794,10 @@ pub(crate) fn resolve_root(
             // user write `fu.creation` and find the unique
             // Functionality named `<feature>.creation`.
             let target_kind = kind_from_prefix(prefix);
-            if let Some(e) = entities.iter().find(|e| {
-                e.kind == target_kind && (e.qualified_name == rest || e.name == rest)
-            }) {
+            if let Some(e) = entities
+                .iter()
+                .find(|e| e.kind == target_kind && (e.qualified_name == rest || e.name == rest))
+            {
                 return Some(e.id.clone());
             }
         }
@@ -975,7 +983,10 @@ mod tests {
     fn tree_view_truncates_long_descriptions() {
         assert!(LONG_DESC.chars().count() > DESC_TRUNCATE);
         let out = render_elevator_text(&graph_with_long_description(), None);
-        assert!(out.contains('…'), "tree view should clip at DESC_TRUNCATE:\n{out}");
+        assert!(
+            out.contains('…'),
+            "tree view should clip at DESC_TRUNCATE:\n{out}"
+        );
         assert!(!out.contains(LONG_DESC));
     }
 

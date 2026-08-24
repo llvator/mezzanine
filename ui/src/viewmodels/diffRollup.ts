@@ -61,6 +61,45 @@ export function normalizeScopePath(p: string): string {
 }
 
 /**
+ * The one spelling of an entity id both sides of a diff can be keyed by.
+ *
+ * The graph's ids are absolute — `/home/me/proj/ui/src/stores/diff.ts:12:f`
+ * — while a diff computed against a ref analyzed its side in a throwaway
+ * worktree, so its ids carry `/var/.../nao-diff-head-<sha>/` instead. Neither
+ * prefix means anything; what both sides share is the repo-relative tail, and
+ * this recovers it.
+ *
+ * The worktree case is exact. The absolute case is a guess — the graph payload
+ * does not carry its own root — and the guess is where this went wrong: the
+ * markers used to be tried in list order and returned on the first *found*,
+ * so `ui/src/stores/diff.ts` matched `src/` before `ui/` and normalized to
+ * `src/stores/diff.ts`, while the same entity on the diff side normalized to
+ * `ui/src/stores/diff.ts`. The two never met, and because the miss reads as
+ * "this entity is not in the diff", every entity under `ui/` silently lost its
+ * status colour, its metric deltas and its before-source in any commit-to-
+ * commit comparison — while `src/` worked perfectly, which is what kept it
+ * hidden.
+ *
+ * So: the marker nearest the *front* of the path wins, not the front of the
+ * list, and it must start at a segment boundary — a directory called `mysrc/`
+ * is not `src/`. A regex gives both for free, since the engine tries match
+ * positions left to right.
+ */
+const REPO_RELATIVE = /(?:^|\/)((?:src|test_data|ui|agents|docs)\/.+)$/;
+
+export function normalizeEntityId(id: string): string {
+  const worktree = id.match(/nao-diff-(?:head|base)-[^/]+\/(.+)$/);
+  if (worktree) return worktree[1];
+  // Only for something id-shaped: `:line:name` is what separates an entity id
+  // from a bare path, and callers pass both.
+  if (id.includes('/') && id.includes(':')) {
+    const rel = id.match(REPO_RELATIVE);
+    if (rel) return rel[1];
+  }
+  return id;
+}
+
+/**
  * The scopes a file is a member of, as the collapsed canvas defines
  * membership: the file itself, and its immediate directory.
  *

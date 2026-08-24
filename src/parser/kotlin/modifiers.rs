@@ -83,8 +83,7 @@ pub(super) fn parse_modifier_attributes(node: &Node, source: &str) -> Vec<String
                 let mut inner = child.walk();
                 for mc in child.children(&mut inner) {
                     match mc.kind() {
-                        "suspend" | "tailrec" | "inline" | "infix"
-                        | "operator" | "external" => {
+                        "suspend" | "tailrec" | "inline" | "infix" | "operator" | "external" => {
                             attrs.push(mc.kind().to_string());
                         }
                         _ => {}

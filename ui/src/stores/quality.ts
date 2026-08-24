@@ -1,5 +1,8 @@
 import { derived, writable } from 'svelte/store';
-import type { D3Node, GraphData, EntityMetrics, ScopeMetrics, BackendThresholds } from '../types/graph';
+import type {
+  D3Node, GraphData, EntityMetrics, ScopeMetrics, BackendThresholds,
+  ShapeBlocker, ShapePattern,
+} from '../types/graph';
 import { graphData, rawEntityGraph, selectedNode } from './graph';
 import { diffData } from './diff';
 import { analysisGraphData } from './scope';
@@ -206,6 +209,17 @@ export const SUMMARY_METRIC_THRESHOLDS: Record<string, { keys: string[]; unit: s
  * Kept terse: this is the elevator pitch, not the full docs. The full
  * guidance lives in the Quality section of the top-level README. */
 export const METRIC_EXPLANATIONS: Record<string, { title: string; body: string }> = {
+  folder_shape: {
+    title: 'Folder shape',
+    body:
+      'How readable the picture this folder draws is, over exactly what the canvas renders when collapsed here — ' +
+      'its immediate children, each subfolder one node. Four tiers: cyclic (children depend on each other in a loop, ' +
+      'so the drawing has no reading order), tangled (acyclic, but edges jump levels instead of stepping down one), ' +
+      'hierarchical (a clean layered DAG), fractal (hierarchical, reached from outside through few doors, and made of ' +
+      'children that hold the same shape). Each cell also names the one gate holding that folder back, which is what ' +
+      'you can act on — the blended compliance score behind it is in the tooltip. Organisation, not code quality: it ' +
+      'feeds no score on this row, and unlike every other number here, higher is better.',
+  },
   score: {
     title: 'Composite score',
     body:
@@ -363,6 +377,46 @@ export const SMELL_META: Record<string, { label: string; hint: string }> = {
     hint: 'Very high fan-in — any change here ripples widely. Stabilise the interface or apply dependency inversion.',
   },
 };
+
+/** What each shape verdict means, in the same words as `ShapePattern::hint()`
+ *  on the Rust side. Duplicated rather than serialised for the reason
+ *  `SMELL_META` above is: it is fixed prose per variant, and shipping it on
+ *  every folder in the payload would pay by the row for a string that never
+ *  varies. */
+export const SHAPE_HINTS: Record<ShapePattern, string> = {
+  cyclic:
+    'Break the loop between these children — usually by moving the shared piece down into a child both can depend on.',
+  tangled:
+    'Edges skip levels here. Either the intermediate layer is not carrying the traffic it should, or the shortcuts around it are the real design.',
+  hierarchical:
+    'Readable at this level, and short of fractal for the one reason named above.',
+  fractal: 'Nothing to do — the shape holds at every level.',
+};
+
+/** The failing gate as a phrase short enough to sit in a table cell.
+ *  `pct` is passed in so the panel keeps one rounding rule for every
+ *  percentage it prints. */
+export function shapeBlockerLabel(
+  blocker: ShapeBlocker | undefined,
+  pct: (v: number | undefined) => string,
+): string | null {
+  if (!blocker) return null;
+  switch (blocker.gate) {
+    // `cyclic` and `tangled` already name their own gate, so the cell adds
+    // the measurement and not the word again. The tiers above them do not
+    // say why they stopped, which is where the wording earns its space.
+    case 'cycles': return `acyclic ${pct(blocker.value)}`;
+    case 'layering': return `layered ${pct(blocker.value)}`;
+    case 'merges': return `merges · branching ${pct(blocker.value)}`;
+    case 'entry': return `many doors · entry ${pct(blocker.value)}`;
+    case 'child_pattern': return `holds a ${blocker.value} folder`;
+    case 'child_compliance': return `children ${pct(blocker.value)}`;
+    case 'unstructured': return 'no edges between children';
+    // A count, not a ratio, so `pct` would turn 18 children into 1800%.
+    case 'breadth': return `${blocker.value} children`;
+    case 'compliance': return `overall ${pct(blocker.value)}`;
+  }
+}
 
 const CALLABLE_KINDS = new Set(['Function', 'Method']);
 

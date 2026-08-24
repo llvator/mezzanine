@@ -7,10 +7,14 @@ import { writable, derived, get } from 'svelte/store';
 import type { Readable } from 'svelte/store';
 import { apiUrl } from '../vscodeAdapter';
 import { isServeMode } from './serveMode';
-import { rollUpByScope, rollUpCounts, normalizeScopePath, type ScopeChange, type ScopeTally } from '../viewmodels/diffRollup';
-import type { DiffLevel } from '../viewmodels/diffLevels';
+import { rollUpByScope, rollUpCounts, normalizeScopePath, normalizeEntityId, type ScopeChange, type ScopeTally } from '../viewmodels/diffRollup';
+import { buildChurnIndex, type ChurnIndex } from '../viewmodels/diffChurn';
+import type { D3Node } from '../types/graph';
+import { detailsMap, ensureDetailsLoaded } from './details';
+import type { DiffLevel, DiffSeedFacet } from '../viewmodels/diffLevels';
+import { headIsWorkingTree } from '../viewmodels/diffVerdict';
 
-export type { DiffLevel };
+export type { DiffLevel, DiffSeedFacet };
 
 export type ChangeStatus = 'added' | 'removed' | 'modified' | 'unchanged';
 
@@ -105,6 +109,19 @@ export const diffActive = writable(false);
  */
 export const diffLevel = writable<DiffLevel>('edits');
 
+/**
+ * Which half of the change the ladder starts from (UI-109).
+ *
+ * Orthogonal to the rungs, and narrows the seed they widen from: `new` is code
+ * that did not exist on the base side, `existing` is code that did and was
+ * changed in place. See `viewmodels/diffLevels.ts` for why it is a second
+ * control rather than a fourth rung.
+ *
+ * Defaults to `all`, which is the picture as it was before this existed — the
+ * split is an addition, and a reader who never touches it sees no change.
+ */
+export const diffSeedFacet = writable<DiffSeedFacet>('all');
+
 /** Master toggle for whether diff filters (changesOnly / coreOnly / dimOpacity)
  *  affect the graph. When false, a diff can still be loaded (entities colored
  *  added/removed/modified) but the filter toggles have no visual effect —
@@ -115,33 +132,58 @@ export const diffFiltersEnabled = writable(true);
 /** Opacity for unchanged/filtered-out nodes when diff filters are active (0 = hidden, 1 = fully visible). */
 export const diffDimOpacity = writable(0);
 
+/**
+ * How strongly the canvas draws what a rung recruited, against the edits it
+ * grew from (UI-112).
+ *
+ * `Rest` fades what the ladder *rejected*; this weights what it *accepted*
+ * for a reason other than being an edit — the far end of a changed edge at
+ * `rewiring`, anything one hop out at `neighbourhood`. Those arrive at full
+ * strength and outnumber the edits, which is how widening the ladder loses
+ * the very nodes it was widened to give context to.
+ *
+ * A third tier, not a second ladder: it cannot add or remove a node. That is
+ * why it is floored well above zero — a control that could empty the rung
+ * would silently duplicate stepping down one, and the reader would have two
+ * ways to reach the same picture with only one of them named for it.
+ */
+export const CONTEXT_OPACITY_FLOOR = 0.1;
+
+/** Default weight for recruited context. Low enough that the edits read as
+ *  the subject at a glance, high enough that a neighbour is still legible. */
+export const diffContextOpacity = writable(0.4);
+
 /** The loaded diff data. Null when no diff is loaded. */
 export const diffData = writable<DiffData | null>(null);
 
 /**
- * Normalize an entity ID by stripping the temp worktree path prefix.
- * Entity IDs look like: `/var/folders/.../nao-diff-head-xxx/src/main.rs:123:foo`
- * We want to extract: `src/main.rs:123:foo` (the relative path portion).
+ * Normalize an entity ID by stripping the temp worktree path prefix, so
+ * diff.json and data.json can be keyed alike.
  *
- * This allows matching between diff.json and data.json even when they were
- * generated with different temp directory paths.
+ * Re-exported rather than defined here: it is a pure string function with a
+ * trap in it, and it belongs beside `normalizeScopePath`, which strips the
+ * same prefix off paths for the same reason — and where `node --test` can
+ * reach it without svelte (`npm run test:diff`). Every existing import site
+ * keeps working.
  */
-export function normalizeEntityId(id: string): string {
-  // Match the pattern: .../nao-diff-(head|base)-<hash>/<relative-path>
-  const match = id.match(/nao-diff-(?:head|base)-[^/]+\/(.+)$/);
-  if (match) return match[1];
-  // Fallback: try to extract just the file:line:name portion (last path segment with colons)
-  const lastSlash = id.lastIndexOf('/');
-  if (lastSlash !== -1 && id.includes(':')) {
-    // Walk back to find where the relative path starts (first component after a recognizable root)
-    // Common patterns: src/, test_data/, ui/
-    for (const marker of ['src/', 'test_data/', 'ui/', 'agents/', 'docs/']) {
-      const idx = id.indexOf(marker);
-      if (idx !== -1) return id.slice(idx);
-    }
-  }
-  return id;
-}
+export { normalizeEntityId } from '../viewmodels/diffRollup';
+
+/**
+ * Whether the loaded diff's head is the tree the canvas is drawing.
+ *
+ * `→ WORKING` analyses the live tree, so the two agree. A commit-to-commit
+ * comparison does not: the server declines to adopt a commit's head graph
+ * (SRV-019), so the canvas keeps showing the working tree while the diff
+ * describes a pair of older ones. That gap is invisible until something asks
+ * what the diff's *silence* about a file means — see `diffVerdict` (UI-104).
+ *
+ * False with no diff loaded, which is the safe reading: nothing is claiming to
+ * describe this tree.
+ */
+export const diffHeadIsWorking: Readable<boolean> = derived(
+  diffData,
+  ($d) => headIsWorkingTree($d?.to_ref),
+);
 
 /** Map from normalized entity ID → change status for O(1) lookup. */
 export const diffStatusMap: Readable<Map<string, ChangeStatus>> = derived(
@@ -376,6 +418,11 @@ export async function loadDiff(opts: { baseDetails?: boolean } = {}): Promise<vo
       console.log(`[diff] Loaded: ${data.summary.added} added, ${data.summary.removed} removed, ${data.summary.modified} modified`);
       diffData.set(data);
       diffActive.set(true);
+      // The head half of what `diffChurnIndex` measures. Already cached after
+      // the first entity anyone selects, so this only pays on a reader who
+      // loads a diff before opening anything — and it is the same one file
+      // the details pane would fetch a moment later anyway.
+      void ensureDetailsLoaded();
       // Also load base details for side-by-side comparison
       if (baseDetails) await loadBaseDetails();
     } else {
@@ -426,6 +473,83 @@ export function getBaseSource(baseEntityId: string | undefined): string | undefi
   if (!baseEntityId) return undefined;
   return get(baseDetailsCache)?.[baseEntityId]?.source_code;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// How many lines the diff moved — the `Lines changed` size channel's domain
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Declared down here rather than beside the other rollups because `derived`
+// runs at module evaluation: a churn store written above `baseDetailsCache`
+// would read it before its `writable` had been assigned.
+
+/**
+ * Head sources keyed the way the diff keys everything else.
+ *
+ * The sidecar is keyed by the graph's raw `original_id` while a diff row is
+ * keyed by `normalizeEntityId(entity_id)`, and on a commit-to-commit diff
+ * those two spellings differ by a temp worktree prefix. Normalising the
+ * sidecar's keys once here is what makes the two sides meet — the same join
+ * `diffBaseIdMap` exists to make on the base side, and the same one whose
+ * absence made the details pane print head source as though nothing had
+ * changed.
+ */
+const headSources: Readable<Map<string, string>> = derived(detailsMap, ($m) => {
+  const out = new Map<string, string>();
+  if (!$m) return out;
+  for (const [id, detail] of Object.entries($m)) {
+    if (detail.source_code) out.set(normalizeEntityId(id), detail.source_code);
+  }
+  return out;
+});
+
+/**
+ * Whether line-level churn can be measured at all.
+ *
+ * Two facts, not a heuristic: a diff is loaded, and its before-sources
+ * arrived. Without the base map every changed entity is unmeasurable and the
+ * channel would draw a canvas of hollow circles — so it is withheld from the
+ * picker entirely, which is the rule `SIZE_CHANNELS` already follows for a
+ * metric with no rollup at the current level.
+ *
+ * A live refresh skips the base fetch (`loadDiff({ baseDetails: false })`)
+ * but does not clear it, so the channel survives a save.
+ */
+export const diffChurnAvailable: Readable<boolean> = derived(
+  [diffData, baseDetailsCache],
+  ([$d, $b]) => $d !== null && $b !== null,
+);
+
+/**
+ * Lines added + removed, per entity and per scope.
+ *
+ * Recomputed when the diff changes or either source map lands — once per diff
+ * load, not per frame. See `viewmodels/diffChurn` for why this is churn and
+ * not the `loc` delta already sitting in `diff.json`.
+ */
+export const diffChurnIndex: Readable<ChurnIndex> = derived(
+  [diffData, baseDetailsCache, headSources],
+  ([$d, $base, $head]): ChurnIndex => buildChurnIndex($d?.entities ?? [], {
+    head: (e) => $head.get(normalizeEntityId(e.entity_id)),
+    base: (e) => (e.base_entity_id ? $base?.[e.base_entity_id]?.source_code : undefined),
+    key: (e) => normalizeEntityId(e.entity_id),
+  }),
+);
+
+/**
+ * Churn for one drawn node, whatever grain the canvas is at.
+ *
+ * Entity id first, then scope path, exactly as `displayPlan`'s `changeOf`
+ * resolves a status: a collapsed File or Module node carries its scope path
+ * in `original_id` where an entity carries an id, and the two cannot collide
+ * because an id carries `:line:name`. Same order, so size and colour can
+ * never end up describing different nodes.
+ */
+export const diffChurnAt: Readable<(d: D3Node) => number | undefined> = derived(
+  diffChurnIndex,
+  ($index) => (d: D3Node) =>
+    $index.byEntity.get(normalizeEntityId(d.original_id))
+    ?? $index.byScope.get(d.original_id),
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // How the details pane draws a changed entity's source
@@ -517,7 +641,116 @@ export async function fetchCommits(limit = 50): Promise<void> {
   }
 }
 
-/** Trigger a diff computation between two refs (commits/branches). */
+/**
+ * One `git stash` entry.
+ *
+ * `base_hash` is the commit the stash was taken on — its own first parent,
+ * and the only base that shows the stashed work and nothing else. `selector`
+ * is the `stash@{N}` label and is for reading only: N is a position in the
+ * list and every push renumbers it, so the refs sent to the server are the
+ * two hashes (UI-107).
+ */
+export interface Stash {
+  hash: string;
+  short_hash: string;
+  selector: string;
+  base_hash: string;
+  base_short: string;
+  message: string;
+  author: string;
+  date: string;
+}
+
+/** Store for the repository's stash entries. */
+export const stashes = writable<Stash[]>([]);
+
+/** Whether we're currently fetching stashes. */
+export const stashesLoading = writable<boolean>(false);
+
+/**
+ * Fetch the repository's stashes.
+ *
+ * An empty list is a normal answer, not a failure — most repositories have no
+ * stashes — so it is left to the panel to say so rather than surfaced through
+ * `diffApiError`.
+ */
+export async function fetchStashes(): Promise<void> {
+  stashesLoading.set(true);
+  diffApiError.set(null);
+  try {
+    const resp = await fetch(apiUrl('/api/stashes'));
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(text || `HTTP ${resp.status}`);
+    }
+    const data: Stash[] = await resp.json();
+    stashes.set(data);
+  } catch (err) {
+    diffApiError.set(`Failed to fetch stashes: ${err}`);
+    stashes.set([]);
+  } finally {
+    stashesLoading.set(false);
+  }
+}
+
+/**
+ * One path in the index, as `GET /api/staged` reports it.
+ *
+ * No hash of any kind, deliberately. The commit that names the index is
+ * manufactured inside the diff call and is unreferenced, so there is nothing
+ * here worth holding: the ref sent back is the `STAGED` sentinel and the server
+ * resolves it afresh. This is the `stash@{N}` lesson from the other end — there
+ * a label outlived the thing and stopped meaning it; here a hash would name a
+ * commit that means whatever the index was when it was made (UI-111).
+ */
+export interface StagedFile {
+  status: string;
+  path: string;
+}
+
+/** Store for the paths currently in the index. */
+export const stagedFiles = writable<StagedFile[]>([]);
+
+/** Whether we're currently fetching the staged list. */
+export const stagedLoading = writable<boolean>(false);
+
+/**
+ * Fetch what is in the index.
+ *
+ * Two git calls, against a diff's worktree checkout and full analysis — which
+ * is why the picker asks this first. An empty list is a normal answer and left
+ * to the panel to say, the way the stash list is.
+ */
+export async function fetchStaged(): Promise<void> {
+  stagedLoading.set(true);
+  diffApiError.set(null);
+  try {
+    const resp = await fetch(apiUrl('/api/staged'));
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(text || `HTTP ${resp.status}`);
+    }
+    const data: StagedFile[] = await resp.json();
+    stagedFiles.set(data);
+  } catch (err) {
+    diffApiError.set(`Failed to read the index: ${err}`);
+    stagedFiles.set([]);
+  } finally {
+    stagedLoading.set(false);
+  }
+}
+
+/**
+ * Trigger a diff computation between two refs (commits/branches), or the
+ * `WORKING` / `STAGED` sentinels.
+ *
+ * A 200 is not the same as a diff. The server answers `success: false` for the
+ * comparisons it declines rather than fails — another diff already running,
+ * diff mode left while this one ran, nothing staged — and each of those has a
+ * message the reader can act on. Reading only `resp.ok` swallowed every one of
+ * them and then called `loadDiff`, which re-served the *previous* comparison:
+ * the picker closed, the overlay stayed, and nothing said why.
+ */
 export async function triggerDiff(fromRef: string, toRef: string): Promise<void> {
   diffComputing.set(true);
   diffApiError.set(null);
@@ -530,6 +763,13 @@ export async function triggerDiff(fromRef: string, toRef: string): Promise<void>
     if (!resp.ok) {
       const text = await resp.text();
       throw new Error(text || `HTTP ${resp.status}`);
+    }
+    const body = await resp.json();
+    if (body?.success === false) {
+      // The server's own words, unwrapped: "Nothing is staged" is not a
+      // failure to compute anything and must not read as one.
+      diffApiError.set(body.message || 'The diff was declined.');
+      return;
     }
     // After successful diff, reload the diff.json
     await loadDiff();

@@ -11,6 +11,44 @@ pub(crate) struct CommitInfo {
     pub date: String,
 }
 
+/// One `git stash list` entry, as the picker needs it.
+///
+/// `base_hash` rides along rather than being left to the client, because the
+/// only correct base for a stash is the commit it was taken on — its own
+/// first parent. Pairing it against HEAD instead reports every commit landed
+/// since the stash as something the stash removed (UI-107).
+///
+/// `selector` is the `stash@{N}` label and is display only. N is a position
+/// in the list, and pushing a stash renumbers every entry below it, so the
+/// ref that crosses the API is always `hash`.
+#[derive(Clone, Serialize)]
+pub(crate) struct StashInfo {
+    pub hash: String,
+    pub short_hash: String,
+    pub selector: String,
+    pub base_hash: String,
+    pub base_short: String,
+    pub message: String,
+    pub author: String,
+    pub date: String,
+}
+
+/// One path in the index, as `GET /api/staged` reports it.
+///
+/// No hash of any kind. The commit that names the index is manufactured inside
+/// the diff call and is unreferenced, so there is nothing here worth a client
+/// holding on to — the ref it sends is the `STAGED` sentinel and the server
+/// resolves it afresh (UI-111).
+///
+/// `status` is git's own letter — `M`, `A`, `D`, `R`, `C`, `T` — kept as given
+/// rather than translated, so a letter this code has not met still arrives at
+/// the reader intact.
+#[derive(Clone, Serialize)]
+pub(crate) struct StagedFile {
+    pub status: String,
+    pub path: String,
+}
+
 // --- Diff request/response ---
 #[derive(Deserialize)]
 pub(crate) struct DiffRequest {

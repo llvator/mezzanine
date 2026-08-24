@@ -1,7 +1,8 @@
-//! Small shared helpers used by multiple submodules:
+//! What every declaration parser reads off a grammar node, whatever kind of
+//! item it is building:
 //! - visibility parsing
 //! - base type-name extraction (strips generics / refs)
-//! - generic-argument stripping for path strings
+//! - generic parameter names
 
 use super::super::language_parser::node_text;
 use crate::models::Visibility;
@@ -27,16 +28,21 @@ pub(super) fn parse_visibility(node: &Node, source: &str) -> Visibility {
 /// Extract the base type name from a type node, stripping generic and
 /// lifetime arguments. Handles `generic_type`, `scoped_type_identifier`,
 /// and reference/pointer wrappers by descending into them.
-pub(super) fn base_type_name(node: &Node, source: &str) -> String {
+///
+/// The node-shaped counterpart to [`crate::parser::rust_type_names::base_type_name`], and
+/// named apart from it deliberately: they take different input and promise
+/// different things — this one always yields a name, because an `impl` head
+/// always names a type, while the text one declines a primitive.
+pub(super) fn parse_base_type_name(node: &Node, source: &str) -> String {
     match node.kind() {
         "generic_type" => {
             if let Some(inner) = node.child_by_field_name("type") {
-                return base_type_name(&inner, source);
+                return parse_base_type_name(&inner, source);
             }
         }
         "reference_type" | "pointer_type" => {
             if let Some(inner) = node.child_by_field_name("type") {
-                return base_type_name(&inner, source);
+                return parse_base_type_name(&inner, source);
             }
         }
         _ => {}
@@ -57,20 +63,4 @@ pub(super) fn parse_generics(node: &Node, source: &str) -> Vec<String> {
     }
 
     generics
-}
-
-/// Strip angle-bracketed generic arguments from a path string while preserving
-/// `::` separators. `Foo<T>::bar<U>` → `Foo::bar`, `Self::new` → `Self::new`.
-pub(super) fn strip_generics(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut depth: i32 = 0;
-    for ch in s.chars() {
-        match ch {
-            '<' => depth += 1,
-            '>' => depth = (depth - 1).max(0),
-            _ if depth == 0 => out.push(ch),
-            _ => {}
-        }
-    }
-    out
 }

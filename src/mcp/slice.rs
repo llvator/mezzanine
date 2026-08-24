@@ -77,7 +77,8 @@ pub fn spec_slice(server: &McpServer, args: &Value) -> Result<String> {
     }
 
     let source = server.root.display().to_string();
-    let slice = elevator_extract::extract_seeds(&result, &selection.seeds, &selection.label, &source);
+    let slice =
+        elevator_extract::extract_seeds(&result, &selection.seeds, &selection.label, &source);
     let report = Report::new(&target, &selection, &slice, &result);
     match args.get("out").and_then(|v| v.as_str()).map(str::trim) {
         Some(out) if !out.is_empty() => {
@@ -244,7 +245,13 @@ fn spec_only(graph: &DependencyGraph) -> AnalysisResult {
         .filter(|r| ids.contains(&r.source_id) && ids.contains(&r.target_id))
         .cloned()
         .collect();
-    AnalysisResult { entities, relationships, files: Vec::new(), warnings: Vec::new() }
+    AnalysisResult {
+        entities,
+        relationships,
+        files: Vec::new(),
+        import_sites: Vec::new(),
+        warnings: Vec::new(),
+    }
 }
 
 // ------------------------------------------------------------------
@@ -255,9 +262,15 @@ fn spec_only(graph: &DependencyGraph) -> AnalysisResult {
 /// file) string. Required: a slice of "the whole project" is what
 /// `overview` already is.
 fn target_folder(server: &McpServer, args: &Value) -> Result<String> {
-    let raw = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let raw = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if raw.is_empty() {
-        bail!("spec_slice needs a `path` — the folder whose spec claims to extract, e.g. `src/mcp`.");
+        bail!(
+            "spec_slice needs a `path` — the folder whose spec claims to extract, e.g. `src/mcp`."
+        );
     }
     let p = PathBuf::from(raw);
     let rel = if p.is_absolute() {
@@ -277,7 +290,10 @@ fn target_folder(server: &McpServer, args: &Value) -> Result<String> {
     };
     let normalized = normalize_rel(&rel.to_string_lossy());
     if normalized.is_empty() {
-        bail!("`{}` is the project root — use `overview` for the whole spec.", raw);
+        bail!(
+            "`{}` is the project root — use `overview` for the whole spec.",
+            raw
+        );
     }
     Ok(normalized)
 }
@@ -324,7 +340,10 @@ fn resolve_out(server: &McpServer, out: &str, args: &Value) -> Result<PathBuf> {
             out
         );
     }
-    let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+    let overwrite = args
+        .get("overwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if path.exists() && !overwrite {
         bail!(
             "{} already exists. Pass overwrite=true to replace it, or choose another `out`.",
@@ -387,15 +406,27 @@ impl Report<'_> {
             .map(short_ref)
             .collect();
         seeds.sort();
-        Report { target, selection, slice, seeds }
+        Report {
+            target,
+            selection,
+            slice,
+            seeds,
+        }
     }
 
     /// Rendering for a slice that was written to `path`: provenance
     /// only, never the body — the file is the artifact.
     fn written(&self, path: &Path, root: &Path) -> String {
-        let where_to = path.strip_prefix(root).unwrap_or(path).display().to_string();
+        let where_to = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
         let mut body = self.provenance();
-        body.insert(0, format!("# Spec slice for {} → {}", self.target, where_to));
+        body.insert(
+            0,
+            format!("# Spec slice for {} → {}", self.target, where_to),
+        );
         body.push(String::new());
         body.push(format!(
             "Standalone .elv: `elevator {} --check` validates it on its own.",
@@ -411,13 +442,19 @@ impl Report<'_> {
         body.insert(0, format!("# Spec slice for {}", self.target));
         body.push(String::new());
         body.extend(self.slice.text.lines().map(String::from));
-        cap_lines(body, "Pass out=<file> to write the full slice to disk instead.")
+        cap_lines(
+            body,
+            "Pass out=<file> to write the full slice to disk instead.",
+        )
     }
 
     /// The provenance block both renderings share: what was selected,
     /// why, and what the slice contains.
     fn provenance(&self) -> Vec<String> {
-        let mut out = vec![String::new(), format!("Selection: {}", self.selection.label)];
+        let mut out = vec![
+            String::new(),
+            format!("Selection: {}", self.selection.label),
+        ];
         if self.selection.fallback {
             out.push(format!(
                 "  ⚠ nothing in the spec claims a path inside {} — this is the branch above it.",
@@ -438,7 +475,12 @@ impl Report<'_> {
         for name in self.seeds.iter().take(MAX_LISTED_SEEDS) {
             out.push(format!("  {}", name));
         }
-        if let Some(extra) = self.seeds.len().checked_sub(MAX_LISTED_SEEDS).filter(|n| *n > 0) {
+        if let Some(extra) = self
+            .seeds
+            .len()
+            .checked_sub(MAX_LISTED_SEEDS)
+            .filter(|n| *n > 0)
+        {
             out.push(format!("  … and {} more", extra));
         }
         out

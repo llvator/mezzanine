@@ -44,6 +44,20 @@ enum Commands {
         force: bool,
     },
 
+    /// Grade the tree against the rules the repo declared in
+    /// `.nao/rules.json`: exit 0 when every one holds, 1 when one does not,
+    /// 2 when no verdict could be computed. Nao declares no rules of its
+    /// own, so a repo without that file passes and says so.
+    Check {
+        /// Path to check (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output format: `human` (default) or `json` for CI consumers.
+        #[arg(long, default_value = "human")]
+        format: CheckFormatArg,
+    },
+
     /// Analyze a codebase and generate dependency visualization
     Analyze {
         /// Path to analyze (defaults to current directory)
@@ -512,6 +526,24 @@ impl From<OutputFormatArg> for OutputFormat {
     }
 }
 
+/// `nao check`'s two renderings. Its own enum rather than a reuse of
+/// [`OutputFormatArg`]: a verdict has no DOT or Mermaid rendering, and
+/// offering one would promise a drawing that does not exist.
+#[derive(Clone, Copy, ValueEnum)]
+enum CheckFormatArg {
+    Human,
+    Json,
+}
+
+impl From<CheckFormatArg> for nao::check::Format {
+    fn from(arg: CheckFormatArg) -> Self {
+        match arg {
+            CheckFormatArg::Human => nao::check::Format::Human,
+            CheckFormatArg::Json => nao::check::Format::Json,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum EntityKindArg {
     File,
@@ -574,7 +606,19 @@ fn main() -> Result<()> {
     match cli.command {
         // Its own arm rather than a group: `init` is the one subcommand that
         // writes the repo's own configuration instead of reading a codebase.
-        Commands::Init { path, vscode, force } => nao::init::run(&path, vscode, force),
+        Commands::Init {
+            path,
+            vscode,
+            force,
+        } => nao::init::run(&path, vscode, force),
+
+        // Its own arm rather than a group: `check` is the one subcommand
+        // whose exit code is a verdict on the tree, so it ends the process
+        // itself instead of returning a `Result` that only says whether nao
+        // ran (ADR 0024).
+        Commands::Check { path, format } => {
+            std::process::exit(nao::check::run(&path, format.into()))
+        }
 
         c @ (Commands::Analyze { .. }
         | Commands::Deps { .. }
@@ -641,7 +685,11 @@ fn dispatch_analysis(command: Commands) -> Result<()> {
             format,
         } => run_deps(target, depth, reverse, format.into()),
 
-        Commands::Find { pattern, path, kind } => run_find(&pattern, path, kind),
+        Commands::Find {
+            pattern,
+            path,
+            kind,
+        } => run_find(&pattern, path, kind),
 
         Commands::Cycles { path, format } => run_cycles(path, format.into()),
 
@@ -702,7 +750,9 @@ fn dispatch_server(command: Commands) -> Result<()> {
                 output_dir: output_dir
                     .or_else(|| settings.output_dir.clone())
                     .unwrap_or_else(|| PathBuf::from("ui/public")),
-                port: port.or(settings.port).unwrap_or(nao::settings::DEFAULT_PORT),
+                port: port
+                    .or(settings.port)
+                    .unwrap_or(nao::settings::DEFAULT_PORT),
                 include_tests: include_tests || settings.include_tests.unwrap_or(false),
                 include_docs: include_docs || settings.include_docs.unwrap_or(false),
                 languages: language.or_else(|| settings.language.clone()),
@@ -744,7 +794,9 @@ fn dispatch_server(command: Commands) -> Result<()> {
             // analyzing it.
             let settings = nao::settings::user();
             run_serve(ServeArgs {
-                port: port.or(settings.port).unwrap_or(nao::settings::DEFAULT_PORT),
+                port: port
+                    .or(settings.port)
+                    .unwrap_or(nao::settings::DEFAULT_PORT),
                 seed,
                 cache_dir,
                 jobs,
@@ -768,7 +820,11 @@ fn dispatch_server(command: Commands) -> Result<()> {
 /// Educator: linting a file, and the two content-generation aids.
 fn dispatch_educator(command: Commands) -> Result<()> {
     match command {
-        Commands::Educate { file, json, content } => run_educate(file, json, content),
+        Commands::Educate {
+            file,
+            json,
+            content,
+        } => run_educate(file, json, content),
 
         Commands::ConstructKinds {
             language,
@@ -807,7 +863,13 @@ fn dispatch_agent(command: Commands) -> Result<()> {
                 include_tests,
                 language,
             } => run_hook_self_review(
-                path, base_ref, state, min_severity, cap, include_tests, language,
+                path,
+                base_ref,
+                state,
+                min_severity,
+                cap,
+                include_tests,
+                language,
             ),
         },
 
@@ -837,8 +899,12 @@ fn run_hook_self_review(
     use nao::mcp::push::{self, Severity};
 
     let root = path.canonicalize().unwrap_or(path);
-    let min = Severity::parse(&min_severity)
-        .ok_or_else(|| anyhow::anyhow!("Invalid --min-severity '{}': use low|medium|high", min_severity))?;
+    let min = Severity::parse(&min_severity).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid --min-severity '{}': use low|medium|high",
+            min_severity
+        )
+    })?;
 
     let output = push::self_review(&root, &base_ref, include_tests, &language, state, min, cap)?;
     // Quiet-when-clean: nothing on stdout, zero tokens into the agent.
@@ -864,7 +930,10 @@ fn run_pr_report(
         Err(e) => {
             // Non-blocking: surface the reason but do not fail the build.
             eprintln!("nao pr-report: {e:#}");
-            println!("{}\n**nao:** report unavailable ({e}).", push::PR_COMMENT_MARKER);
+            println!(
+                "{}\n**nao:** report unavailable ({e}).",
+                push::PR_COMMENT_MARKER
+            );
         }
     }
     Ok(())
@@ -904,7 +973,9 @@ fn run_educate(file: PathBuf, json: bool, content: Option<PathBuf>) -> Result<()
             "warning" => "warning".yellow().bold(),
             _ => "info".blue().bold(),
         };
-        *by_severity.entry(severity_label_key(&hit.severity)).or_insert(0) += 1;
+        *by_severity
+            .entry(severity_label_key(&hit.severity))
+            .or_insert(0) += 1;
         println!(
             "{}:{}:{}  {}  {}  {}",
             path_label,
@@ -950,9 +1021,7 @@ fn run_educator_index(
         ))?;
     let educator = Educator::load(&content_root)?;
     let rendered = nao::educator::index::render_index(&educator, language);
-    let target = output.unwrap_or_else(|| {
-        content_root.join(format!("{}/INDEX.md", language))
-    });
+    let target = output.unwrap_or_else(|| content_root.join(format!("{}/INDEX.md", language)));
 
     if check {
         let current = std::fs::read_to_string(&target).unwrap_or_default();
@@ -1007,7 +1076,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     nao::server::serve(nao::server::ServeOptions {
         port: args.port,
         seeds,
-        cache_dir: args.cache_dir.unwrap_or_else(nao::server::default_cache_dir),
+        cache_dir: args
+            .cache_dir
+            .unwrap_or_else(nao::server::default_cache_dir),
         jobs: args.jobs,
         clone_timeout_secs: args.clone_timeout_secs,
         max_repo_mb: args.max_repo_mb,
@@ -1019,11 +1090,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     })
 }
 
-fn run_construct_kinds(
-    language: &str,
-    output: Option<PathBuf>,
-    check: bool,
-) -> Result<()> {
+fn run_construct_kinds(language: &str, output: Option<PathBuf>, check: bool) -> Result<()> {
     use nao::educator::catalog;
 
     let specs = catalog::for_language(language).ok_or_else(|| {
@@ -1033,9 +1100,8 @@ fn run_construct_kinds(
         )
     })?;
     let rendered = catalog::render_catalog(language, specs);
-    let target = output.unwrap_or_else(|| {
-        PathBuf::from(format!("content/{}/construct-kinds.md", language))
-    });
+    let target =
+        output.unwrap_or_else(|| PathBuf::from(format!("content/{}/construct-kinds.md", language)));
 
     if check {
         let current = std::fs::read_to_string(&target).unwrap_or_default();
@@ -1118,7 +1184,10 @@ fn run_analyze(
     // Last: the settings file fills only what the flags above left alone.
     // `depth` travels separately because a defaulted `max_depth` and a typed
     // one are the same number by the time the config gets here.
-    let flags = nao::settings::Flags { max_depth: depth, ..Default::default() };
+    let flags = nao::settings::Flags {
+        max_depth: depth,
+        ..Default::default()
+    };
     nao::settings::load(&path).apply_with(&mut config, flags);
 
     // Run analysis
@@ -1182,10 +1251,13 @@ fn run_deps(
     let mut config = Config::for_path(root)
         .with_output_format(format)
         .with_max_depth(DEPS_DEFAULT_DEPTH);
-    let flags = nao::settings::Flags { max_depth: depth, ..Default::default() };
+    let flags = nao::settings::Flags {
+        max_depth: depth,
+        ..Default::default()
+    };
     nao::settings::load(root).apply_with(&mut config, flags);
     // The settled depth, whichever link of the chain supplied it. The
-    // printing below walks the same levels the traversal did.
+    // report below walks that many levels out of the file.
     let depth = config.analysis.max_depth;
 
     let mut analyzer = Analyzer::new(config.clone());
@@ -1193,35 +1265,10 @@ fn run_deps(
 
     let graph = DependencyGraph::from_analysis(&result);
 
-    println!("Dependencies for: {}", target.display());
-    println!();
-
-    // Find the file entity
-    for entity in graph.entities() {
-        if entity.file_path == target {
-            if reverse {
-                println!("Dependents (what depends on this):");
-                for (dep, rel) in graph.dependents(&entity.id) {
-                    println!("  ← {} ({})", dep.name, rel.kind.display_label());
-                }
-            } else {
-                println!("Dependencies:");
-                let deps = graph.transitive_dependencies(&entity.id, depth);
-                for d in 1..=depth {
-                    if let Some(level_deps) = deps.get(&d) {
-                        println!("  Level {}:", d);
-                        for dep_id in level_deps {
-                            if let Some(dep) = graph.get_entity(dep_id) {
-                                println!("    → {}", dep.name);
-                            } else {
-                                println!("    → {} (external)", dep_id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    print!(
+        "{}",
+        nao::output::deps_report::render(&graph, &target, depth, reverse)
+    );
 
     Ok(())
 }
@@ -1250,7 +1297,10 @@ fn run_find(pattern: &str, path: PathBuf, kind: Option<EntityKindArg>) -> Result
 
         // Match by name
         if entity.name.to_lowercase().contains(&pattern_lower)
-            || entity.qualified_name.to_lowercase().contains(&pattern_lower)
+            || entity
+                .qualified_name
+                .to_lowercase()
+                .contains(&pattern_lower)
         {
             println!(
                 "{} {} in {} [L{}]",
@@ -1367,17 +1417,17 @@ fn run_stats(path: PathBuf, json: bool) -> Result<()> {
         println!();
 
         println!("Graph metrics:");
-        println!("  Average connections per entity: {:.2}", metrics.average_degree);
+        println!(
+            "  Average connections per entity: {:.2}",
+            metrics.average_degree
+        );
         println!("  Circular dependencies: {}", metrics.cycle_count);
         println!();
 
         if !metrics.most_connected.is_empty() {
             println!("Most connected entities:");
             for (i, (id, count)) in metrics.most_connected.iter().take(5).enumerate() {
-                let name = graph
-                    .get_entity(id)
-                    .map(|e| e.name.as_str())
-                    .unwrap_or(id);
+                let name = graph.get_entity(id).map(|e| e.name.as_str()).unwrap_or(id);
                 println!("  {}. {} ({} connections)", i + 1, name, count);
             }
         }
@@ -1395,8 +1445,8 @@ fn run_diff(
     languages: Option<Vec<String>>,
 ) -> Result<()> {
     use nao::diff::{
-        compute_diff, verify_git_repo, resolve_git_ref,
-        create_worktree, remove_worktree, analyze_at, render_base_details, write_diff_outputs,
+        analyze_with, build_analysis_config, compute_diff, create_worktree, remove_worktree,
+        render_base_details, resolve_git_ref, rooted_at, verify_git_repo, write_diff_outputs,
     };
 
     let repo_root = path.canonicalize()?;
@@ -1411,19 +1461,36 @@ fn run_diff(
     let base_dir = tmp.join(format!("nao-diff-base-{}", from_sha));
     let head_dir = tmp.join(format!("nao-diff-head-{}", to_sha));
 
+    // One scope for both sides, settled from the working tree. Each
+    // worktree carries the `.nao/settings.json` committed at its own ref,
+    // so building a config per checkout would let a settings change between
+    // the two refs read as every file it excludes being added or removed.
+    let scope = build_analysis_config(&repo_root, include_tests, &languages);
+
     create_worktree(&repo_root, &base_dir, from_ref)?;
-    let (base_graph, base_config) = analyze_at(&base_dir, include_tests, &languages, &format!("base ({})", from_sha))?;
+    let (base_graph, base_config) = analyze_with(
+        rooted_at(&scope, &base_dir),
+        &format!("base ({})", from_sha),
+    )?;
 
     // Create + analyze head worktree.
     if let Err(e) = create_worktree(&repo_root, &head_dir, to_ref) {
         remove_worktree(&repo_root, &base_dir);
         return Err(e);
     }
-    let (head_graph, head_config) = analyze_at(&head_dir, include_tests, &languages, &format!("head ({})", to_sha))?;
+    let (head_graph, head_config) =
+        analyze_with(rooted_at(&scope, &head_dir), &format!("head ({})", to_sha))?;
 
     // Compute diff.
     eprintln!("  Computing structural diff...");
-    let diff = compute_diff(&base_graph, &head_graph, &base_dir, &head_dir, &from_sha, &to_sha);
+    let diff = compute_diff(
+        &base_graph,
+        &head_graph,
+        &base_dir,
+        &head_dir,
+        &from_sha,
+        &to_sha,
+    );
     eprintln!(
         "  Result: {} added, {} removed, {} modified, {} unchanged",
         diff.summary.added, diff.summary.removed, diff.summary.modified, diff.summary.unchanged,

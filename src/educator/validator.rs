@@ -7,8 +7,9 @@
 //! HTTP `/api/educator/diagnostics` endpoint exposes the full issue list.
 
 use super::catalog::{self, AttributeSpec, ConstructKindSpec};
+use super::issues::{LoadIssue, LoadIssueSeverity};
 use super::lessons::Lesson;
-use super::rules::{LoadIssue, LoadIssueSeverity, MatchOp, Rule};
+use super::rules::Rule;
 use std::collections::{HashMap, HashSet};
 
 const ALLOWED_SEVERITIES: &[&str] = &["info", "warning", "error"];
@@ -32,7 +33,13 @@ pub fn validate(
 
     let duplicate_ids: HashSet<String> = id_to_paths
         .iter()
-        .filter_map(|(id, paths)| if paths.len() > 1 { Some(id.clone()) } else { None })
+        .filter_map(|(id, paths)| {
+            if paths.len() > 1 {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
         .collect();
 
     let mut kept: Vec<Rule> = Vec::new();
@@ -76,7 +83,10 @@ fn validate_applies_to(rule: &Rule, errors: &mut Vec<LoadIssue>) {
             rule_id: Some(rule.id.clone()),
             severity: LoadIssueSeverity::Error,
             field: Some("language".to_string()),
-            message: format!("no Educator catalog registered for language `{}`", rule.language),
+            message: format!(
+                "no Educator catalog registered for language `{}`",
+                rule.language
+            ),
             suggestion: None,
         });
         return;
@@ -98,11 +108,15 @@ fn validate_applies_to(rule: &Rule, errors: &mut Vec<LoadIssue>) {
 }
 
 fn validate_match(rule: &Rule, errors: &mut Vec<LoadIssue>) {
-    let Some(predicate) = rule.match_predicate.as_ref() else { return };
+    let Some(predicate) = rule.match_predicate.as_ref() else {
+        return;
+    };
     if predicate.is_empty() {
         return;
     }
-    let Some(specs) = catalog::for_language(&rule.language) else { return };
+    let Some(specs) = catalog::for_language(&rule.language) else {
+        return;
+    };
 
     // Union of attributes across every applies-to kind the rule names.
     // A `match:` key is OK if any of the attached kinds declares it.
@@ -205,7 +219,13 @@ pub fn validate_lessons(
     }
     let duplicate_ids: HashSet<String> = id_to_paths
         .iter()
-        .filter_map(|(id, paths)| if paths.len() > 1 { Some(id.clone()) } else { None })
+        .filter_map(|(id, paths)| {
+            if paths.len() > 1 {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
         .collect();
 
     let mut kept: Vec<Lesson> = Vec::new();
@@ -247,7 +267,10 @@ fn validate_lesson_applies_to(lesson: &Lesson, errors: &mut Vec<LoadIssue>) {
             rule_id: Some(lesson.id.clone()),
             severity: LoadIssueSeverity::Error,
             field: Some("language".to_string()),
-            message: format!("no Educator catalog registered for language `{}`", lesson.language),
+            message: format!(
+                "no Educator catalog registered for language `{}`",
+                lesson.language
+            ),
             suggestion: None,
         });
         return;
@@ -291,7 +314,8 @@ fn validate_lesson_body(lesson: &Lesson, warnings: &mut Vec<LoadIssue>) {
             rule_id: Some(lesson.id.clone()),
             severity: LoadIssueSeverity::Warning,
             field: Some("body".to_string()),
-            message: "lesson body is empty — learners need at least a short explanation".to_string(),
+            message: "lesson body is empty — learners need at least a short explanation"
+                .to_string(),
             suggestion: None,
         });
     }
@@ -314,17 +338,19 @@ fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let (m, n) = (a.len(), b.len());
-    if m == 0 { return n; }
-    if n == 0 { return m; }
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
     let mut prev: Vec<usize> = (0..=n).collect();
     let mut curr = vec![0usize; n + 1];
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }

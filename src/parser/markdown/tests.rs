@@ -83,7 +83,10 @@ fn the_filename_is_kept_so_a_wikilink_can_match_either_name() {
 
 #[test]
 fn the_first_paragraph_becomes_the_summary() {
-    let result = parse("/vault/a.md", "# Title\n\nThe opening line.\n\nA second one.\n");
+    let result = parse(
+        "/vault/a.md",
+        "# Title\n\nThe opening line.\n\nA second one.\n",
+    );
     assert_eq!(
         note(&result).documentation.as_deref(),
         Some("The opening line.")
@@ -123,7 +126,10 @@ fn a_link_is_a_reference_edge() {
     let result = parse("/vault/a.md", "See [B](b.md).\n");
     assert_eq!(result.relationships[0].kind, RelationshipKind::References);
     assert_eq!(
-        result.relationships[0].metadata.get("link").map(String::as_str),
+        result.relationships[0]
+            .metadata
+            .get("link")
+            .map(String::as_str),
         Some("inline")
     );
 }
@@ -133,7 +139,10 @@ fn a_section_link_keeps_the_anchor_and_still_reaches_the_note() {
     let result = parse("/vault/a.md", "See [B](b.md#install).\n");
     assert_eq!(targets(&result), vec!["md::note./vault/b.md"]);
     assert_eq!(
-        result.relationships[0].metadata.get("anchor").map(String::as_str),
+        result.relationships[0]
+            .metadata
+            .get("anchor")
+            .map(String::as_str),
         Some("install")
     );
 }
@@ -183,7 +192,10 @@ fn an_embed_is_marked_as_one() {
     let result = parse("/vault/a.md", "![[Other Note]]\n");
     assert_eq!(targets(&result), vec!["md::wiki.other note"]);
     assert_eq!(
-        result.relationships[0].metadata.get("link").map(String::as_str),
+        result.relationships[0]
+            .metadata
+            .get("link")
+            .map(String::as_str),
         Some("embed")
     );
 }
@@ -212,7 +224,10 @@ fn two_wikilinks_on_one_line_both_count() {
 
 #[test]
 fn a_link_to_source_becomes_a_code_ref_not_an_edge() {
-    let result = parse("/repo/docs/adr/0003.md", "See [the parser](../../src/parser/mod.rs).\n");
+    let result = parse(
+        "/repo/docs/adr/0003.md",
+        "See [the parser](../../src/parser/mod.rs).\n",
+    );
     assert!(result.relationships.is_empty());
     assert_eq!(code_refs(&result), vec!["/repo/src/parser/mod.rs"]);
 }
@@ -336,5 +351,9 @@ fn an_unclosed_bracket_costs_one_link_not_the_file() {
 fn unicode_in_a_title_does_not_panic_the_truncator() {
     let long = "é".repeat(400);
     let result = parse("/vault/a.md", &format!("# T\n\n{}\n", long));
-    assert!(note(&result).documentation.as_deref().unwrap().ends_with('…'));
+    assert!(note(&result)
+        .documentation
+        .as_deref()
+        .unwrap()
+        .ends_with('…'));
 }

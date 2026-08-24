@@ -242,7 +242,9 @@ fn add_container(
     ctx: &mut ExtractCtx<'_>,
     parse: fn(&Node, &str, &Path, Option<&str>, &str) -> Option<CodeEntity>,
 ) {
-    let Some(entity) = parse(node, ctx.source, ctx.path, parent_id, ctx.package) else { return };
+    let Some(entity) = parse(node, ctx.source, ctx.path, parent_id, ctx.package) else {
+        return;
+    };
     let entity_id = entity.id.clone();
     ctx.result.add_entity(entity);
     if let Some(body) = node.child_by_field_name("body") {
@@ -267,11 +269,8 @@ fn handle_field_decl(node: &Node, parent_id: Option<&str>, ctx: &mut ExtractCtx<
     for entity in entities {
         let target_id = entity.id.clone();
         ctx.result.add_entity(entity);
-        let mut rel = Relationship::new(
-            caller_id.to_string(),
-            target_id,
-            RelationshipKind::WritesTo,
-        );
+        let mut rel =
+            Relationship::new(caller_id.to_string(), target_id, RelationshipKind::WritesTo);
         rel.metadata
             .insert("module_state".to_string(), "true".to_string());
         ctx.result.add_relationship(rel);

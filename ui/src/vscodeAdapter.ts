@@ -201,6 +201,10 @@ export function reportDiff(state: {
   /** Reported relationship changes the canvas cannot draw at any rung. */
   undrawableEdges: number;
   dimOpacity: number;
+  /** How loudly the nodes a rung recruited are drawn against the edits it
+   *  grew from (UI-112). Meaningless at the `edits` rung, which recruits
+   *  nothing — the native view hides the control there. */
+  contextOpacity: number;
   computing: boolean;
   error?: string | null;
   hasScope: boolean;

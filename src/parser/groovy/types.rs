@@ -39,19 +39,68 @@ use super::super::language_parser::ParseResult;
 /// signal. The JDK half matches the Java parser's table so the two
 /// languages drop the same names; the tail is Groovy's own vocabulary.
 const STD_TYPES: &[&str] = &[
-    "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte",
-    "Short", "Character", "Object", "Void", "Number", "CharSequence",
-    "StringBuilder", "Comparable", "Runnable", "List", "ArrayList",
-    "LinkedList", "Map", "HashMap", "LinkedHashMap", "TreeMap", "Set",
-    "HashSet", "LinkedHashSet", "TreeSet", "Queue", "Deque", "ArrayDeque",
-    "Collection", "Iterable", "Iterator", "Optional", "Stream",
-    "Exception", "RuntimeException", "Error", "Throwable",
-    "IllegalArgumentException", "IllegalStateException", "IOException",
-    "CompletableFuture", "Future", "LocalDate", "LocalDateTime",
-    "LocalTime", "Instant", "Duration", "BigDecimal", "BigInteger", "UUID",
+    "String",
+    "Integer",
+    "Long",
+    "Double",
+    "Float",
+    "Boolean",
+    "Byte",
+    "Short",
+    "Character",
+    "Object",
+    "Void",
+    "Number",
+    "CharSequence",
+    "StringBuilder",
+    "Comparable",
+    "Runnable",
+    "List",
+    "ArrayList",
+    "LinkedList",
+    "Map",
+    "HashMap",
+    "LinkedHashMap",
+    "TreeMap",
+    "Set",
+    "HashSet",
+    "LinkedHashSet",
+    "TreeSet",
+    "Queue",
+    "Deque",
+    "ArrayDeque",
+    "Collection",
+    "Iterable",
+    "Iterator",
+    "Optional",
+    "Stream",
+    "Exception",
+    "RuntimeException",
+    "Error",
+    "Throwable",
+    "IllegalArgumentException",
+    "IllegalStateException",
+    "IOException",
+    "CompletableFuture",
+    "Future",
+    "LocalDate",
+    "LocalDateTime",
+    "LocalTime",
+    "Instant",
+    "Duration",
+    "BigDecimal",
+    "BigInteger",
+    "UUID",
     // Groovy's own always-imported vocabulary.
-    "GString", "Closure", "Binding", "Script", "Range", "Tuple",
-    "GroovyObject", "GroovyRuntimeException", "MetaClass",
+    "GString",
+    "Closure",
+    "Binding",
+    "Script",
+    "Range",
+    "Tuple",
+    "GroovyObject",
+    "GroovyRuntimeException",
+    "MetaClass",
 ];
 
 /// Drop `@Annotation` names (including dotted `@com.acme.Anno`) so
@@ -132,7 +181,9 @@ pub(super) fn emit_uses_type_edges(result: &mut ParseResult) {
 
     let mut rels: Vec<Relationship> = Vec::new();
     for entity in &result.entities {
-        let Some(mut type_names) = declared_types(entity) else { continue };
+        let Some(mut type_names) = declared_types(entity) else {
+            continue;
+        };
         let owner_name = entity
             .parent_id
             .as_deref()

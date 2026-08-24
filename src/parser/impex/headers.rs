@@ -82,10 +82,7 @@ pub(super) fn parse_header(line: &str) -> Option<ImpexHeader> {
     let (op, target_type, modifiers) = parse_op_target(cells[0].trim())?;
     let class_refs = collect_class_refs(&modifiers);
 
-    let columns: Vec<Column> = cells[1..]
-        .iter()
-        .filter_map(|c| parse_column(c))
-        .collect();
+    let columns: Vec<Column> = cells[1..].iter().filter_map(|c| parse_column(c)).collect();
 
     Some(ImpexHeader {
         op,
@@ -159,11 +156,9 @@ fn looks_like_fqn(value: &str) -> bool {
     let first = parts[0];
     last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && first.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 #[cfg(test)]

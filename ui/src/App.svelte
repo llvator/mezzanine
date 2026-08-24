@@ -24,8 +24,8 @@
     connectLiveReload, liveConnected, liveReloading, liveStatus,
     liveIsBroken, reconnectLiveReload, stopLiveReload,
   } from './stores/liveReload';
-  import { loadDiff, diffActive, diffData, diffLevel, diffChangedEdges, diffDimOpacity } from './stores/diff';
-  import { DIFF_LEVELS, isDiffLevel, type DiffLevel } from './viewmodels/diffLevels';
+  import { loadDiff, diffActive, diffData, diffLevel, diffSeedFacet, diffChangedEdges, diffDimOpacity, diffContextOpacity, CONTEXT_OPACITY_FLOOR } from './stores/diff';
+  import { DIFF_LEVELS, isDiffLevel, SEED_FACETS, type DiffLevel, type DiffSeedFacet } from './viewmodels/diffLevels';
   import { refreshData, refreshing } from './stores/scope';
   import CommitPicker from './components/CommitPicker.svelte';
 
@@ -90,6 +90,17 @@
 
   /** Window width, so the layout can decide whether a column still fits. */
   let winWidth = typeof window !== 'undefined' ? window.innerWidth : 1600;
+
+  /** Measured height of the bottom strip, which grows with the controls the
+   *  diff badge carries and wraps on a narrow window. Anything else floating
+   *  over the canvas bottom lifts by this rather than by a constant, because
+   *  a constant is only right for the strip the day it was written. */
+  let bottomBarHeight = 0;
+  /** Where the overview panel's bottom edge sits: clear of the strip, plus
+   *  the same 20px the strip keeps off the canvas floor and a little air.
+   *  With no strip at all (the VS Code webview) it keeps the constant it had
+   *  before, which clears the build stamp pinned in that corner there. */
+  $: overviewBottom = bottomBarHeight > 0 ? bottomBarHeight + 28 : 60;
 
   // A window can't always hold three columns, and squeezing the canvas past
   // the point where the graph is readable defeats the purpose of having any
@@ -262,6 +273,10 @@
   function showChangesOnly() {
     diffFiltersEnabled.set(true);
     diffLevel.set('edits');
+    // The whole change, not whichever half was last selected: this remedy is
+    // offered to a reader whose canvas is over the draw ceiling, and it has to
+    // land them somewhere they can predict (UI-109).
+    diffSeedFacet.set('all');
   }
 
   /** Stop the ladder filtering at all — the one-click way out of a canvas it
@@ -302,6 +317,42 @@
       + 'wiring between what is shown, changed or not. Use it to see what your '
       + 'change sits next to; expect most of the lines to be untouched.',
   };
+  /* The seed split (UI-109). A second control rather than a fourth rung: the
+     ladder is ordered — each rung adds to the one below — and new code and
+     pre-existing code are siblings, so they have no place on it. It sits to
+     the LEFT of the ladder because that is the order the two apply in: this
+     one chooses the seed, the ladder widens from it. */
+  const FACET_LABEL: Record<DiffSeedFacet, string> = {
+    all: 'All',
+    new: 'New',
+    existing: 'Existing',
+  };
+  const FACET_TIP: Record<DiffSeedFacet, string> = {
+    all:
+      'All — both halves of the change.\n\n'
+      + 'The whole seed, and what the ladder drew before this control '
+      + 'existed.',
+    new:
+      'New — only code that did not exist before.\n\n'
+      + 'Entities the diff reports as added, plus — on a diff of the working '
+      + 'tree — files created since it ran, which the diff never saw.\n\n'
+      + 'Pair it with Neighbourhood to see what the new code plugs into.',
+    existing:
+      'Existing — only code that was already there.\n\n'
+      + 'Entities that existed on the base side and changed in place. '
+      + 'Deletions count as existing: they were there to be deleted.\n\n'
+      + 'This is the half that needs reviewing against what it used to do.',
+  };
+  const CONTEXT_TIP =
+    'Context — how strongly the entities this rung recruited are drawn, '
+    + 'against the edits it grew from.\n\n'
+    + 'Above Edits the ladder draws code you did not touch: the far end of a '
+    + 'changed relationship at Rewiring, everything one hop out at '
+    + 'Neighbourhood. At Neighbourhood that context usually outnumbers the '
+    + 'changes several times over, and at full strength it is drawn exactly '
+    + 'like them.\n\n'
+    + 'This weights the two apart. It cannot remove anything — stepping down '
+    + 'a rung is what does that.';
   const REST_TIP =
     'Rest — how visible the entities the ladder left out stay.\n\n'
     + 'At 0% everything below the current rung is gone from the canvas. Raise '
@@ -691,6 +742,7 @@
               console.log(`[nao] scopeToChangedFiles: ignored ${droppedImpactOnly} impact-only / unchanged entities (not scoped)`);
             }
             diffLevel.set('edits');
+            diffSeedFacet.set('all');
             diffFiltersEnabled.set(true);
             // No `force` needed since UI-061: the diff filters set just
             // above run upstream of the render gate, so they narrow the
@@ -714,6 +766,9 @@
             break;
           case 'setDiffDimOpacity':
             diffDimOpacity.set(Number(value));
+            break;
+          case 'setDiffContextOpacity':
+            diffContextOpacity.set(Math.max(CONTEXT_OPACITY_FLOOR, Number(value)));
             break;
           case 'setDiffFiltersEnabled':
             diffFiltersEnabled.set(!!value);
@@ -807,9 +862,9 @@
       // Broadcast diff state — active flag, refs, summary counts, filter
       // toggles, compute/error status. The native Diff view mirrors this.
       const diffState = svelteDerived(
-        [diffActive, diffData, diffLevel, diffChangedEdges, diffDimOpacity,
+        [diffActive, diffData, diffLevel, diffChangedEdges, diffDimOpacity, diffContextOpacity,
          diffComputing, diffApiError, selectedScopes, diffFiltersEnabled, selectedNode],
-        ([$act, $data, $lvl, $edges, $dim, $comp, $err, $sel, $filtEn, $selNode]) => {
+        ([$act, $data, $lvl, $edges, $dim, $ctx, $comp, $err, $sel, $filtEn, $selNode]) => {
           // Match the filter used by `scopeToChangedFiles` — files with
           // real (core) changes only, not impact-only ripples.
           const changedFiles = $data
@@ -844,6 +899,10 @@
             // so the native view can say so rather than imply full coverage.
             undrawableEdges: $edges.removedCount + $edges.unplaceable,
             dimOpacity: $dim,
+            // The second tier (UI-112): how loudly the rung's recruits are
+            // drawn against the edits. Sent unconditionally — the native view
+            // decides whether the current rung has anything to weight.
+            contextOpacity: $ctx,
             computing: $comp,
             error: $err,
             hasScope: $sel.size > 0,
@@ -1254,14 +1313,24 @@
 
   <GraphView bind:this={graphView}>
     {#if !isVscode()}
-    <div class="stats">
+    <!-- One strip along the bottom of the canvas, not two overlays pinned to
+         opposite corners. Pinned, the left group grew with every control the
+         diff badge gained until it ran under the refresh button and the
+         endpoint chip on the right — a button you cannot click is worse than
+         one that is absent, because the corner still looks operable. As one
+         flex row they push each other instead, and the group wraps upward
+         when the window is too narrow for both. The canvas still gives up no
+         height: the strip floats over it, and `bottomBarHeight` is what the
+         overview panel lifts itself by to stay clear of whatever it grew to. -->
+    <div class="canvas-bottom-bar" data-probe="canvas-bottom-bar" bind:clientHeight={bottomBarHeight}>
+    <div class="stats" data-probe="canvas-stats">
       <!-- Commit picker drives `POST /api/diff`, which serve mode doesn't
            expose. Hidden there rather than offering a button that 404s. -->
       {#if !$serveMode}
         <CommitPicker />
       {/if}
       {#if $diffActive && $diffData}
-        <span class="diff-summary-badge">
+        <span class="diff-summary-badge" data-probe="diff-badge">
           🔀 {$diffData.from_ref}→{$diffData.to_ref}:
           <span style="color:#A5D6A7">+{$diffData.summary.added}</span>
           <span style="color:#EF9A9A">-{$diffData.summary.removed}</span>
@@ -1282,6 +1351,23 @@
             </span>
           {/if}
           <span class="diff-filter-group">
+            <!-- The seed split (UI-109), before the ladder because it applies
+                 before it: this picks which half of the change seeds the
+                 rungs, and every rung then only ever adds to that seed. -->
+            <span class="diff-level diff-facet" role="radiogroup" aria-label="Which changes to start from" data-probe="diff-facet">
+              {#each SEED_FACETS as facet (facet)}
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={$diffSeedFacet === facet}
+                  class="diff-level-rung"
+                  class:active={$diffSeedFacet === facet}
+                  data-probe="diff-facet-{facet}"
+                  title={FACET_TIP[facet]}
+                  on:click={() => diffSeedFacet.set(facet)}
+                >{FACET_LABEL[facet]}</button>
+              {/each}
+            </span>
             <!-- The ladder, narrow → wide (UI-088). A segmented control rather
                  than checkboxes because the rungs are ordered: the reader can
                  see which way each one moves the picture, which two
@@ -1300,6 +1386,19 @@
                 >{LEVEL_LABEL[level]}</button>
               {/each}
             </span>
+            <!-- Only above the narrowest rung: at `edits` every drawn node is
+                 an edit, so the control would have nothing to weight and
+                 would read as a slider that does nothing. -->
+            {#if $diffLevel !== 'edits'}
+              <label class="diff-filter-toggle diff-opacity-control" title={CONTEXT_TIP}>
+                <span class="diff-opacity-name">Context</span>
+                <input type="range" min={CONTEXT_OPACITY_FLOOR * 100} max="100" step="5"
+                  data-probe="diff-context-opacity"
+                  value={$diffContextOpacity * 100}
+                  on:input={(e) => diffContextOpacity.set(Number(e.currentTarget.value) / 100)} />
+                <span class="diff-opacity-label">{Math.round($diffContextOpacity * 100)}%</span>
+              </label>
+            {/if}
             <label class="diff-filter-toggle diff-opacity-control" title={REST_TIP}>
               <span class="diff-opacity-name">Rest</span>
               <input type="range" min="0" max="15" step="1"
@@ -1349,7 +1448,7 @@
          The live toggle needs `/events`, which serve mode has no equivalent
          of (repos are analyzed once, not watched) — so it's hidden there and
          only the manual refresh remains, which works fine. -->
-    <div class="mode-bar-bottom">
+    <div class="mode-bar-bottom" data-probe="mode-bar">
       {#if !$serveMode}
       <button
         type="button"
@@ -1400,6 +1499,7 @@
           ⇄ {endpoint().base.replace(/^https?:\/\//, '')}
         </button>
       {/if}
+    </div>
     </div>
     {/if}
 
@@ -1483,8 +1583,21 @@
                   <button type="button" class="link-btn" on:click={clearDiffFilters}>
                     Clear the diff filters
                   </button>
-                  — nothing in this scope changed{$diffLevel === 'edits' ? ' at the source level' : ''}
+                  — nothing in this scope
+                  {$diffSeedFacet === 'new' ? 'is new' : $diffSeedFacet === 'existing' ? 'existing changed' : 'changed'}{$diffSeedFacet === 'all' && $diffLevel === 'edits' ? ' at the source level' : ''}
                 </li>
+                <!-- The seed split can empty a canvas on its own — a commit
+                     that only adds files has no existing half at all — so the
+                     way out of it has to be offered here, before the ladder
+                     remedy that cannot help while half the change is excluded. -->
+                {#if $diffSeedFacet !== 'all'}
+                  <li>
+                    <button type="button" class="link-btn" on:click={() => diffSeedFacet.set('all')}>
+                      Show both new and existing changes
+                    </button>
+                    — the {$diffSeedFacet} half of this change is empty
+                  </li>
+                {/if}
                 {#if $diffLevel !== 'neighbourhood'}
                   <li>
                     <button type="button" class="link-btn" on:click={() => diffLevel.set('neighbourhood')}>
@@ -1587,7 +1700,7 @@
     <!-- Last in the slot so it paints over the canvas but under the overlay
          cards, which are full-cover and answer a more urgent question than
          "where am I" when they are up. -->
-    <OverviewPanel {graphView} />
+    <OverviewPanel {graphView} bottomInset={overviewBottom} />
   </GraphView>
   </div>
   {/if}
@@ -1780,10 +1893,31 @@
     min-height: 0;
   }
 
-  .stats {
+  /* The floor of the canvas, spanned once. Its two groups are laid out
+     against each other, so neither can be drawn over by the other however
+     wide the diff badge grows. Empty in the middle by design — pointer
+     events pass through to the graph and only the groups take clicks. */
+  .canvas-bottom-bar {
     position: absolute;
-    bottom: 20px;
     left: 20px;
+    right: 20px;
+    bottom: 20px;
+    z-index: 6;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+    pointer-events: none;
+  }
+
+  .canvas-bottom-bar > * { pointer-events: auto; }
+
+  .stats {
+    /* Wraps rather than pushes: on a narrow window the badge stacks upward
+       into canvas the graph can spare, instead of shoving the mode bar off
+       the right edge. */
+    flex: 0 1 auto;
+    min-width: 0;
     background: color-mix(in srgb, var(--bg-surface) 90%, transparent);
     padding: 10px 15px;
     border-radius: 4px;
@@ -1791,18 +1925,26 @@
     color: var(--text-muted);
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 10px;
   }
 
   .diff-summary-badge {
     font-size: 0.75rem;
-    padding: 2px 8px;
+    padding: 4px 8px;
     border-radius: 10px;
     background: rgba(255, 167, 38, 0.1);
     border: 1px solid rgba(255, 167, 38, 0.3);
     display: inline-flex;
     align-items: center;
+    /* Wrapping is what keeps the badge inside the strip. Without it the
+       badge overflowed the box the strip had shrunk it to and went on
+       reaching right, back under the mode bar — measurably clear, visibly
+       on top of it. Every group inside it wraps for the same reason. */
+    flex-wrap: wrap;
+    max-width: 100%;
     gap: 8px;
+    row-gap: 6px;
   }
 
   .diff-edge-counts {
@@ -1817,7 +1959,9 @@
   .diff-filter-group {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 6px;
+    row-gap: 6px;
     padding-left: 8px;
     border-left: 1px solid rgba(255, 167, 38, 0.3);
   }
@@ -1842,6 +1986,18 @@
     border: 1px solid rgba(255, 167, 38, 0.35);
     border-radius: 4px;
     overflow: hidden;
+  }
+
+  /* The seed split is the same shape as the ladder at lower contrast (UI-109).
+     Two identically-drawn segmented controls side by side read as one control
+     with six buttons — which would say the six are alternatives, and three of
+     them are not. Its selected rung still lights up like a rung: a facet that
+     is filtering has to be as visible as the rung it seeds. */
+  .diff-facet {
+    border-color: rgba(255, 167, 38, 0.18);
+  }
+  .diff-facet .diff-level-rung {
+    border-left-color: rgba(255, 167, 38, 0.15);
   }
 
   .diff-level-rung {
@@ -1929,12 +2085,15 @@
     text-align: right;
   }
 
+  /* Never squeezed: the live indicator, the refresh button and the endpoint
+     chip are the controls that say whether what is on screen is current, and
+     a diff badge is not worth losing them to. */
   .mode-bar-bottom {
-    position: absolute;
-    bottom: 20px;
-    right: 20px;
+    flex: none;
     display: flex;
     align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 6px;
   }
 

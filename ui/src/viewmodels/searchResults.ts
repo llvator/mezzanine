@@ -33,6 +33,7 @@ import {
   showGhostNodes,
   showBuiltinGhosts,
   showTemplateVars,
+  structureOnly,
 } from '../stores/graph';
 import { fullGraphDataStore, addScopes, autoLevel } from '../stores/scope';
 import {
@@ -105,12 +106,13 @@ export const searchResults: Readable<SearchResult[]> = derived(
     searchEntityKinds,
     splitViewOpen,
     crossFilterPaths,
+    structureOnly,
   ],
   ([
     $inScope, $full, $raw, $plan, $selected,
     $kinds, $langs, $files, $ghosts, $builtinGhosts, $templateVars,
     $term, $inNames, $inFiles, $inFolders, $searchKinds,
-    $splitView, $crossPaths,
+    $splitView, $crossPaths, $structureOnly,
   ]) => {
     const s = $term.trim();
     if (!s) return [] as SearchResult[];
@@ -124,6 +126,10 @@ export const searchResults: Readable<SearchResult[]> = derived(
       showTemplateVars: $templateVars,
       splitView: $splitView,
       crossFilterPaths: $crossPaths,
+      structureOnly: $structureOnly,
+      // Same exemption `displayPlan` applies: the selection's own body is on
+      // screen, so a hit inside it is not blocked and must not be badged.
+      exemptBody: $selected?.original_id ?? null,
     };
 
     // The overflow card replaces the canvas wholesale, and every visibility
@@ -299,6 +305,15 @@ export function unblock(reason: BlockReason): boolean {
       const previous = get(selectedNode);
       selectedNode.set(null);
       record('selection cleared', () => selectedNode.set(previous));
+      return true;
+    }
+    case 'internals': {
+      // The whole filter comes off, not one entity's body. Opening a single
+      // body is what *selecting* it does, and doing that from a search row
+      // would move the reader's selection to answer a question about
+      // visibility — two gestures wearing one button. UI-113.
+      structureOnly.set(false);
+      record('function internals shown', () => structureOnly.set(true));
       return true;
     }
     case 'cross-filter': {

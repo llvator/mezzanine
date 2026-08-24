@@ -95,9 +95,7 @@ pub(super) fn parse_script_line(line: &str) -> Option<ScriptLine<'_>> {
 /// * `"#% expr"` (no trailing `;`, rare but seen)
 fn strip_decoration(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    let inner = if let Some(stripped) = trimmed
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
+    let inner = if let Some(stripped) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
     {
         stripped
     } else {
@@ -126,7 +124,9 @@ mod tests {
 
     #[test]
     fn if_start() {
-        let line = parse_script_line("#% if: platformInfoService.isExtensionAvailable(\"catalogtest\")").unwrap();
+        let line =
+            parse_script_line("#% if: platformInfoService.isExtensionAvailable(\"catalogtest\")")
+                .unwrap();
         assert_eq!(
             line,
             ScriptLine::IfStart("platformInfoService.isExtensionAvailable(\"catalogtest\")")

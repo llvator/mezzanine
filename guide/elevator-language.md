@@ -430,6 +430,7 @@ elevator ./my-spec --focus fu.protocol.creation # context bundle for one entity
 elevator ./my-spec --check                      # run the spec checker (no artifact)
 elevator ./my-spec --code-map                   # inverted index: code paths → entities
 elevator ./my-spec --drift --code-root ../repo  # spec-vs-code drift: cr paths + identifier anchors
+elevator ./my-spec --drift --fix                # rewrite the cr paths git can prove moved
 elevator ./my-spec --list                       # enumerate every entity, grouped by kind
 elevator ./my-spec --stats                      # compact count table per kind
 elevator ./my-spec --extract f.protocol         # carve one slice back out as `.elv` source
@@ -495,7 +496,42 @@ verifies the two anchors mechanically:
 ```bash
 elevator ./my-spec --drift                        # specs co-located with code
 elevator ./my-spec --drift --code-root ~/repo     # specs in a separate docs repo
+elevator ./my-spec --drift --fix                  # apply the moves git recorded
 ```
+
+#### `--fix` — apply the moves the repository already recorded
+
+Most dead `cr:` paths died the same way: someone moved the file. Git
+recorded that, so re-typing the new path by hand is work the repository
+can do. `--drift --fix` rewrites those paths in place.
+
+A path is rewritten only when **both** gates pass:
+
+1. `git log -M --diff-filter=R` names the commit in which the old path
+   became a new one, and
+2. the new path exists on disk — the same check `--drift` runs, so a
+   repair can never introduce the drift it was meant to remove.
+
+Chains are followed (`A → B → C` rewrites straight to `C`). Directory
+refs — the usual shape — are fixed only when every file that left the
+old directory in that commit landed under one common new directory; a
+directory whose contents scattered is reported, not rewritten. The edit
+is textual and bounded by the entity's own definition, so comments,
+blank lines and the other paths on a `cr: "a", "b"` line are untouched.
+
+Everything else is left for a human, and that is deliberate. A `cr:`
+is a declaration, not a derivation; approximate matching would make the
+anchor a guess and there would be nothing left to trust. Where a dead
+file path has exactly one same-named file left in the tree, the report
+names it as a **candidate** — never applied, never counted as repaired,
+and not enough to change the exit code. The identifier hints have no
+mechanical fix at all: rewriting a `d:` means rewriting prose.
+
+Without `--fix`, the report names each rename it found and the commit it
+came from, so you can see exactly what would change before it does.
+`--fix` writes `.elv` files under the spec path only; the code root is
+read for evidence and never touched. Outside a git repository it
+degrades to the plain report with a note.
 
 `--code-root` is the directory `cr:` paths are relative to; it defaults
 to the spec path. Grounding scans file *text*, not the parsed graph, so

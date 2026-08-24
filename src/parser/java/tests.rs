@@ -1,7 +1,7 @@
 //! Integration tests for the Java parser. Currently focused on the
 //! per-callable complexity metrics — wires `compute_complexity` through
 //! the full parser flow so the assertions cover both the algorithm and
-//! the [`callables::populate_body_metrics`] glue.
+//! the `declarations::callables::populate_body_metrics` glue.
 
 use super::JavaParser;
 use crate::models::{CodeEntity, EntityKind};
@@ -236,7 +236,10 @@ fn field_types_produce_uses_type_edges() {
         "{edges:?}"
     );
     // Primitives and std generics carry no signal.
-    assert!(!edges.iter().any(|(_, t)| t == "Map" || t == "String"), "{edges:?}");
+    assert!(
+        !edges.iter().any(|(_, t)| t == "Map" || t == "String"),
+        "{edges:?}"
+    );
 }
 
 #[test]
@@ -272,8 +275,14 @@ fn annotations_never_become_type_targets() {
     for anno in ["Autowired", "Transactional", "Valid"] {
         assert!(!edges.iter().any(|(_, t)| t == anno), "{edges:?}");
     }
-    assert!(edges.contains(&("handle".into(), "Order".into())), "{edges:?}");
-    assert!(edges.contains(&("handle".into(), "Receipt".into())), "{edges:?}");
+    assert!(
+        edges.contains(&("handle".into(), "Order".into())),
+        "{edges:?}"
+    );
+    assert!(
+        edges.contains(&("handle".into(), "Receipt".into())),
+        "{edges:?}"
+    );
     assert!(
         edges.contains(&("repository".into(), "OrderRepository".into())),
         "{edges:?}"
@@ -318,7 +327,10 @@ fn recursive_self_mentions_are_skipped() {
     // The field's own container type carries no signal; the method's
     // name differs from `Node`, so its signature edges stay (parity
     // with the Rust post-pass, which only skips name-identical types).
-    assert!(!edges.contains(&("next".into(), "Node".into())), "{edges:?}");
+    assert!(
+        !edges.contains(&("next".into(), "Node".into())),
+        "{edges:?}"
+    );
     assert!(edges.contains(&("find".into(), "Node".into())), "{edges:?}");
 }
 
