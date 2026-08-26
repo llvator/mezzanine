@@ -161,7 +161,7 @@
     an absolute path when the spec sits outside it. Set it and only `.elv`
     files under that folder are the spec; leave it empty and every `.elv` in
     the tree is. Applies to this session; the durable answer is
-    <code>spec_dir</code> in <code>.nao/settings.json</code>.
+    <code>spec_dir</code> in <code>.mezz/settings.json</code>.
   </p>
 
   <div class="actions">
@@ -202,7 +202,7 @@
         on:click={saveScopeAsRepoDefault}
         title={$analysisScopeDirty
           ? 'Apply the staged scope first — this saves what is currently drawn'
-          : "Write this scope into .nao/settings.json so it survives a restart"}
+          : "Write this scope into .mezz/settings.json so it survives a restart"}
       >
         {#if $analysisScopeSaving}
           Saving…

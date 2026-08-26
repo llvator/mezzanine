@@ -132,9 +132,9 @@ export function shapeResolvers(picture: FolderPicture): { grainOf: GrainOf; scop
   return {
     grainOf: (node: D3Node): GraphLevel => {
       const child = node.file_path ? childHolding(folder, node.file_path) : null;
-      // A subfolder draws as one circle, so its files are at module grain;
+      // A subfolder draws as one circle, so its files are at folder grain;
       // a file directly inside the folder is its own circle.
-      if (child !== null) return kindOf.get(child) === 'folder' ? 'module' : 'file';
+      if (child !== null) return kindOf.get(child) === 'folder' ? 'folder' : 'file';
       return 'file';
     },
     scopeOf: (node: D3Node): string | null => {

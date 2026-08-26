@@ -15,6 +15,7 @@ pub use folder_picture::{
 };
 pub use relationship::{ImportSite, Precision, Relationship, RelationshipKind};
 pub use scope_metrics::{
-    FileMetrics, FolderShape, ModuleMetrics, ScopeMetrics, ShapeBlocker, ShapePattern,
+    FileMetrics, FolderMetrics, FolderShape, ScopeMetrics, ShapeBlocker, ShapePattern,
+    ShapeTerms, WIRING_FILES,
 };
 pub use thresholds::Thresholds;

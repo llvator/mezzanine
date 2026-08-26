@@ -13,7 +13,7 @@ struct TmpDir(std::path::PathBuf);
 impl TmpDir {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "nao-edu-test-{}-{}-{}",
+            "mezz-edu-test-{}-{}-{}",
             name,
             std::process::id(),
             // Nanosecond timestamp keeps parallel test invocations from colliding.
@@ -1821,7 +1821,7 @@ fn java_catalog_on_disk_matches_registry() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content/java/construct-kinds.md");
     let actual = fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "could not read {}: {} — run `nao construct-kinds java`",
+            "could not read {}: {} — run `mezz construct-kinds java`",
             path.display(),
             e
         )
@@ -1829,7 +1829,7 @@ fn java_catalog_on_disk_matches_registry() {
     assert_eq!(
         actual,
         expected,
-        "{} is out of date — run `nao construct-kinds java` to regenerate",
+        "{} is out of date — run `mezz construct-kinds java` to regenerate",
         path.display(),
     );
 }
@@ -1844,7 +1844,7 @@ fn java_index_on_disk_matches_renderer() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content/java/INDEX.md");
     let actual = fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "could not read {}: {} — run `nao educator-index java`",
+            "could not read {}: {} — run `mezz educator-index java`",
             path.display(),
             e
         )
@@ -1852,7 +1852,7 @@ fn java_index_on_disk_matches_renderer() {
     assert_eq!(
         actual,
         expected,
-        "{} is out of date — run `nao educator-index java` to regenerate",
+        "{} is out of date — run `mezz educator-index java` to regenerate",
         path.display(),
     );
 }

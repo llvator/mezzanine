@@ -61,7 +61,7 @@ test('stroke width still ranks weights, within a range an arrow can sit on', () 
 });
 
 test('the heaviest module edges stay thinner than the arrow they carry', () => {
-  // 377 is the top merged weight in this repo at Module level; the old ramp
+  // 377 is the top merged weight in this repo at Folder level; the old ramp
   // put it at 6 px, and with `markerUnits="strokeWidth"` that alone made the
   // head 36 px — larger than the biggest module circle's radius.
   assert.ok(

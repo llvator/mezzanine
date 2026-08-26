@@ -39,6 +39,90 @@ pub(super) fn extract_file(root: &Node, path: &Path, source: &str, result: &mut 
         result,
     };
     extract_entities(*root, None, None, &mut ctx);
+    module_scope(root, &mut ctx);
+}
+
+/// Give the file's top-level statements somewhere to hang their calls
+/// (TS-008).
+///
+/// `export const x = f(…)` has a binding to own what it calls (TS-007). A
+/// statement written straight into the module has none:
+///
+/// ```ts
+/// subject.subscribe((current) => { void ensureDetailsLoaded().then(…); });
+/// ```
+///
+/// Nothing covers that call, so no edge was produced and the file read as
+/// depending on nothing. In a store or a side-effecting entry module that is
+/// most of the file.
+///
+/// The owner is a **`Module`**, deliberately not a `File`. A `File` entity
+/// would be picked up by `file_path_to_id`, which is what decides whether
+/// `resolve_imports` emits an `Imports` edge — so it would mint an edge per
+/// resolvable import and take `import_coverage` to ~100% while the calls this
+/// exists to capture were still missing. A signal that goes quiet without the
+/// problem being fixed is worse than no signal (AN-030).
+///
+/// Named with its extension — `description.ts`, not `description` — because
+/// every entity name enters the resolver's `name_to_id`, and a bare stem is a
+/// call target a stranger can bind to. That is AN-029 exactly, and a name no
+/// callee expression can spell cannot repeat it.
+///
+/// Created only when there is something to own, so a file of pure
+/// declarations gains nothing.
+fn module_scope(root: &Node, ctx: &mut ExtractCtx<'_>) {
+    let statements: Vec<Node> = top_level_statements(root);
+    if statements.is_empty() {
+        return;
+    }
+    let name = ctx
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "module".to_string());
+    let entity = CodeEntity::new(
+        &name,
+        crate::models::EntityKind::Module,
+        ctx.path,
+        crate::parser::language_parser::node_to_span(root),
+    );
+    let id = entity.id.clone();
+    ctx.result.add_entity(entity);
+    for statement in statements {
+        super::bodies::calls::extract_body_calls(&statement, &id, &name, None, None, ctx);
+    }
+}
+
+/// The file's own statements: everything at module scope that is not a
+/// declaration, an import or an export.
+///
+/// Declarations are excluded because they already own what they contain —
+/// walking them here would attribute a function's calls to the module as well
+/// as to the function, and double every edge they hold.
+fn top_level_statements<'a>(root: &Node<'a>) -> Vec<Node<'a>> {
+    let mut cursor = root.walk();
+    root.children(&mut cursor)
+        .filter(|child| !is_declaration(child.kind()))
+        .collect()
+}
+
+/// Whether a node at module scope already has an owner of its own.
+fn is_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "lexical_declaration"
+            | "variable_declaration"
+            | "export_statement"
+            | "import_statement"
+            | "comment"
+    )
 }
 
 /// Walk a node's children and dispatch each to the appropriate extractor.

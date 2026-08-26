@@ -241,7 +241,7 @@ pub(super) fn annotations(anchor: &Node, source: &str) -> Vec<String> {
 /// A bodyless declaration — abstract, external, or an interface member —
 /// scores `cyclomatic = 1` and zero nesting: it has one straight-through
 /// path by virtue of existing as a signature. Leaving the metrics unset
-/// instead would drop the entity out of `nao quality` entirely.
+/// instead would drop the entity out of `mezz quality` entirely.
 fn populate_body_metrics(callable: &Callable<'_>, entity: &mut CodeEntity) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
     entity.metrics.param_count = Some(entity.parameters.len() as u32);

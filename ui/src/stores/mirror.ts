@@ -39,7 +39,7 @@ import {
 } from '../viewmodels/mirror';
 
 /** Whether this window is publishing and listening. */
-export const mirrorOn = persistedFlag('nao-mirror-on', false);
+export const mirrorOn = persistedFlag('mezz-mirror-on', false);
 
 /** How many other windows are on the channel. Zero with the mode on is the
  *  failure worth seeing — a mirror nobody is on the other end of. */

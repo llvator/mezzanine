@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * What `.nao/settings.json` resolved to, and where each value came from.
+   * What `.mezz/settings.json` resolved to, and where each value came from.
    *
    * Read-only on purpose. The three tiers are not decoration — they are what
    * decides whether a key can be edited from a browser at all:
@@ -37,7 +37,7 @@
 <div class="setting-section">
   <h2>Settings file</h2>
   <p class="section-desc">
-    What nao resolved before drawing anything, and which of the four sources
+    What mezz resolved before drawing anything, and which of the four sources
     decided each value. Precedence runs command line → environment → this repo
     → your settings → default; the first one that says something wins.
   </p>
@@ -58,7 +58,7 @@
         <div class="file-row">
           <span class="file-label">This repo</span>
           <span class="absent">
-            not read — a repo submitted to <code>nao serve</code> arrived from a
+            not read — a repo submitted to <code>mezz serve</code> arrived from a
             URL someone pasted, so it does not get to configure this server.
           </span>
         </div>

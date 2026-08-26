@@ -30,7 +30,7 @@
 //!
 //! The file is `slice.rs` rather than `spec_slice.rs` on purpose:
 //! `is_test_path` classifies any path containing `spec` as test code,
-//! so the obvious name would drop this module out of nao's own graph —
+//! so the obvious name would drop this module out of mezz's own graph —
 //! and out of the complexity gate and `dead_code` with it.
 
 use std::collections::BTreeSet;

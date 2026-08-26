@@ -25,7 +25,7 @@ import type { GraphLevel, LevelOverrides } from '../types/graph';
 import type { ScopeRule } from '../utils/scopeRules';
 
 /** The captured picture. Plain JSON — this is what lands in
- *  `.nao/views.json`, so every field has to survive a round trip through a
+ *  `.mezz/views.json`, so every field has to survive a round trip through a
  *  file a human may have edited. */
 export interface ViewState {
   /** ADR 0009 rule list — the visual scope. */
@@ -65,7 +65,7 @@ export interface ViewState {
   searchHides: boolean;
 }
 
-/** One entry in `.nao/views.json`. Mirrors the server's typed envelope. */
+/** One entry in `.mezz/views.json`. Mirrors the server's typed envelope. */
 export interface SavedView {
   id: string;
   name: string;
@@ -75,7 +75,29 @@ export interface SavedView {
   state: ViewState;
 }
 
-const LEVELS: GraphLevel[] = ['entity', 'file', 'module'];
+const LEVELS: GraphLevel[] = ['entity', 'file', 'folder'];
+
+/**
+ * Levels as they were spelled before the coarse grain was renamed from
+ * `module` to `folder`, mapped to what they are called now.
+ *
+ * `.mezz/views.json` outlives the build that wrote it — that is the whole
+ * point of a saved view — so a reader who upgrades finds every view they
+ * saved at the coarse level holding a string this build no longer knows.
+ * Without this they would not fail loudly: `normalizeState` is total and
+ * would fall back to `'entity'`, quietly reopening a folder-level view as
+ * thousands of circles. Read-only and one-way; views are re-saved in the
+ * new spelling, and a new one is never written in the old.
+ */
+const LEGACY_LEVELS: Record<string, GraphLevel> = { module: 'folder' };
+
+/** The stored `level` string as a level this build understands, or `null`
+ *  when it is neither a current spelling nor a known legacy one. */
+function level(v: unknown): GraphLevel | null {
+  if (typeof v !== 'string') return null;
+  if (LEVELS.includes(v as GraphLevel)) return v as GraphLevel;
+  return LEGACY_LEVELS[v] ?? null;
+}
 
 /** A view of nothing in particular — the shape every field falls back to
  *  when a stored view doesn't mention it. Never restored as-is; it exists so
@@ -161,19 +183,16 @@ function overrides(v: unknown): Record<number, LevelOverrides> {
 /**
  * Turn anything claiming to be a view state into one.
  *
- * Total by construction: `.nao/views.json` is a file a human can open and
+ * Total by construction: `.mezz/views.json` is a file a human can open and
  * edit, and a missing or mistyped field has to degrade to a default rather
  * than throw somewhere deep in a restore that has already half-run.
  */
 export function normalizeState(raw: unknown): ViewState {
   const base = emptyState();
   if (!isRecord(raw)) return base;
-  const level = raw.level;
   return {
     scope: rules(raw.scope),
-    level: typeof level === 'string' && LEVELS.includes(level as GraphLevel)
-      ? (level as GraphLevel)
-      : base.level,
+    level: level(raw.level) ?? base.level,
     autoLevel: bool(raw.autoLevel, base.autoLevel),
     // A hand-edited `''` is not a focus on the repo root, it is an empty
     // string someone left behind — and as a ring focus the two are the
@@ -336,7 +355,7 @@ export function stateSummary(state: ViewState): string {
   else parts.push(`${includes.length} paths`);
   // With a focus the level names only the OUTER grain, so printing it alone
   // would describe a picture the view does not hold — the row would read
-  // `module` for a view whose whole point is the entities in the middle.
+  // `folder` for a view whose whole point is the entities in the middle.
   parts.push(state.autoLevel ? `${state.level} (auto)` : state.level);
   if (state.ringFocus !== null) parts.push(`focus ${state.ringFocus} +${state.ringReach}`);
   if (state.hiddenFiles.length) parts.push(`${state.hiddenFiles.length} files hidden`);

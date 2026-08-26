@@ -167,15 +167,29 @@ export interface DiffState {
    *  filters behave (non-matching nodes get hidden rather than dimmed). */
   hasSelection: boolean;
 }
+/**
+ * The branch label the webview computed, or `null` for "say nothing" — a root
+ * that is not a checkout, or an engine too old to answer (UI-114).
+ *
+ * The finished strings rather than the server's answer, so the sidebar and
+ * the standalone canvas chip cannot word the same state differently.
+ */
+export interface BranchLabel {
+  text: string;
+  title: string;
+  detached: boolean;
+}
+
 type DiffHandler = (state: DiffState) => void;
+type BranchHandler = (label: BranchLabel | null) => void;
 type ScopesHandler = (paths: string[]) => void;
 
 /**
  * Manages the Webview panel that hosts the Svelte visualization UI.
  *
  * The webview loads the same Svelte app built by Vite, but with a small
- * adapter injected via window.__NAO_VSCODE__ that tells the app to
- * route API calls to the local nao server and enables go-to-definition.
+ * adapter injected via window.__MEZZ_VSCODE__ that tells the app to
+ * route API calls to the local mezz server and enables go-to-definition.
  */
 export class VisualizerPanel {
   static currentPanel: VisualizerPanel | undefined;
@@ -192,7 +206,9 @@ export class VisualizerPanel {
   private static levelFilterHandlers: LevelFilterHandler[] = [];
   private static levelFilterDisposable: vscode.Disposable | undefined;
   private static diffHandlers: DiffHandler[] = [];
+  private static branchHandlers: BranchHandler[] = [];
   private static diffDisposable: vscode.Disposable | undefined;
+  private static branchDisposable: vscode.Disposable | undefined;
   private static scopesHandlers: ScopesHandler[] = [];
   private static scopesDisposable: vscode.Disposable | undefined;
   private static analysisScopesHandlers: ScopesHandler[] = [];
@@ -262,8 +278,8 @@ export class VisualizerPanel {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      'naoVisualizer',
-      'Nao — Code Visualizer',
+      'mezzVisualizer',
+      'Mezzanine — Code Visualizer',
       column,
       {
         enableScripts: true,
@@ -366,6 +382,18 @@ export class VisualizerPanel {
       };
     }
     return VisualizerPanel.diffDisposable;
+  }
+
+  static onBranchChanged(handler: BranchHandler): vscode.Disposable {
+    VisualizerPanel.branchHandlers.push(handler);
+    if (!VisualizerPanel.branchDisposable) {
+      VisualizerPanel.branchDisposable = {
+        dispose: () => {
+          VisualizerPanel.branchHandlers = [];
+        },
+      };
+    }
+    return VisualizerPanel.branchDisposable;
   }
 
   static onScopesChanged(handler: ScopesHandler): vscode.Disposable {
@@ -521,6 +549,15 @@ export class VisualizerPanel {
         }
         break;
       }
+      case 'branchChanged': {
+        // `null` is a value here, not a missing one: it is how the webview
+        // says there is no branch to name.
+        const label = (msg.label as BranchLabel | null) ?? null;
+        for (const handler of VisualizerPanel.branchHandlers) {
+          handler(label);
+        }
+        break;
+      }
       case 'scopesChanged': {
         const paths = (msg.paths as string[]) ?? [];
         for (const handler of VisualizerPanel.scopesHandlers) {
@@ -552,7 +589,7 @@ export class VisualizerPanel {
    * Build the HTML for the webview.
    *
    * Strategy: if a pre-built webview-dist/ exists (from `npm run build:webview`),
-   * load it. Otherwise, fall back to an iframe pointing at the nao server,
+   * load it. Otherwise, fall back to an iframe pointing at the mezz server,
    * which serves the UI directly (works during development).
    */
   private getHtml(): string {
@@ -563,7 +600,7 @@ export class VisualizerPanel {
       return this.getBuiltHtml(indexPath, webviewDistPath);
     }
 
-    // Fallback: iframe to the running nao server
+    // Fallback: iframe to the running mezz server
     return this.getIframeHtml();
   }
 
@@ -593,7 +630,7 @@ export class VisualizerPanel {
   }
 
   /**
-   * Fallback: render the UI in an iframe pointing at the nao server.
+   * Fallback: render the UI in an iframe pointing at the mezz server.
    * This works during development without building the webview.
    */
   private getIframeHtml(): string {
@@ -609,10 +646,10 @@ export class VisualizerPanel {
   </style>
 </head>
 <body>
-  <iframe id="nao-frame" src="${serverUrl}"></iframe>
+  <iframe id="mezz-frame" src="${serverUrl}"></iframe>
   <script>
     const vscode = acquireVsCodeApi();
-    const frame = document.getElementById('nao-frame');
+    const frame = document.getElementById('mezz-frame');
 
     // Forward messages from the iframe to the extension
     window.addEventListener('message', (e) => {
@@ -634,7 +671,7 @@ export class VisualizerPanel {
 
   /**
    * Adapter script injected into the webview HTML.
-   * Sets up window.__NAO_VSCODE__ so the Svelte app knows it's inside VS Code.
+   * Sets up window.__MEZZ_VSCODE__ so the Svelte app knows it's inside VS Code.
    */
   private getAdapterScript(): string {
     return /* html */ `<script>
@@ -642,8 +679,8 @@ export class VisualizerPanel {
   const __vscode = acquireVsCodeApi();
 
   // Configuration object that the Svelte app reads
-  window.__NAO_VSCODE__ = {
-    /** Base URL for all API calls (points to the nao server) */
+  window.__MEZZ_VSCODE__ = {
+    /** Base URL for all API calls (points to the mezz server) */
     apiBase: 'http://localhost:${this.serverPort}',
 
     /** Send a go-to-definition request to the extension host */
@@ -668,18 +705,18 @@ export class VisualizerPanel {
       if (msg.type === 'drillIn') {
         console.log('[drill] webview-bridge received drillIn message', msg);
       }
-      window.dispatchEvent(new CustomEvent('nao:' + msg.type, { detail: msg }));
+      window.dispatchEvent(new CustomEvent('mezz:' + msg.type, { detail: msg }));
       if (msg.type === 'focusCursor') {
-        console.log('[cursor-sync/webview-bridge] dispatched CustomEvent nao:focusCursor');
+        console.log('[cursor-sync/webview-bridge] dispatched CustomEvent mezz:focusCursor');
       }
       if (msg.type === 'drillIn') {
-        console.log('[drill] webview-bridge dispatched CustomEvent nao:drillIn');
+        console.log('[drill] webview-bridge dispatched CustomEvent mezz:drillIn');
       }
     }
   });
 
   // The Svelte app signals ready itself (after onMount attaches listeners)
-  // by calling window.__NAO_VSCODE__.postMessage({ type: 'ready' }).
+  // by calling window.__MEZZ_VSCODE__.postMessage({ type: 'ready' }).
 </script>`;
   }
 }

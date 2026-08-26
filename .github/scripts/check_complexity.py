@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare nao analysis output between the PR's base and head.
+"""Compare mezz analysis output between the PR's base and head.
 
 Fails (exit 1) if either:
   - A new function (not in baseline) exceeds the complexity ceiling.
@@ -9,7 +9,7 @@ Fails (exit 1) if either:
 Usage:
     check_complexity.py BASELINE.json CURRENT.json
 
-Both inputs are expected to be the JSON output of `nao analyze -f json`.
+Both inputs are expected to be the JSON output of `mezz analyze -f json`.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def normalize_path(p: str) -> str:
 
 
 def load(path: str) -> dict[str, dict[str, int]]:
-    """Read a nao JSON dump → {key: {cyclo, cog, nest}}."""
+    """Read a mezz JSON dump → {key: {cyclo, cog, nest}}."""
     data = json.loads(Path(path).read_text())
     out: dict[str, dict[str, int]] = {}
     for entity in data.get("entities", []):

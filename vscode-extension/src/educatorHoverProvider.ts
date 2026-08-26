@@ -12,7 +12,7 @@ import {
  *
  * Calls `GET /api/educator/position`, partitions the response into Specific
  * (matched predicates) and General (attached without predicate) buckets, and
- * renders a markdown hover under a `### Nao Educator` header.
+ * renders a markdown hover under a `### Mezzanine Educator` header.
  *
  * Returns `undefined` (no contribution) when both buckets are empty, when the
  * setting is disabled, when there is no workspace, or when the server is not
@@ -29,7 +29,7 @@ export class EducatorHoverProvider implements vscode.HoverProvider {
     position: vscode.Position,
     token: vscode.CancellationToken
   ): Promise<vscode.Hover | undefined> {
-    const config = vscode.workspace.getConfiguration('nao');
+    const config = vscode.workspace.getConfiguration('mezz');
     if (!config.get<boolean>('educator.hoverEnabled', true)) {
       return undefined;
     }
@@ -62,7 +62,7 @@ export class EducatorHoverProvider implements vscode.HoverProvider {
 
 function renderHover(response: PositionResponse): string {
   const lines: string[] = [];
-  lines.push('### Nao Educator');
+  lines.push('### Mezzanine Educator');
 
   if (response.specific.length > 0) {
     lines.push('');

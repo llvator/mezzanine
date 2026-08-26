@@ -86,37 +86,37 @@ export function persistedFlag(key: string, fallback: boolean): Writable<boolean>
  * window whose whole job is the graph. `sessionStorage` is scoped to the tab
  * and survives its reloads, which is exactly the reach this switch wants.
  */
-export const canvasPaneOpen = persistedIn('session', 'nao-canvas-pane-open', true, (v) => v === 'true');
+export const canvasPaneOpen = persistedIn('session', 'mezz-canvas-pane-open', true, (v) => v === 'true');
 
 /** Whether the Details column is expanded. Default open: it is where a click
  *  on a node lands, and one click hides it. */
-export const detailsPaneOpen = persisted('nao-details-pane-open', true, (v) => v === 'true');
+export const detailsPaneOpen = persisted('mezz-details-pane-open', true, (v) => v === 'true');
 
 /** Whether the left column is expanded. It was a plain `let` in App until the
  *  shortcut layer needed to open it from a keystroke (`0`), which is a
  *  decision taken outside the component that renders it. */
-export const sidebarPaneOpen = persisted('nao-sidebar-pane-open', true, (v) => v === 'true');
+export const sidebarPaneOpen = persisted('mezz-sidebar-pane-open', true, (v) => v === 'true');
 
 /** Which of the sidebar's three tabs is showing. Same move, same reason: `f`,
  *  `q` and `s` switch tabs from outside `Sidebar.svelte`. */
 export type SidebarTab = 'filters' | 'quality' | 'settings';
 const SIDEBAR_TABS: SidebarTab[] = ['filters', 'quality', 'settings'];
-export const sidebarTab = persisted<SidebarTab>('nao-sidebar-tab', 'filters', (v) =>
+export const sidebarTab = persisted<SidebarTab>('mezz-sidebar-tab', 'filters', (v) =>
   SIDEBAR_TABS.includes(v as SidebarTab) ? (v as SidebarTab) : 'filters');
 
 /** Whether the view controls above the canvas are folded away. The key is the
  *  one `CanvasToolbar` used when it owned this as component state, so an
  *  existing preference survives the move. */
-export const toolbarCollapsed = persisted('nao-toolbar-collapsed', false, (v) => v === 'true');
+export const toolbarCollapsed = persisted('mezz-toolbar-collapsed', false, (v) => v === 'true');
 
 /** Whether the Description column is expanded. Same key as when this lived in
  *  `description.ts`, so an existing preference survives the move. */
-export const describePaneOpen = persisted('nao-describe-pane-open', true, (v) => v === 'true');
+export const describePaneOpen = persisted('mezz-describe-pane-open', true, (v) => v === 'true');
 
 /** Whether the Elevator spec renders as its own pane beside the code canvas
  *  (ADR 0011). Off by default: a project with no `.elv` layer gains nothing
  *  from it, and the single canvas stays what the tool opens as. */
-export const splitViewOpen = persisted('nao-split-view-open', false, (v) => v === 'true');
+export const splitViewOpen = persisted('mezz-split-view-open', false, (v) => v === 'true');
 
 /**
  * Whether the spec pane draws only entities whose `cr:` claims reach code the
@@ -133,7 +133,7 @@ export const splitViewOpen = persisted('nao-split-view-open', false, (v) => v ==
  * `splitViewOpen` — the pane and its one behavioural switch are read together
  * and there is no second consumer of either.
  */
-export const followAnalysisScope = persisted('nao-spec-follow-scope', false, (v) => v === 'true');
+export const followAnalysisScope = persisted('mezz-spec-follow-scope', false, (v) => v === 'true');
 
 /**
  * What each column remembers being dragged to.
@@ -152,17 +152,17 @@ function width(key: string, fallback: number, min: number): Writable<number> {
   });
 }
 
-export const specWidth = width('nao-spec-width', 400, SPEC_MIN_WIDTH);
-export const detailsWidth = width('nao-details-width', 340, DETAILS_MIN_WIDTH);
+export const specWidth = width('mezz-spec-width', 400, SPEC_MIN_WIDTH);
+export const detailsWidth = width('mezz-details-width', 340, DETAILS_MIN_WIDTH);
 
 /** The Description column was a fixed 300px with no handle at all — the pane
  *  holding the most prose was the one you could not widen (UI-093). The key is
  *  new because there was never a stored value to inherit. */
-export const describeWidth = width('nao-describe-width', 300, DESCRIPTION_MIN_WIDTH);
+export const describeWidth = width('mezz-describe-width', 300, DESCRIPTION_MIN_WIDTH);
 
 /** The sidebar was a plain `let` in `App.svelte`, so it forgot its width on
  *  every reload while the two panes beside it remembered theirs. */
-export const sidebarWidth = width('nao-sidebar-width', 360, SIDEBAR_MIN_WIDTH);
+export const sidebarWidth = width('mezz-sidebar-width', 360, SIDEBAR_MIN_WIDTH);
 
 /**
  * Whether the focused pane grows into the slack (UI-094).
@@ -172,4 +172,4 @@ export const sidebarWidth = width('nao-sidebar-width', 360, SIDEBAR_MIN_WIDTH);
  * opt into rather than to discover. What it does to the arithmetic is in
  * `viewmodels/paneLayout.ts`; all that lives here is whether it is on.
  */
-export const focusExpand = persisted('nao-focus-expand', false, (v) => v === 'true');
+export const focusExpand = persisted('mezz-focus-expand', false, (v) => v === 'true');

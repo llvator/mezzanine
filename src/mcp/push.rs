@@ -1,17 +1,17 @@
-//! Push-mode: nao's structural signal arrives without being asked.
+//! Push-mode: mezz's structural signal arrives without being asked.
 //!
 //! The MCP tools are pull-only — an agent that forgets to call
 //! `assess_change` ships regressions silently. This module drives the
 //! two push legs that fix that:
 //!
-//! - **`self_review`** (MCP-007): a `nao hook self-review` subcommand
+//! - **`self_review`** (MCP-007): a `mezz hook self-review` subcommand
 //!   for a Claude Code Stop/PostToolUse hook. It reports structural
 //!   regressions of the working tree with the LSP-diagnostics token
 //!   contract: silent when clean, each finding surfaced exactly once
 //!   per session (fingerprint state file), a severity floor, and a
 //!   hard line cap. Determinism (AN-002) is what makes the fingerprints
 //!   stable across runs.
-//! - **`pr_report`** (MCP-008): a `nao pr-report` subcommand that
+//! - **`pr_report`** (MCP-008): a `mezz pr-report` subcommand that
 //!   renders the full `assess_change` report as a PR comment body, or a
 //!   one-liner when the PR touches nothing structural.
 //!
@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
+use crate::check;
 use crate::diff;
 use crate::graph::DependencyGraph;
 use crate::mcp::tools;
@@ -105,12 +106,12 @@ pub fn build_artifacts(
     }
 
     // One scope for both sides, settled from the working tree — the base
-    // checkout carries the `.nao/settings.json` committed at `base_ref`, and
+    // checkout carries the `.mezz/settings.json` committed at `base_ref`, and
     // two sides that exclude different files report the difference as
     // structural change.
     let scope = diff::build_analysis_config(root, include_tests, languages);
 
-    let base_dir = std::env::temp_dir().join(format!("nao-push-base-{}", from_sha));
+    let base_dir = std::env::temp_dir().join(format!("mezz-push-base-{}", from_sha));
     diff::create_worktree(root, &base_dir, base_ref)?;
     let base = diff::analyze_with(
         diff::rooted_at(&scope, &base_dir),
@@ -329,7 +330,7 @@ fn shape_findings(a: &DiffArtifacts) -> Vec<Finding> {
 
 fn shapes_by_folder(graph: &DependencyGraph, root: &Path) -> BTreeMap<String, FolderShape> {
     graph
-        .module_metrics()
+        .folder_metrics()
         .iter()
         .filter_map(|m| {
             let shape = m.metrics.shape.as_ref()?;
@@ -437,19 +438,25 @@ type SessionState = BTreeMap<String, String>;
 ///   state to retry.
 /// - **hard cap**: output never exceeds `cap` lines; overflow replaces
 ///   the last line with a pointer to `assess_change`.
+/// `current` is (fingerprint, line) rather than [`Finding`] because the check
+/// hook (MCP-019) has neither a severity nor a diff behind it and reports the
+/// same way. Two implementations of "have I said this already" would be free
+/// to disagree, and the one that is wrong is the one nobody is watching.
+/// `more` names the command that prints the full list when the cap bites.
 fn diff_against_state(
-    current: &[Finding],
+    current: &[(String, String)],
     seen: &SessionState,
     cap: usize,
+    more: &str,
 ) -> (String, SessionState) {
-    let current_fps: BTreeSet<&str> = current.iter().map(|f| f.fingerprint.as_str()).collect();
+    let current_fps: BTreeSet<&str> = current.iter().map(|f| f.0.as_str()).collect();
 
     // Candidates in priority order: new findings (already worst-first),
     // then resolved lines. Each carries its fingerprint for state math.
     let mut candidates: Vec<(String, String, bool)> = Vec::new(); // (fp, line, is_new)
     for f in current {
-        if !seen.contains_key(&f.fingerprint) {
-            candidates.push((f.fingerprint.clone(), format!("⚠ {}", f.line), true));
+        if !seen.contains_key(&f.0) {
+            candidates.push((f.0.clone(), format!("⚠ {}", f.1), true));
         }
     }
     for (fp, line) in seen {
@@ -474,7 +481,9 @@ fn diff_against_state(
 
     let mut lines: Vec<String> = emitted.iter().map(|(_, l, _)| l.clone()).collect();
     if overflow {
-        lines.push("… more findings — run `assess_change` for the full report.".to_string());
+        lines.push(format!(
+            "… more findings — run `{more}` for the full report."
+        ));
     }
     let emitted_fps: BTreeSet<&str> = emitted.iter().map(|(fp, _, _)| fp.as_str()).collect();
 
@@ -484,8 +493,8 @@ fn diff_against_state(
     // truncation) are kept so they retry.
     let mut next: SessionState = BTreeMap::new();
     for f in current {
-        if seen.contains_key(&f.fingerprint) || emitted_fps.contains(f.fingerprint.as_str()) {
-            next.insert(f.fingerprint.clone(), f.line.clone());
+        if seen.contains_key(&f.0) || emitted_fps.contains(f.0.as_str()) {
+            next.insert(f.0.clone(), f.1.clone());
         }
     }
     for (fp, line) in seen {
@@ -503,11 +512,18 @@ fn diff_against_state(
 /// session boundary — a new commit moves HEAD, so the state resets and
 /// findings that were surfaced against the old base start fresh.
 fn default_state_path(root: &Path, base_sha: &str) -> PathBuf {
+    state_path_in("mezz-self-review", root, base_sha)
+}
+
+/// As [`default_state_path`], under a directory naming the hook. Two hooks
+/// sharing one state file would each report the other's findings as already
+/// said.
+fn state_path_in(dir: &str, root: &Path, base_sha: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.to_string_lossy().hash(&mut hasher);
     let repo = hasher.finish();
     std::env::temp_dir()
-        .join("nao-self-review")
+        .join(dir)
         .join(format!("{:016x}-{}.json", repo, base_sha))
 }
 
@@ -526,13 +542,13 @@ fn save_state(path: &Path, state: &SessionState) {
         Ok(body) => {
             if let Err(e) = std::fs::write(path, body) {
                 eprintln!(
-                    "nao: could not persist self-review state to {}: {}",
+                    "mezz: could not persist self-review state to {}: {}",
                     path.display(),
                     e
                 );
             }
         }
-        Err(e) => eprintln!("nao: could not serialize self-review state: {}", e),
+        Err(e) => eprintln!("mezz: could not serialize self-review state: {}", e),
     }
 }
 
@@ -556,18 +572,109 @@ pub fn self_review(
     let state_file = state_path.unwrap_or_else(|| default_state_path(root, &from_sha));
     let seen = load_state(&state_file);
 
-    let (output, next) = diff_against_state(&current, &seen, cap);
+    let (output, next) = diff_against_state(&fingerprinted(&current), &seen, cap, "assess_change");
     if next != seen {
         save_state(&state_file, &next);
     }
     Ok(output)
 }
 
+/// A finding as the shared state diff wants it. Its own function rather than
+/// an inline map, because the complexity gate fails on any metric increase to
+/// an existing one and `self_review` is not the place to spend that.
+fn fingerprinted(findings: &[Finding]) -> Vec<(String, String)> {
+    findings
+        .iter()
+        .map(|f| (f.fingerprint.clone(), f.line.clone()))
+        .collect()
+}
+
+/// MCP-019 entry point. Reports the rule violations the *working tree
+/// introduced* — present now, absent at `base_ref` — once per session.
+///
+/// Not every violation, which is what `mezz check` is for. A repo that adopts
+/// a rule it does not yet satisfy is the usual case, and a hook that recites
+/// its whole backlog on every stop is one that gets switched off in a week.
+/// Paying that backlog down is a deliberate act; this leg exists only to stop
+/// it growing.
+pub fn check_new(
+    root: &Path,
+    base_ref: &str,
+    state_path: Option<PathBuf>,
+    cap: usize,
+) -> Result<String> {
+    // No rules is not an error and not something to say. `mezz check` says it
+    // out loud, because a reader who typed the command is owed an answer; a
+    // hook nobody asked to run is owed silence.
+    let Some(rules) = check::rules::load(root)
+        .ok()
+        .flatten()
+        .filter(|r| !r.is_empty())
+    else {
+        return Ok(String::new());
+    };
+    diff::verify_git_repo(root)?;
+    let from_sha = diff::resolve_git_ref(root, base_ref)?;
+    if from_sha.is_empty() {
+        bail!("Cannot resolve git ref '{}'", base_ref);
+    }
+
+    // Head's scope and head's rules on both sides. The base worktree carries
+    // the settings and the `rules.json` committed at that ref, and grading
+    // each side against its own would report a tightened bar as something the
+    // edit introduced — true in a useless sense, since the code did not change
+    // and the standard did.
+    let scope = check::scope_for(root);
+    let base_dir = std::env::temp_dir().join(format!("mezz-check-base-{}", from_sha));
+    diff::create_worktree(root, &base_dir, base_ref)?;
+    let base = check::graded(&base_dir, diff::rooted_at(&scope, &base_dir), &rules);
+    diff::remove_worktree(root, &base_dir);
+
+    let head = check::graded(root, scope, &rules);
+    let already: BTreeSet<String> = breaches(&base).map(violation_key).collect();
+    let current: Vec<(String, String)> = breaches(&head)
+        .filter(|v| !already.contains(&violation_key(v)))
+        .map(|v| (violation_key(v), check::violation_line(v)))
+        .collect();
+
+    let state_file = state_path.unwrap_or_else(|| state_path_in("mezz-check", root, &from_sha));
+    let seen = load_state(&state_file);
+    let (output, next) = diff_against_state(&current, &seen, cap, "mezz check");
+    if next != seen {
+        save_state(&state_file, &next);
+    }
+    Ok(output)
+}
+
+/// The violations in an outcome, and none for one that could not be graded.
+/// An unusable base — a worktree that would not analyze — must not turn the
+/// whole backlog into "introduced by this edit".
+fn breaches(outcome: &check::Outcome) -> impl Iterator<Item = &check::Violation> {
+    match outcome {
+        check::Outcome::Checked { violations, .. } => violations.iter(),
+        _ => [].iter(),
+    }
+}
+
+/// What makes two violations the same one across two trees.
+///
+/// Deliberately without the measurement: a folder going from five doors to
+/// four is still the same unfixed breach, and including the count would
+/// re-announce it as news every time it got closer to passing.
+fn violation_key(v: &check::Violation) -> String {
+    format!(
+        "{}|{}|{}",
+        v.rule.name(),
+        v.path,
+        v.subject.as_deref().unwrap_or("")
+    )
+}
+
 /// MCP-008 entry point. Renders the `assess_change` report as a PR
 /// comment body — a one-liner when the PR touches nothing structural,
 /// otherwise the full report. The leading HTML marker lets the CI job
 /// find and edit its own comment in place instead of posting a new one.
-pub const PR_COMMENT_MARKER: &str = "<!-- nao-pr-report -->";
+pub const PR_COMMENT_MARKER: &str = "<!-- mezz-pr-report -->";
 
 pub fn pr_report(
     root: &Path,
@@ -583,7 +690,7 @@ pub fn pr_report(
     out.push('\n');
     if structural == 0 {
         out.push_str(&format!(
-            "**nao:** no structural change vs `{}` — metrics steady, nothing to report.",
+            "**mezz:** no structural change vs `{}` — metrics steady, nothing to report.",
             base_ref
         ));
         return Ok(out);
@@ -619,7 +726,7 @@ mod tests {
     impl TmpDir {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "nao-push-shape-{}-{}-{}",
+                "mezz-push-shape-{}-{}-{}",
                 name,
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -641,6 +748,152 @@ mod tests {
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A git repo with one commit, so the check hook has a base ref to
+    /// judge against. `check_new` resolves `HEAD` and stands a worktree up
+    /// from it; without a repository there is nothing to compare to.
+    struct GitRepo(TmpDir);
+
+    impl GitRepo {
+        /// Not `new`: the gate matches functions by name within a file, and
+        /// a second `new` beside `TmpDir::new` reads as that one growing.
+        fn init(name: &str) -> Self {
+            let dir = TmpDir::new(name);
+            for args in [
+                vec!["init", "-q"],
+                vec!["config", "user.email", "t@example.com"],
+                vec!["config", "user.name", "t"],
+            ] {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir.0)
+                    .output()
+                    .unwrap();
+            }
+            GitRepo(dir)
+        }
+
+        fn commit(&self) {
+            for args in [vec!["add", "-A"], vec!["commit", "-qm", "base"]] {
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&self.0 .0)
+                    .output()
+                    .unwrap();
+            }
+        }
+
+        /// One folder whose door count is the thing under test, plus the
+        /// outside file whose imports decide it.
+        fn two_doors_unless(&self, second_import: bool) {
+            self.0.write(
+                ".mezz/rules.json",
+                r#"{"rules": {"max_doors_per_folder": 1}}"#,
+            );
+            self.0.write("src/a/one.rs", "pub fn one() -> i32 { 1 }\n");
+            self.0.write(
+                "src/a/two.rs",
+                "use super::one::one;\npub fn two() -> i32 { one() + 1 }\n",
+            );
+            self.0.write(
+                "src/outside.rs",
+                if second_import {
+                    "use crate::a::one::one;\nuse crate::a::two::two;\n\
+                     pub fn call() -> i32 { one() + two() }\n"
+                } else {
+                    "use crate::a::one::one;\npub fn call() -> i32 { one() }\n"
+                },
+            );
+        }
+
+        fn hook(&self, state: &Path) -> String {
+            check_new(&self.0 .0, "HEAD", Some(state.to_path_buf()), 10).unwrap()
+        }
+    }
+
+    /// The whole point of the hook. A repo that adopts a rule it does not
+    /// yet satisfy must not be told about its backlog on every stop — only
+    /// about what this edit added. Reciting the backlog is `mezz check`'s
+    /// job, and a hook that does it gets switched off.
+    #[test]
+    fn a_violation_that_was_already_there_is_not_reported_as_introduced() {
+        let repo = GitRepo::init("check-debt");
+        repo.two_doors_unless(true);
+        repo.commit();
+        let state = repo.0 .0.join("state.json");
+
+        assert_eq!(repo.hook(&state), "", "existing debt was reported");
+    }
+
+    /// Introduced, said once, then not again; fixed, said once, then not
+    /// again. The same contract `self-review` has, and the reason both can
+    /// share one state file mechanism.
+    #[test]
+    fn an_introduced_violation_is_reported_once_and_its_fix_once() {
+        let repo = GitRepo::init("check-new");
+        repo.two_doors_unless(false);
+        repo.commit();
+        let state = repo.0 .0.join("state.json");
+        assert_eq!(repo.hook(&state), "", "clean tree was not silent");
+
+        repo.two_doors_unless(true);
+        let first = repo.hook(&state);
+        assert!(first.contains("max_doors_per_folder"), "{first}");
+        assert!(first.starts_with("⚠ "), "{first}");
+        assert_eq!(repo.hook(&state), "", "said twice");
+
+        repo.two_doors_unless(false);
+        let fixed = repo.hook(&state);
+        assert!(fixed.starts_with("✓ resolved"), "{fixed}");
+        assert_eq!(repo.hook(&state), "", "resolution said twice");
+    }
+
+    /// A repo declaring no rules is owed silence, not the "no rules" notice
+    /// `mezz check` prints. Nobody asked this to run.
+    #[test]
+    fn a_repo_with_no_rules_file_says_nothing() {
+        let repo = GitRepo::init("check-norules");
+        repo.0.write("src/a/one.rs", "pub fn one() -> i32 { 1 }\n");
+        repo.commit();
+        let state = repo.0 .0.join("state.json");
+
+        assert_eq!(repo.hook(&state), "");
+    }
+
+    /// Two violations are the same one across two trees when the rule, the
+    /// path and the subject match — the measurement is deliberately out.
+    /// A folder going from five doors to four is still the same unfixed
+    /// breach, and counting it would re-announce it as news every time it
+    /// got closer to passing.
+    #[test]
+    fn a_violation_getting_closer_to_passing_is_not_a_new_violation() {
+        let five = check::Violation {
+            rule: check::Rule::MaxDoorsPerFolder,
+            path: "src/mcp".to_string(),
+            line: None,
+            subject: None,
+            measured: 5,
+            names: Vec::new(),
+            bar: 1,
+        };
+        let four = check::Violation {
+            measured: 4,
+            ..five_like(&five)
+        };
+        assert_eq!(violation_key(&five), violation_key(&four));
+    }
+
+    fn five_like(v: &check::Violation) -> check::Violation {
+        check::Violation {
+            rule: v.rule,
+            path: v.path.clone(),
+            line: v.line,
+            subject: v.subject.clone(),
+            measured: v.measured,
+            names: Vec::new(),
+            bar: v.bar,
         }
     }
 
@@ -740,9 +993,19 @@ mod tests {
         assert!(found.is_empty(), "an improvement is not a regression: {found:#?}");
     }
 
+    /// `diff_against_state` works in (fingerprint, line) pairs so both
+    /// hooks can share it; these tests still speak in findings.
+    fn pairs(findings: &[Finding]) -> Vec<(String, String)> {
+        findings
+            .iter()
+            .map(|f| (f.fingerprint.clone(), f.line.clone()))
+            .collect()
+    }
+
     #[test]
     fn silent_when_no_findings_and_none_seen() {
-        let (out, next) = diff_against_state(&[], &SessionState::new(), DEFAULT_LINE_CAP);
+        let (out, next) =
+            diff_against_state(&[], &SessionState::new(), DEFAULT_LINE_CAP, "assess_change");
         assert_eq!(out, "", "clean run must be zero bytes");
         assert!(next.is_empty());
     }
@@ -755,14 +1018,20 @@ mod tests {
             "complexity +12: Function foo — src/a.rs",
         )];
         // First run: new finding is printed, enters state.
-        let (out1, state1) = diff_against_state(&current, &SessionState::new(), DEFAULT_LINE_CAP);
+        let (out1, state1) = diff_against_state(
+            &pairs(&current),
+            &SessionState::new(),
+            DEFAULT_LINE_CAP,
+            "assess_change",
+        );
         assert!(
             out1.contains("⚠ complexity +12"),
             "first run must print it:\n{out1}"
         );
         assert!(state1.contains_key("cx|Function|foo|src/a.rs|"));
         // Second run, same finding still present: silent.
-        let (out2, state2) = diff_against_state(&current, &state1, DEFAULT_LINE_CAP);
+        let (out2, state2) =
+            diff_against_state(&pairs(&current), &state1, DEFAULT_LINE_CAP, "assess_change");
         assert_eq!(out2, "", "unchanged finding must not reprint:\n{out2}");
         assert_eq!(state1, state2);
     }
@@ -776,14 +1045,14 @@ mod tests {
         .into_iter()
         .collect();
         // Finding gone from current → one resolved line, dropped from state.
-        let (out, next) = diff_against_state(&[], &seen, DEFAULT_LINE_CAP);
+        let (out, next) = diff_against_state(&[], &seen, DEFAULT_LINE_CAP, "assess_change");
         assert!(
             out.contains("✓ resolved: new cycle: Struct Bar"),
             "resolved line missing:\n{out}"
         );
         assert!(next.is_empty(), "resolved finding must leave state");
         // Next run: nothing to say.
-        let (out2, _) = diff_against_state(&[], &next, DEFAULT_LINE_CAP);
+        let (out2, _) = diff_against_state(&[], &next, DEFAULT_LINE_CAP, "assess_change");
         assert_eq!(out2, "");
     }
 
@@ -799,7 +1068,12 @@ mod tests {
             })
             .collect();
         let cap = 10;
-        let (out, next) = diff_against_state(&current, &SessionState::new(), cap);
+        let (out, next) = diff_against_state(
+            &pairs(&current),
+            &SessionState::new(),
+            cap,
+            "assess_change",
+        );
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), cap, "must cap at exactly {cap} lines");
         assert!(

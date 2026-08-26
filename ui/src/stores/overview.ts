@@ -51,7 +51,7 @@ export const canvasViewport = writable<CanvasViewport | null>(null);
  * off by default means it is never there when it is wanted. The corner is
  * cheap to give back and the choice sticks.
  */
-const OPEN_KEY = 'nao-overview-open';
+const OPEN_KEY = 'mezz-overview-open';
 
 function initialOpen(): boolean {
   try {

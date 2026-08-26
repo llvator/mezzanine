@@ -1,9 +1,9 @@
-# The nao visualizer
+# The mezz visualizer
 
 The browser UI: a Svelte app that renders the code graph, the scope tree, the
 quality report and the diff overlay. It is a **client of the engine's HTTP
 API**, not a part of the engine. Nothing in `src/` imports anything from here,
-and nothing here is compiled into the `nao` binary.
+and nothing here is compiled into the `mezz` binary.
 
 ## Two build targets
 
@@ -30,7 +30,7 @@ npx vite preview --port 4173          # or python3 -m http.server, or any static
 Then start an engine and tell it to answer that origin:
 
 ```bash
-nao watch . --port 3200 --allow-origin http://localhost:4173
+mezz watch . --port 3200 --allow-origin http://localhost:4173
 ```
 
 Open `http://localhost:4173`. The first thing you see is the connect screen —
@@ -42,7 +42,7 @@ The `--allow-origin` flag is not ceremony. Both servers bind loopback, and
 loopback is not a boundary against a browser: the browser is on the same
 machine, so without an allowlist any page you have open could read
 `/api/details`, which returns source code. See
-[guide/getting-started.md](../guide/getting-started.md#nao-cli) for the whole
+[guide/getting-started.md](../guide/getting-started.md#mezz-cli) for the whole
 story, including the pairing token that non-loopback origins also need.
 
 **On a hosted page**, an `https://` site reaching `http://localhost` is gated
@@ -53,7 +53,7 @@ Loopback-to-loopback, which is what the recipe above is, is unaffected.
 ## Development
 
 ```bash
-nao watch . --port 3000            # terminal 1
+mezz watch . --port 3000            # terminal 1
 npm run dev -- --port 5199         # terminal 2
 ```
 

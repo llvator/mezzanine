@@ -31,7 +31,7 @@ impl SpecDir {
     fn new(files: &[(&str, &str)]) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("nao-elv-extract-{}-{}", std::process::id(), n));
+            std::env::temp_dir().join(format!("mezz-elv-extract-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).expect("create temp spec dir");
         for (name, body) in files {
             std::fs::write(dir.join(name), body).expect("write spec file");

@@ -1,11 +1,11 @@
 /**
  * VS Code adapter layer.
  *
- * When the app runs inside a VS Code webview, `window.__NAO_VSCODE__`
+ * When the app runs inside a VS Code webview, `window.__MEZZ_VSCODE__`
  * is set by the extension host. This module exposes helpers that the
  * stores and components can use without directly touching the VS Code API.
  *
- * When running standalone (browser / nao watch), these are no-ops or
+ * When running standalone (browser / mezz watch), these are no-ops or
  * fall through to the default behaviour.
  */
 
@@ -19,13 +19,13 @@ export interface VscodeConfig {
 
 declare global {
   interface Window {
-    __NAO_VSCODE__?: VscodeConfig;
+    __MEZZ_VSCODE__?: VscodeConfig;
   }
 }
 
 /** True when the app is running inside a VS Code webview. */
 export function isVscode(): boolean {
-  return typeof window !== 'undefined' && !!window.__NAO_VSCODE__;
+  return typeof window !== 'undefined' && !!window.__MEZZ_VSCODE__;
 }
 
 /**
@@ -39,8 +39,8 @@ export function apiBase(): string {
 }
 
 /**
- * Slug of the repo the app is currently viewing under `nao serve`, or
- * `null` under `nao watch` / VS Code, where the repo is implicit.
+ * Slug of the repo the app is currently viewing under `mezz serve`, or
+ * `null` under `mezz watch` / VS Code, where the repo is implicit.
  *
  * Deliberately a module-level variable rather than a store: `apiUrl` is
  * called from plain async functions all over `stores/`, and every one of
@@ -68,11 +68,11 @@ export function serveRepo(): string | null {
  * Configured:  `/api/graph` → `http://localhost:3200/api/graph`
  *
  * VS Code mode never takes the serve branch — the extension talks to a
- * `nao watch` server, which has no per-repo namespace.
+ * `mezz watch` server, which has no per-repo namespace.
  *
  * The two prefixes compose rather than compete: the serve-mode slug is a
  * *path* namespace and the configured base is an *origin*, so a remote
- * `nao serve` needs both. Applying only the slug — which is what this did
+ * `mezz serve` needs both. Applying only the slug — which is what this did
  * before UI-032 — sent every serve-mode request back to the page's own
  * origin, where nothing is listening.
  */
@@ -106,16 +106,16 @@ export function flatApiUrl(path: string): string {
  * source view panel in the future).
  */
 export function goToDefinition(filePath: string, line?: number): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.goToDefinition(filePath, line);
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.goToDefinition(filePath, line);
   }
 }
 
 /** Report that the user selected (or deselected) a node in the graph.
  *  The extension forwards this payload to the native Selection side view. */
 export function reportSelection(payload: Record<string, unknown> | null): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({
       type: 'selectionChanged',
       payload: payload ?? undefined,
     });
@@ -131,8 +131,8 @@ export function reportDescription(payload: {
   source: 'hover' | 'selection';
   chain: unknown[];
 } | null): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({
       type: 'descriptionChanged',
       payload: payload ?? undefined,
     });
@@ -145,8 +145,8 @@ export function reportQuality(payload: {
   summary: Record<string, unknown>;
   rows: unknown[];
 }): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({ type: 'qualityChanged', payload });
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'qualityChanged', payload });
   }
 }
 
@@ -155,16 +155,16 @@ export function reportQuality(payload: {
  *  anywhere other than a user click in the tree itself (e.g. from the
  *  Diff view's "Scope to changes" button). */
 export function reportScopes(paths: string[]): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({ type: 'scopesChanged', paths });
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'scopesChanged', paths });
   }
 }
 
 /** Same as reportScopes but for the separate *analysis* scope that
  *  drives the Quality / Summary side panels. */
 export function reportAnalysisScopes(paths: string[]): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({ type: 'analysisScopesChanged', paths });
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'analysisScopesChanged', paths });
   }
 }
 
@@ -177,8 +177,26 @@ export function reportFilters(state: {
   directions: { outgoing: boolean; incoming: boolean };
   languages: { name: string; enabled: boolean }[];
 }): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({ type: 'filtersChanged', state });
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'filtersChanged', state });
+  }
+}
+
+/**
+ * Report which branch the canvas is drawing, for the native Diff view
+ * (UI-114).
+ *
+ * The webview has no canvas strip — that whole bottom bar is standalone-only
+ * — so the chip has nowhere to render inside VS Code. It goes to the Diff
+ * view instead, which is the right neighbour anyway: everything else in that
+ * panel is a ref chosen to compare *against* this branch.
+ *
+ * `null` means "say nothing", and covers a root that is not a checkout as
+ * well as an engine too old to answer.
+ */
+export function reportBranch(label: { text: string; title: string; detached: boolean } | null): void {
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'branchChanged', label });
   }
 }
 
@@ -212,8 +230,8 @@ export function reportDiff(state: {
   filtersEnabled: boolean;
   hasSelection: boolean;
 }): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({ type: 'diffChanged', state });
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'diffChanged', state });
   }
 }
 
@@ -235,8 +253,8 @@ export function reportLevelFilters(state: {
   showDirectEdges: boolean;
   showCrossLevelEdges: boolean;
 }): void {
-  if (window.__NAO_VSCODE__) {
-    window.__NAO_VSCODE__.postMessage({ type: 'levelFiltersChanged', state });
+  if (window.__MEZZ_VSCODE__) {
+    window.__MEZZ_VSCODE__.postMessage({ type: 'levelFiltersChanged', state });
   }
 }
 
@@ -271,8 +289,8 @@ export function onFocusFile(
       });
     }
   };
-  window.addEventListener('nao:focusFile', handler);
-  return () => window.removeEventListener('nao:focusFile', handler);
+  window.addEventListener('mezz:focusFile', handler);
+  return () => window.removeEventListener('mezz:focusFile', handler);
 }
 
 /** Subscribe to cursor-follow events (cursor moved within the editor). */
@@ -289,8 +307,8 @@ export function onFocusCursor(
       });
     }
   };
-  window.addEventListener('nao:focusCursor', handler);
-  return () => window.removeEventListener('nao:focusCursor', handler);
+  window.addEventListener('mezz:focusCursor', handler);
+  return () => window.removeEventListener('mezz:focusCursor', handler);
 }
 
 /** Subscribe to external scope-selection changes (from the native TreeView). */
@@ -299,8 +317,8 @@ export function onSetScopes(callback: (paths: string[]) => void): () => void {
     const detail = (e as CustomEvent).detail;
     if (Array.isArray(detail?.paths)) callback(detail.paths);
   };
-  window.addEventListener('nao:setScopes', handler);
-  return () => window.removeEventListener('nao:setScopes', handler);
+  window.addEventListener('mezz:setScopes', handler);
+  return () => window.removeEventListener('mezz:setScopes', handler);
 }
 
 /** Subscribe to drill-in requests (native Selection panel's "Drill in"
@@ -311,8 +329,8 @@ export function onDrillIn(callback: (path: string) => void): () => void {
     const detail = (e as CustomEvent).detail;
     if (typeof detail?.path === 'string') callback(detail.path);
   };
-  window.addEventListener('nao:drillIn', handler);
-  return () => window.removeEventListener('nao:drillIn', handler);
+  window.addEventListener('mezz:drillIn', handler);
+  return () => window.removeEventListener('mezz:drillIn', handler);
 }
 
 /** Subscribe to generic view-option commands from the native Controls panel.
@@ -326,6 +344,6 @@ export function onCommand(
     const detail = (e as CustomEvent).detail;
     if (typeof detail?.command === 'string') callback(detail.command, detail.value);
   };
-  window.addEventListener('nao:command', handler);
-  return () => window.removeEventListener('nao:command', handler);
+  window.addEventListener('mezz:command', handler);
+  return () => window.removeEventListener('mezz:command', handler);
 }

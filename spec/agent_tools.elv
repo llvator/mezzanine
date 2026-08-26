@@ -64,7 +64,7 @@ f dead_code {
 }
 
 f push_review {
-    d: "Push mode: nao's structural signal arrives without being asked. Fresh-process commands over the assess_change diff, advisory only — signals, never gates."
+    d: "Push mode: mezz's structural signal arrives without being asked. Fresh-process commands over the assess_change diff, advisory only — signals, never gates."
     cr: "src/mcp/push.rs"
     fu self_review
     fu pr_report

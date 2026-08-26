@@ -97,7 +97,7 @@ test('rollups the population no longer holds are dropped, ancestors kept', () =>
     nodes: [node({ id: 'a', file_path: 'ui/src/a.ts' }), node({ id: 'b', file_path: 'ui/lib/b.ts' })],
     links: [],
     files: [scope('ui/src/a.ts'), scope('ui/lib/b.ts')],
-    modules: [scope(''), scope('ui'), scope('ui/src'), scope('ui/lib')],
+    folders: [scope(''), scope('ui'), scope('ui/src'), scope('ui/lib')],
   };
 
   const narrowed = narrowRollups(g, [g.nodes[0]]);
@@ -105,7 +105,7 @@ test('rollups the population no longer holds are dropped, ancestors kept', () =>
   assert.deepEqual(narrowed.files?.map((f) => f.path), ['ui/src/a.ts']);
   // `ui` survives because it is still an ancestor of what is left; `ui/lib`
   // does not, because nothing in the population lives under it.
-  assert.deepEqual(narrowed.modules?.map((m) => m.path), ['', 'ui', 'ui/src']);
+  assert.deepEqual(narrowed.folders?.map((m) => m.path), ['', 'ui', 'ui/src']);
   assert.equal(narrowed.nodes.length, 1);
 });
 
@@ -114,7 +114,7 @@ test('rollup numbers are left as the engine computed them', () => {
     nodes: [node({ id: 'a', file_path: 'a.ts' }), node({ id: 'b', file_path: 'a.ts' })],
     links: [],
     files: [{ ...scope('a.ts'), entity_count: 2 } as ScopeMetrics],
-    modules: [],
+    folders: [],
   };
 
   // Half the file's entities, but cohesion and entity_count still describe the
@@ -129,12 +129,12 @@ test('ghosts carry no path and pull no rollup in with them', () => {
     nodes: [node({ id: 'ghost', file_path: '', tags: ['ghost'] })],
     links: [],
     files: [scope('a.ts')],
-    modules: [scope('')],
+    folders: [scope('')],
   };
 
   const narrowed = narrowRollups(g);
   assert.deepEqual(narrowed.files, []);
-  assert.deepEqual(narrowed.modules, []);
+  assert.deepEqual(narrowed.folders, []);
 });
 
 // --- selectionPopulation ----------------------------------------------------
@@ -167,8 +167,8 @@ test('selecting a File node takes the whole file, containment aside', () => {
   assert.deepEqual(picked, ['Thing', 'Thing::run', 'Thing::step', 'loose']);
 });
 
-test('selecting a Module node takes its whole subtree', () => {
-  const mod = node({ id: 'src', file_path: 'src', kind_raw: 'Module' });
+test('selecting a Folder node takes its whole subtree', () => {
+  const mod = node({ id: 'src', file_path: 'src', kind_raw: 'Folder' });
   mod.original_id = 'src';
   assert.equal(selectionPopulation(TREE, mod).length, 5);
 });

@@ -3,7 +3,7 @@
 //! Two scopes, resolved in this order, each losing to the one after it:
 //!
 //! ```text
-//! CLI flag  >  env var  >  <repo>/.nao/settings.json  >  ~/.config/nao/settings.json  >  defaults
+//! CLI flag  >  env var  >  <repo>/.mezz/settings.json  >  ~/.config/mezz/settings.json  >  defaults
 //! ```
 //!
 //! The split is not cosmetic. `ui_dir` is a property of the *installation* —
@@ -22,7 +22,7 @@
 //! and filtered so that no future edit can reintroduce them by forgetting a
 //! check — see [`report_rejected`], which names them when it sees them.
 //!
-//! `nao serve` goes further and never reads a repo-scope file at all: there
+//! `mezz serve` goes further and never reads a repo-scope file at all: there
 //! the whole tree arrived from a URL a stranger pasted. That mirrors the
 //! reasoning already in [`crate::config::AnalysisConfig::allow_unsafe_passes`].
 
@@ -40,18 +40,18 @@ use crate::models::EntityKind;
 
 /// Explicit override of the user-scope directory, for tests and for wrapper
 /// scripts with nowhere to put a flag. Exists for the same reason
-/// `NAO_CACHE_DIR` does: a test must be able to run without reading — or
+/// `MEZZ_CACHE_DIR` does: a test must be able to run without reading — or
 /// writing — the developer's real home directory.
-const CONFIG_DIR_ENV: &str = "NAO_CONFIG_DIR";
+const CONFIG_DIR_ENV: &str = "MEZZ_CONFIG_DIR";
 
 /// The repo-scope directory, resolved against the *repo the analyzed path
-/// lies in* rather than the process working directory. `nao watch
-/// /elsewhere/repo` reads `/elsewhere/repo/.nao/settings.json`, or the file
+/// lies in* rather than the process working directory. `mezz watch
+/// /elsewhere/repo` reads `/elsewhere/repo/.mezz/settings.json`, or the file
 /// would be useless the moment you analyze anything but the directory you are
-/// standing in — and `nao analyze src` reads that same file, or the normal way
+/// standing in — and `mezz analyze src` reads that same file, or the normal way
 /// to ask a shape question about one part of a tree would be the one
 /// invocation that drops the tree's configuration (CFG-012).
-const REPO_DIR: &str = ".nao";
+const REPO_DIR: &str = ".mezz";
 
 /// What marks the top of a checkout. A *file* rather than a directory in a
 /// linked worktree, which `assess_change` analyzes, so the test is existence
@@ -62,7 +62,7 @@ const FILE_NAME: &str = "settings.json";
 
 /// The port `watch` and `serve` fall back to when neither a flag nor a
 /// settings file names one. Public because anything that *generates* a way
-/// to reach the server — `nao init`'s VS Code tasks — has to agree with what
+/// to reach the server — `mezz init`'s VS Code tasks — has to agree with what
 /// the server will actually bind, and a second literal `3000` is how those
 /// two drift apart.
 pub const DEFAULT_PORT: u16 = 3000;
@@ -86,9 +86,9 @@ const REJECTED: &[(&str, &str)] = &[
 /// Which file a value came from. Determines which keys are honoured.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
-    /// `~/.config/nao/settings.json` — properties of this installation.
+    /// `~/.config/mezz/settings.json` — properties of this installation.
     User,
-    /// `<repo-root>/.nao/settings.json` — properties of the repo.
+    /// `<repo-root>/.mezz/settings.json` — properties of the repo.
     Repo,
 }
 
@@ -99,7 +99,7 @@ pub enum Severity {
     /// A key that would have granted a capability. The repo asked for
     /// something a cloned file may never have.
     Rejected,
-    /// A key nao could not use: a typo, the wrong scope, a path that
+    /// A key mezz could not use: a typo, the wrong scope, a path that
     /// escapes the repo, a language nobody parses.
     Ignored,
     /// The file itself could not be read or parsed. Nothing in it applied.
@@ -109,7 +109,7 @@ pub enum Severity {
 /// Something the loader could not honour, kept rather than only printed.
 ///
 /// Every one of these used to be an `eprintln!` and nothing else, which is
-/// fine for `nao analyze` in a terminal and useless for the browser UI: a
+/// fine for `mezz analyze` in a terminal and useless for the browser UI: a
 /// reader who typos `exclude_pattern` saw their setting do nothing, with the
 /// explanation on a stream they were not watching. Collecting them costs a
 /// `Vec` per load and lets both surfaces say the same thing.
@@ -151,16 +151,16 @@ impl Warning {
 /// inside the reader.
 #[derive(Clone, Debug, Default)]
 pub struct Loaded {
-    /// `<root>/.nao/settings.json`, already stripped of keys its scope may
+    /// `<root>/.mezz/settings.json`, already stripped of keys its scope may
     /// not set. Always default under `serve`, which never reads it.
     pub repo: Settings,
-    /// `~/.config/nao/settings.json`, same treatment.
+    /// `~/.config/mezz/settings.json`, same treatment.
     pub user: Settings,
     pub warnings: Vec<Warning>,
 }
 
 impl Loaded {
-    /// The merged view the rest of nao consumes: repo over user.
+    /// The merged view the rest of mezz consumes: repo over user.
     pub fn merged(&self) -> Settings {
         self.repo.clone().over(self.user.clone())
     }
@@ -227,7 +227,7 @@ pub struct Settings {
     ///
     /// Repo-scope only, and **relative paths only**, checked by
     /// [`Self::clear_escaping_spec_dir`]. A repo file is content cloned from
-    /// a stranger, and this key is a path nao will read from: an absolute
+    /// a stranger, and this key is a path mezz will read from: an absolute
     /// `/home/you/.ssh` or a `../../..` would let the clone choose where.
     /// Naming a directory outside the tree is a real layout — a spec in a
     /// sibling docs repo — but it takes an operator saying so, with
@@ -244,12 +244,12 @@ pub struct Settings {
     pub include_tests: Option<bool>,
     /// Analyze Markdown alongside the code. The durable way to turn the doc
     /// layer on, which matters more here than for most flags: the VS Code
-    /// extension and `nao watch` are launched without anyone typing a flag.
+    /// extension and `mezz watch` are launched without anyone typing a flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_docs: Option<bool>,
     /// Keep local and module-level assignments as entities (CFG-005). Off by
     /// default, and a repo that wants the detail — a focused reading, dataflow
-    /// work — says so here rather than in a flag nobody types: `nao watch` and
+    /// work — says so here rather than in a flag nobody types: `mezz watch` and
     /// the VS Code extension are launched without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_locals: Option<bool>,
@@ -270,14 +270,14 @@ pub struct Settings {
     /// Matched against the path **relative to the repo root** — the root this
     /// file is itself read from, so the file and the patterns inside it agree
     /// about what "the repo" means (CFG-013). `src/contracts.d.ts` names that
-    /// file whether the run is `nao analyze .`, `nao analyze src` or
-    /// `nao analyze /abs/path/repo/src`. Outside a checkout there is no repo
+    /// file whether the run is `mezz analyze .`, `mezz analyze src` or
+    /// `mezz analyze /abs/path/repo/src`. Outside a checkout there is no repo
     /// root to find and the analyzed root stands in for it.
     ///
     /// One surprise is kept deliberately: **`*` crosses `/`**, so `*.d.ts`
     /// matches `src/a.d.ts` and the leading `**/` of the built-in defaults is
     /// decorative. It is not the better semantics. It is what every pattern
-    /// written against nao so far relies on, and a filter that quietly stops
+    /// written against mezz so far relies on, and a filter that quietly stops
     /// filtering is a worse failure than one that filters too widely and can
     /// be read.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -289,7 +289,7 @@ pub struct Settings {
 
     /// Everything serde did not recognise. Captured rather than dropped so a
     /// key can be named back to whoever wrote it — a silently ignored setting
-    /// reads as "nao is broken" to an author who meant well, and tells a
+    /// reads as "mezz is broken" to an author who meant well, and tells a
     /// reader being attacked nothing at all.
     // Never serialized: writing these back out would re-emit the very keys
     // `report_rejected` just refused.
@@ -297,12 +297,12 @@ pub struct Settings {
     unrecognized: BTreeMap<String, serde_json::Value>,
 }
 
-/// The user-scope directory: `NAO_CONFIG_DIR`, else `$XDG_CONFIG_HOME/nao`,
-/// else `$HOME/.config/nao`.
+/// The user-scope directory: `MEZZ_CONFIG_DIR`, else `$XDG_CONFIG_HOME/mezz`,
+/// else `$HOME/.config/mezz`.
 ///
 /// Deliberately the same shape as
 /// [`crate::analyzer::parse_store`]'s cache root, three strings changed. The
-/// alternative, `~/.nao`, would scatter nao's state across two conventions
+/// alternative, `~/.mezz`, would scatter mezz's state across two conventions
 /// and reopen the question every time something new needs a home. `None`
 /// when nothing resolves — some CI and container environments have no `HOME`,
 /// and the answer there is "no settings file", not a synthesized one.
@@ -329,10 +329,10 @@ fn config_root_from(
         return Some(PathBuf::from(dir));
     }
     if let Some(dir) = xdg.filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir).join("nao"));
+        return Some(PathBuf::from(dir).join("mezz"));
     }
     home.filter(|h| !h.is_empty())
-        .map(|home| PathBuf::from(home).join(".config").join("nao"))
+        .map(|home| PathBuf::from(home).join(".config").join("mezz"))
 }
 
 /// The user-scope settings file path, whether or not it exists.
@@ -358,9 +358,9 @@ pub fn repo_dir(root: &Path) -> PathBuf {
 /// `.git`, or the analyzed path itself when there is none.
 ///
 /// One answer per checkout, which is what "properties of the repo" means
-/// (ADR-0008). `nao analyze .`, `nao analyze src` and `nao deps src/a/b.ts`
+/// (ADR-0008). `mezz analyze .`, `mezz analyze src` and `mezz deps src/a/b.ts`
 /// all configure themselves from the same file, and no file from an
-/// intermediate directory can surprise a reader who pointed nao at a
+/// intermediate directory can surprise a reader who pointed mezz at a
 /// subfolder. It also bounds the security question the module docs open with:
 /// the file always comes from inside the checkout the reader pointed into,
 /// never from a parent directory they were not thinking about.
@@ -383,7 +383,7 @@ pub fn repo_root(root: &Path) -> PathBuf {
         .position(|dir| dir.join(GIT_DIR).exists())
     else {
         // Outside a checkout the analyzed root *is* the repo, which is the
-        // right answer for `nao analyze /some/loose/directory`.
+        // right answer for `mezz analyze /some/loose/directory`.
         return root.to_path_buf();
     };
     match root.ancestors().nth(levels) {
@@ -416,7 +416,7 @@ fn absolutize(root: &Path) -> Option<PathBuf> {
 /// does not understand.
 ///
 /// Deliberately *not* forgiving where [`read`] is. `read` treats a malformed
-/// file as "no settings" because a stray comma must never fail `nao analyze`.
+/// file as "no settings" because a stray comma must never fail `mezz analyze`.
 /// A writer cannot afford that reading: answering "you had nothing" for a
 /// file we failed to parse is exactly how the next save destroys it. Absent
 /// is still the normal case and still says nothing.
@@ -451,7 +451,7 @@ pub fn write(path: &Path, body: &serde_json::Map<String, serde_json::Value>) -> 
 /// Read and validate one settings file. Absent is the normal case and says
 /// nothing; unreadable or malformed warns and yields defaults.
 ///
-/// A bad settings file is never fatal. `nao analyze` does not need the UI
+/// A bad settings file is never fatal. `mezz analyze` does not need the UI
 /// directory and must not die because of a stray comma in a file it barely
 /// consults.
 fn read(path: &Path, scope: Scope) -> (Settings, Vec<Warning>) {
@@ -487,7 +487,7 @@ fn read_and_print(path: &Path, scope: Scope) -> Settings {
     settings
 }
 
-/// The user-scope settings alone. This is what `nao serve` gets: the
+/// The user-scope settings alone. This is what `mezz serve` gets: the
 /// operator's own preferences apply, the submitted repo's do not.
 pub fn user() -> Settings {
     user_path().map_or_else(Settings::default, |p| read_and_print(&p, Scope::User))
@@ -514,7 +514,7 @@ pub fn load(root: &Path) -> Settings {
 
 /// Both scopes kept apart, warnings retained, everything printed once.
 ///
-/// The reading half of every caller in nao goes through here, so the stderr
+/// The reading half of every caller in mezz goes through here, so the stderr
 /// output is emitted in exactly one place and cannot drift from what the
 /// browser is shown.
 pub fn load_scoped(root: &Path) -> Loaded {
@@ -553,8 +553,8 @@ impl Settings {
     /// The key is relative to the repo, and since CFG-012 the repo is the
     /// checkout rather than the analyzed root: `spec_dir: "docs/domain"` at
     /// the top of a repo means `<repo>/docs/domain` whether the reader typed
-    /// `nao analyze .` or `nao analyze src`. Resolving it against the analyzed
-    /// root instead would send `nao analyze src` looking for
+    /// `mezz analyze .` or `mezz analyze src`. Resolving it against the analyzed
+    /// root instead would send `mezz analyze src` looking for
     /// `src/docs/domain`, which is the failure
     /// [`Config::spec_root`](crate::config::Config::spec_root) is written to
     /// avoid: a spec layer that is empty for a reason nobody can see.
@@ -596,7 +596,7 @@ impl Settings {
     /// Drop a repo-scope `spec_dir` that names anywhere but inside the repo.
     ///
     /// The whole of this module's threat model in one rule: the file was
-    /// cloned, so it may not choose which directories nao reads. Syntactic
+    /// cloned, so it may not choose which directories mezz reads. Syntactic
     /// on purpose — absolute paths and `..` components, decided without
     /// touching the filesystem — because a check that canonicalizes has to
     /// answer what a not-yet-existing path means, and every answer to that
@@ -617,7 +617,7 @@ impl Settings {
             Some("spec_dir"),
             Severity::Ignored,
             "`spec_dir` must stay inside the repo — a cloned file does not get \
-             to pick which directories nao reads. Pass `--spec-dir` to name one \
+             to pick which directories mezz reads. Pass `--spec-dir` to name one \
              elsewhere."
                 .to_string(),
         )]
@@ -713,7 +713,7 @@ impl Settings {
                 ("output_dir", self.output_dir.is_some()),
                 ("spec_dir", self.spec_dir.is_some()),
             ],
-            "is repo-relative — set it in a repo's .nao/settings.json, not \
+            "is repo-relative — set it in a repo's .mezz/settings.json, not \
              machine-wide.",
         )
     }
@@ -751,7 +751,7 @@ impl Settings {
         }
     }
 
-    /// Every configured language name nao has no parser for.
+    /// Every configured language name mezz has no parser for.
     ///
     /// `apply_filters` says this on stderr as it drops them, but that runs
     /// once per command and long after the file was read. Recomputing it is
@@ -912,7 +912,7 @@ mod tests {
     impl TempConfig {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "nao-settings-test-{}-{}",
+                "mezz-settings-test-{}-{}",
                 std::process::id(),
                 tag
             ));
@@ -967,7 +967,7 @@ mod tests {
 
     /// The one-shot rendering flags describe a single invocation, not a
     /// standing preference. A file that could set `format` would make
-    /// `nao analyze -f json | jq` fail depending on a file the reader forgot
+    /// `mezz analyze -f json | jq` fail depending on a file the reader forgot
     /// about, so they are not fields either.
     #[test]
     fn rendering_flags_are_not_settable_from_a_file() {
@@ -1009,7 +1009,7 @@ mod tests {
         );
     }
 
-    /// The regression that matters for this key: `spec_dir` is a path nao
+    /// The regression that matters for this key: `spec_dir` is a path mezz
     /// reads from, and a cloned settings file must not be able to aim it
     /// outside the tree it came with.
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
     impl TempTree {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "nao-settings-tree-{}-{}",
+                "mezz-settings-tree-{}-{}",
                 std::process::id(),
                 tag
             ));
@@ -1104,7 +1104,7 @@ mod tests {
             assert_eq!(
                 shape(&load_scoped(&tree.0.join(sub)).repo),
                 root,
-                "`nao analyze {sub}` disagreed with the repo root"
+                "`mezz analyze {sub}` disagreed with the repo root"
             );
         }
     }
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(load_scoped(&sub).repo.include_tests, Some(true));
     }
 
-    /// `nao analyze /some/loose/directory` keeps the behaviour it had: with
+    /// `mezz analyze /some/loose/directory` keeps the behaviour it had: with
     /// no checkout to stop at, the analyzed root is the repo.
     #[test]
     fn outside_a_checkout_the_analyzed_root_is_the_repo() {
@@ -1221,7 +1221,7 @@ mod tests {
         );
     }
 
-    /// The everyday case: a typo reads as "nao is broken" unless the key is
+    /// The everyday case: a typo reads as "mezz is broken" unless the key is
     /// named back to whoever wrote it.
     #[test]
     fn an_unknown_key_is_kept_with_its_file() {
@@ -1279,17 +1279,17 @@ mod tests {
     /// An absent file is the normal case and says nothing at all.
     #[test]
     fn a_file_that_is_not_there_produces_no_warnings() {
-        let (_, warnings) = read(Path::new("/nonexistent/nao/settings.json"), Scope::User);
+        let (_, warnings) = read(Path::new("/nonexistent/mezz/settings.json"), Scope::User);
         assert!(warnings.is_empty());
     }
 
     /// The distinction a writer depends on: absent is fine, unparseable is
     /// not. `read` deliberately conflates them so a stray comma cannot fail
-    /// `nao analyze`; `read_raw` must not, or the next save overwrites a file
+    /// `mezz analyze`; `read_raw` must not, or the next save overwrites a file
     /// we never understood.
     #[test]
     fn read_raw_separates_an_absent_file_from_an_unreadable_one() {
-        assert!(read_raw(Path::new("/nonexistent/nao/settings.json"))
+        assert!(read_raw(Path::new("/nonexistent/mezz/settings.json"))
             .unwrap()
             .is_empty());
         let dir = TempConfig::new("raw-malformed");
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn a_language_nao_cannot_parse_is_named() {
+    fn a_language_mezz_cannot_parse_is_named() {
         let settings = Settings {
             language: Some(vec!["rust".into(), "cobol".into()]),
             ..Default::default()
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[test]
     fn absent_file_is_not_an_error() {
-        let settings = values(Path::new("/nonexistent/nao/settings.json"), Scope::User);
+        let settings = values(Path::new("/nonexistent/mezz/settings.json"), Scope::User);
         assert!(settings.ui_dir.is_none());
     }
 
@@ -1404,7 +1404,7 @@ mod tests {
             .any(|p| p == "**/generated/**"));
     }
 
-    /// CFG-005. The durable way to ask for assignment detail: `nao watch` and
+    /// CFG-005. The durable way to ask for assignment detail: `mezz watch` and
     /// the VS Code extension are launched without anyone typing a flag, so a
     /// repo that wants locals has to be able to say so in the file.
     #[test]
@@ -1429,7 +1429,7 @@ mod tests {
     }
 
     /// The regression this pair exists for: `max_depth` was applied
-    /// unconditionally, so `nao analyze --depth 7` on a repo whose file said
+    /// unconditionally, so `mezz analyze --depth 7` on a repo whose file said
     /// 3 traversed 3. `spec_dir` and `languages` had tests for exactly this
     /// and the scalars did not, which is how it survived.
     #[test]
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     /// Silence from both leaves whatever the command already chose — this is
-    /// what keeps `nao deps`'s shallower default of 2 alive.
+    /// what keeps `mezz deps`'s shallower default of 2 alive.
     #[test]
     fn neither_flag_nor_file_leaves_the_commands_own_depth() {
         let mut config = Config::default();
@@ -1529,16 +1529,16 @@ mod tests {
     fn config_root_uses_xdg_before_home() {
         assert_eq!(
             config_root_from(None, os("/xdg"), os("/home")),
-            Some(PathBuf::from("/xdg/nao")),
+            Some(PathBuf::from("/xdg/mezz")),
         );
     }
 
-    /// With `XDG_CONFIG_HOME` set, `~/.config/nao` is not consulted at all.
+    /// With `XDG_CONFIG_HOME` set, `~/.config/mezz` is not consulted at all.
     #[test]
     fn config_root_falls_back_to_dot_config_under_home() {
         assert_eq!(
             config_root_from(None, None, os("/home")),
-            Some(PathBuf::from("/home/.config/nao")),
+            Some(PathBuf::from("/home/.config/mezz")),
         );
     }
 
@@ -1554,7 +1554,7 @@ mod tests {
     fn config_root_treats_empty_as_unset() {
         assert_eq!(
             config_root_from(os(""), os(""), os("/home")),
-            Some(PathBuf::from("/home/.config/nao")),
+            Some(PathBuf::from("/home/.config/mezz")),
         );
     }
 }

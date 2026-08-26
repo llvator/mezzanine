@@ -1,4 +1,4 @@
-# nao.elv — domain map of nao itself (root file of the spec).
+# mezz.elv — domain map of mezz itself (root file of the spec).
 # Sketch-first: every area named in one line here; deepened categories
 # live in <category>.elv (split rule: a category moves out when it
 # gains Features).

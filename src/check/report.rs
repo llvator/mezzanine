@@ -63,7 +63,11 @@ pub(super) fn human(outcome: &Outcome) -> String {
 
 /// One violation, as the author will read it: where to look, which rule,
 /// what was measured, where that came from, and the bar they wrote.
-fn line(v: &Violation) -> String {
+///
+/// `pub(super)` so the push-mode hook (MCP-019) prints the same sentence as
+/// the command. A hook with its own phrasing is a second place for the rule
+/// to be described, and the two drift.
+pub(super) fn line(v: &Violation) -> String {
     format!(
         "{}{} — {}: {}{}, bar is {}",
         v.path,

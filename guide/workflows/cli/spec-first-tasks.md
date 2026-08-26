@@ -35,7 +35,7 @@ has three peers with an established shape.
 ## 2. Capture the slice you are working on
 
 ```
-spec_slice { "path": "src/mcp", "out": ".nao/spec-slice.elv" }
+spec_slice { "path": "src/mcp", "out": ".mezz/spec-slice.elv" }
 ```
 
 This extracts every spec entity whose `cr:` claims a path inside the folder,

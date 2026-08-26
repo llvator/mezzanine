@@ -39,7 +39,7 @@
     type RegionTraffic,
   } from '../viewmodels/regionTraffic';
   import { canvasChrome, type CanvasChrome } from '../utils/canvasChrome';
-  import { drillIn, refreshing } from '../stores/scope';
+  import { drillIn, drillInKeepingLevel, refreshing, scopeRules } from '../stores/scope';
   import { isMarked, markedPaths, toggleMark } from '../stores/marks';
   import { isMoreChildThan } from '../utils/kindPriority';
   import { nodeEncoding } from '../stores/encoding';
@@ -59,8 +59,8 @@
    *  the new (smaller) subset allows. */
   function drillInto(d: D3Node): void {
     console.log(`[drill] drillInto() on canvas dblclick — kind=${d.kind_raw} id=${d.id} original_id=${d.original_id}`);
-    if (d.kind_raw !== 'File' && d.kind_raw !== 'Module') {
-      console.log(`[drill] drillInto() skipped — not a File/Module node`);
+    if (d.kind_raw !== 'File' && d.kind_raw !== 'Folder') {
+      console.log(`[drill] drillInto() skipped — not a File/Folder node`);
       return;
     }
     void drillIn(d.original_id);
@@ -79,7 +79,7 @@
    */
   function onNodeDoubleClick(event: MouseEvent, d: D3Node): void {
     event.stopPropagation();
-    if (d.kind_raw !== 'File' && d.kind_raw !== 'Module') return;
+    if (d.kind_raw !== 'File' && d.kind_raw !== 'Folder') return;
     if (event.shiftKey) {
       toggleExpanded(d.original_id);
       return;
@@ -122,7 +122,7 @@
    * The grain in force right now (UI-103).
    *
    * Read through `groupGrainFor` and never straight from the store, so the
-   * File and Module levels cannot be handed a grain they have no meaning for.
+   * File and Folder levels cannot be handed a grain they have no meaning for.
    * Called rather than cached because `linkWeights` above is built once and
    * outlives every level and grain change — a captured value there would go
    * stale silently, where a call cannot.
@@ -659,15 +659,19 @@
   /**
    * Double-click a region: make it the whole view (UI-089).
    *
-   * The same gesture and the same verb as double-clicking a collapsed node —
-   * `drillIn` narrows the scope and re-enables auto-level, so the view opens
-   * to the finest detail the smaller subset affords. A region is the one thing
-   * on the canvas that names a folder without being a node, and it was the
-   * only one you could not drill into.
+   * The same gesture and the same verb as double-clicking a collapsed node,
+   * on the one thing on the canvas that names a folder without being a node.
+   *
+   * `drillInKeepingLevel`, not `drillIn`: a region is drawn at the grain the
+   * reader is reading at, so focusing one narrows *this* picture rather than
+   * trading it for a finer one. Drilling a collapsed File node is the
+   * opposite request — it asks for what is inside — and keeps `drillIn`.
    *
    * Double-click rather than click for two reasons: a single click inside a
    * region has to keep meaning "deselect", and a gesture that replaces the
-   * entire view should not be one stray click away.
+   * entire view should not be one stray click away. Both reasons are about
+   * the *area*. The name is a different target and takes a single click —
+   * see `onRegionLabelClick`.
    *
    * `stopPropagation` keeps d3's own dblclick-to-zoom from firing on the same
    * gesture — the same guard `onNodeDoubleClick` uses.
@@ -676,7 +680,51 @@
     event.stopPropagation();
     event.preventDefault();
     clearRegionHover();
-    void drillIn(h.path);
+    void drillInKeepingLevel(h.path);
+  }
+
+  /**
+   * The path the canvas is already scoped to, when it is scoped to exactly
+   * one path and nothing is filtered out of it — otherwise `null`.
+   *
+   * Deliberately conservative. Any exclusion, or any second include, makes
+   * "already there" a claim this cannot check without deciding pattern
+   * containment, and the cost of answering `null` is one redundant drill.
+   */
+  function soleScopePath(): string | null {
+    const rules = get(scopeRules);
+    if (rules.length !== 1 || rules[0].negate) return null;
+    return rules[0].pattern;
+  }
+
+  /** A focus a name has asked for and the drill has not finished applying.
+   *  Read by `onRegionLabelClick`, which is the only writer. */
+  let focusInFlight: string | null = null;
+
+  /**
+   * Click a region's name: make it the whole view (UI-115).
+   *
+   * The same focus the area's double-click performs — grain and all — on the
+   * one part of a region that can carry a single click safely. UI-089 chose
+   * double-click for two reasons that are both about pointing at the *shape*:
+   * a click inside a region has to keep meaning "deselect", and a hull covers
+   * most of the canvas so a stray click is easy. Neither survives on the name
+   * — it is a few dozen pixels of text drawn outside the outline, nothing on
+   * the canvas sits under it, and it has advertised itself as clickable since
+   * UI-055 with `cursor: pointer` and a hover underline. A reader who reads
+   * that affordance and clicks was, until now, told nothing.
+   *
+   * The two guards make the second click of a double-click a no-op rather
+   * than a second navigation frame — someone who learned the area gesture and
+   * applies it to the name should not have to press back twice.
+   */
+  function onRegionLabelClick(event: MouseEvent, h: FolderHull): void {
+    event.stopPropagation();
+    event.preventDefault();
+    if (h.path === focusInFlight || h.path === soleScopePath()) return;
+    focusInFlight = h.path;
+    clearRegionHover();
+    void drillInKeepingLevel(h.path).finally(() => { focusInFlight = null; });
   }
 
   /**
@@ -727,10 +775,10 @@
     // Tree mode draws no hulls, as before. The layout is a strict hierarchy
     // and an outline over it fights the thing it is outlining.
     if (currentMode !== 'force') return false;
-    // Module level: every node already *is* a folder, so outlining their
+    // Folder level: every node already *is* a folder, so outlining their
     // parent directories stacks a second grouping tier on the first with
     // nothing to tell them apart. Same rule as the cohesion force.
-    if (get(graphLevel) === 'module') return false;
+    if (get(graphLevel) === 'folder') return false;
     return true;
   }
 
@@ -810,8 +858,19 @@
             // `onContentDoubleClick` finds no region under it. That makes it
             // the one way to focus an ancestor whose middle is entirely
             // covered by the regions inside it.
+            //
+            // On the first click since UI-115, which is what the pointer
+            // cursor on this element has been promising all along.
+            .on('click', function (event: MouseEvent) {
+              onRegionLabelClick(event, d3.select<SVGTextElement, FolderHull>(this).datum());
+            })
+            // The click above has already focused; this exists only so the
+            // second press of a double-click — the gesture the area takes,
+            // and the one people who learned it will try here — does not
+            // escape to d3's `dblclick.zoom` and zoom the canvas instead.
             .on('dblclick', function (event: MouseEvent) {
-              onRegionDoubleClick(event, d3.select<SVGTextElement, FolderHull>(this).datum());
+              event.stopPropagation();
+              event.preventDefault();
             });
           return grp;
         },
@@ -1319,11 +1378,11 @@
     orderBadgeSel.classed('dimmed', (l) => !edgeInGroup(l));
   }
 
-  /** Dispatch a hover to whichever question the user is asking. Module level
+  /** Dispatch a hover to whichever question the user is asking. Folder level
    *  falls back to connections: every node there already *is* a folder, so
    *  "what else lives here" has no answer to give. */
   function highlightHover(d: D3Node) {
-    if ($hoverMode === 'group' && get(graphLevel) !== 'module') highlightGroup(d);
+    if ($hoverMode === 'group' && get(graphLevel) !== 'folder') highlightGroup(d);
     else highlightConnections(d);
   }
 
@@ -1512,7 +1571,7 @@
     plan: DisplayPlan,
     data: import('../types/graph').GraphData,
   ): import('../types/graph').GraphData {
-    const empty = { nodes: [], links: [], files: data.files, modules: data.modules };
+    const empty = { nodes: [], links: [], files: data.files, folders: data.folders };
     if (plan.overflow) return empty;
     // Same definition the ceiling is measured against — see `drawnIdsOf`.
     // If these two ever disagree the gate is charging for a different set
@@ -1527,7 +1586,7 @@
     const links = data.links.filter(
       (l) => plan.visibleLinkKeys.has(linkKeyFor(l)) && keep.has(sourceId(l)) && keep.has(targetId(l)),
     );
-    return { nodes, links, files: data.files, modules: data.modules };
+    return { nodes, links, files: data.files, folders: data.folders };
   }
 
   function teardownGraph() {
@@ -1642,7 +1701,7 @@
       .force('collision', d3.forceCollide().radius(collisionRadius()))
       // UI-052. Everything above is edge-driven or global; this is the only
       // force that knows two nodes live in the same group. Strength is a
-      // user setting, and `cohesionStrengthFor` zeroes it at Module level
+      // user setting, and `cohesionStrengthFor` zeroes it at Folder level
       // where each node already is a folder. The chain is passed in rather
       // than imported by the force (UI-103), so the grain is decided here,
       // once, alongside every other consumer. See utils/forceCohesion.ts.
@@ -2278,8 +2337,11 @@
              quietly, and only where there is a spec to be missing from. -->
         <div class="region-spec-none" data-probe="region-spec-none">No spec entity claims this folder</div>
       {/if}
+      <!-- Both gestures, because they act on different targets and the card
+           is the only place either one is written down: the area takes a
+           double-click, the name takes a single one (UI-115). -->
       <div class="region-hint" data-probe="region-hint">
-        Double-click to focus {hoveredRegions[hoveredRegions.length - 1].label}
+        Double-click, or click its name, to focus {hoveredRegions[hoveredRegions.length - 1].label}
       </div>
     </div>
   {/if}
@@ -2333,7 +2395,9 @@
     letter-spacing: 0.12em;
     /* The name is the one part of a region small enough to point at
        precisely, which is what makes it the way to focus an *ancestor* whose
-       middle is covered by its children. */
+       middle is covered by its children — and, since UI-115, why it is the
+       one part that can take a single click without stealing the deselect
+       that a click inside a region has to keep meaning. */
     pointer-events: auto;
     cursor: pointer;
   }

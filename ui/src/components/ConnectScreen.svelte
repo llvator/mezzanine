@@ -57,7 +57,7 @@
 
 <div class="connect" data-probe="connect-screen">
   <header>
-    <h1>Nao</h1>
+    <h1>Mezzanine</h1>
     <p class="tagline">Point this page at a running engine.</p>
   </header>
 
@@ -84,7 +84,7 @@
     <p class="hint">
       A port (<code>3200</code>) or a full origin
       (<code>http://localhost:3200</code>). Start one with
-      <code>nao watch . --port 3200</code>.
+      <code>mezz watch . --port 3200</code>.
       {#if parsed && parsed !== input.trim()}
         <br />Will connect to <code>{parsed}</code>.
       {/if}
@@ -113,9 +113,9 @@
         {#if result.kind === 'unreachable'}
           <strong>Nothing is listening there.</strong>
           <p>Check the port, and that the engine is still running:</p>
-          <pre>nao watch . --port {parsed ? new URL(parsed).port || '80' : '3200'}</pre>
-        {:else if result.kind === 'not-nao'}
-          <strong>Something is listening, but it isn't nao.</strong>
+          <pre>mezz watch . --port {parsed ? new URL(parsed).port || '80' : '3200'}</pre>
+        {:else if result.kind === 'not-mezz'}
+          <strong>Something is listening, but it isn't mezz.</strong>
           <p>
             That port belongs to another server. Check which port the engine
             printed at startup — it is not always the one you last used.
@@ -126,7 +126,7 @@
             It only answers pages it served itself, or origins you name. Restart
             it with this origin allowed:
           </p>
-          <pre>nao watch . --allow-origin {pageOrigin}</pre>
+          <pre>mezz watch . --allow-origin {pageOrigin}</pre>
           <p class="why">
             Loopback is not a boundary against a browser on the same machine,
             which is why the engine asks rather than assuming.

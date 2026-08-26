@@ -5,7 +5,7 @@
     qualityRows,
     qualitySummary,
     fileRows,
-    moduleRows,
+    folderRows,
     repoQuality,
     scopeHolds,
     METRIC_EXPLANATIONS,
@@ -57,7 +57,7 @@
     return i >= 0 ? path.slice(0, i) : '';
   }
 
-  type Mode = 'entities' | 'files' | 'modules';
+  type Mode = 'entities' | 'files' | 'folders';
   let mode: Mode = 'entities';
 
   type SortKey =
@@ -307,8 +307,8 @@
     return '#66BB6A';
   }
 
-  // --- Scope (file/module) table: sort + filter + copy ---
-  // Files and modules use the same table shape so we share one filter
+  // --- Scope (file/folder) table: sort + filter + copy ---
+  // Files and folders use the same table shape so we share one filter
   // pipeline and toggle the data source by mode.
   function scopeValue(r: ScopeRow, key: SortKey): number | string {
     const s = r.scope;
@@ -367,12 +367,13 @@
       // and a folder at compliance 95% held back by branching 40% is exactly
       // the case the separation exists for.
       `branching ${pct(shape.arborescence)} — gates fractal, not part of compliance\n` +
+      `out at the bottom ${pct(shape.egress)} — gates fractal, not part of compliance\n` +
       `${shape.child_count} immediate ${shape.child_count === 1 ? 'child' : 'children'} — ` +
       `gates fractal, not part of compliance`;
     return { text: `${SHAPE_GLYPH[shape.pattern]} ${shape.pattern}`, why, cls, tip };
   }
 
-  $: activeScopeRows = (mode as Mode) === 'files' ? $fileRows : $moduleRows;
+  $: activeScopeRows = (mode as Mode) === 'files' ? $fileRows : $folderRows;
 
   $: shapeTally = activeScopeRows.reduce(
     (acc, r) => {
@@ -386,7 +387,7 @@
   $: scopeFiltered = activeScopeRows.filter((r) => {
     if (severityFilter === 'all') return true;
     if (severityFilter === 'cycle') return r.scope.in_cycle;
-    // Only modules carry a shape, so in Files mode this filter has nothing
+    // Only folders carry a shape, so in Files mode this filter has nothing
     // to say and hides nothing rather than emptying the table.
     if (severityFilter === 'shape') return (mode as Mode) === 'files' || shapeIsPoor(r.scope);
     const tiers: Tier[] = Object.values(r.tiers);
@@ -414,12 +415,13 @@
     'Score', 'Path', 'Entities', 'Callables', 'Containers', 'LOC',
     'Internal', 'External', 'Cohesion', 'Fan-in', 'Fan-out', 'Cycle',
   ];
-  // Shape is folder-only, so the modules table exports six more columns
+  // Shape is folder-only, so the folders table exports six more columns
   // than the files one rather than six empty cells.
   const SHAPE_COPY_HEADER = [
     'Shape', 'Held back by', 'Compliance', 'Layered', 'Branching', 'One door in',
+    'Out at the bottom',
   ];
-  $: scopeCopyHeader = (mode as Mode) === 'modules'
+  $: scopeCopyHeader = (mode as Mode) === 'folders'
     ? [...SCOPE_COPY_HEADER, ...SHAPE_COPY_HEADER]
     : SCOPE_COPY_HEADER;
   function shapeRowValues(s: ScopeMetrics): string[] {
@@ -431,6 +433,7 @@
       pct(s.shape.layering),
       pct(s.shape.arborescence),
       pct(s.shape.entry_concentration),
+      pct(s.shape.egress),
     ];
   }
   function scopeRowValues(r: ScopeRow): string[] {
@@ -472,23 +475,23 @@
   }
 
   /**
-   * Select what a file or module row names.
+   * Select what a file or folder row names.
    *
-   * The canvas draws a File or Module node for the path whenever the level is
+   * The canvas draws a File or Folder node for the path whenever the level is
    * collapsed that far, and that node is the row's own subject — so it is what
    * a click should land on. Falling straight to "first entity in the file" was
    * the only rule before, and it is level-dependent in a way the reader is not:
-   * at Module level no node carries a plain file path, and at Entity level no
-   * node carries a directory path, so a module row's click resolved to nothing
+   * at Folder level no node carries a plain file path, and at Entity level no
+   * node carries a directory path, so a folder row's click resolved to nothing
    * and did nothing at all.
    */
   function selectScope(r: ScopeRow) {
     activeScopePath = r.scope.path;
-    const isModule = (mode as Mode) === 'modules';
+    const isFolder = (mode as Mode) === 'folders';
     const nodes = $graphData.nodes;
     const target =
-      nodes.find((n) => n.original_id === r.scope.path && (n.kind_raw === 'File' || n.kind_raw === 'Module'))
-      ?? nodes.find((n) => scopeHolds(r.scope.path, isModule, n.file_path));
+      nodes.find((n) => n.original_id === r.scope.path && (n.kind_raw === 'File' || n.kind_raw === 'Folder'))
+      ?? nodes.find((n) => scopeHolds(r.scope.path, isFolder, n.file_path));
     if (target) selectedNode.set(target);
   }
 
@@ -497,13 +500,13 @@
    *
    * Tracked rather than read back off `selectedNode`, because the two only
    * coincide when the canvas happens to be collapsed to this row's level: at
-   * Entity level no node carries a directory path, so a module row's click
-   * lands on an entity *inside* the module and a "is the selection this path"
+   * Entity level no node carries a directory path, so a folder row's click
+   * lands on an entity *inside* the folder and a "is the selection this path"
    * test says no. The row would then highlight or not depending on the
    * aggregation level, which is not something the reader changed.
    */
   let activeScopePath: string | null = null;
-  // A path means one thing in the Files table and another in Modules, so it
+  // A path means one thing in the Files table and another in Folders, so it
   // does not survive the switch.
   $: if (mode) activeScopePath = null;
 
@@ -520,11 +523,11 @@
    * them, and pick 'what the canvas is drawing' when they want both to move.
    *
    * Paths come from `rawEntityGraph`, never from `graphData`: a collapsed
-   * Module node carries a *directory* as its `file_path`, so filtering off the
+   * Folder node carries a *directory* as its `file_path`, so filtering off the
    * drawn graph would write directories into a store that holds files, and the
    * filter would mean something different at each aggregation level. Written
    * as real file paths it means one thing everywhere — including being the
-   * documented no-op at Module level, where there is no per-file node to hide.
+   * documented no-op at Folder level, where there is no per-file node to hide.
    */
   /**
    * Why the last "Only" click could not narrow anything, or null.
@@ -554,10 +557,10 @@
 
   function filterToScope(e: Event, r: ScopeRow) {
     e.stopPropagation();
-    const isModule = (mode as Mode) === 'modules';
+    const isFolder = (mode as Mode) === 'folders';
     const files = $rawEntityGraph.nodes
       .map((n) => n.file_path)
-      .filter((p) => !!p && scopeHolds(r.scope.path, isModule, p));
+      .filter((p) => !!p && scopeHolds(r.scope.path, isFolder, p));
     filterNotice = filterToFiles(new Set(files)) ? null : outsideScope(r.scope.path || '(root)');
   }
 
@@ -710,7 +713,7 @@
   {/if}
 
   <!-- Above the mode bar, not inside a tab: it decides what every tab below
-       is measuring, so a reader on Files or Modules needs it as much as one
+       is measuring, so a reader on Files or Folders needs it as much as one
        on Entities — and while it lived in the Entities branch they could not
        reach it at all without switching tabs first. -->
   <label class="population-picker">
@@ -728,12 +731,12 @@
     </select>
   </label>
 
-  <!-- Mode selector: Entities / Files / Modules.
+  <!-- Mode selector: Entities / Files / Folders.
        Each mode reuses the same severity filter + sort + copy pipeline. -->
   <div class="mode-bar">
     <button type="button" class="mode-btn" class:active={mode === 'entities'} on:click={() => (mode = 'entities')}>Entities</button>
     <button type="button" class="mode-btn" class:active={mode === 'files'} on:click={() => (mode = 'files')}>Files</button>
-    <button type="button" class="mode-btn" class:active={mode === 'modules'} on:click={() => (mode = 'modules')}>Modules</button>
+    <button type="button" class="mode-btn" class:active={mode === 'folders'} on:click={() => (mode = 'folders')}>Folders</button>
   </div>
 
   {#if mode === 'entities'}
@@ -978,8 +981,8 @@
     {:else}
       <div class="qr-head">
       <section class="summary">
-        <h3>{mode === 'files' ? 'Files' : 'Modules'} ({activeScopeRows.length})</h3>
-        {#if mode === 'modules' && shapeTally.measured > 0}
+        <h3>{mode === 'files' ? 'Files' : 'Folders'} ({activeScopeRows.length})</h3>
+        {#if mode === 'folders' && shapeTally.measured > 0}
           <!-- Reads as a ladder, worst first, so the two tiers with
                something to fix sit at the front where they are read. -->
           <p class="shape-tally" data-probe="folder-shape-tally">
@@ -1015,7 +1018,7 @@
             <option value="warnbad">amber + red</option>
             <option value="bad">red only</option>
             <option value="cycle">in cycle</option>
-            {#if mode === 'modules'}
+            {#if mode === 'folders'}
               <option value="shape">shape below hierarchical</option>
             {/if}
           </select>
@@ -1041,7 +1044,7 @@
 
       <section class="table-section" data-probe="quality-table">
         <h3>
-          Problem {mode === 'files' ? 'files' : 'modules'}
+          Problem {mode === 'files' ? 'files' : 'folders'}
           ({scopeFiltered.length} shown, top {scopeVisible.length} rendered)
         </h3>
         <table class="metrics-table">
@@ -1057,7 +1060,7 @@
               <th class="sortable num help" data-tip={explain('scope_fan_in')} aria-label={explain('scope_fan_in')} on:click={() => toggleSort('scope_fan_in')}>Fin</th>
               <th class="sortable num help" data-tip={explain('scope_fan_out')} aria-label={explain('scope_fan_out')} on:click={() => toggleSort('scope_fan_out')}>Fout</th>
               <th class="help" data-tip={explain('scope_cycle')} aria-label={explain('scope_cycle')}>Cyc</th>
-              {#if mode === 'modules'}
+              {#if mode === 'folders'}
                 <th class="sortable help" data-tip={explain('folder_shape')} aria-label={explain('folder_shape')} on:click={() => toggleSort('shape')}>Shape {sortKey === 'shape' ? (sortDir === 'desc' ? '▼' : '▲') : ''}</th>
               {/if}
               <th aria-label="Copy row"></th>
@@ -1093,7 +1096,7 @@
                 <td class="num" title={fin.tip}>{fin.text}</td>
                 <td class="num {fout.unmeasured ? '' : tierClass(r.tiers.fanOut)}" title={fout.tip}>{fout.text}</td>
                 <td class="num">{r.scope.in_cycle ? '●' : ''}</td>
-                {#if mode === 'modules'}
+                {#if mode === 'folders'}
                   {@const shape = shapeCell(r.scope)}
                   <!-- UI-108 — the cell is the door from the number to the
                        picture. ADR 0012's premise is that the score is a

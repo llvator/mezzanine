@@ -1,4 +1,4 @@
-//! Text report behind `nao deps <file>`.
+//! Text report behind `mezz deps <file>`.
 //!
 //! The unit is the *file*, not the declarations inside it. Most languages
 //! never produce a File-kind entity — a parsed file is a handful of function
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(out, "Dependencies for: solo.ts\n\nNo dependencies.\n");
     }
 
-    /// A file nao could not parse — or one that isn't in the graph at all —
+    /// A file mezz could not parse — or one that isn't in the graph at all —
     /// has no seeds, so the walk is empty rather than unbounded.
     #[test]
     fn an_unknown_file_says_it_has_no_dependencies() {

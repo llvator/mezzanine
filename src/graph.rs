@@ -2,13 +2,36 @@
 
 use crate::analyzer::AnalysisResult;
 use crate::models::{
-    CodeEntity, EntityKind, FileMetrics, FolderPicture, ImportSite, ModuleMetrics, Relationship,
+    CodeEntity, EntityKind, FileMetrics, FolderPicture, ImportSite, FolderMetrics, Relationship,
     RelationshipKind, ScopeMetrics,
 };
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use std::collections::{HashMap, HashSet};
+
+/// Entities the parser mints to describe structure rather than to name a
+/// declaration: a parameter, the arm of a conditional, a loop body, a local
+/// binding. They carry real edges and belong in the file map; they are not
+/// things a reader counts.
+fn is_synthetic(e: &CodeEntity) -> bool {
+    matches!(
+        e.kind,
+        EntityKind::Parameter | EntityKind::Branch | EntityKind::Loop
+    ) || e.tags.contains("local_var")
+}
+
+/// Which immediate child of `folder` holds `path`, or `None` when `path` is
+/// outside the folder entirely.
+///
+/// The unit a folder is drawn in: a file directly inside it is its own node, a
+/// file deeper down is the subfolder standing for it, and two paths answering
+/// the same child are one node as far as this folder's picture is concerned.
+fn immediate_child<'a>(folder: &str, path: &'a str) -> Option<&'a str> {
+    let rest = path.strip_prefix(folder)?.strip_prefix('/')?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(&path[..folder.len() + 1 + end])
+}
 
 /// Wrapper around petgraph for dependency visualization.
 #[derive(Clone)]
@@ -23,7 +46,7 @@ pub struct DependencyGraph {
     /// Renderers strip the project root for display.
     file_metrics: Vec<FileMetrics>,
     /// Per-module (directory) rollup metrics keyed by full directory path.
-    module_metrics: Vec<ModuleMetrics>,
+    folder_metrics: Vec<FolderMetrics>,
     /// What each file says it is for, keyed the same way as `file_metrics`.
     /// Prose rather than a rollup, so it sits beside the metrics instead of
     /// inside them, and only files that carry a header appear.
@@ -148,7 +171,7 @@ impl DependencyGraph {
             node_map: HashMap::new(),
             reverse_map: HashMap::new(),
             file_metrics: Vec::new(),
-            module_metrics: Vec::new(),
+            folder_metrics: Vec::new(),
             file_docs: HashMap::new(),
             import_sites: Vec::new(),
         }
@@ -169,8 +192,8 @@ impl DependencyGraph {
     }
 
     /// Per-directory quality rollups (empty until `from_analysis` runs).
-    pub fn module_metrics(&self) -> &[ModuleMetrics] {
-        &self.module_metrics
+    pub fn folder_metrics(&self) -> &[FolderMetrics] {
+        &self.folder_metrics
     }
 
     /// Where the analysis saw each cross-file import written (AN-024).
@@ -180,8 +203,129 @@ impl DependencyGraph {
         &self.import_sites
     }
 
+    /// How much of what the parsers read actually reached the graph.
+    ///
+    /// `(landed, seen)` over cross-file import statements: `seen` is every
+    /// [`ImportSite`] a parser recorded — a statement whose specifier it
+    /// resolved to a file — and `landed` is those with a dependency edge
+    /// between the same two files to show for it.
+    ///
+    /// The gap is silent everywhere else. `resolve_import_target` drops an
+    /// import it cannot bind to an entity without a word, so a folder whose
+    /// incoming edges went missing is reported as quiet rather than
+    /// unreadable, and every verdict computed over it — shape, doors, exits,
+    /// a `check` rule — is confidently wrong with nothing attached to say so.
+    /// A reader cannot tell "clean" from "did not see it", which is the one
+    /// distinction that decides whether to trust the answer.
+    ///
+    /// Sites are deduped by `(from, to)` because the count is of dependencies
+    /// that should be drawable, not of statements: three `use` lines between
+    /// one pair of files are one edge in every consumer downstream.
+    ///
+    /// **Build-erased statements are left out of both halves.** A TypeScript
+    /// `import type` is deleted by the compiler and no bundler resolves it
+    /// (AN-022), and ADR 0026 already keeps those arrows out of every score.
+    /// The sentence this number is printed under is about *verdicts* being
+    /// unsound, and verdicts are computed over the scored graph — so counting
+    /// an erased statement as a missing dependency would raise an alarm about
+    /// something no verdict reads. Seven of `ui/src`'s 32 were of that kind.
+    pub fn import_coverage(&self) -> (usize, usize) {
+        let seen = self.import_dependencies();
+        let missing = self.unresolved_imports();
+        (seen.len().saturating_sub(missing.len()), seen.len())
+    }
+
+    /// Every cross-file dependency an import statement asks for, deduped and
+    /// with the build-erased ones dropped. The denominator of
+    /// [`Self::import_coverage`], and the set the unresolved ones come out of.
+    fn import_dependencies(&self) -> std::collections::BTreeSet<(String, String)> {
+        self.import_sites
+            .iter()
+            .filter(|site| !site.is_type_only)
+            .map(|site| {
+                (
+                    site.from.display().to_string(),
+                    site.to.display().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The import statements the graph holds no dependency edge for.
+    pub fn unresolved_imports(&self) -> std::collections::BTreeSet<(String, String)> {
+        let pairs: std::collections::HashSet<(String, String)> =
+            self.file_graph().pairs.into_iter().collect();
+        self.import_dependencies()
+            .into_iter()
+            .filter(|pair| !pairs.contains(pair))
+            .collect()
+    }
+
+    /// The unresolved imports that would have changed `folder`'s drawing, as
+    /// the statements a reader can go and look at.
+    ///
+    /// The count alone was not enough. A missing import is what *creates* a
+    /// child with no parent in the drawing, so `reshape` would print "these
+    /// children have no parent" and offer three diagnoses of a folder whose
+    /// parent exists in the source — a fabricated task, worded as
+    /// confidently as a real one, with only a "treat this as provisional"
+    /// banner above it. Provisional reads as "the number may be off", not
+    /// "the instruction is invented".
+    ///
+    /// Naming them collapses that: a reader who sees
+    /// `algorithms.ts:4 → nanoid.ts` knows immediately which finding is an
+    /// artifact, without deriving it from the source.
+    pub fn unresolved_imports_in(&self, folder: &str) -> Vec<&ImportSite> {
+        let missing = self.unresolved_imports();
+        let mut sites: Vec<&ImportSite> = self
+            .import_sites
+            .iter()
+            .filter(|site| !site.is_type_only)
+            .filter(|site| {
+                let pair = (
+                    site.from.display().to_string(),
+                    site.to.display().to_string(),
+                );
+                missing.contains(&pair)
+                    && immediate_child(folder, &pair.0) != immediate_child(folder, &pair.1)
+            })
+            .collect();
+        sites.sort_by(|a, b| (&a.from, a.line, &a.to).cmp(&(&b.from, b.line, &b.to)));
+        sites.dedup_by(|a, b| (&a.from, a.line, &a.to) == (&b.from, b.line, &b.to));
+        sites
+    }
+
+    /// How many of them would have changed `folder`'s **drawing**.
+    ///
+    /// The count that belongs next to a verdict about that folder. A repo
+    /// figure in the footer says the graph has holes somewhere; it cannot tell
+    /// a reader whether the folder they are being given an answer about is one
+    /// of the holed ones.
+    ///
+    /// "Would have changed the drawing", not "is somewhere beneath it". A
+    /// folder is scored over its immediate children with each subfolder
+    /// collapsed to one node (ADR 0012), so an unresolved import matters here
+    /// only if it is an edge in *that* picture: between two different
+    /// immediate children, or across the boundary. One between two files
+    /// inside a single child is invisible at this level — it is that child's
+    /// business — and the first version counted it anyway, by asking only
+    /// whether an endpoint sat beneath the folder.
+    ///
+    /// Two symptoms, both reported from the field: `src/uid/generators`, whose
+    /// three files hold no relative import at all, was marked as having two
+    /// unresolved; and the analysis root was marked with *every* unresolved
+    /// import in the project, since every path is beneath it. Both told a
+    /// reader to distrust a verdict that was sound, and both sat in the
+    /// "Start here" list, which is the first thing acted on.
+    pub fn unresolved_imports_touching(&self, folder: &str) -> usize {
+        self.unresolved_imports()
+            .iter()
+            .filter(|(from, to)| immediate_child(folder, from) != immediate_child(folder, to))
+            .count()
+    }
+
     /// The graph one folder draws, with a verdict on every node and edge —
-    /// the evidence behind the `shape` its [`ModuleMetrics`] reports.
+    /// the evidence behind the `shape` its [`FolderMetrics`] reports.
     ///
     /// Recomputed on demand from the same two scans `populate_scope_metrics`
     /// runs, rather than kept from that pass: the scalars are four floats a
@@ -212,7 +356,7 @@ impl DependencyGraph {
     pub fn file_graph(&self) -> FileGraph {
         let tally = self.scan_entity_files();
         let edges = self.scan_file_edges(&tally.entity_file);
-        let folders = Self::enumerate_module_paths(&tally);
+        let folders = Self::enumerate_folder_paths(&tally);
         FileGraph {
             files: tally.entity_count.keys().cloned().collect(),
             pairs: edges.deps.pairs,
@@ -919,9 +1063,9 @@ impl DependencyGraph {
         let edges = self.scan_file_edges(&tally.entity_file);
         let cycles = Self::compute_file_cycles(&tally, &edges);
         let files = Self::assemble_file_metrics(&tally, &edges, &cycles);
-        let modules = Self::compute_module_metrics(&tally, &edges, &cycles, &self.import_sites);
+        let folders = Self::compute_folder_metrics(&tally, &edges, &cycles, &self.import_sites);
         self.file_metrics = files;
-        self.module_metrics = modules;
+        self.folder_metrics = folders;
     }
 
     // ------------------------------------------------------------------
@@ -996,21 +1140,31 @@ impl DependencyGraph {
 
         for idx in self.graph.node_indices() {
             let e = &self.graph[idx];
-            // Synthetic entities (Parameter, Branch, Loop, local_var
-            // Variables) are rendering aids, not real program structure
-            // — exclude from per-file counts.
-            if e.kind == EntityKind::Parameter
-                || e.kind == EntityKind::Branch
-                || e.kind == EntityKind::Loop
-                || e.tags.contains("local_var")
-            {
-                continue;
-            }
             let path = Self::normalize_path(&e.file_path);
             if path.is_empty() {
                 continue;
             }
+            // Every entity is mapped to its file, synthetic or not. This map is
+            // what `scan_file_edges` resolves an edge's two endpoints through,
+            // and a call written inside an `if` or a `try` is attributed to the
+            // Branch entity for that arm — so excluding synthetic entities here
+            // dropped those edges out of the file graph completely.
+            //
+            // The consequence was not cosmetic. The file graph is what folder
+            // shape, `mezz check`'s door and importer rules, and
+            // `import_coverage` are all computed over, so a dependency created
+            // inside a conditional body was invisible to every one of them: a
+            // folder read as having no edge between two children that call each
+            // other, and the import that carried it read as unresolved. Five
+            // field reports in a row correlated their missing edges with calls
+            // inside `if` and `try` bodies, which is exactly this.
             tally.entity_file.insert(idx, path.clone());
+            // Counts are a different question, and synthetic entities are
+            // rendering aids rather than program structure — a Branch is not a
+            // declaration a reader meets on opening the file.
+            if is_synthetic(e) {
+                continue;
+            }
             *tally.entity_count.entry(path.clone()).or_insert(0) += 1;
             if e.kind != EntityKind::Module {
                 substantive.insert(path.clone());
@@ -1153,16 +1307,15 @@ impl DependencyGraph {
         files
     }
 
-    /// Phase 5: roll file-level data up to directory (module) granularity.
-    /// Phase 5: roll file-level data up to directory (module) granularity.
-    fn compute_module_metrics(
+    /// Phase 5: roll file-level data up to directory (folder) granularity.
+    fn compute_folder_metrics(
         tally: &FileTally,
         edges: &FileEdgeData,
         cycles: &HashSet<String>,
         imports: &[ImportSite],
-    ) -> Vec<ModuleMetrics> {
-        let module_paths = Self::enumerate_module_paths(tally);
-        if module_paths.is_empty() {
+    ) -> Vec<FolderMetrics> {
+        let folder_paths = Self::enumerate_folder_paths(tally);
+        if folder_paths.is_empty() {
             return Vec::new();
         }
 
@@ -1175,13 +1328,13 @@ impl DependencyGraph {
             tally.entity_count.keys().map(String::as_str),
             &edges.deps.pairs,
             imports,
-            &module_paths,
+            &folder_paths,
             &tally.declaration_only,
         );
 
-        let mut sorted: Vec<String> = module_paths.into_iter().collect();
+        let mut sorted: Vec<String> = folder_paths.into_iter().collect();
         sorted.sort();
-        let mut modules = Vec::with_capacity(sorted.len());
+        let mut folders = Vec::with_capacity(sorted.len());
 
         for mp in &sorted {
             let descendants: Vec<&String> = tally
@@ -1192,13 +1345,13 @@ impl DependencyGraph {
 
             let mut m = Self::aggregate_file_counts(tally, &descendants);
             let (internal, external, fan_in, fan_out) =
-                Self::classify_module_edges(&edges.deps, &descendants);
+                Self::classify_folder_edges(&edges.deps, &descendants);
             // Same classification over the reference bucket. Only the fan
             // counts are kept: references feed no ratio and no score, they
             // exist so the reader can tell an unmeasured scope from a
             // decoupled one (UI-091).
             let (_, _, ref_fan_in, ref_fan_out) =
-                Self::classify_module_edges(&edges.refs, &descendants);
+                Self::classify_folder_edges(&edges.refs, &descendants);
             m.ref_fan_in = ref_fan_in;
             m.ref_fan_out = ref_fan_out;
             m.internal_edges = internal;
@@ -1240,12 +1393,12 @@ impl DependencyGraph {
             // Assigned after the composite score, and never read by it:
             // organisation is not code quality (see `ScopeMetrics::shape`).
             m.shape = shapes.get(mp).cloned();
-            modules.push(ModuleMetrics {
+            folders.push(FolderMetrics {
                 path: mp.clone(),
                 metrics: m,
             });
         }
-        modules
+        folders
     }
 
     /// Parent directory of a file path (everything before the last separator).
@@ -1256,52 +1409,56 @@ impl DependencyGraph {
         }
     }
 
-    /// Does `file_path` live under `module_path` (possibly in a subdirectory)?
-    fn is_descendant(module_path: &str, file_path: &str) -> bool {
-        if module_path.is_empty() {
+    /// Does `file_path` live under `folder_path` (possibly in a subdirectory)?
+    fn is_descendant(folder_path: &str, file_path: &str) -> bool {
+        if folder_path.is_empty() {
             return true;
         }
         file_path
-            .strip_prefix(module_path)
+            .strip_prefix(folder_path)
             .map_or(false, |rest| rest.starts_with(std::path::MAIN_SEPARATOR))
     }
 
-    /// Compute the longest common directory prefix across all file paths,
-    /// then enumerate every ancestor directory down to (and including) that
-    /// prefix. Returns the full set of module paths.
-    fn enumerate_module_paths(tally: &FileTally) -> HashSet<String> {
+    /// The deepest directory every analysed file sits under, or `None` when
+    /// nothing was analysed.
+    ///
+    /// Compared component by component rather than as a string prefix, so
+    /// `src/parser/` and `src/parsed/` reduce to `src` and not to the
+    /// characters they happen to share.
+    fn common_parent_dir(tally: &FileTally) -> Option<String> {
         use std::path::{Path, PathBuf};
 
-        // LCP at the component level so `src/parser/` and `src/parsed/`
-        // correctly reduce to `src` instead of `""`.
-        let lcp = {
-            let mut iter = tally.entity_count.keys();
-            match iter.next() {
-                None => return HashSet::new(),
-                Some(first) => {
-                    let mut prefix: Vec<_> = Path::new(&Self::parent_dir(first))
-                        .components()
-                        .map(|c| c.as_os_str().to_owned())
-                        .collect();
-                    for path in iter {
-                        let comps: Vec<_> = Path::new(&Self::parent_dir(path))
-                            .components()
-                            .map(|c| c.as_os_str().to_owned())
-                            .collect();
-                        let keep = prefix
-                            .iter()
-                            .zip(comps.iter())
-                            .take_while(|(a, b)| a == b)
-                            .count();
-                        prefix.truncate(keep);
-                    }
-                    let mut buf = PathBuf::new();
-                    for c in &prefix {
-                        buf.push(c);
-                    }
-                    buf.display().to_string()
-                }
-            }
+        let components = |p: &str| -> Vec<std::ffi::OsString> {
+            Path::new(&Self::parent_dir(p))
+                .components()
+                .map(|c| c.as_os_str().to_owned())
+                .collect()
+        };
+
+        let mut iter = tally.entity_count.keys();
+        let mut prefix = components(iter.next()?);
+        for path in iter {
+            let keep = prefix
+                .iter()
+                .zip(components(path).iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            prefix.truncate(keep);
+        }
+
+        let mut buf = PathBuf::new();
+        for c in &prefix {
+            buf.push(c);
+        }
+        Some(buf.display().to_string())
+    }
+
+    /// Every ancestor directory from [`Self::common_parent_dir`] down to the
+    /// one holding each analysed file, inclusive. The full set of folder
+    /// paths the rollups are computed over.
+    fn enumerate_folder_paths(tally: &FileTally) -> HashSet<String> {
+        let Some(lcp) = Self::common_parent_dir(tally) else {
+            return HashSet::new();
         };
 
         let mut paths: HashSet<String> = HashSet::new();
@@ -1335,7 +1492,7 @@ impl DependencyGraph {
     /// Classify cross-file edge pairs as internal or external to a module
     /// defined by `descendants`. Returns `(internal_edges, external_edges,
     /// fan_in_count, fan_out_count)`.
-    fn classify_module_edges(edges: &EdgeBuckets, descendants: &[&String]) -> (u32, u32, u32, u32) {
+    fn classify_folder_edges(edges: &EdgeBuckets, descendants: &[&String]) -> (u32, u32, u32, u32) {
         // Intra-file edges are always internal to any ancestor module.
         let mut internal = 0u32;
         for f in descendants {
@@ -1776,6 +1933,52 @@ impl DependencyGraph {
         self.node_map.get(id).map(|&idx| &self.graph[idx])
     }
 
+    /// How much of each entity's `fan_out` points at something mezz could
+    /// not identify, keyed by entity id.
+    ///
+    /// The number behind a ranking artefact the `quality` header has been
+    /// disclaiming in the abstract since it was written: *"a builder chain
+    /// scores its every link as a dependency"*. On this repo 56% of
+    /// dependency edges land on a ghost, and a fluent chain against an
+    /// external library — `new Setting(el).setName().setDesc().addText()` —
+    /// is four of them, on a function whose real dependency set is one
+    /// class.
+    ///
+    /// Reported rather than corrected, deliberately. Collapsing a chain to
+    /// its receiver needs the receiver, and an external chain resolves to
+    /// parentless ghosts carrying no receiver at all (AN-031) — so the
+    /// correction is a parser change, and a scoring change made without
+    /// one would re-rank every repo while leaving this exact case alone.
+    /// A reader who can see *which* rows are mostly unidentified does not
+    /// have to learn to skim the whole list.
+    ///
+    /// Distinct targets, matching how `fan_out` itself counts, so the two
+    /// numbers are on the same scale and "17 of 20" means what it looks
+    /// like.
+    pub fn unresolved_fan_out(&self) -> HashMap<&str, u32> {
+        let mut seen: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for edge in self.graph.edge_indices() {
+            let rel = &self.graph[edge];
+            if !rel.kind.is_dependency() {
+                continue;
+            }
+            let Some((src, tgt)) = self.graph.edge_endpoints(edge) else {
+                continue;
+            };
+            if src == tgt || !self.graph[tgt].tags.contains("ghost") {
+                continue;
+            }
+            seen.entry(self.graph[src].id.as_str())
+                .or_default()
+                .insert(self.graph[tgt].id.as_str());
+        }
+        seen.into_iter()
+            .map(|(id, targets)| (id, targets.len() as u32))
+            .collect()
+    }
+
+
+    /// Get all entities
     /// Get all entities
     pub fn entities(&self) -> impl Iterator<Item = &CodeEntity> {
         self.graph.node_weights()
@@ -2273,6 +2476,220 @@ mod tests {
         DependencyGraph::from_analysis(&result)
     }
 
+    /// The point of the count: a statement a parser read and resolved to a
+    /// file, with no edge between those two files to show for it, is a hole —
+    /// and a hole is what makes a verdict computed over the graph confidently
+    /// wrong rather than merely imprecise.
+    #[test]
+    fn an_import_with_no_edge_behind_it_is_counted_as_missing() {
+        let entities = vec![
+            entity("a.ts", 1, "callsB", EntityKind::Function),
+            entity("b.ts", 1, "fromB", EntityKind::Function),
+            entity("c.ts", 1, "fromC", EntityKind::Function),
+        ];
+        // a -> b landed as a real edge; a -> c did not.
+        let mut result = AnalysisResult {
+            relationships: vec![Relationship::new(
+                &entities[0].id,
+                &entities[1].id,
+                RelationshipKind::Calls,
+            )],
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![import_site("a.ts", "b.ts"), import_site("a.ts", "c.ts")];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        assert_eq!(graph.import_coverage(), (1, 2));
+    }
+
+    /// Several statements between one pair of files are one dependency, not
+    /// three. The count is of edges that should be drawable, because that is
+    /// what every consumer downstream reads.
+    #[test]
+    fn repeated_imports_between_two_files_count_once() {
+        let entities = vec![
+            entity("a.ts", 1, "callsB", EntityKind::Function),
+            entity("b.ts", 1, "fromB", EntityKind::Function),
+        ];
+        let mut result = AnalysisResult {
+            relationships: Vec::new(),
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![
+            import_site("a.ts", "b.ts"),
+            import_site("a.ts", "b.ts"),
+            import_site("a.ts", "b.ts"),
+        ];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        assert_eq!(graph.import_coverage(), (0, 1));
+    }
+
+    /// A repo-wide figure cannot tell a reader whether the folder they are
+    /// being given a verdict about is one of the holed ones. This is the
+    /// count that belongs beside the verdict.
+    #[test]
+    fn unresolved_imports_are_attributable_to_the_folder_they_touch() {
+        let entities = vec![
+            entity("src/a/one.ts", 1, "usesTwo", EntityKind::Function),
+            entity("src/b/two.ts", 1, "fromTwo", EntityKind::Function),
+            entity("src/c/three.ts", 1, "fromThree", EntityKind::Function),
+        ];
+        let mut result = AnalysisResult {
+            relationships: Vec::new(),
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![
+            import_site("src/a/one.ts", "src/b/two.ts"),
+            import_site("src/c/three.ts", "src/b/two.ts"),
+        ];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        assert_eq!(graph.import_coverage(), (0, 2));
+        assert_eq!(graph.unresolved_imports_touching("src/a"), 1);
+        assert_eq!(graph.unresolved_imports_touching("src/c"), 1);
+        // Named by both, so it counts both.
+        assert_eq!(graph.unresolved_imports_touching("src/b"), 2);
+        // A folder none of them touch is not warned about.
+        assert_eq!(graph.unresolved_imports_touching("src/d"), 0);
+    }
+
+    /// The two false alarms from the field. A folder is scored over its
+    /// immediate children, so an import that lives wholly inside one of them
+    /// is not an edge in this folder's picture and cannot have changed its
+    /// verdict. Counting it told a reader to distrust an answer that was
+    /// sound — and the root, under which every path sits, was told to
+    /// distrust everything.
+    #[test]
+    fn an_import_inside_one_child_does_not_taint_the_parents_verdict() {
+        let entities = vec![
+            entity("src/uid/model/a.ts", 1, "a", EntityKind::Function),
+            entity("src/uid/model/b.ts", 1, "b", EntityKind::Function),
+            entity("src/uid/generators/x.ts", 1, "x", EntityKind::Function),
+        ];
+        let mut result = AnalysisResult {
+            relationships: Vec::new(),
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        // Unresolved, and wholly inside `src/uid/model`.
+        result.import_sites = vec![import_site("src/uid/model/a.ts", "src/uid/model/b.ts")];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        // `model` draws it — a.ts and b.ts are two of its children.
+        assert_eq!(graph.unresolved_imports_touching("src/uid/model"), 1);
+        // `uid` collapses model to one node, so the edge is inside that node.
+        assert_eq!(graph.unresolved_imports_touching("src/uid"), 0);
+        // And the root does not inherit every hole beneath it.
+        assert_eq!(graph.unresolved_imports_touching("src"), 0);
+        // A sibling with no relative imports of its own stays unmarked.
+        assert_eq!(graph.unresolved_imports_touching("src/uid/generators"), 0);
+    }
+
+    /// An import that crosses two children *is* an edge in the parent's
+    /// drawing, and one crossing the boundary changes its doors — both still
+    /// count, or the marker would never fire where it matters.
+    #[test]
+    fn an_import_across_children_or_the_boundary_still_counts() {
+        let entities = vec![
+            entity("src/uid/model/a.ts", 1, "a", EntityKind::Function),
+            entity("src/uid/generators/x.ts", 1, "x", EntityKind::Function),
+            entity("src/plugin/p.ts", 1, "p", EntityKind::Function),
+        ];
+        let mut result = AnalysisResult {
+            relationships: Vec::new(),
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![
+            import_site("src/uid/model/a.ts", "src/uid/generators/x.ts"),
+            import_site("src/plugin/p.ts", "src/uid/model/a.ts"),
+        ];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        // Between two of uid's children, and one arriving from outside it.
+        assert_eq!(graph.unresolved_imports_touching("src/uid"), 2);
+        // At the root only one of them does: model → generators is inside
+        // `src/uid`, which the root draws as a single node.
+        assert_eq!(graph.unresolved_imports_touching("src"), 1);
+    }
+
+    /// A statement the build erases is not a missing dependency. ADR 0026
+    /// already keeps those arrows out of every score, and the sentence this
+    /// count is printed under is about verdicts being unsound — so counting
+    /// one would raise an alarm about something no verdict reads.
+    #[test]
+    fn a_build_erased_import_is_not_counted_as_missing() {
+        let entities = vec![
+            entity("a.ts", 1, "usesB", EntityKind::Function),
+            entity("b.ts", 1, "fromB", EntityKind::Function),
+        ];
+        let mut result = AnalysisResult {
+            relationships: Vec::new(),
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut erased = import_site("a.ts", "b.ts");
+        erased.is_type_only = true;
+        result.import_sites = vec![erased];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        // Neither half counts it: no edge is expected, so none is missing.
+        assert_eq!(graph.import_coverage(), (0, 0));
+    }
+
+    /// A whole graph says nothing, so a sound analysis costs no tokens and
+    /// the footer line means something when it does appear.
+    #[test]
+    fn a_graph_with_every_import_behind_an_edge_reports_no_gap() {
+        let entities = vec![
+            entity("a.ts", 1, "callsB", EntityKind::Function),
+            entity("b.ts", 1, "fromB", EntityKind::Function),
+        ];
+        let mut result = AnalysisResult {
+            relationships: vec![Relationship::new(
+                &entities[0].id,
+                &entities[1].id,
+                RelationshipKind::Calls,
+            )],
+            entities,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![import_site("a.ts", "b.ts")];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        let (landed, seen) = graph.import_coverage();
+        assert_eq!((landed, seen), (1, 1));
+        assert!(landed >= seen, "a whole graph must not read as holed");
+    }
+
+    fn import_site(from: &str, to: &str) -> crate::models::ImportSite {
+        crate::models::ImportSite {
+            from: std::path::PathBuf::from(from),
+            to: std::path::PathBuf::from(to),
+            line: 0,
+            is_reexport: false,
+            is_type_only: false,
+        }
+    }
+
     #[test]
     fn a_files_own_description_survives_the_path_spelling() {
         use crate::models::file_info::Language;
@@ -2756,11 +3173,11 @@ mod reference_edge_tests {
             .metrics
     }
 
-    fn module<'a>(g: &'a DependencyGraph, path: &str) -> &'a ScopeMetrics {
-        &g.module_metrics()
+    fn folder<'a>(g: &'a DependencyGraph, path: &str) -> &'a ScopeMetrics {
+        &g.folder_metrics()
             .iter()
             .find(|m| m.path == path)
-            .expect("a module rollup")
+            .expect("a folder rollup")
             .metrics
     }
 
@@ -2804,10 +3221,10 @@ mod reference_edge_tests {
         // `docs/a.md -> docs/b.md` stays inside; only the `guide/` link is a
         // reference out of the folder. Same rule the dependency rollup uses.
         let g = note_graph();
-        assert_eq!(module(&g, "docs").ref_fan_out, 1);
-        assert_eq!(module(&g, "docs").ref_fan_in, 0);
-        assert_eq!(module(&g, "guide").ref_fan_in, 1);
-        assert_eq!(module(&g, "guide").ref_fan_out, 0);
+        assert_eq!(folder(&g, "docs").ref_fan_out, 1);
+        assert_eq!(folder(&g, "docs").ref_fan_in, 0);
+        assert_eq!(folder(&g, "guide").ref_fan_in, 1);
+        assert_eq!(folder(&g, "guide").ref_fan_out, 0);
     }
 
     #[test]
@@ -2817,8 +3234,8 @@ mod reference_edge_tests {
         let g = note_graph();
         assert_eq!(file(&g, "docs/a.md").cohesion, None);
         assert_eq!(file(&g, "docs/a.md").instability, None);
-        assert_eq!(module(&g, "docs").cohesion, None);
-        assert!(!module(&g, "docs").in_cycle);
+        assert_eq!(folder(&g, "docs").cohesion, None);
+        assert!(!folder(&g, "docs").in_cycle);
     }
 
     #[test]

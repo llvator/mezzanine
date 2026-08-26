@@ -3,8 +3,8 @@ import * as path from 'path';
 import { ScanHit, fetchScan, relativeToWorkspace } from './educatorClient';
 
 /**
- * Dedicated "Educator Problems" panel under the Nao sidebar — replaces the
- * earlier `DiagnosticCollection` integration so Nao findings don't share the
+ * Dedicated "Educator Problems" panel under the Mezzanine sidebar — replaces the
+ * earlier `DiagnosticCollection` integration so Mezzanine findings don't share the
  * Problems view with Java / SonarQube / compiler diagnostics.
  *
  * Lifecycle mirrors the previous diagnostics module: scan a Java buffer on
@@ -29,7 +29,7 @@ interface HitNode {
 }
 
 export class EducatorProblemsView implements vscode.TreeDataProvider<EducatorTreeNode> {
-  static readonly viewId = 'nao.educatorProblems';
+  static readonly viewId = 'mezz.educatorProblems';
 
   private readonly hitsByUri = new Map<string, FileNode>();
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<EducatorTreeNode | undefined>();
@@ -82,7 +82,7 @@ export class EducatorProblemsView implements vscode.TreeDataProvider<EducatorTre
     item.tooltip = `${hit.title}\n\nRule: ${hit.rule_id}\nSeverity: ${hit.severity}\nKind: ${hit.rule_kind}`;
     item.iconPath = severityIcon(hit.severity);
     item.command = {
-      command: 'nao.educator.openHit',
+      command: 'mezz.educator.openHit',
       title: 'Open Educator Hit',
       arguments: [{ file: node.uri.fsPath, line: hit.line, col: hit.col }],
     };

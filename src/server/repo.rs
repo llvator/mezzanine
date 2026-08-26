@@ -1,7 +1,7 @@
-//! Per-repo state for `nao serve` (SRV-003, SRV-004).
+//! Per-repo state for `mezz serve` (SRV-003, SRV-004).
 //!
-//! `nao watch` answers "which repo is this request about?" implicitly — it's
-//! the path the process was launched with. `nao serve` hosts several repos at
+//! `mezz watch` answers "which repo is this request about?" implicitly — it's
+//! the path the process was launched with. `mezz serve` hosts several repos at
 //! once, so the answer has to be carried in the URL. This module holds the
 //! analyzed-repo value type, the slot that wraps it with a job status, and
 //! the registry keyed by slug that the route extractor resolves against.
@@ -225,8 +225,8 @@ pub(crate) fn is_valid_slug(slug: &str) -> bool {
 /// The one thing that differs from [`super::state::build_config`] is
 /// `allow_unsafe_passes`: AN-004's rust-analyzer tracer drives `cargo check`,
 /// which executes the analyzed repo's `build.rs` and proc-macros. Under
-/// `nao serve` the repo came from a URL a stranger pasted, so the pass is off
-/// unless the operator sets `NAO_SERVE_ALLOW_UNSAFE_PASSES=1` for their own
+/// `mezz serve` the repo came from a URL a stranger pasted, so the pass is off
+/// unless the operator sets `MEZZ_SERVE_ALLOW_UNSAFE_PASSES=1` for their own
 /// use. Tree-sitter parsing never executes the code it reads and stays on.
 pub(crate) fn build_serve_config(
     root: &Path,
@@ -246,10 +246,10 @@ pub(crate) fn build_serve_config(
     config
 }
 
-/// The `NAO_SERVE_ALLOW_UNSAFE_PASSES=1` escape hatch. Off unless explicitly
+/// The `MEZZ_SERVE_ALLOW_UNSAFE_PASSES=1` escape hatch. Off unless explicitly
 /// set — an unset or malformed value means "off", never "on".
 pub(crate) fn unsafe_passes_allowed() -> bool {
-    std::env::var_os("NAO_SERVE_ALLOW_UNSAFE_PASSES").is_some_and(|v| v == "1" || v == "true")
+    std::env::var_os("MEZZ_SERVE_ALLOW_UNSAFE_PASSES").is_some_and(|v| v == "1" || v == "true")
 }
 
 /// Analyze `path` into a ready-to-serve [`RepoState`].
@@ -466,7 +466,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Read the snapshot, preferring the compressed form and falling back to the
-/// uncompressed one a pre-SRV-006 nao wrote.
+/// uncompressed one a pre-SRV-006 mezz wrote.
 fn read_snapshot(cache_dir: &Path, slug: &str) -> Result<AnalysisResult> {
     let compressed = snapshot_path(cache_dir, slug);
     if compressed.exists() {
@@ -545,7 +545,7 @@ fn rehydrate_one(
 
 /// Scan `<cache-dir>/*/meta.json` and rebuild every completed repo.
 ///
-/// Best-effort per entry: a cache written by an older nao whose snapshot no
+/// Best-effort per entry: a cache written by an older mezz whose snapshot no
 /// longer deserializes is reported and skipped, not fatal. Starting with a
 /// smaller map is always recoverable — the user re-submits — whereas
 /// refusing to boot is not.
@@ -575,16 +575,16 @@ pub(crate) fn rehydrate(
     out
 }
 
-/// Default cache root: `$XDG_CACHE_HOME/nao/serve`, else `~/.cache/nao/serve`,
+/// Default cache root: `$XDG_CACHE_HOME/mezz/serve`, else `~/.cache/mezz/serve`,
 /// else a temp directory. Overridable with `--cache-dir`.
 pub fn default_cache_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg).join("nao").join("serve");
+        return PathBuf::from(xdg).join("mezz").join("serve");
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home).join(".cache").join("nao").join("serve");
+        return PathBuf::from(home).join(".cache").join("mezz").join("serve");
     }
-    std::env::temp_dir().join("nao-serve")
+    std::env::temp_dir().join("mezz-serve")
 }
 
 /// Parse one `--seed <slug>=<path>` argument.
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn slug_accepts_the_owner_repo_form() {
         assert!(is_valid_slug("tinygrad__tinygrad"));
-        assert!(is_valid_slug("llvator__nao"));
+        assert!(is_valid_slug("llvator__mezz"));
         assert!(is_valid_slug("some-org__some_repo-2"));
         // Dotted repo names are ordinary on GitHub and must round-trip.
         assert!(is_valid_slug("mrdoob__three.js"));
@@ -652,7 +652,7 @@ mod tests {
 
     /// The safety property SRV-003 exists to guarantee: serve mode must not
     /// let AN-004 execute build scripts from an untrusted tree. Checked at
-    /// the config layer, so it holds whatever `NAO_LSP_EXACT` says.
+    /// the config layer, so it holds whatever `MEZZ_LSP_EXACT` says.
     #[test]
     fn serve_config_disables_unsafe_passes_by_default() {
         // The escape hatch is process-wide env, so only assert the default
@@ -767,7 +767,7 @@ mod tests {
     /// this is the very first run.
     #[test]
     fn rehydrate_tolerates_a_missing_cache_dir() {
-        let missing = std::env::temp_dir().join("nao-cache-does-not-exist-xyz");
+        let missing = std::env::temp_dir().join("mezz-cache-does-not-exist-xyz");
         let _ = std::fs::remove_dir_all(&missing);
         assert!(rehydrate(&missing, false, &None).is_empty());
     }
@@ -776,7 +776,7 @@ mod tests {
     /// directory without one is an interrupted write and must be skipped.
     #[test]
     fn rehydrate_skips_a_slug_without_its_marker() {
-        let root = std::env::temp_dir().join("nao-cache-marker-test");
+        let root = std::env::temp_dir().join("mezz-cache-marker-test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("a__b")).unwrap();
         std::fs::write(root.join("a__b").join("analysis.json.zst"), b"partial").unwrap();
@@ -788,7 +788,7 @@ mod tests {
     /// aborting the whole boot.
     #[test]
     fn rehydrate_skips_a_corrupt_snapshot() {
-        let root = std::env::temp_dir().join("nao-cache-corrupt-test");
+        let root = std::env::temp_dir().join("mezz-cache-corrupt-test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("a__b")).unwrap();
         std::fs::write(
@@ -806,7 +806,7 @@ mod tests {
     /// the whole point of not re-analyzing on restart.
     #[test]
     fn persisted_analysis_rehydrates_to_the_same_graph() {
-        let root = std::env::temp_dir().join("nao-cache-roundtrip-test");
+        let root = std::env::temp_dir().join("mezz-cache-roundtrip-test");
         let _ = std::fs::remove_dir_all(&root);
 
         let (state, result) = analyze_repo(
@@ -857,7 +857,7 @@ mod tests {
     /// and its write-only rendered payloads must be reclaimed.
     #[test]
     fn rehydrate_reads_a_legacy_cache_and_reclaims_its_dead_weight() {
-        let root = std::env::temp_dir().join("nao-cache-legacy-test");
+        let root = std::env::temp_dir().join("mezz-cache-legacy-test");
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("a__b");
         std::fs::create_dir_all(&dir).unwrap();

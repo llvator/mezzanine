@@ -1,6 +1,6 @@
 //! `GET /api/settings` — what the settings file resolved to, and why.
 //!
-//! The browser had no way to see any of this. A repo's `.nao/settings.json`
+//! The browser had no way to see any of this. A repo's `.mezz/settings.json`
 //! decides which languages get parsed and how deep the traversal goes, and
 //! the panel that reads "Settings" showed four client-side preferences and
 //! nothing else. Asked why their graph looked the way it did, a user had
@@ -80,7 +80,7 @@ fn build_report(state: &AppState, root: &Path) -> Result<SettingsReport, (Status
 }
 
 /// POST /api/settings/analysis — write the applied analysis scope into
-/// `<root>/.nao/settings.json` and report the file back.
+/// `<root>/.mezz/settings.json` and report the file back.
 ///
 /// Saving does not re-analyze. The scope being saved is the one already
 /// applied, so there is nothing to recompute; this is about disk.
@@ -168,7 +168,7 @@ fn merge_analysis_keys(
 
 /// A `--spec-dir` outside the tree is a legitimate thing for an operator to
 /// pass and an illegitimate thing to write down: the loader refuses it on the
-/// next start (a cloned file does not get to pick which directories nao
+/// next start (a cloned file does not get to pick which directories mezz
 /// reads), so saving it would produce a file that silently stops working.
 fn reject_escaping_spec_dir(scope: &Settings) -> Result<(), (StatusCode, String)> {
     let escapes = scope.spec_dir.as_ref().is_some_and(|dir| {

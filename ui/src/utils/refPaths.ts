@@ -22,7 +22,7 @@
  *
  * **This must be applied to both sides of every comparison.** It originally
  * was not: refs went through it and `file_path`s did not. The renderer writes
- * `file_path` relative to the analysis root, so a bare `nao watch` — whose
+ * `file_path` relative to the analysis root, so a bare `mezz watch` — whose
  * root is `.` — emitted `./src/parser/mod.rs` while the ref beside it said
  * `src/parser`. Nothing matched, and the UI reported every reference in the
  * graph as drift while looking entirely healthy about it.

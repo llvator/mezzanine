@@ -1,6 +1,6 @@
 # The MCP warm cache: lazy invalidation with a generation counter
 
-How `nao mcp` serves repeat tool calls in milliseconds without ever
+How `mezz mcp` serves repeat tool calls in milliseconds without ever
 returning a stale answer. This doc explains the general mechanisms
 first, then walks the concrete implementation in `src/mcp/`.
 
@@ -30,7 +30,7 @@ There are two classic ways to keep a cache fresh:
   changes, only *mark the cache stale* — a cheap operation. The
   expensive rebuild happens on the next read that actually needs it.
 
-Nao chooses lazy, and the reason is the workload's shape. An agent
+Mezzanine chooses lazy, and the reason is the workload's shape. An agent
 editing code produces *bursts of writes* (ten file saves in a minute)
 followed by *occasional reads* (one `assess_change` at the end). Eager
 rebuilding would re-analyze ten times and use one result. Lazy

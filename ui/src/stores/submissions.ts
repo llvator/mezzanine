@@ -6,7 +6,7 @@
  * `EventSource` per job that keeps them current.
  *
  * Deliberately separate from `liveReload.ts`: that store is the *graph*
- * reload channel for `nao watch` and has different reconnect semantics (it
+ * reload channel for `mezz watch` and has different reconnect semantics (it
  * retries forever). A job stream ends when its job does.
  */
 
@@ -38,7 +38,7 @@ export function setOnReady(cb: (slug: string) => void): void {
   onReady = cb;
 }
 
-const STORAGE_KEY = 'nao.submissions';
+const STORAGE_KEY = 'mezz.submissions';
 const MAX_REMEMBERED = 5;
 
 const streams = new Map<string, EventSource>();

@@ -6,14 +6,14 @@
  * components with no compile-time dependency on each other shipped together.
  *
  * The mechanism to do better already existed with one caller — the VS Code
- * webview passes `window.__NAO_VSCODE__.apiBase` and has been a cross-origin
- * client of `nao watch` all along. This module generalises that one hook into
+ * webview passes `window.__MEZZ_VSCODE__.apiBase` and has been a cross-origin
+ * client of `mezz watch` all along. This module generalises that one hook into
  * a resolution order, so a UI opened from anywhere can be pointed at a running
  * engine.
  *
  * Resolution, first hit wins:
  *
- *   1. `window.__NAO_VSCODE__.apiBase` — the webview keeps priority. The
+ *   1. `window.__MEZZ_VSCODE__.apiBase` — the webview keeps priority. The
  *      extension is the primary surface; nothing here may outrank it.
  *   2. `?api=<origin>` in the query string — a session, and the demo path.
  *   3. `localStorage` — what the connect screen (UI-034) writes.
@@ -35,8 +35,8 @@ export interface Endpoint {
   source: EndpointSource;
 }
 
-const STORAGE_BASE = 'nao.apiBase';
-const STORAGE_TOKEN = 'nao.apiToken';
+const STORAGE_BASE = 'mezz.apiBase';
+const STORAGE_TOKEN = 'mezz.apiToken';
 
 let resolved: Endpoint | null = null;
 
@@ -70,7 +70,7 @@ export function normalizeOrigin(raw: string): string | null {
  *
  * A bare port is the common case by a wide margin — the engine is almost
  * always on this machine, and the only thing that varies is which port the
- * user passed to `nao watch`.
+ * user passed to `mezz watch`.
  */
 export function parseEndpointInput(raw: string): string | null {
   const trimmed = raw.trim();
@@ -93,7 +93,7 @@ export function endpoint(): Endpoint {
 }
 
 function resolve(): Endpoint {
-  const webviewBase = window.__NAO_VSCODE__?.apiBase;
+  const webviewBase = window.__MEZZ_VSCODE__?.apiBase;
   if (webviewBase) {
     return { base: webviewBase, token: null, source: 'webview' };
   }

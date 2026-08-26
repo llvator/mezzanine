@@ -1,7 +1,7 @@
 //! Statement splitting for SQL files.
 //!
 //! `sqlparser` is all-or-nothing per parse: one unsupported statement in a
-//! file costs the whole file. Every other parser in Nao is error-tolerant
+//! file costs the whole file. Every other parser in Mezzanine is error-tolerant
 //! because tree-sitter is, so the SQL parser has to buy that tolerance
 //! itself — split the file into statements first, then parse each one and
 //! warn on the ones that fail.

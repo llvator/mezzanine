@@ -25,9 +25,12 @@
     liveIsBroken, reconnectLiveReload, stopLiveReload,
   } from './stores/liveReload';
   import { loadDiff, diffActive, diffData, diffLevel, diffSeedFacet, diffChangedEdges, diffDimOpacity, diffContextOpacity, CONTEXT_OPACITY_FLOOR } from './stores/diff';
+  import { branchInfo, fetchBranch } from './stores/branch';
+  import { branchLabel } from './viewmodels/branchLabel';
   import { DIFF_LEVELS, isDiffLevel, SEED_FACETS, type DiffLevel, type DiffSeedFacet } from './viewmodels/diffLevels';
   import { refreshData, refreshing } from './stores/scope';
   import CommitPicker from './components/CommitPicker.svelte';
+  import BranchChip from './components/BranchChip.svelte';
 
   function toggleLiveMode() {
     if ($liveConnected) {
@@ -186,7 +189,7 @@
   import { onMount, onDestroy } from 'svelte';
   import {
     isVscode, onFocusFile, onFocusCursor, onSetScopes, onDrillIn, onCommand,
-    reportSelection, reportQuality, reportFilters, reportLevelFilters, reportDiff, reportScopes, reportAnalysisScopes,
+    reportSelection, reportQuality, reportFilters, reportLevelFilters, reportDiff, reportBranch, reportScopes, reportAnalysisScopes,
     reportDescription,
   } from './vscodeAdapter';
   import { description, describeOnHover } from './stores/description';
@@ -256,7 +259,7 @@
   /** Next coarser aggregation level, or null at the coarsest. Drives the
    *  overflow card's first remedy — the one that helps most, because it
    *  divides the drawn count rather than trimming it. */
-  $: coarserLevel = $graphLevel === 'entity' ? 'file' : $graphLevel === 'file' ? 'module' : null;
+  $: coarserLevel = $graphLevel === 'entity' ? 'file' : $graphLevel === 'file' ? 'folder' : null;
 
   /** Collapse a level from the overflow card. Pins the level (autoLevel off)
    *  because the user asked for this one specifically — the same contract the
@@ -457,6 +460,7 @@
   let unsubFilters: (() => void) | undefined;
   let unsubLevelFilters: (() => void) | undefined;
   let unsubDiff: (() => void) | undefined;
+  let unsubBranch: (() => void) | undefined;
   let unsubScopes: (() => void) | undefined;
   let unsubAnalysisScopes: (() => void) | undefined;
   let unsubCommand: (() => void) | undefined;
@@ -509,7 +513,7 @@
           // anywhere in this file). If yes, auto-drill so the user sees
           // entities without having to click "Drill in" manually.
           const hasEntitiesForFile = $graphData.nodes.some(
-            (n) => n.kind_raw !== 'File' && n.kind_raw !== 'Module' && (
+            (n) => n.kind_raw !== 'File' && n.kind_raw !== 'Folder' && (
               n.file_path === relativePath ||
               n.file_path.endsWith('/' + relativePath) ||
               relativePath.endsWith('/' + n.file_path)
@@ -731,15 +735,15 @@
             const droppedNonLeaf = rawPaths.length - leafFiles.length;
             const droppedImpactOnly = data.entities.length - coreChanges.length;
             console.log(
-              `[nao] scopeToChangedFiles: ${coreChanges.length} core-changed entities across ${leafFiles.length} files`,
+              `[mezz] scopeToChangedFiles: ${coreChanges.length} core-changed entities across ${leafFiles.length} files`,
               leafFiles,
             );
             if (droppedNonLeaf > 0) {
-              console.log(`[nao] scopeToChangedFiles: dropped ${droppedNonLeaf} non-file paths (folders / ghosts):`,
+              console.log(`[mezz] scopeToChangedFiles: dropped ${droppedNonLeaf} non-file paths (folders / ghosts):`,
                 rawPaths.filter((p) => !leafFiles.includes(p)));
             }
             if (droppedImpactOnly > 0) {
-              console.log(`[nao] scopeToChangedFiles: ignored ${droppedImpactOnly} impact-only / unchanged entities (not scoped)`);
+              console.log(`[mezz] scopeToChangedFiles: ignored ${droppedImpactOnly} impact-only / unchanged entities (not scoped)`);
             }
             diffLevel.set('edits');
             diffSeedFacet.set('all');
@@ -774,18 +778,18 @@
             diffFiltersEnabled.set(!!value);
             break;
           case 'setQualityAnalysisScope':
-            console.log('[nao] setQualityAnalysisScope →', value);
+            console.log('[mezz] setQualityAnalysisScope →', value);
             qualityAnalysisScope.set(value as QualityAnalysisScope);
             break;
           case 'setQualitySortBy':
             qualitySortBy.set(value as QualitySortKey);
             break;
           case 'setAnalysisScopes':
-            console.log('[nao] setAnalysisScopes →', value);
+            console.log('[mezz] setAnalysisScopes →', value);
             setAnalysisScopes(value as string[]);
             break;
           case 'setCurrentFile':
-            console.log('[nao] setCurrentFile →', value);
+            console.log('[mezz] setCurrentFile →', value);
             currentEditorFile.set(value as string);
             break;
         }
@@ -914,6 +918,13 @@
       );
       unsubDiff = diffState.subscribe((state) => reportDiff(state));
 
+      // Which branch the canvas is drawing. The webview has no canvas strip
+      // to put the chip in, so the native Diff view renders it — see
+      // `reportBranch` (UI-114). Sent as the finished label rather than the
+      // server's answer, so both surfaces word it identically.
+      void fetchBranch();
+      unsubBranch = branchInfo.subscribe((info) => reportBranch(branchLabel(info)));
+
       // Broadcast the selected scope paths so the native Scopes tree can
       // sync its checkbox state. Needed whenever scope changes from outside
       // the tree (e.g. "Scope to changes" in the Diff view).
@@ -1003,12 +1014,12 @@
         },
       );
       unsubQuality = qualityPayload.subscribe((payload: any) => {
-        console.log('[nao] qualityPayload → broadcast: analysisScope=', payload.analysisScope, 'rows=', payload.rows.length);
+        console.log('[mezz] qualityPayload → broadcast: analysisScope=', payload.analysisScope, 'rows=', payload.rows.length);
         reportQuality(payload);
       });
 
       // Listeners attached — tell the extension to flush queued messages.
-      (window as any).__NAO_VSCODE__?.postMessage({ type: 'ready' });
+      (window as any).__MEZZ_VSCODE__?.postMessage({ type: 'ready' });
     }
 
     // Which engine, and does it answer (UI-034)? Skipped in the webview,
@@ -1068,7 +1079,7 @@
     // Try to connect to the watch server's SSE endpoint for live reload.
     // No-ops in serve mode, which has no `/events`.
     connectLiveReload();
-    // Try to load a diff overlay (from `nao diff`). Silent no-op if
+    // Try to load a diff overlay (from `mezz diff`). Silent no-op if
     // diff.json doesn't exist, and skipped entirely in serve mode.
     loadDiff();
     // Saved views (UI-082). After the repo is settled, since serve mode keys
@@ -1115,6 +1126,7 @@
     unsubFilters?.();
     unsubLevelFilters?.();
     unsubDiff?.();
+    unsubBranch?.();
     unsubScopes?.();
     unsubAnalysisScopes?.();
   });
@@ -1324,6 +1336,11 @@
          overview panel lifts itself by to stay clear of whatever it grew to. -->
     <div class="canvas-bottom-bar" data-probe="canvas-bottom-bar" bind:clientHeight={bottomBarHeight}>
     <div class="stats" data-probe="canvas-stats">
+      <!-- Which branch these circles are. First in the strip because the
+           controls after it all pick something to compare *against* it, and
+           because with a comparison loaded every other ref on screen belongs
+           to the overlay rather than to the canvas (UI-114). -->
+      <BranchChip />
       <!-- Commit picker drives `POST /api/diff`, which serve mode doesn't
            expose. Hidden there rather than offering a button that 404s. -->
       {#if !$serveMode}
@@ -1692,7 +1709,7 @@
         <div class="overlay-card warn">
           <h3>Failed to load index</h3>
           <p>{$indexLoadError}</p>
-          <p>Generate one with: <code>nao analyze &lt;path&gt; -f json -o ui/public/data.json</code></p>
+          <p>Generate one with: <code>mezz analyze &lt;path&gt; -f json -o ui/public/data.json</code></p>
         </div>
       </div>
     {/if}

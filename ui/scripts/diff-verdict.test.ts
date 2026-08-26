@@ -139,7 +139,7 @@ test('editKind splits the seed the ladder starts from', () => {
 });
 
 test('the split holds on a collapsed scope node, not only on entities', () => {
-  // The canvas draws File and Module nodes above entity level, and their
+  // The canvas draws File and Folder nodes above entity level, and their
   // status comes from the rollup. If the facet meant something different up
   // there, `New` would empty the picture the moment a reader zoomed out.
   assert.equal(editKind(FRESH_FILE, facts(true)), 'new');

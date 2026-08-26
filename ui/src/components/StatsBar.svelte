@@ -11,7 +11,7 @@
    *
    * The vocabulary, used here and in the Quality panel (UI-010):
    *
-   *   Indexed   — every entity nao knows about, whole repo
+   *   Indexed   — every entity mezz knows about, whole repo
    *   In scope  — entities inside the current visual scope
    *   Shown     — nodes actually drawn, after aggregation collapse
    *   Analysed  — full-detail entities behind the quality metrics

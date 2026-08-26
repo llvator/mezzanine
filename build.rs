@@ -1,5 +1,5 @@
 //! Fingerprint the code that decides what a parse result contains, and hand
-//! it to the crate as `NAO_PARSE_FINGERPRINT`.
+//! it to the crate as `MEZZ_PARSE_FINGERPRINT`.
 //!
 //! The parse store (`src/analyzer/parse_store.rs`) caches one `ParsedFile`
 //! per source file, keyed by content hash. That is safe only while "same
@@ -53,9 +53,9 @@ fn main() {
     // Twelve hex chars: this only has to separate cache generations on one
     // machine, and it ends up in a directory name a human reads.
     let fingerprint = &hasher.finalize().to_hex()[..12];
-    println!("cargo:rustc-env=NAO_PARSE_FINGERPRINT={fingerprint}");
+    println!("cargo:rustc-env=MEZZ_PARSE_FINGERPRINT={fingerprint}");
 
-    println!("cargo:rustc-env=NAO_GIT_COMMIT={}", git_commit(&root));
+    println!("cargo:rustc-env=MEZZ_GIT_COMMIT={}", git_commit(&root));
 }
 
 /// Build the vendored Dart grammar into the crate.

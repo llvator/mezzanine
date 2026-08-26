@@ -8,7 +8,7 @@ import { AgentLaunchError, spawnAgentTerminal } from './agentTerminal';
  * (if Follow Selection is on) opens the source file at its line.
  */
 export class QualityViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'nao.quality';
+  static readonly viewType = 'mezz.quality';
 
   private view?: vscode.WebviewView;
   private lastRows: QualityItem[] = [];
@@ -31,12 +31,12 @@ export class QualityViewProvider implements vscode.WebviewViewProvider {
    */
   private async spawnAgent(entityId: string, entityName: string): Promise<void> {
     if (this.serverPort === undefined) {
-      vscode.window.showWarningMessage('Nao: the analysis server is not running yet.');
+      vscode.window.showWarningMessage('Mezzanine: the analysis server is not running yet.');
       return;
     }
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!cwd) {
-      vscode.window.showWarningMessage('Nao: open a folder before launching an agent.');
+      vscode.window.showWarningMessage('Mezzanine: open a folder before launching an agent.');
       return;
     }
     try {
@@ -45,7 +45,7 @@ export class QualityViewProvider implements vscode.WebviewViewProvider {
         entityId,
         entityName,
         cwd,
-        binary: vscode.workspace.getConfiguration('nao').get<string>('claudeBinary'),
+        binary: vscode.workspace.getConfiguration('mezz').get<string>('claudeBinary'),
       });
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
@@ -54,7 +54,7 @@ export class QualityViewProvider implements vscode.WebviewViewProvider {
       const prompt = e instanceof AgentLaunchError ? e.prompt : undefined;
       const copy = 'Copy prompt instead';
       const choice = await vscode.window.showErrorMessage(
-        `Nao: could not launch an agent for ${entityName} — ${detail}`,
+        `Mezzanine: could not launch an agent for ${entityName} — ${detail}`,
         ...(prompt ? [copy] : [])
       );
       if (choice === copy && prompt) {
@@ -117,7 +117,7 @@ export class QualityViewProvider implements vscode.WebviewViewProvider {
         // Forward to the same internal command endpoint the Filters /
         // View Options webviews use so it lands in the main panel's
         // Svelte onCommand handler.
-        vscode.commands.executeCommand('nao.internalFilterCommand', {
+        vscode.commands.executeCommand('mezz.internalFilterCommand', {
           command: msg.command,
           value: msg.value,
         });
@@ -381,7 +381,7 @@ export class QualityViewProvider implements vscode.WebviewViewProvider {
     },
     cycle: {
       title: 'In cycle',
-      body: 'This entity participates in a dependency cycle. Cycles make modules impossible to understand in isolation and break layering. Typical fix: dependency inversion \u2014 both sides depend on an interface instead of each other.',
+      body: 'This entity participates in a dependency cycle. Cycles make folders impossible to understand in isolation and break layering. Typical fix: dependency inversion \u2014 both sides depend on an interface instead of each other.',
     },
     fieldCount: {
       title: 'Field / variant count',
@@ -685,7 +685,7 @@ export class QualityViewProvider implements vscode.WebviewViewProvider {
       ['In cycle',               METRIC_EXPLANATIONS.cycle.body],
       ['Code smells',            'Named anti-pattern signals emitted by the backend (e.g. "god_object", "deep_nesting"). One row can carry several.'],
     ];
-    const lines = ['# Nao \u2014 Metrics glossary', ''];
+    const lines = ['# Mezzanine \u2014 Metrics glossary', ''];
     for (const [name, body] of entries) {
       lines.push('- **' + name + '** \u2014 ' + body);
     }

@@ -109,7 +109,7 @@ fn an_abstract_class_is_its_own_kind() {
     let repo = entity(&result, "Repository");
     assert_eq!(repo.kind, EntityKind::AbstractClass);
     assert!(repo.tags.contains("abstract"));
-    // The bodyless member still scores, or `nao quality` cannot see it.
+    // The bodyless member still scores, or `mezz quality` cannot see it.
     let find = entity(&result, "find");
     assert_eq!(find.metrics.cyclomatic, Some(1));
 }

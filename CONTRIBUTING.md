@@ -1,4 +1,4 @@
-# Contributing to Nao
+# Contributing to Mezzanine
 
 Thanks for your interest. This document is everything you need to get a
 change merged. It is also what CI enforces, so following it is the fastest
@@ -6,7 +6,7 @@ path to a green build.
 
 New to the project? Start with
 [guide/getting-started.md](guide/getting-started.md) for a 5-minute
-install-and-run of the `nao` CLI, the `elevator` CLI, and the VS Code
+install-and-run of the `mezz` CLI, the `elevator` CLI, and the VS Code
 extension.
 
 ## Before you start
@@ -19,8 +19,8 @@ straight to a PR.
 ## One-time setup
 
 ```sh
-git clone https://github.com/llvator/nao.git
-cd nao
+git clone https://github.com/llvator/mezzanine.git
+cd mezz
 cargo build
 bash scripts/install_hooks.sh
 ```
@@ -35,7 +35,7 @@ Two other scripts are worth knowing about:
 
 - `./scripts/build.sh` — recompile in place without installing, for
   iteration. Note `ui/` has two build targets: `--ui` writes `ui/dist` (the
-  browser UI `nao watch` serves) and `--webview` writes `webview-dist`
+  browser UI `mezz watch` serves) and `--webview` writes `webview-dist`
   (bundled into the `.vsix`).
 - `./scripts/install.sh` — full build *and* install of both binaries plus
   the VS Code extension. See
@@ -59,7 +59,7 @@ cargo test
 cargo clippy --all-targets
 
 # 4. New code is below the complexity ceiling
-cargo run --quiet --bin nao -- analyze -f json -l rust src/ 2>/dev/null \
+cargo run --quiet --bin mezz -- analyze -f json -l rust src/ 2>/dev/null \
   | jq -r '.entities[]
       | select(.metrics.cyclomatic != null)
       | select(.metrics.cyclomatic > 15 or .metrics.cognitive_complexity > 22 or .metrics.max_nesting > 4)
@@ -112,7 +112,7 @@ If your change touches the browser UI's layout, panels, toolbar, themes or
 the graph canvas, run the probe harness as well:
 
 ```sh
-nao watch . --port 3000                           # terminal 1
+mezz watch . --port 3000                           # terminal 1
 cd ui && npm run dev -- --port 5199 --strictPort  # terminal 2
 node ui/scripts/ux-probe.mjs --all                # terminal 3
 ```
@@ -142,7 +142,7 @@ leave it as a manual step.
 
 ## Complexity ceiling
 
-Nao analyzes its own source, and CI enforces a ceiling on every PR:
+Mezzanine analyzes its own source, and CI enforces a ceiling on every PR:
 
 | Metric | Ceiling |
 |---|---|
@@ -168,13 +168,13 @@ Each line reads `cyclo  cognitive  nesting  function_name  file_path`:
 To reproduce the exact CI gate, compare two snapshots:
 
 ```sh
-cargo build --release --bin nao
+cargo build --release --bin mezz
 
 git stash
-./target/release/nao analyze -f json -l rust src/ > /tmp/baseline.json
+./target/release/mezz analyze -f json -l rust src/ > /tmp/baseline.json
 git stash pop
 
-./target/release/nao analyze -f json -l rust src/ > /tmp/current.json
+./target/release/mezz analyze -f json -l rust src/ > /tmp/current.json
 
 python3 .github/scripts/check_complexity.py /tmp/baseline.json /tmp/current.json
 ```
@@ -244,7 +244,25 @@ is a bug in the comment worth reporting.
 Use one in your own comments only if you're citing an issue you can link to.
 Prose is better than an unresolvable code.
 
-## License
+## License and the CLA
 
-By contributing, you agree that your contributions will be licensed under
-the [GNU AGPL v3](LICENSE), the same license as the project.
+Mezzanine is dual-licensed: [AGPL v3](LICENSE) for everyone, and a
+[commercial licence](COMMERCIAL.md) for organisations that cannot accept the
+AGPL. Offering both requires holding rights broad enough to grant both, which
+the AGPL alone does not provide — so contributions are covered by a
+[Contributor Licence Agreement](CLA.md).
+
+Read it once; it is short and the reasoning is stated in it. In summary: you
+keep ownership of everything you write and may reuse it anywhere, and you
+grant the maintainers a licence broad enough to offer it under both licences.
+It is not a copyright assignment.
+
+To accept it, sign off your commits and say so in your first PR:
+
+```sh
+git commit -s        # adds a Signed-off-by: line
+```
+
+**If you are contributing work written in the course of employment**, your
+employer may own it. Section 4 of the CLA covers what to do; sort it out
+before opening the PR rather than after review.

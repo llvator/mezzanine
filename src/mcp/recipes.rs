@@ -43,7 +43,8 @@ use std::path::{Path, MAIN_SEPARATOR};
 use super::format::{listed, num, MAX_LISTED};
 use crate::graph::DependencyGraph;
 use crate::models::{
-    ChildKind, EdgeVerdict, EntityKind, FolderPicture, OutsideVerdict, PictureEdge, Thresholds,
+    ChildKind, CodeEntity, EdgeVerdict, EntityKind, FolderPicture, OutsideVerdict, PictureEdge,
+    Thresholds,
 };
 
 /// Entity kinds that make a file a contract rather than a helper. A
@@ -120,6 +121,132 @@ fn usage(
         }
     }
     out
+}
+
+/// Above this many dependents, a shared name says more about the codebase
+/// than about the two exports that share it. Not a threshold anything is
+/// gated on — it only changes how a citation is worded.
+const WIDELY_SHARED: u32 = 8;
+
+/// What the shared child's own exports have in common.
+///
+/// The evidence the "do these share a concern" test needs, which a reader
+/// otherwise gets by opening the file. Two exports that both reach for
+/// `ERROR_NOTICE_MS` and both call into `uid/bulk` are one idea however
+/// separate their callers are; two that reach for nothing in common are two
+/// jobs sharing a filename. That is the distinction the bullet above asks the
+/// reader to make, and this is the fact it turns on.
+///
+/// The same move as printing "5 ways in" beside an entry ratio: attach the
+/// concrete thing the criterion needs, rather than describing the criterion
+/// and leaving the reader to go and find it.
+///
+/// Resolved to the top-level export, not to whatever entity holds the edge —
+/// since AN-033 a call written inside an `if` belongs to the Branch entity for
+/// that arm, and grouping by the edge's own source would put each arm in its
+/// own bucket and find nothing shared.
+fn shared_ground(graph: &DependencyGraph, root: &Path, child: &str) -> BTreeSet<(u32, String)> {
+    let by_id: HashMap<&str, &CodeEntity> = graph.entities().map(|e| (e.id.as_str(), e)).collect();
+    // Keyed by fan-in first, so the ordering out of the set is
+    // most-discriminating first. A constant two files share says something
+    // about those two; a context type twenty-five files share says almost
+    // nothing, and citing it as evidence of a shared concern is close to
+    // citing the language.
+    let mut per_export: BTreeMap<String, BTreeSet<(u32, String)>> = BTreeMap::new();
+    for rel in graph.relationships() {
+        let (Some(from), Some(to)) = (
+            by_id.get(rel.source_id.as_str()),
+            by_id.get(rel.target_id.as_str()),
+        ) else {
+            continue;
+        };
+        if relative(&from.file_path, root) != child {
+            continue;
+        }
+        // Only what the file reaches *outward*: two exports both calling a
+        // third function in the same file is ordinary internal structure, not
+        // evidence of one concern.
+        // Ghosts are unresolved names — a primitive like `number`, or a
+        // symbol from outside the analysis. Two exports both annotated
+        // `: number` share a keyword, not a concern, and counting it would
+        // make almost every pair look cohesive.
+        if relative(&to.file_path, root) == child || to.name.is_empty() || to.tags.contains("ghost")
+        {
+            continue;
+        }
+        let Some(export) = top_level_of(&by_id, from, root, child) else {
+            continue;
+        };
+        per_export
+            .entry(export)
+            .or_default()
+            .insert((to.metrics.fan_in, to.name.clone()));
+    }
+    if per_export.len() < 2 {
+        return BTreeSet::new();
+    }
+    let mut sets = per_export.into_values();
+    let first = sets.next().unwrap_or_default();
+    sets.fold(first, |acc, next| acc.intersection(&next).cloned().collect())
+}
+
+/// The name of the outermost entity in `child` that contains `e`.
+fn top_level_of(
+    by_id: &HashMap<&str, &CodeEntity>,
+    e: &CodeEntity,
+    root: &Path,
+    child: &str,
+) -> Option<String> {
+    let mut current = e;
+    // Bounded rather than `loop`: a parent chain is shallow, and a cycle in
+    // it would hang the tool rather than mis-report one folder.
+    for _ in 0..16 {
+        let Some(parent) = current
+            .parent_id
+            .as_deref()
+            .and_then(|id| by_id.get(id))
+            .filter(|p| relative(&p.file_path, root) == child)
+        else {
+            return Some(current.name.clone());
+        };
+        current = parent;
+    }
+    None
+}
+
+/// The one-line reading of [`shared_ground`], or nothing when the child has
+/// fewer than two exports to compare.
+fn shared_ground_line(graph: &DependencyGraph, root: &Path, child: &str) -> String {
+    let shared = shared_ground(graph, root, child);
+    if shared.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = shared.iter().take(4).map(|(n, name)| cited(*n, name)).collect();
+    format!(
+        " Its exports do share ground — {}{} — which is evidence for one concern \
+         rather than two.",
+        named.join(", "),
+        if shared.len() > named.len() {
+            format!(" and {} more", shared.len() - named.len())
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// One piece of shared ground, with a warning when it is too common to mean
+/// anything.
+///
+/// Reported from the field: the line cited `UidContext`, a type twenty-five
+/// files in that repo import, when a module-local constant and a shared
+/// import were both available and both far stronger. Two exports sharing
+/// something ubiquitous have not been shown to share a concern — they have
+/// been shown to be written in the same codebase.
+fn cited(fan_in: u32, name: &str) -> String {
+    if fan_in > WIDELY_SHARED {
+        return format!("`{name}` (used by {fan_in}, so weak evidence)");
+    }
+    format!("`{name}`")
 }
 
 fn relative(path: &Path, root: &Path) -> String {
@@ -214,6 +341,7 @@ pub(super) fn merge_lines(
     root: &Path,
     child: &str,
     parents: &[String],
+    breakdown_follows: bool,
 ) -> Vec<String> {
     match classify(p, graph, root, child, parents) {
         MergeShape::PassThrough { parent, middle } => {
@@ -256,11 +384,25 @@ pub(super) fn merge_lines(
         ],
         MergeShape::Plain => vec![
             header(child, parents, "shared helper"),
-            "  No redundant path to it and no type its dependents agree on, so this is the \
-             case the gate is describing plainly: one file serving several callers. Split it \
-             if it serves them for unrelated reasons — see the usage breakdown below — and \
-             otherwise leave it and clear a different merge."
-                .to_string(),
+            format!(
+                "  No redundant path to it and no type its dependents agree on, so this \
+                 is the case the gate is describing plainly: one file serving several \
+                 callers.{} **Disjoint callers are not the test.** What decides it is \
+                 whether the exports share a concern — the same types, constants, \
+                 error and reporting shape, or one idea a reader would name. Two \
+                 functions can have entirely separate callers and still be one thing, \
+                 and splitting those leaves you with caller-shaped wrappers, which is \
+                 the pass-through layer on the forbidden list. Split only what a \
+                 reader would describe as two jobs; otherwise leave it and clear a \
+                 different merge.{}",
+                if breakdown_follows {
+                    " The usage breakdown below says which entities each dependent \
+                     reaches for, which bounds the question without answering it:"
+                } else {
+                    ""
+                },
+                shared_ground_line(graph, root, child),
+            ),
         ],
     }
 }
@@ -272,6 +414,17 @@ pub(super) fn merge_lines(
 /// helper that serves two unrelated purposes". Printing that line without
 /// checking is a guess; a helper whose dependents use overlapping sets has
 /// no such split in it, and an agent sent looking for one will invent it.
+///
+/// It bounds the question rather than answering it, and the prose above says
+/// so. Overlap is evidence a split is *unavailable*; disjointness is not
+/// evidence one is *warranted*. Reported from the field with two cases that
+/// separate cleanly: one file held two functions with disjoint callers,
+/// different signatures and nothing in common but a filename — splitting was
+/// right; another held two long-running passes with disjoint callers that
+/// shared notice timings, error-reporting shape and the idea "a pass the
+/// settings tab can start" — splitting would have produced caller-shaped
+/// wrappers. Nothing in the graph tells those apart, so the tool must not
+/// pretend the measurement does.
 pub(super) fn split_lines(
     graph: &DependencyGraph,
     root: &Path,
@@ -1437,7 +1590,7 @@ mod tests {
             matches!(&shape, MergeShape::SharedContract { types } if types == &["DefStmt"]),
             "a shared type between independent siblings was not read as a contract",
         );
-        let body = merge_lines(&p, &graph, Path::new(""), "ast.rs", &parents).join("\n");
+        let body = merge_lines(&p, &graph, Path::new(""), "ast.rs", &parents, false).join("\n");
         assert!(body.contains("**Leave it.**"), "{body}");
     }
 
@@ -1998,6 +2151,71 @@ mod tests {
             is_type_only: true,
             ..site(from, to, line, false)
         }
+    }
+
+    /// The evidence behind "do these exports share a concern". Two functions
+    /// in one file that both reach for the same constant are one idea however
+    /// separate their callers are; two that reach for nothing in common are
+    /// two jobs sharing a filename. Both cases came from the field, and the
+    /// point of printing it is that a reader can apply the test at a glance
+    /// instead of opening the file.
+    #[test]
+    fn shared_ground_separates_one_concern_from_two_jobs() {
+        let span = crate::models::Span::from_positions(1, 0, 1, 0);
+        let shared_const = CodeEntity::new("NOTICE_MS", EntityKind::Constant, "bulk.ts", span);
+        let helper = CodeEntity::new("runPass", EntityKind::Function, "bulk.ts", span);
+        // Two exports of one file, both reaching for the same two things.
+        let cohesive_a = CodeEntity::new("backfill", EntityKind::Function, "passes.ts", span);
+        let cohesive_b = CodeEntity::new("clearAll", EntityKind::Function, "passes.ts", span);
+        // Two exports of another, sharing nothing outward.
+        let split_a = CodeEntity::new("inScope", EntityKind::Function, "scope.ts", span);
+        let split_b = CodeEntity::new("listFiles", EntityKind::Function, "scope.ts", span);
+
+        let dep = |from: &CodeEntity, to: &CodeEntity| {
+            crate::models::Relationship::new(
+                &from.id,
+                &to.id,
+                crate::models::RelationshipKind::Calls,
+            )
+        };
+        let graph = DependencyGraph::from_analysis(&crate::analyzer::AnalysisResult {
+            relationships: vec![
+                dep(&cohesive_a, &helper),
+                dep(&cohesive_a, &shared_const),
+                dep(&cohesive_b, &helper),
+                dep(&cohesive_b, &shared_const),
+                dep(&split_b, &helper),
+            ],
+            entities: vec![
+                shared_const,
+                helper,
+                cohesive_a,
+                cohesive_b,
+                split_a,
+                split_b,
+            ],
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        });
+
+        let cohesive = shared_ground(&graph, Path::new(""), "passes.ts");
+        let names: Vec<&str> = cohesive.iter().map(|(_, n)| n.as_str()).collect();
+        assert!(names.contains(&"NOTICE_MS"), "{names:?}");
+        assert!(names.contains(&"runPass"), "{names:?}");
+        // Ordered most-discriminating first: a name two exports share is
+        // stronger evidence than one the whole codebase shares.
+        let fan_ins: Vec<u32> = cohesive.iter().map(|(f, _)| *f).collect();
+        assert!(
+            fan_ins.windows(2).all(|w| w[0] <= w[1]),
+            "not ranked by how rare it is: {fan_ins:?}"
+        );
+
+        // One export reaching outward and the other not is not shared ground.
+        assert!(
+            shared_ground(&graph, Path::new(""), "scope.ts").is_empty(),
+            "two jobs read as one concern"
+        );
     }
 
     /// A graph carrying nothing but import sites — enough to ask where an

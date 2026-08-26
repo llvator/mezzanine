@@ -1,7 +1,7 @@
 /**
  * A document's neighbourhood: the notes one link away from an in-scope note.
  *
- * Every other language nao parses puts several entities in a file, so a scope
+ * Every other language mezz parses puts several entities in a file, so a scope
  * narrower than the repo still leaves a graph behind — a class with its
  * methods, a file with its functions and the calls between them. Markdown does
  * not. The parser emits one Note per file, because a link addresses a whole

@@ -2,7 +2,7 @@
  * Unit tests for the diff scope rollup (UI-064).
  *
  * The bug these exist to keep dead: with a diff loaded, the canvas drew
- * *nothing* at File or Module aggregation. A collapsed node carries its
+ * *nothing* at File or Folder aggregation. A collapsed node carries its
  * scope path in `original_id`, the status map is keyed by entity id, the
  * lookup missed on every node, and a miss was read as "unchanged" — which,
  * with `coreOnly` on and the dim slider at 0, is `display: none`.
@@ -69,7 +69,7 @@ test('the root scope is its own chain', () => {
 
 test('a base-worktree path is brought back to repo-relative', () => {
   assert.equal(
-    normalizeScopePath('/var/folders/x/nao-diff-base-abc123/ui/src/App.svelte'),
+    normalizeScopePath('/var/folders/x/mezz-diff-base-abc123/ui/src/App.svelte'),
     'ui/src/App.svelte',
   );
   assert.equal(normalizeScopePath('ui/src/App.svelte'), 'ui/src/App.svelte');
@@ -85,7 +85,7 @@ test('a base-worktree path is brought back to repo-relative', () => {
 
 test('a worktree-side id is brought back to repo-relative', () => {
   assert.equal(
-    normalizeEntityId('/var/folders/x/T/nao-diff-head-abc123/src/diff.rs:12:foo'),
+    normalizeEntityId('/var/folders/x/T/mezz-diff-head-abc123/src/diff.rs:12:foo'),
     'src/diff.rs:12:foo',
   );
 });
@@ -97,7 +97,7 @@ test('an absolute id and its worktree twin normalize to the same key', () => {
   // `ui/` lost its status, its deltas and its before-source, while `src/`
   // worked — which is what kept it hidden.
   const absolute = '/home/me/proj/ui/src/stores/mirror.ts:114:nodeById';
-  const worktree = '/var/folders/x/T/nao-diff-head-abc/ui/src/stores/mirror.ts:114:nodeById';
+  const worktree = '/var/folders/x/T/mezz-diff-head-abc/ui/src/stores/mirror.ts:114:nodeById';
   assert.equal(normalizeEntityId(absolute), 'ui/src/stores/mirror.ts:114:nodeById');
   assert.equal(normalizeEntityId(absolute), normalizeEntityId(worktree));
 });
@@ -262,7 +262,7 @@ const graph: GraphData = {
   links: [],
 } as unknown as GraphData;
 
-for (const level of ['file', 'module'] as const) {
+for (const level of ['file', 'folder'] as const) {
   test(`every ${level}-level node the canvas draws can be found in the rollup`, () => {
     const collapsed = collapseGraph(graph, level);
     const scopes = rollUpByScope(FILES.map((f) => entry(f, 'unchanged', false)));
@@ -286,7 +286,7 @@ test('a collapsed file node carries its scope path, not an entity id', () => {
 });
 
 test('a file that changed reaches its own module node and no other', () => {
-  const collapsed = collapseGraph(graph, 'module');
+  const collapsed = collapseGraph(graph, 'folder');
   const scopes = rollUpByScope([
     entry('ui/src/stores/diff.ts', 'modified', true),
     entry('ui/src/stores/graph.ts', 'unchanged', false),

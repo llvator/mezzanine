@@ -6,7 +6,7 @@
  * code graph's machinery — collapse levels, metric encoding, file scoping.
  * That machinery answers questions the spec layer does not have: a Feature has
  * no cyclomatic complexity, does not collapse to a file circle usefully, and
- * is not interesting at "module" granularity.
+ * is not interesting at "folder" granularity.
  *
  * So this module cuts the spec out as a standalone subgraph and answers the
  * three questions the split view asks of it:
@@ -339,7 +339,7 @@ export function matchesSpecQuery(node: D3Node, query: string): boolean {
  * - `unanalyzed` — the claims name nothing in the *analysed graph* at all.
  *   Two very different causes, and this cannot tell them apart: the path died
  *   (real drift), or its file type is outside the parsed language set —
- *   `.nao/settings.json` restricts this repo to rust/typescript/svelte/
+ *   `.mezz/settings.json` restricts this repo to rust/typescript/svelte/
  *   elevator, so a `cr:` at a `.py` script resolves on disk and appears
  *   nowhere here. It was called `stale` and asserted drift, which put a
  *   warning badge on correct refs and sent readers to edit a healthy spec.

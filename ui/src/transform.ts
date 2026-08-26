@@ -76,6 +76,12 @@ interface AnalysisJson {
   entities: AnalysisEntity[];
   relationships: AnalysisRelationship[];
   files?: AnalysisScopeMetrics[];
+  folders?: AnalysisScopeMetrics[];
+  /** Pre-rename spelling of `folders`. A UI build is not always talking to
+   *  a backend of its own vintage — a `.json` saved by an older `mezz
+   *  analyze`, or an extension that outlived the binary beside it — and a
+   *  missing rollup reads as "this repo has no folders" rather than as a
+   *  version skew. Read it, never write it. */
   modules?: AnalysisScopeMetrics[];
   thresholds?: Record<string, unknown>;
 }
@@ -460,7 +466,7 @@ export function transformAnalysisJson(analysis: AnalysisJson): GraphData {
     nodes,
     links,
     files: analysis.files ?? [],
-    modules: analysis.modules ?? [],
+    folders: analysis.folders ?? analysis.modules ?? [],
     thresholds: analysis.thresholds as GraphData['thresholds'],
   };
 }

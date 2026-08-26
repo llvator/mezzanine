@@ -192,8 +192,10 @@ pub enum OutsideVerdict {
     /// into the interior. What `entry_concentration` charges for, and the
     /// thing to fix when a folder is held back by its doors.
     Breach,
-    /// Leaves the folder. Never a defect on its own: depending outward is
-    /// what a folder is for, and where it lands is its target's business.
+    /// Leaves the folder. Where it *lands* is never a defect and is its
+    /// target's business — depending outward is what a folder is for. Where
+    /// it *starts* is this folder's own shape, and is graded: an exit from a
+    /// middle-layer child is what `egress` charges for (AN-028, ADR 0031).
     Exit,
 }
 

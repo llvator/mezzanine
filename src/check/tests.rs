@@ -1,4 +1,4 @@
-//! Tests for `nao check`.
+//! Tests for `mezz check`.
 //!
 //! Three parts, and they fail for different reasons. The rules-file tests
 //! are about *refusing to guess*: every one of them asserts an error naming
@@ -7,7 +7,7 @@
 //! the tree tests grade real fixtures through the real analyzer, because
 //! every rule is a count over resolved entities and edges — a hand-built
 //! graph would prove nothing about whether the resolution is the part that
-//! works, and resolution is the whole reason these rules belong in nao
+//! works, and resolution is the whole reason these rules belong in mezz
 //! rather than in a script beside it.
 
 use std::path::{Path, PathBuf};
@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use super::rules;
 use super::*;
 
-/// A throwaway repo: `.nao/rules.json` plus whatever source the test writes.
+/// A throwaway repo: `.mezz/rules.json` plus whatever source the test writes.
 struct Fixture(PathBuf);
 
 impl Fixture {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("nao-check-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-check-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -34,7 +34,7 @@ impl Fixture {
     }
 
     fn rules(&self, body: &str) {
-        self.write(".nao/rules.json", body);
+        self.write(".mezz/rules.json", body);
     }
 
     /// The verdict, with a configuration built from the fixture alone — no
@@ -102,9 +102,9 @@ fn an_empty_rules_object_declares_nothing() {
 
 #[test]
 fn the_rules_file_is_named_the_way_a_reader_would_type_it() {
-    // `repo_dir(".")` answers `./.nao`, and a reader looking for that file
-    // types `.nao/rules.json`.
-    assert_eq!(tidy(Path::new("./.nao/rules.json")), ".nao/rules.json");
+    // `repo_dir(".")` answers `./.mezz`, and a reader looking for that file
+    // types `.mezz/rules.json`.
+    assert_eq!(tidy(Path::new("./.mezz/rules.json")), ".mezz/rules.json");
 }
 
 #[test]
@@ -328,7 +328,7 @@ fn the_shape_examples_meet_the_rules_they_were_built_to() {
         "dart",
     ] {
         let example = root.join(language);
-        let rules = rules::parse(&example.join(".nao/rules.json"), rules_body).unwrap();
+        let rules = rules::parse(&example.join(".mezz/rules.json"), rules_body).unwrap();
         let config = Config::for_path(&example);
         let result = Analyzer::new(config).analyze().expect("analysis succeeds");
         let graph = DependencyGraph::from_analysis(&result);
@@ -392,7 +392,7 @@ fn a_file_with_two_importers_names_both() {
 }
 
 /// The capability the review's hand-written test lacked, and the reason this
-/// rule belongs in nao at all: a file that never types the leaf's path still
+/// rule belongs in mezz at all: a file that never types the leaf's path still
 /// depends on the leaf, because the shim forwards a name it does not own.
 #[test]
 fn an_importer_through_a_re_export_is_counted_against_the_declaring_file() {
@@ -400,14 +400,14 @@ fn an_importer_through_a_re_export_is_counted_against_the_declaring_file() {
     fixture.rules(r#"{"rules": {"max_importers_per_file": 1}}"#);
     fixture.write("src/settings/settingsDefaults.ts", LEAF);
     fixture.write(
-        "src/settings/index.ts",
+        "src/settings/front.ts",
         "export { shared } from \"./settingsDefaults.ts\";\n",
     );
     fixture.write(
         "src/settings/settings.ts",
         &importer("./settingsDefaults.ts"),
     );
-    fixture.write("src/main.ts", &importer("./settings/index.ts"));
+    fixture.write("src/main.ts", &importer("./settings/front.ts"));
     let outcome = fixture.check();
     assert_eq!(
         violations(&outcome),
@@ -417,7 +417,7 @@ fn an_importer_through_a_re_export_is_counted_against_the_declaring_file() {
     );
     // And the report says why the file main.ts never names is charged to it.
     assert!(
-        report::human(&outcome).contains("src/main.ts:1 via src/settings/index.ts"),
+        report::human(&outcome).contains("src/main.ts:1 via src/settings/front.ts"),
         "the shim is not named: {}",
         report::human(&outcome)
     );
@@ -463,6 +463,153 @@ fn a_folder_entered_at_two_files_names_both_doors() {
         "doors not named: {}",
         report::human(&outcome)
     );
+}
+
+/// The rule `max_doors_per_folder` cannot express. A door is the *busiest*
+/// file, so a folder whose front door takes more of the traffic than its
+/// neighbour has one door and still two ways in — which is not what "a
+/// single entry point" means to anyone who asks for it.
+#[test]
+fn one_door_is_not_one_way_in() {
+    let fixture = Fixture::new("entered");
+    fixture.rules(r#"{"rules": {"max_doors_per_folder": 1, "max_entered_files_per_folder": 1}}"#);
+    fixture.write("src/settings/settings.ts", LEAF);
+    fixture.write(
+        "src/settings/settingsDefaults.ts",
+        "export function defaults(): number { return 2; }\n",
+    );
+    fixture.write(
+        "src/main.ts",
+        "import { shared } from \"./settings/settings.ts\";\n         import { defaults } from \"./settings/settingsDefaults.ts\";\n         export function run(): number { return shared() + defaults(); }\n",
+    );
+    // A second dependency on the busier file, which is what breaks the tie:
+    // one door now, and the folder is entered at two files regardless.
+    fixture.write(
+        "src/extra.ts",
+        "import { shared } from \"./settings/settings.ts\";\n         export function extra(): number { return shared(); }\n",
+    );
+
+    let found = violations(&fixture.check());
+    assert!(
+        !found.iter().any(|v| v.contains("max_doors_per_folder")),
+        "the doors rule was satisfied, which is the premise: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|v| v == "src/settings max_entered_files_per_folder 2/1"),
+        "the second way in went unreported: {found:?}"
+    );
+}
+
+/// The rule the ladder tolerated until AN-028: a folder can be entered at one
+/// file and still reach outside from a child that has siblings under it.
+#[test]
+fn a_middle_child_reaching_outside_is_a_violation() {
+    let fixture = Fixture::new("middle_exit");
+    fixture.rules(r#"{"rules": {"max_middle_exits_per_folder": 0}}"#);
+    fixture.write("src/other.ts", LEAF);
+    // `mid.ts` depends on a sibling *and* on the outside, so the level drawn
+    // above it is a fiction. `leaf.ts` depends on nothing inside, so its own
+    // reach outward is the shape the funnel wants.
+    fixture.write(
+        "src/db/leaf.ts",
+        "export function leaf(): number { return 1; }\n",
+    );
+    fixture.write(
+        "src/db/mid.ts",
+        "import { leaf } from \"./leaf.ts\";\n         import { shared } from \"../other.ts\";\n         export function mid(): number { return leaf() + shared(); }\n",
+    );
+
+    let found = violations(&fixture.check());
+    assert!(
+        found
+            .iter()
+            .any(|v| v == "src/db max_middle_exits_per_folder 1/0"),
+        "the middle-layer exit went unreported: {found:?}"
+    );
+}
+
+/// The other half of the same rule: an exit from the bottom of the drawing is
+/// the shape it is asking for, and must not be charged for. A rule that fired
+/// on every outgoing dependency would just be "do not depend on anything".
+#[test]
+fn an_exit_from_a_leaf_is_not_a_violation() {
+    let fixture = Fixture::new("leaf_exit");
+    fixture.rules(r#"{"rules": {"max_middle_exits_per_folder": 0}}"#);
+    fixture.write("src/other.ts", LEAF);
+    fixture.write(
+        "src/db/mid.ts",
+        "import { leaf } from \"./leaf.ts\";\n         export function mid(): number { return leaf(); }\n",
+    );
+    fixture.write(
+        "src/db/leaf.ts",
+        "import { shared } from \"../other.ts\";\n         export function leaf(): number { return shared(); }\n",
+    );
+
+    let found = violations(&fixture.check());
+    assert!(
+        !found
+            .iter()
+            .any(|v| v.contains("max_middle_exits_per_folder")),
+        "an exit from the bottom of the funnel was charged for: {found:?}"
+    );
+}
+
+/// Doors are files tied at a maximum, so one more dependency on one of them
+/// breaks the tie and drops the count — a number that moves while the code
+/// keeps its shape. This one counts a set, and does not.
+#[test]
+fn a_second_dependency_on_a_file_already_entered_changes_nothing() {
+    let counted = |extra: bool| {
+        let fixture = Fixture::new(if extra { "stable-b" } else { "stable-a" });
+        fixture
+            .rules(r#"{"rules": {"max_doors_per_folder": 1, "max_entered_files_per_folder": 1}}"#);
+        fixture.write("src/settings/settings.ts", LEAF);
+        fixture.write(
+            "src/settings/settingsDefaults.ts",
+            "export function defaults(): number { return 2; }\n",
+        );
+        fixture.write(
+            "src/main.ts",
+            "import { shared } from \"./settings/settings.ts\";\n         import { defaults } from \"./settings/settingsDefaults.ts\";\n         export function run(): number { return shared() + defaults(); }\n",
+        );
+        if extra {
+            fixture.write(
+                "src/extra.ts",
+                "import { shared } from \"./settings/settings.ts\";\n         export function extra(): number { return shared(); }\n",
+            );
+        }
+        let found = violations(&fixture.check());
+        let rule = |name: &str| {
+            found
+                .iter()
+                .any(|v| v.contains(name))
+                .then(|| name.to_string())
+        };
+        (
+            rule("max_doors_per_folder"),
+            rule("max_entered_files_per_folder"),
+        )
+    };
+
+    let (doors_before, entered_before) = counted(false);
+    let (doors_after, entered_after) = counted(true);
+
+    // The doors rule is the demonstration, not the subject: one edge takes
+    // it from breached to satisfied.
+    assert!(doors_before.is_some(), "the tie should have made two doors");
+    assert!(
+        doors_after.is_none(),
+        "breaking the tie should have satisfied the doors rule"
+    );
+    // The rule under test does not move, because nothing about the folder's
+    // ways in did.
+    assert_eq!(
+        entered_before, entered_after,
+        "a tie-break moved a verdict it has nothing to do with"
+    );
+    assert!(entered_before.is_some(), "two files are entered either way");
 }
 
 /// Both rules read edges rather than files, so `exempt` has to reach the
@@ -520,11 +667,11 @@ fn a_path_outside_the_repo_root_keeps_its_own_spelling() {
     );
 }
 
-/// Over `KNOWN` rather than a list written here, so a rule added without a
+/// Over `known()` rather than a list written here, so a rule added without a
 /// phrase fails instead of being reported as a bare number.
 #[test]
 fn every_known_rule_has_a_name_and_a_phrase() {
-    for rule in rules::KNOWN.iter().copied() {
+    for rule in rules::known() {
         assert!(rule.name().starts_with("max_"));
         assert!(rule.phrase(9, Some("Thing")).contains('9'));
     }

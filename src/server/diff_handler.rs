@@ -254,7 +254,7 @@ fn compute_diff_blocking(
 
     // Create + analyze base worktree, unless the last diff already did.
     let tmp = std::env::temp_dir();
-    let base_dir = tmp.join(format!("nao-diff-base-{}", from_sha));
+    let base_dir = tmp.join(format!("mezz-diff-base-{}", from_sha));
     let worktree_start = Instant::now();
     let (base, base_is_ours) = acquire_base(
         repo_root,
@@ -271,7 +271,7 @@ fn compute_diff_blocking(
     // The staged head goes down the worktree path like any commit — the
     // manufactured commit it checks out is an ordinary ref by then.
     let (head_graph, head_config, head_dir_for_diff) = if let Some(head_ref) = &head.git_ref {
-        let hdir = tmp.join(format!("nao-diff-head-{}", to_sha));
+        let hdir = tmp.join(format!("mezz-diff-head-{}", to_sha));
         if let Err(e) = diff::create_worktree(repo_root, &hdir, head_ref) {
             if base_is_ours {
                 diff::remove_worktree(repo_root, &base_dir);
@@ -335,7 +335,7 @@ fn compute_diff_blocking(
         diff::remove_worktree(repo_root, &base_dir);
     }
     if !is_working {
-        let hdir = tmp.join(format!("nao-diff-head-{}", to_sha));
+        let hdir = tmp.join(format!("mezz-diff-head-{}", to_sha));
         diff::remove_worktree(repo_root, &hdir);
     }
 
@@ -812,7 +812,7 @@ mod tests {
 
     /// A repository with one commit, at a path unique to this test.
     fn repo(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nao-head-{}-{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-head-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
@@ -889,7 +889,7 @@ mod tests {
     }
 
     /// An ordinary ref keeps its name for the checkout and reports the sha, so
-    /// `nao-diff-head-<label>` stays one directory per tree rather than one per
+    /// `mezz-diff-head-<label>` stays one directory per tree rather than one per
     /// spelling of it.
     #[test]
     fn an_ordinary_ref_is_checked_out_by_name_and_reported_by_sha() {
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn the_working_head_is_rooted_where_the_server_watches() {
         let mut live = Config::default();
-        live.root_path = PathBuf::from("/tmp/nao-diff-head-abc123");
+        live.root_path = PathBuf::from("/tmp/mezz-diff-head-abc123");
         let rooted = working_head_config(live, Path::new("/repo"));
         assert_eq!(rooted.root_path, PathBuf::from("/repo"));
     }
@@ -915,8 +915,8 @@ mod tests {
         // is what makes the second call independent of the first, so this
         // holds however badly the config arrives.
         for poisoned in [
-            "/tmp/nao-diff-head-abc",
-            "/tmp/nao-diff-base-def",
+            "/tmp/mezz-diff-head-abc",
+            "/tmp/mezz-diff-base-def",
             "relative/nonsense",
             "/",
         ] {
@@ -972,7 +972,7 @@ mod tests {
         // settings are the user's current choices and have to survive, or a
         // diff would silently widen the analysis it compares.
         let mut live = Config::default();
-        live.root_path = PathBuf::from("/tmp/nao-diff-head-abc");
+        live.root_path = PathBuf::from("/tmp/mezz-diff-head-abc");
         live.analysis.include_tests = !live.analysis.include_tests;
         let expected_tests = live.analysis.include_tests;
         let expected_langs = live.analysis.languages.clone();

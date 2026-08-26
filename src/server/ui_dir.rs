@@ -1,7 +1,7 @@
 //! Finding the built browser UI (SRV-008).
 //!
 //! The UI mount used to be `Path::new("ui/dist")`, resolved against the
-//! process working directory. That made `nao watch` a command you had to run
+//! process working directory. That made `mezz watch` a command you had to run
 //! from one particular directory, and made `cargo install --git …` produce a
 //! binary whose watch mode could never serve a UI — the fallback page told
 //! the reader to `cd ui && npm run build` in a repo they had never cloned.
@@ -17,12 +17,12 @@ use axum::{response::Html, routing::get, Router};
 
 /// Environment variable equivalent of `--ui-dir`, for wrapper scripts and
 /// launchers that have nowhere to put a flag.
-const UI_DIR_ENV: &str = "NAO_UI_DIR";
+const UI_DIR_ENV: &str = "MEZZ_UI_DIR";
 
 /// Locate the built UI. Resolution order, first hit wins:
 ///
 /// 1. `--ui-dir <path>`,
-/// 2. `NAO_UI_DIR`,
+/// 2. `MEZZ_UI_DIR`,
 /// 3. `ui_dir` in the user settings file (CFG-002) — the place to write it
 ///    down once, rather than keeping an `export` in a shell profile,
 /// 4. a `ui/dist` sibling of the running executable — what an installed
@@ -36,7 +36,7 @@ const UI_DIR_ENV: &str = "NAO_UI_DIR";
 ///
 /// A `--ui-dir` that does not resolve is an error: the user typed it, and
 /// silently falling through to `./ui/dist` is the class of surprise this
-/// whole ticket removes. `NAO_UI_DIR` and the settings file only warn,
+/// whole ticket removes. `MEZZ_UI_DIR` and the settings file only warn,
 /// because both outlive the session that set them.
 ///
 /// `from_settings` is passed in rather than read here so the settings file is
@@ -154,7 +154,7 @@ fn missing_ui_page(port: u16) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>nao — engine running, no UI bundled</title>
+<head><meta charset="utf-8"><title>mezz — engine running, no UI bundled</title>
 <style>
   body {{ font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 3rem 1.5rem;
           background: #16181d; color: #d7dae0; }}
@@ -170,21 +170,21 @@ fn missing_ui_page(port: u16) -> String {
 </style>
 </head>
 <body><main>
-  <h1>The nao engine is running.</h1>
+  <h1>The mezz engine is running.</h1>
   <p class="lede">It has no browser UI bundled with it, so there is nothing to show here.
      The API is live at <code>{base}</code> and answering.</p>
 
   <h2>Point the engine at a UI</h2>
   <p>If you have a built UI on disk (<code>npm run build</code> in the
      <code>ui/</code> directory writes <code>ui/dist</code>), start the engine with it:</p>
-  <pre>nao watch . --port {port} --ui-dir /path/to/ui/dist</pre>
-  <p>Or set <code>NAO_UI_DIR</code> once instead of passing the flag every time.</p>
+  <pre>mezz watch . --port {port} --ui-dir /path/to/ui/dist</pre>
+  <p>Or set <code>MEZZ_UI_DIR</code> once instead of passing the flag every time.</p>
 
   <h2>Point a UI at the engine</h2>
   <p>The UI is an ordinary static site and can be served from anywhere — it does
      not have to come from this server. Open it, tell it this engine's address
      (<code>{base}</code>), and allow its origin here:</p>
-  <pre>nao watch . --port {port} --allow-origin http://localhost:4173</pre>
+  <pre>mezz watch . --port {port} --allow-origin http://localhost:4173</pre>
   <p>Without that flag the engine refuses to answer a page it did not serve,
      because loopback is not a boundary against a browser on the same machine.</p>
 </main></body>
@@ -198,7 +198,7 @@ mod tests {
 
     /// A directory that passes the `index.html` test, under a fresh temp dir.
     fn built_ui(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nao-ui-dir-test-{name}"));
+        let dir = std::env::temp_dir().join(format!("mezz-ui-dir-test-{name}"));
         let dist = dir.join("dist");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dist).unwrap();
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn ui_dir_explicit_flag_that_is_not_a_build_is_an_error() {
-        let empty = std::env::temp_dir().join("nao-ui-dir-test-empty");
+        let empty = std::env::temp_dir().join("mezz-ui-dir-test-empty");
         std::fs::create_dir_all(&empty).unwrap();
         let err = resolve(Some(&empty), None).unwrap_err();
         assert!(err.contains("--ui-dir"), "{err}");
@@ -239,10 +239,10 @@ mod tests {
 
     /// Ambient configuration warns and falls through rather than failing —
     /// a settings file outlives the session that wrote it, exactly like
-    /// `NAO_UI_DIR`.
+    /// `MEZZ_UI_DIR`.
     #[test]
     fn ui_dir_settings_that_is_not_a_build_falls_through() {
-        let empty = std::env::temp_dir().join("nao-ui-dir-test-settings-empty");
+        let empty = std::env::temp_dir().join("mezz-ui-dir-test-settings-empty");
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         assert!(resolve(None, Some(&empty)).is_ok());

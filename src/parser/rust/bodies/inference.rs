@@ -5,7 +5,7 @@
 
 use crate::parser::language_parser::node_text;
 use crate::parser::rust_type_names::{base_type_name, strip_generics};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 /// Everything the call extractor knows about types in one function body:
@@ -18,6 +18,47 @@ pub(super) struct TypeEnv<'a> {
     pub fields: &'a HashMap<String, HashMap<String, String>>,
     /// The enclosing `impl` block's type name, if any.
     pub self_type: Option<&'a str>,
+    /// Names bound to a closure by a `let` in this body. Calls naming one of
+    /// them are not calls to anything the graph holds — see
+    /// [`closure_bindings`].
+    pub closures: HashSet<String>,
+}
+
+/// Every name a `let` in this body binds to a closure.
+///
+/// `let row = |e| …;` then `row(e)` is an ordinary way to name a small helper.
+/// The closure is not an entity, so the call has nothing in the graph to point
+/// at — and left alone the bare name resolves to *some* function called `row`
+/// somewhere else in the tree. This repo had `src/mcp/tools.rs` depending on
+/// `src/settings/report.rs` for exactly that reason (AN-029), and the false
+/// edge reached a `check` rule's evidence, sending a reader to a file with
+/// nothing in it.
+///
+/// Only closures, deliberately. Any `let` shadows a function name for call
+/// syntax in Rust, so the wider rule would be defensible — but it would also
+/// suppress real edges wherever a binding happens to share a name with a
+/// function called elsewhere in the same body, and a lost true edge is the
+/// more expensive mistake here.
+pub(super) fn closure_bindings(body: &Node, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_closure_bindings(body, source, &mut names);
+    names
+}
+
+fn collect_closure_bindings(node: &Node, source: &str, out: &mut HashSet<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "let_declaration" {
+            let pattern = child.child_by_field_name("pattern");
+            let value = child.child_by_field_name("value");
+            if let (Some(pattern), Some(value)) = (pattern, value) {
+                if value.kind() == "closure_expression" && pattern.kind() == "identifier" {
+                    out.insert(node_text(&pattern, source).to_string());
+                }
+            }
+        }
+        collect_closure_bindings(&child, source, out);
+    }
 }
 
 /// How far a dotted receiver could be typed from declarations in *this* file.

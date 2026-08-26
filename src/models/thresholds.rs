@@ -36,10 +36,10 @@ pub struct Thresholds {
     pub file_loc: WarnBad,
     pub file_fan_out: WarnBad,
 
-    // --- Scope-level (module) ---
-    pub module_entity_count: WarnBad,
-    pub module_loc: WarnBad,
-    pub module_fan_out: WarnBad,
+    // --- Scope-level (folder) ---
+    pub folder_entity_count: WarnBad,
+    pub folder_loc: WarnBad,
+    pub folder_fan_out: WarnBad,
 
     // --- Cohesion (inverted: lower is worse) ---
     pub cohesion: WarnBad,
@@ -83,6 +83,11 @@ pub struct Thresholds {
     /// Entry concentration a folder must reach to count as fractal — how
     /// much of the traffic arriving from outside lands on one file.
     pub shape_entry: f32,
+    /// Share of a folder's outgoing dependencies that must start at a leaf
+    /// or at its door for it to count as fractal — whether the folder
+    /// reaches outward from the bottom or leaks from its middle. The mirror
+    /// of `shape_entry`: that one grades what arrives, this what leaves.
+    pub shape_egress: f32,
     /// Mean compliance a folder's subfolders must reach for it to count as
     /// fractal. The recursive gate.
     pub shape_child: f32,
@@ -163,15 +168,15 @@ impl Default for Thresholds {
                 bad: 20.0,
             },
 
-            module_entity_count: WarnBad {
+            folder_entity_count: WarnBad {
                 warn: 60.0,
                 bad: 150.0,
             },
-            module_loc: WarnBad {
+            folder_loc: WarnBad {
                 warn: 2000.0,
                 bad: 5000.0,
             },
-            module_fan_out: WarnBad {
+            folder_fan_out: WarnBad {
                 warn: 15.0,
                 bad: 30.0,
             },
@@ -206,6 +211,7 @@ impl Default for Thresholds {
             // fractal badge (src/parser/elevator, vscode-extension/src).
             shape_arborescence: 0.7,
             shape_entry: 0.6,
+            shape_egress: 0.7,
             shape_child: 0.8,
             shape_compliance: 0.85,
             // Eight. It began at seven, from the span of what a reader

@@ -1,4 +1,4 @@
-//! # Nao
+//! # Mezzanine
 //!
 //! A tool for visualizing code relationships and dependencies at multiple levels:
 //! - **File level**: Classes, functions, interfaces within a file

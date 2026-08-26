@@ -36,7 +36,7 @@ use tokio::sync::broadcast;
 
 use state::{build_config, write_json, AppState, ReloadKind};
 
-/// Everything `nao watch` needs from the CLI, in one place so `main.rs`
+/// Everything `mezz watch` needs from the CLI, in one place so `main.rs`
 /// doesn't grow a nine-argument call — the same reason `ServeOptions` exists.
 pub struct WatchOptions {
     pub path: PathBuf,
@@ -60,7 +60,7 @@ pub struct WatchOptions {
     /// rest of [`ui_dir::resolve`]'s order.
     pub ui_dir: Option<PathBuf>,
     /// `ui_dir` from the user settings file, already loaded by the caller.
-    /// Ranks below `--ui-dir` and `NAO_UI_DIR`; see [`ui_dir::resolve`].
+    /// Ranks below `--ui-dir` and `MEZZ_UI_DIR`; see [`ui_dir::resolve`].
     pub settings_ui_dir: Option<PathBuf>,
     /// Both settings scopes, still unmerged. Watch analyzes a path the
     /// operator chose, so both apply — unlike `serve`, which never reads a
@@ -79,7 +79,7 @@ pub struct WatchOptions {
     /// `--pin-diff`: stop a working-tree diff from following the watcher, so
     /// a comparison stays where it was put (UI-067). On by default because
     /// "compare against the last commit and watch it evolve" is the reason
-    /// most people open a diff next to `nao watch`.
+    /// most people open a diff next to `mezz watch`.
     pub pin_diff: bool,
 }
 
@@ -242,6 +242,11 @@ fn spawn_file_watcher(
             }
             match notify_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(Ok(events)) => {
+                    // Before the filter below, which is about files that
+                    // would be *analyzed*: a checkout that swaps no source
+                    // file still changes which branch this graph is, and that
+                    // batch is exactly the one the filter drops (UI-114).
+                    announce_head_move(&events, &tx);
                     // Asked of the *live* scope, not the watcher's startup
                     // copy, for the same reason `handle_reanalysis` analyzes
                     // with the live one: a reader who narrowed the analysis
@@ -313,6 +318,48 @@ fn analyzable_changes(
         .into_iter()
         .filter(|p| !ignored.contains(p))
         .collect()
+}
+
+/// Tell every client that `HEAD` moved, when this batch says it did.
+///
+/// A function of its own rather than an `if` in the watch loop: the loop body
+/// is already three levels deep inside a thread, a loop and a match, and a
+/// branch there costs more read than the whole rule does.
+fn announce_head_move(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    tx: &Arc<broadcast::Sender<ReloadKind>>,
+) {
+    if head_moved(events) {
+        let _ = tx.send(ReloadKind::Head);
+    }
+}
+
+/// Whether this batch touched something that decides what `HEAD` is.
+///
+/// A display signal, not an analysis one — everything it matches is inside
+/// `.git`, which the walker never analyzes, so this cannot cause a re-parse.
+/// It errs towards firing: `refs/heads` and the reflog are matched as well as
+/// `HEAD` itself, so that committing refreshes the abbreviated sha the chip
+/// shows and not only switching branches does. A spurious event costs the
+/// client two git calls.
+///
+/// Component-wise rather than string matching, so a directory named
+/// `my.gitignore` or a source file called `head.rs` cannot look like a ref.
+fn head_moved(events: &[notify_debouncer_mini::DebouncedEvent]) -> bool {
+    events.iter().any(|e| names_head_ref(&e.path))
+}
+
+/// One path's answer to the question above.
+fn names_head_ref(path: &std::path::Path) -> bool {
+    if !path.components().any(|c| c.as_os_str() == ".git") {
+        return false;
+    }
+    // `.git/HEAD` and `.git/logs/HEAD`; `ORIG_HEAD` and `FETCH_HEAD` are
+    // whole components of their own and do not match.
+    path.ends_with("HEAD")
+        || path.ends_with("packed-refs")
+        // `.git/refs/heads/**`, at any depth — branch names contain slashes.
+        || path.components().any(|c| c.as_os_str() == "heads")
 }
 
 fn log_changed_files(changed: &[String]) {
@@ -511,13 +558,15 @@ async fn run_http_server(
 /// in the watcher.
 ///
 /// Only `Graph` events are answered. The refresh publishes `Diff`, which
-/// this loop must therefore ignore, or a single save would spin.
+/// this loop must therefore ignore, or a single save would spin. `Head` is
+/// ignored for a plainer reason: a moved `HEAD` re-analyzes nothing and moves
+/// no overlay, so there is nothing here for it to do (UI-114).
 async fn follow_the_watcher(state: AppState) {
     let mut rx = state.tx.subscribe();
     loop {
         match rx.recv().await {
             Ok(ReloadKind::Graph) => diff_handler::refresh_live_diff(&state).await,
-            Ok(ReloadKind::Diff) => {}
+            Ok(ReloadKind::Diff) | Ok(ReloadKind::Head) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -536,6 +585,7 @@ fn build_router(
 
     let app = Router::new()
         .route("/events", get(handlers::sse_handler))
+        .route("/api/branch", get(handlers::branch_handler))
         .route("/api/commits", get(handlers::commits_handler))
         .route("/api/stashes", get(handlers::stashes_handler))
         .route("/api/staged", get(handlers::staged_handler))
@@ -565,7 +615,7 @@ fn build_router(
             post(analysis_handler::analysis_scope_handler)
                 .get(analysis_handler::analysis_scope_state_handler),
         )
-        // Saved views (UI-082) — repo-scope, so `nao serve` never gets these
+        // Saved views (UI-082) — repo-scope, so `mezz serve` never gets these
         // routes and its UI falls back to browser storage. See
         // `views_handler.rs` and ADR 0008.
         .route(
@@ -625,7 +675,8 @@ fn print_startup_banner(port: u16, policy: &AccessPolicy, ui: Option<&std::path:
         "   Data files:     http://localhost:{}/data/data.json",
         port
     );
-    eprintln!("   API:            GET  /api/commits   - list recent commits");
+    eprintln!("   API:            GET  /api/branch    - which branch this checkout is on");
+    eprintln!("                   GET  /api/commits   - list recent commits");
     eprintln!("                   POST /api/diff      - compute diff between commits");
     eprintln!("                   DEL  /api/diff      - leave diff mode");
     eprintln!("                   GET  /api/root      - get current analyzed path");
@@ -656,6 +707,43 @@ mod tests {
                 kind: DebouncedEventKind::Any,
             })
             .collect()
+    }
+
+    /// A checkout that swaps no source file — `git checkout -b`, or a branch
+    /// whose tree is identical — produces no analyzable change at all. That
+    /// batch is precisely the one the analysis filter drops, so if the head
+    /// signal were read from what survives the filter, the reader would be
+    /// left looking at the name of a branch they are no longer on (UI-114).
+    #[test]
+    fn switching_branches_signals_even_when_no_source_file_moved() {
+        let git = std::path::Path::new("/repo/.git");
+        for moved in ["HEAD", "logs/HEAD", "refs/heads/main", "refs/heads/feat/a"] {
+            let events = touched(&[&git.join(moved)]);
+            assert!(head_moved(&events), ".git/{moved} moves HEAD");
+            assert!(
+                analyzable_changes(&events, &crate::config::Config::for_path("/repo")).is_empty(),
+                ".git/{moved} must not trigger a re-analysis",
+            );
+        }
+    }
+
+    /// The signal is a `.git` fact. A source file whose *name* looks like a
+    /// ref is still a source file, and waking the chip for it would be noise
+    /// on every keystroke in it.
+    #[test]
+    fn a_source_file_named_like_a_ref_is_not_a_head_move() {
+        for quiet in [
+            "/repo/src/HEAD",
+            "/repo/heads/README.md",
+            "/repo/.gitignore",
+            "/repo/.git/ORIG_HEAD",
+            "/repo/.git/FETCH_HEAD",
+        ] {
+            assert!(
+                !head_moved(&touched(&[std::path::Path::new(quiet)])),
+                "{quiet} does not decide which branch this is",
+            );
+        }
     }
 
     /// The watcher used to test the file extension and nothing else, so a

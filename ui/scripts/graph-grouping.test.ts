@@ -112,7 +112,7 @@ test('strength rises with the setting', () => {
 
 test('the force is inert at module level, where each node is already a folder', () => {
   for (const level of COHESION_LEVELS) {
-    assert.equal(cohesionStrengthFor('module', level), 0);
+    assert.equal(cohesionStrengthFor('folder', level), 0);
   }
 });
 
@@ -576,7 +576,7 @@ test('file grain is an entity-level reading and collapses elsewhere', () => {
   // hold one member and draw nothing; at module level the force is inert.
   assert.equal(groupGrainFor('entity', 'file'), 'file');
   assert.equal(groupGrainFor('file', 'file'), 'folder');
-  assert.equal(groupGrainFor('module', 'file'), 'folder');
+  assert.equal(groupGrainFor('folder', 'file'), 'folder');
   assert.equal(groupGrainFor('entity', 'folder'), 'folder');
 });
 
@@ -1352,16 +1352,16 @@ function mixedGraph() {
 }
 
 test('with nothing expanded, module level is one node per directory', () => {
-  const out = collapseGraph(mixedGraph(), 'module');
+  const out = collapseGraph(mixedGraph(), 'folder');
   assert.deepEqual(out.nodes.map((n) => n.original_id).sort(), ['other', 'pkg/sub']);
 });
 
 test('expanding a module opens it to files and leaves the rest collapsed', () => {
-  const out = collapseGraph(mixedGraph(), 'module', new Set(['pkg/sub']));
+  const out = collapseGraph(mixedGraph(), 'folder', new Set(['pkg/sub']));
   assert.deepEqual(out.nodes.map((n) => n.original_id).sort(),
     ['other', 'pkg/sub/a.ts', 'pkg/sub/b.ts']);
-  // The unexpanded neighbour is still a single Module circle.
-  assert.equal(out.nodes.find((n) => n.original_id === 'other')?.kind_raw, 'Module');
+  // The unexpanded neighbour is still a single Folder circle.
+  assert.equal(out.nodes.find((n) => n.original_id === 'other')?.kind_raw, 'Folder');
   assert.equal(out.nodes.find((n) => n.original_id === 'pkg/sub/a.ts')?.kind_raw, 'File');
 });
 
@@ -1374,7 +1374,7 @@ test('expanding a file at file level opens it to entities', () => {
 test('expansion opens exactly one level, not all the way down', () => {
   // An expanded module yields files, never entities — one gesture must not
   // be able to drop hundreds of nodes onto the canvas.
-  const out = collapseGraph(mixedGraph(), 'module', new Set(['pkg/sub']));
+  const out = collapseGraph(mixedGraph(), 'folder', new Set(['pkg/sub']));
   assert.ok(!out.nodes.some((n) => n.original_id === 'a1'));
 });
 
@@ -1413,8 +1413,8 @@ test('intra-scope edges stay hidden, expanded or not', () => {
 });
 
 test('expanding nothing is byte-for-byte the old behaviour', () => {
-  const a = collapseGraph(mixedGraph(), 'module');
-  const b = collapseGraph(mixedGraph(), 'module', new Set());
+  const a = collapseGraph(mixedGraph(), 'folder');
+  const b = collapseGraph(mixedGraph(), 'folder', new Set());
   assert.deepEqual(a.nodes.map((n) => n.original_id), b.nodes.map((n) => n.original_id));
   assert.deepEqual(a.links.length, b.links.length);
 });

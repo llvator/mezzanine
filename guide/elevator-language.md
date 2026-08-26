@@ -1,6 +1,6 @@
 # Elevator language guide
 
-Elevator is a small spec language for describing a project's *user-facing capabilities* at the level above code. You write `.elv` files, Nao parses them, and the analyzer turns them into a graph you can read top-down to onboard onto an unfamiliar project — categories at the ground floor, features one floor up, the verbs each feature supports as leaves.
+Elevator is a small spec language for describing a project's *user-facing capabilities* at the level above code. You write `.elv` files, Mezzanine parses them, and the analyzer turns them into a graph you can read top-down to onboard onto an unfamiliar project — categories at the ground floor, features one floor up, the verbs each feature supports as leaves.
 
 This is the syntax reference. For domain terminology and design rationale, see [CONTEXT.md](../CONTEXT.md).
 
@@ -32,7 +32,7 @@ trail of actual work, not to be filled in upfront.
   list*, not a to-fix list — unfinished is a legitimate permanent
   state. `--code-map` flags the drift the abstraction is prone to:
   the same code claimed by two differently-named entities.
-- **Consumers only need one branch deep.** `--focus` (and the nao MCP
+- **Consumers only need one branch deep.** `--focus` (and the mezz MCP
   `overview` tool) serve the entity being worked on; a stub extension
   elsewhere costs the reader nothing. Depth where work happens is also
   depth that stays fresh.
@@ -416,7 +416,7 @@ There are two binaries; pick whichever fits the workflow:
 
 ```bash
 elevator ./my-spec                      # standalone, focused on `.elv` work
-nao analyze ./my-spec -l elevator …     # full Nao surface; same engine
+mezz analyze ./my-spec -l elevator …     # full Mezzanine surface; same engine
 ```
 
 `elevator` is the recommended one for spec work — it implies `--language elevator` and the `elevator-text` output format, so the command line stays short. Internally it's the same parser + analyzer + renderer pipeline.
@@ -439,7 +439,7 @@ elevator ./my-spec --no-legend                  # suppress the format-key preamb
 elevator --docs                                 # print this language guide and exit
 ```
 
-The same flags work on `nao analyze -f elevator-text`.
+The same flags work on `mezz analyze -f elevator-text`.
 
 ### `--code-map` (inverted index by code path)
 
@@ -846,7 +846,7 @@ Every text artifact starts with a six-line legend (suppressible with `--no-legen
 ### Watch mode + VS Code
 
 ```bash
-nao watch ./my-spec --port 3200
+mezz watch ./my-spec --port 3200
 ```
 
 The VS Code extension picks `.elv` files up automatically and re-analyzes on save. Multi-file specs render whole: selecting any `.elv` file in the Visual Scopes panel pulls in the transitive containment descendants of its entities (and any attached Concepts) even when they are defined in other files — a Category never renders without the Features it declares elsewhere. Ancestors are not pulled in, so scoping to one feature file still narrows the view to that branch.
@@ -854,7 +854,7 @@ The VS Code extension picks `.elv` files up automatically and re-analyzes on sav
 ### Installation
 
 ```bash
-# From the repo root — installs both `nao` and `elevator` to ~/.cargo/bin/
+# From the repo root — installs both `mezz` and `elevator` to ~/.cargo/bin/
 cargo install --path . --force
 ```
 

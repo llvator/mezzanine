@@ -2,7 +2,7 @@
 
 > I am new here — what is this system, from the domain down to the function?
 
-This is the one thing Nao can do that nothing else can, because it holds two
+This is the one thing Mezzanine can do that nothing else can, because it holds two
 altitudes in the same renderer: the domain layer authored in Elevator
 (`.elv`) and the code graph derived from source. You arrive at a function
 already knowing which capability it serves.

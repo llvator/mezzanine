@@ -48,7 +48,7 @@ const REPO: GraphData = {
 };
 
 test('a root-level file keeps its edges at module level', () => {
-  const collapsed = collapseGraph(REPO, 'module');
+  const collapsed = collapseGraph(REPO, 'folder');
   assert.deepEqual(collapsed.nodes.map((n) => n.original_id).sort(), ['', 'docs']);
   assert.deepEqual(ends(collapsed).sort(), [['_root_', 'docs'], ['docs', '_root_']]);
 });

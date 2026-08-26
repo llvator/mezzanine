@@ -4,7 +4,7 @@
  * The panel names a *population* ("whole analysis scope", "what the canvas is
  * drawing", "the current selection") and every number in it — the repo banner,
  * the summary counts, the scatters, the entity leaderboard, the file and
- * module rollups — has to be that same population, or the reader is comparing
+ * folder rollups — has to be that same population, or the reader is comparing
  * a summary of one set of files against a table of another. These functions
  * are the rules that decide membership; `stores/quality.ts` wires them to the
  * stores and re-exports them.
@@ -21,13 +21,13 @@ import type { DiffData } from '../stores/diff';
  * Does `filePath` belong to the rollup at `scopePath`?
  *
  * The one membership rule, shared by every consumer, and it mirrors the
- * engine's `is_descendant`: a file rollup holds exactly its own file, a module
- * rollup holds its whole subtree, and the root module (`''`) holds everything.
+ * engine's `is_descendant`: a file rollup holds exactly its own file, a folder
+ * rollup holds its whole subtree, and the root folder (`''`) holds everything.
  * Written once because the answer decides which rows a population lists, and
  * two copies of it would drift into two different populations.
  */
-export function scopeHolds(scopePath: string, isModule: boolean, filePath: string): boolean {
-  if (!isModule) return filePath === scopePath;
+export function scopeHolds(scopePath: string, isFolder: boolean, filePath: string): boolean {
+  if (!isFolder) return filePath === scopePath;
   if (scopePath === '') return true;
   return filePath.startsWith(`${scopePath}/`);
 }
@@ -46,7 +46,7 @@ export function ancestorDirs(filePath: string): string[] {
 }
 
 /**
- * Cut a graph's file/module rollups down to the population its nodes describe.
+ * Cut a graph's file/folder rollups down to the population its nodes describe.
  *
  * What narrows is which rows are *listed*, never the numbers on them. The
  * rollup fields (cohesion, fan-out, entity count) are computed by the engine
@@ -55,7 +55,7 @@ export function ancestorDirs(filePath: string): string[] {
  * cohesion, it is nothing. A file the population no longer holds is not a file
  * that got better; it is a file the reader is not looking at, so it goes.
  *
- * This is what kept the Files and Modules tabs out of step with the rest of
+ * This is what kept the Files and Folders tabs out of step with the rest of
  * the panel: they read `graphData` directly, so the population selector moved
  * the summary and the entity table and left them showing the visual scope.
  */
@@ -71,7 +71,7 @@ export function narrowRollups(g: GraphData, nodes: D3Node[] = g.nodes): GraphDat
     ...g,
     nodes,
     files: (g.files ?? []).filter((f) => files.has(f.path)),
-    modules: (g.modules ?? []).filter((m) => dirs.has(m.path)),
+    folders: (g.folders ?? []).filter((m) => dirs.has(m.path)),
   };
 }
 
@@ -93,7 +93,7 @@ function childrenOf(n: D3Node, byParent: Map<string, D3Node[]>): D3Node[] {
 /**
  * What a selected node stands for as a population.
  *
- * A File or Module node names a path and stands for everything under it. Any
+ * A File or Folder node names a path and stands for everything under it. Any
  * other entity stands for itself *and what it contains*, so selecting a struct
  * measures its methods rather than reporting a single row and calling it a
  * scope. Selecting a leaf function does report one row, which is the honest
@@ -101,9 +101,9 @@ function childrenOf(n: D3Node, byParent: Map<string, D3Node[]>): D3Node[] {
  */
 export function selectionPopulation(all: D3Node[], sel: D3Node | null): D3Node[] {
   if (!sel) return [];
-  if (sel.kind_raw === 'File' || sel.kind_raw === 'Module') {
-    const isModule = sel.kind_raw === 'Module';
-    return all.filter((n) => scopeHolds(sel.original_id, isModule, n.file_path));
+  if (sel.kind_raw === 'File' || sel.kind_raw === 'Folder') {
+    const isFolder = sel.kind_raw === 'Folder';
+    return all.filter((n) => scopeHolds(sel.original_id, isFolder, n.file_path));
   }
   const byParent = new Map<string, D3Node[]>();
   for (const n of all) {

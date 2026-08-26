@@ -4,7 +4,7 @@
  *
  * Two failure modes are worth guarding, and both are silent:
  *
- *   1. A view read back from `.nao/views.json` — a file a human can edit —
+ *   1. A view read back from `.mezz/views.json` — a file a human can edit —
  *      that throws or half-restores. `normalizeState` is total for exactly
  *      this reason, so the tests feed it garbage on purpose.
  *   2. A view that restores to a *different* picture than it captured. The
@@ -160,8 +160,23 @@ test('scope rule order IS a difference — last match wins (ADR 0009)', () => {
 });
 
 test('a real difference is seen', () => {
-  assert.equal(sameState(state({ level: 'file' }), state({ level: 'module' })), false);
+  assert.equal(sameState(state({ level: 'file' }), state({ level: 'folder' })), false);
   assert.equal(sameState(state({ showGhosts: true }), state({ showGhosts: false })), false);
+});
+
+// --- the pre-rename level spelling ---
+
+test('a view saved at the old `module` level reopens at folder level', () => {
+  // `.mezz/views.json` outlives the build that wrote it. `normalizeState` is
+  // total, so an unrecognised level does not fail — it falls back to
+  // `entity`, which would silently reopen a folder-level view as thousands
+  // of circles. That is the failure this migration exists to prevent.
+  assert.equal(normalizeState({ level: 'module' }).level, 'folder');
+});
+
+test('an unknown level is still the entity fallback, not a guess', () => {
+  assert.equal(normalizeState({ level: 'package' }).level, emptyState().level);
+  assert.equal(normalizeState({ level: 7 }).level, emptyState().level);
 });
 
 // --- naming ---
@@ -183,7 +198,7 @@ test('the summary names the scope and the level', () => {
     stateSummary(state({ scope: [{ pattern: 'a', negate: false }, { pattern: 'b', negate: false }] })),
     /2 paths/,
   );
-  assert.match(stateSummary(state({ autoLevel: false, level: 'module' })), /module/);
+  assert.match(stateSummary(state({ autoLevel: false, level: 'folder' })), /folder/);
   assert.match(stateSummary(state({ spec: ['a', 'b'] })), /spec ×2/);
 });
 
@@ -200,10 +215,10 @@ test('a view with rings is not the same picture as one without', () => {
   // states agreeing on `level` can still be two different canvases. If this
   // compared equal the list would mark a mixed view active while showing a
   // uniform one.
-  const uniform = state({ level: 'module' });
-  const mixed = state({ level: 'module', ringFocus: 'ui/src' });
+  const uniform = state({ level: 'folder' });
+  const mixed = state({ level: 'folder', ringFocus: 'ui/src' });
   assert.equal(sameState(uniform, mixed), false);
-  assert.equal(sameState(mixed, state({ level: 'module', ringFocus: 'ui/src', ringReach: 2 })), false);
+  assert.equal(sameState(mixed, state({ level: 'folder', ringFocus: 'ui/src', ringReach: 2 })), false);
 });
 
 test('an empty ring focus is no focus, not a focus on the repo root', () => {
@@ -220,6 +235,6 @@ test('a hand-written reach is clamped rather than believed', () => {
 });
 
 test('the row subtitle says a view is focused', () => {
-  const summary = stateSummary(state({ level: 'module', ringFocus: 'ui/src', ringReach: 2 }));
+  const summary = stateSummary(state({ level: 'folder', ringFocus: 'ui/src', ringReach: 2 }));
   assert.match(summary, /focus ui\/src \+2/);
 });

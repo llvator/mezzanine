@@ -11,22 +11,29 @@ a path and a description.
 Off by default. It has to be asked for:
 
 ```bash
-nao watch . --port 3200 --allow-agent-spawn
+mezz watch . --port 3200 --allow-agent-spawn
 ```
+
+In VS Code, `mezz init --vscode --allow-agent-spawn` writes that as a task —
+`Mezzanine: Start web UI (agent spawn)`, alongside the plain one, so the engine you
+start by default is still the one that cannot spawn anything.
 
 Then click a node and refactor it — the UI opens a Claude Code terminal on
 this machine, scoped to that entity.
 
 | Variable | Purpose |
 | --- | --- |
-| `NAO_TERMINAL` | Which terminal to open |
-| `NAO_CLAUDE_BIN` | Claude Code binary, when it is not on `PATH` |
+| `MEZZ_TERMINAL` | Which terminal to open |
+| `MEZZ_CLAUDE_BIN` | Claude Code binary, when it is not on `PATH` |
 
 ## Why it is off by default
 
 This is the one route that **runs code rather than serving data**, so it does
-not exist unless you ask for it — and it **always requires the pairing
-token**, including from loopback, where reading the graph does not.
+not exist unless you ask for it — and it authenticates itself instead of
+inheriting the data API's access model. The bar is **a page this engine
+served** (matched by comparing `Origin` against `Host`, plus the VS Code
+webview) **or the pairing token** from the startup banner. Loopback alone is
+not enough, where for reading the graph it is.
 
 That asymmetry is deliberate. Binding to loopback is not a security boundary
 against a browser: any page you happen to have open is on the same machine as

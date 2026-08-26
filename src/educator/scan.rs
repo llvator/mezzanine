@@ -1,6 +1,6 @@
 //! File-level Educator scan — walks every node in a Java file and reports
 //! every rule that fires, regardless of cursor position. Powers
-//! `nao educate <file>` (a linter-style report) and the future
+//! `mezz educate <file>` (a linter-style report) and the future
 //! `/api/educator/scan` endpoint.
 //!
 //! Differs from [`super::position::query`]:

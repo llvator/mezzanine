@@ -1,30 +1,30 @@
 # Getting started
 
-Nao is two CLI binaries plus a VS Code extension. They share one Rust analysis engine. This page is the install-and-run map; deeper docs are linked at the bottom.
+Mezzanine is two CLI binaries plus a VS Code extension. They share one Rust analysis engine. This page is the install-and-run map; deeper docs are linked at the bottom.
 
 ## What you'll have after install
 
 | | What it does | When to use it |
 |---|---|---|
-| **`nao`** binary | Parses Rust / Python / JS / TS / Java / Kotlin / Dart / Groovy / Impex / Elevator. Emits JSON / DOT / Mermaid / ASCII output. Powers a watch server with SSE for live reload. | Code analysis from the command line; the watch server the VS Code extension talks to. |
-| **`elevator`** binary | Standalone CLI focused on `.elv` spec files. Same engine as `nao analyze -l elevator`, focused command line. | Working on Elevator (.elv) specs without the rest of Nao. LLM context bundles. |
-| **VS Code extension** | Activity-bar view, force-directed graph, side panels, bidirectional editor sync. | Most users — the primary way to use Nao. |
+| **`mezz`** binary | Parses Rust / Python / JS / TS / Java / Kotlin / Dart / Groovy / Impex / Elevator. Emits JSON / DOT / Mermaid / ASCII output. Powers a watch server with SSE for live reload. | Code analysis from the command line; the watch server the VS Code extension talks to. |
+| **`elevator`** binary | Standalone CLI focused on `.elv` spec files. Same engine as `mezz analyze -l elevator`, focused command line. | Working on Elevator (.elv) specs without the rest of Mezzanine. LLM context bundles. |
+| **VS Code extension** | Activity-bar view, force-directed graph, side panels, bidirectional editor sync. | Most users — the primary way to use Mezzanine. |
 
 ## Install (one-time, ~2 min)
 
 Requires: `git`, [`rustup`](https://rustup.rs), Node 18+, the VS Code `code` CLI on your `$PATH` (in VS Code: *Command Palette → Shell Command: Install 'code' command in PATH*).
 
 ```bash
-git clone https://github.com/llvator/nao.git
-cd nao
+git clone https://github.com/llvator/mezzanine.git
+cd mezz
 ./scripts/install.sh
 ```
 
 That builds and installs both binaries into `~/.cargo/bin/`, then packages the
 VS Code extension and installs it into your default profile. Pass profile names
 to target [VS Code profiles](https://code.visualstudio.com/docs/editor/profiles)
-instead — `./scripts/install.sh Work Personal`. Set `NAO_CODE_CLI=cursor` for a
-different editor CLI, or `NAO_SKIP_EXTENSION=1` for the binaries alone.
+instead — `./scripts/install.sh Work Personal`. Set `MEZZ_CODE_CLI=cursor` for a
+different editor CLI, or `MEZZ_SKIP_EXTENSION=1` for the binaries alone.
 
 Prefer to run the steps yourself:
 
@@ -36,10 +36,10 @@ cd vscode-extension && npm install && npm run install:local
 **Binaries only, no clone** — installs straight from the default branch:
 
 ```bash
-cargo install --git https://github.com/llvator/nao.git --force
+cargo install --git https://github.com/llvator/mezzanine.git --force
 ```
 
-Reload VS Code. The Nao icon appears in the activity bar. To update later,
+Reload VS Code. The Mezzanine icon appears in the activity bar. To update later,
 `git pull` and re-run `./scripts/install.sh`.
 
 ## Using each piece
@@ -47,28 +47,28 @@ Reload VS Code. The Nao icon appears in the activity bar. To update later,
 ### VS Code extension (recommended for most users)
 
 1. Open a folder.
-2. Click the Nao icon in the activity bar.
-3. Run **Command Palette → Nao: Open Code Visualizer**.
+2. Click the Mezzanine icon in the activity bar.
+3. Run **Command Palette → Mezzanine: Open Code Visualizer**.
 4. In the **Visual Scopes** panel, check the folders/files you want to analyse.
 
 The graph renders entity nodes (functions, classes, Categories, Features…) with edges for containment and dependencies. Saves trigger live reanalysis.
 
 Full panel reference: [vscode-extension/README.md](../vscode-extension/README.md).
 
-### `nao` CLI
+### `mezz` CLI
 
 ```bash
 # One-shot analysis to JSON
-nao analyze ./my-project -f json -o analysis.json
+mezz analyze ./my-project -f json -o analysis.json
 
 # Watch mode — re-analyses on file change, serves data + SSE on a port
-nao watch ./my-project --port 3200
+mezz watch ./my-project --port 3200
 
 # Filter by language, limit depth, scope to a path
-nao analyze ./my-project -l rust -l python -d 5
+mezz analyze ./my-project -l rust -l python -d 5
 ```
 
-`nao watch` is what the VS Code extension uses internally. You only run it directly if you want to inspect the JSON output, drive the UI from a browser, or wire Nao into an external tool.
+`mezz watch` is what the VS Code extension uses internally. You only run it directly if you want to inspect the JSON output, drive the UI from a browser, or wire Mezzanine into an external tool.
 
 ### Browser UI, served yourself
 
@@ -80,7 +80,7 @@ point it at a running engine:
 cd ui && npm run build
 npx vite preview --port 4173                                  # or any static host
 
-nao watch . --port 3200 --allow-origin http://localhost:4173  # in another terminal
+mezz watch . --port 3200 --allow-origin http://localhost:4173  # in another terminal
 open http://localhost:4173
 ```
 
@@ -100,7 +100,7 @@ the server, so any page you happen to have open could otherwise read
 `/api/details`, which contains your source. So any other origin has to be named:
 
 ```bash
-nao watch . --port 3200 --allow-origin http://localhost:4173
+mezz watch . --port 3200 --allow-origin http://localhost:4173
 ```
 
 The flag is repeatable, and every origin you pass is echoed in the startup
@@ -123,7 +123,7 @@ The token is new on every run, so restarting the engine invalidates it.
 allowlist.
 
 A UI on a *hosted* `https://` page reaching `http://localhost` runs into one
-more gate that is neither nao's nor yours: the browser's Local Network Access
+more gate that is neither mezz's nor yours: the browser's Local Network Access
 permission. That is why the standalone build is documented and a hosted
 live-connect page is not — measured, with versions, in
 ADR 0006.
@@ -131,24 +131,74 @@ The loopback-to-loopback recipe above is unaffected.
 
 ### VS Code tasks for the browser UI
 
-`nao init --vscode` writes three tasks into `.vscode/tasks.json`, so the UI is
+`mezz init --vscode` writes three tasks into `.vscode/tasks.json`, so the UI is
 a **Run Task** away rather than a terminal you have to keep:
 
 | Task | Does |
 |---|---|
-| `Nao: Start web UI` | `nao watch .`, in the background |
-| `Nao: Open web UI in browser` | opens the port, starting the engine first |
-| `Nao: Stop web UI` | kills the engine holding that port — and only if it *is* nao |
+| `Mezzanine: Start web UI` | `mezz watch .`, in the background |
+| `Mezzanine: Open web UI in browser` | opens the port, starting the engine first |
+| `Mezzanine: Stop web UI` | kills the engine holding that port — and only if it *is* mezz |
 
-The stop task exists because `nao watch` has no idle shutdown: closing the
+A fourth is written only when asked for, because it is the one that runs code
+rather than serving data:
+
+```sh
+mezz init --vscode --allow-agent-spawn
+```
+
+| Task | Does |
+|---|---|
+| `Mezzanine: Start web UI (agent spawn)` | `mezz watch . --allow-agent-spawn`, so the quality tables offer a **Refactor** button that opens a Claude Code terminal here |
+
+It is a second task rather than a flag on the first, so the engine a reader
+starts by default still cannot spawn anything and picking the other one is a
+deliberate act with the reason on the label. It binds the same port, so stop
+the plain engine before starting it. `--all` does **not** include it: that
+means every optional *file*, and this is not a file. See
+[canvas-to-agent.md](workflows/web-ui/canvas-to-agent.md).
+
+The stop task exists because `mezz watch` has no idle shutdown: closing the
 browser tab leaves the engine running and the port taken. All three agree on
-one port — whatever `.nao/settings.json` pins, else 3000.
+one port — whatever `.mezz/settings.json` pins, else 3000.
 
 An existing `tasks.json` is merged into by label, leaving your own tasks
-alone; `--force` replaces Nao tasks whose bodies have since changed. One
+alone; `--force` replaces Mezzanine tasks whose bodies have since changed. One
 refusal is deliberate: VS Code accepts comments in `tasks.json` and JSON does
-not, so a file nao cannot parse is left **untouched** with the tasks printed
+not, so a file mezz cannot parse is left **untouched** with the tasks printed
 for you to paste — rewriting it would delete the comments.
+
+### MCP registration for agents
+
+`mezz init --mcp` writes `.mcp.json`, so an agent opened in the repo has the
+code graph — `map`, `quality`, `assess_change` and the rest — without anyone
+wiring it up:
+
+```json
+{ "mcpServers": { "mezz": { "command": "mezz", "args": ["mcp"] } } }
+```
+
+The binary by name rather than the path your machine has it at, because the
+file is committed and an absolute path out of your home directory registers a
+server none of your colleagues can start. It has to be on `PATH`, and mezz
+says so when it is not. No path argument either: `mezz mcp` defaults its root
+to the directory the agent runs in.
+
+Other servers in that file are merged around, never replaced, and an entry
+already named `mezz` is left alone — somebody may have pointed it at a local
+build on purpose — until `--force`. A file mezz cannot parse as
+`{"mcpServers": {…}}` is left **untouched**, with the entry printed for you
+to paste, for the same reason as `tasks.json`: what is registered there is
+worth more than what we came to add.
+
+One file `mezz init` deliberately does **not** write is
+`.vscode/settings.json`. The extension's `mezz.language` and
+`mezz.includeTests` reach the engine as CLI flags, and a flag beats
+`.mezz/settings.json` — so scaffolding them would hand the repo a second,
+uncommitted copy of its own configuration that silently wins. `mezz.language`
+is worse still: one string against the pinned list, so writing it into a
+Rust-and-TypeScript repo would drop TypeScript from every graph the extension
+draws. Leave those unset and let the committed file rule.
 
 ### `elevator` CLI (`.elv` spec files)
 
@@ -184,12 +234,12 @@ if you'd rather run the narrower command, see the table in
 
 One thing the install path does *not* cover: `ui/` has two build targets.
 `install.sh` refreshes `vscode-extension/webview-dist/` (the VS Code webview),
-but the browser UI that `nao watch` serves comes from `ui/dist/`. After a
+but the browser UI that `mezz watch` serves comes from `ui/dist/`. After a
 `ui/**` change, run `./scripts/build.sh --ui` if you use the browser UI.
 
-`nao watch` finds that build in the first place it exists: `--ui-dir <path>`,
-then `NAO_UI_DIR`, then `ui_dir` in your settings file (below), then a
-`ui/dist` beside the `nao` binary, then `./ui/dist`. Running from the repo
+`mezz watch` finds that build in the first place it exists: `--ui-dir <path>`,
+then `MEZZ_UI_DIR`, then `ui_dir` in your settings file (below), then a
+`ui/dist` beside the `mezz` binary, then `./ui/dist`. Running from the repo
 root hits the last one, which is why it needs no flag. Anywhere else — or
 from a `cargo install`ed binary with no checkout — set `ui_dir` once in your
 settings file, pass `--ui-dir`, or let the server come up without a UI and
@@ -203,23 +253,27 @@ describes:
 
 | File | Holds | Found at |
 |---|---|---|
-| **User** | Properties of *this installation* | `$XDG_CONFIG_HOME/nao/settings.json`, else `~/.config/nao/settings.json` |
-| **Repo** | Properties of *the analyzed repo* | `<repo>/.nao/settings.json` — commit it |
+| **User** | Properties of *this installation* | `$XDG_CONFIG_HOME/mezz/settings.json`, else `~/.config/mezz/settings.json` |
+| **Repo** | Properties of *the analyzed repo* | `<repo>/.mezz/settings.json` — commit it |
 
 Both are optional, both are plain JSON, and the keys are the CLI flag
-names. **JSON means no comments and no trailing commas** — nao warns and
+names. **JSON means no comments and no trailing commas** — mezz warns and
 discards the whole file on a parse error, so one stray `//` costs you every
 setting in it.
 
-`nao init` writes the repo file for you. It walks the tree — honoring
+`mezz init` writes the repo file for you. It walks the tree — honoring
 `.gitignore`, so vendored code never votes — and pins the languages the repo
 is *actually* written in, plus `spec_dir` when every `.elv` file sits in one
 directory:
 
 ```sh
-nao init                 # in the repo you want set up
-nao init --vscode        # also add the browser-UI tasks (below)
-nao init --force         # replace a settings file that is already there
+mezz init                 # in the repo you want set up
+mezz init --vscode        # also add the browser-UI tasks (below)
+mezz init --mcp           # also register the MCP server in .mcp.json (below)
+mezz init --all           # every optional file above
+mezz init --allow-agent-spawn  # also the VS Code task that starts the engine
+                              # with --allow-agent-spawn (implies --vscode)
+mezz init --force         # replace what is already there
 ```
 
 It writes only what it inferred. Keys with working defaults — `port`,
@@ -229,23 +283,23 @@ does not make yours a Python repo either; a language has to hold a twentieth
 of the tree, with Elevator exempt because a spec is outnumbered by design.
 
 For the fuller starting point, there is a ready-made template in
-[`.nao.example/`](../.nao.example/README.md) — copy it to `.nao/`, edit, and
+[`.mezz.example/`](../.mezz.example/README.md) — copy it to `.mezz/`, edit, and
 commit:
 
 ```sh
-cp -R .nao.example .nao
+cp -R .mezz.example .mezz
 ```
 
-`~/.config/nao/settings.json` — yours, not the repo's. Most people need
+`~/.config/mezz/settings.json` — yours, not the repo's. Most people need
 nothing here: `scripts/install.sh` puts the browser UI beside the installed
-binary, and `nao watch` finds it there without being told. Set `ui_dir` only
+binary, and `mezz watch` finds it there without being told. Set `ui_dir` only
 to override that:
 
 ```json
 { "ui_dir": "/path/to/a/built/ui/dist" }
 ```
 
-`<repo>/.nao/settings.json` — the repo's, shared with everyone who clones it:
+`<repo>/.mezz/settings.json` — the repo's, shared with everyone who clones it:
 
 ```json
 {
@@ -279,15 +333,15 @@ The last row is deliberate. Those four grant capability — opening a terminal
 on your machine, dropping the pairing-token requirement, letting another
 browser origin read your source, permitting analysis passes that execute build
 scripts out of the tree — and a repo you cloned should not be able to turn any
-of them on by existing. They are flag-and-env only. `nao serve` goes further
+of them on by existing. They are flag-and-env only. `mezz serve` goes further
 and ignores a submitted repo's settings file entirely.
 
-`spec_dir` is the odd one out: a path nao *reads from*, rather than a filter
+`spec_dir` is the odd one out: a path mezz *reads from*, rather than a filter
 over what it already found. A repo-scope one must therefore stay inside the
 repo — relative, no `..` — for the same reason as the last row. Specs that
 live somewhere else entirely (a sibling docs repo, or the top of a monorepo
 whose services you watch one at a time) are a real layout, but naming that
-directory takes an operator: `nao watch . --spec-dir ../docs/domain`, or the
+directory takes an operator: `mezz watch . --spec-dir ../docs/domain`, or the
 **Spec folder** field in the browser UI's Analysis scope panel, which changes
 the running session without touching any file.
 
@@ -305,8 +359,8 @@ Three behaviours worth knowing:
   so the narrower scope wins outright.
 - **A pattern is matched against the path relative to the repo root** — the
   same root the settings file is read from. So `src/contracts.d.ts` excludes
-  that file whether you run `nao analyze .`, `nao analyze src`, or
-  `nao analyze /path/to/repo/src`; one spelling works from anywhere. Analyze a
+  that file whether you run `mezz analyze .`, `mezz analyze src`, or
+  `mezz analyze /path/to/repo/src`; one spelling works from anywhere. Analyze a
   directory that isn't in a checkout and the analyzed root stands in for the
   repo root. Note that `*` crosses `/`, so `*.d.ts` matches `src/a.d.ts` and
   the leading `**/` above is decorative — surprising, but every pattern
@@ -315,13 +369,13 @@ Three behaviours worth knowing:
   key in the wrong scope prints a warning naming the key and the file, then the
   command runs as if that line weren't there.
 
-`NAO_CONFIG_DIR` overrides the user-scope location, mostly for tests and
+`MEZZ_CONFIG_DIR` overrides the user-scope location, mostly for tests and
 wrapper scripts.
 
 ## Installing the extension into multiple VS Code profiles
 
 If you keep separate [VS Code profiles](https://code.visualstudio.com/docs/editor/profiles)
-(e.g. Playground vs Work) and want Nao in both, pass their names:
+(e.g. Playground vs Work) and want Mezzanine in both, pass their names:
 
 ```bash
 ./scripts/install.sh Playground Work
@@ -344,6 +398,6 @@ each profile's window after install (`Cmd+Shift+P → Developer: Reload Window`)
 
 - **`elevator: command not found`** — `cargo install --path .` didn't run, or `~/.cargo/bin` isn't on your `$PATH`. Check `echo $PATH | tr ':' '\n' | grep cargo`.
 - **`code: command not found`** — install the VS Code CLI: *Command Palette → Shell Command: Install 'code' command in PATH*.
-- **Extension installed but the Nao icon doesn't appear** — reload the window (`Cmd+Shift+P → Developer: Reload Window`).
+- **Extension installed but the Mezzanine icon doesn't appear** — reload the window (`Cmd+Shift+P → Developer: Reload Window`).
 - **Graph shows file nodes instead of entity nodes** — the auto-level picker has escalated to "file" because there are too many entities for the viewport budget. In View Options, pin the level to "entity", or scope to a smaller folder via the Visual Scopes panel.
-- **`.elv` file edits don't refresh the graph** — make sure your installed `nao` binary is up to date (`cargo install --path . --force`); pre-2026 versions had a watcher gap on `.elv`.
+- **`.elv` file edits don't refresh the graph** — make sure your installed `mezz` binary is up to date (`cargo install --path . --force`); pre-2026 versions had a watcher gap on `.elv`.

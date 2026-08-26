@@ -2,7 +2,7 @@
 
 > What does the documentation cover, contradict, and no longer reach?
 
-Nao read every language in this repo except the one most of it was written
+Mezzanine read every language in this repo except the one most of it was written
 in: 368 markdown files against 175 Rust ones, carrying 670 links to each
 other and 1,549 to source files. None of those were in the graph, so none of
 the questions they answer were askable.
@@ -16,10 +16,10 @@ something you can look at.
 Opt-in, by design:
 
 ```bash
-nao watch . -l markdown -l rust
+mezz watch . -l markdown -l rust
 ```
 
-Every other extension Nao claims belongs to source code, so finding one is
+Every other extension Mezzanine claims belongs to source code, so finding one is
 evidence you want it read. `.md` is not — claiming it by default would
 rewrite every existing graph.
 

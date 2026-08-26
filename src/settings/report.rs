@@ -38,11 +38,11 @@ use crate::config::Config;
 pub enum Origin {
     /// Typed on the command line that started this process.
     Flag,
-    /// One of the `NAO_*` environment variables.
+    /// One of the `MEZZ_*` environment variables.
     Env,
-    /// `<analyzed-root>/.nao/settings.json`.
+    /// `<analyzed-root>/.mezz/settings.json`.
     RepoFile,
-    /// `~/.config/nao/settings.json`.
+    /// `~/.config/mezz/settings.json`.
     UserFile,
     /// Nobody set it.
     Default,
@@ -121,9 +121,9 @@ pub struct SettingsReport {
     pub warnings: Vec<Warning>,
     pub user_path: Option<PathBuf>,
     pub user_exists: bool,
-    /// Where the repo-scope file was looked for — the `.nao` of the checkout
+    /// Where the repo-scope file was looked for — the `.mezz` of the checkout
     /// the analyzed path lies in, which is not the analyzed path itself when
-    /// nao was pointed at a subfolder (CFG-012). Reporting the resolved path
+    /// mezz was pointed at a subfolder (CFG-012). Reporting the resolved path
     /// rather than the root it was derived from is what makes that resolution
     /// something a reader can check instead of infer.
     ///
@@ -430,13 +430,13 @@ fn process_rows(inputs: &Inputs) -> Vec<Row> {
             path(&e.output_dir),
             |s| s.output_dir.is_some(),
         ),
-        from_env(inputs, "ui_dir", "NAO_UI_DIR", path(&e.ui_dir), |s| {
+        from_env(inputs, "ui_dir", "MEZZ_UI_DIR", path(&e.ui_dir), |s| {
             s.ui_dir.is_some()
         }),
         from_env(
             inputs,
             "content_fallback",
-            "NAO_EDUCATOR_CONTENT",
+            "MEZZ_EDUCATOR_CONTENT",
             path(&e.content_fallback),
             |s| s.content_fallback.is_some(),
         ),
@@ -473,7 +473,7 @@ mod tests {
     fn report(loaded: Loaded, flags: &[&str], config: Config) -> SettingsReport {
         let flags = named(&flags.iter().map(|f| (*f, true)).collect::<Vec<_>>());
         let eff = Effective::default();
-        let root = Path::new("/tmp/nao-report-test");
+        let root = Path::new("/tmp/mezz-report-test");
         SettingsReport::build(Some(root), &inputs(&loaded, &flags, &config, &eff))
     }
 
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn the_repo_file_is_named_where_the_loader_looked_for_it() {
         let dir = std::env::temp_dir().join(format!(
-            "nao-report-root-{}-{}",
+            "mezz-report-root-{}-{}",
             std::process::id(),
             "cfg012"
         ));
@@ -498,7 +498,7 @@ mod tests {
         let eff = Effective::default();
         let r = SettingsReport::build(Some(&sub), &inputs(&loaded, &flags, &config, &eff));
 
-        assert_eq!(r.repo_path, Some(dir.join(".nao").join("settings.json")));
+        assert_eq!(r.repo_path, Some(dir.join(".mezz").join("settings.json")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

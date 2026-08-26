@@ -1,4 +1,4 @@
-# Nao
+# Mezzanine
 
 Interactive code visualizer that builds a single typed graph from heterogeneous source files. Per-language parsers are independent but feed a shared entity/relationship model.
 
@@ -7,7 +7,7 @@ Interactive code visualizer that builds a single typed graph from heterogeneous 
 ### Code-graph terms
 
 **Entity**:
-A node in Nao's graph — a function, class, module, file, or any other source-level construct a parser surfaces. Identified by a stable string `id`; carries `kind`, `qualified_name`, `parent_id`, `span`, and per-entity `metrics`.
+A node in Mezzanine's graph — a function, class, module, file, or any other source-level construct a parser surfaces. Identified by a stable string `id`; carries `kind`, `qualified_name`, `parent_id`, `span`, and per-entity `metrics`.
 _Avoid_: Node, item, declaration.
 
 **Relationship**:
@@ -21,15 +21,19 @@ The trait every per-language parser implements. Returns a `ParseResult` of Entit
 A named anti-pattern signal (God Class, Dispatcher, Feature Envy, Shotgun Surgery, Data Bag) detected by combining metrics in a post-parse pass. Surfaced in the UI's Quality panel.
 
 **Population**:
-The set of Entities the Quality panel's numbers describe, chosen explicitly by the reader: the whole analysis scope, the scope tree selection, what the canvas is currently drawing (post-filter), the current selection, the file open in the editor, or the files a diff changed. One population governs the whole panel — summary, scatters, entity rows, and the file and module rollups — so two figures in it always count the same Entities. Distinct from **scope**, which decides what is loaded and analysed, and from the **Files** visual filter, which decides what the canvas draws and deliberately leaves the population alone (ADR 0010).
+The set of Entities the Quality panel's numbers describe, chosen explicitly by the reader: the whole analysis scope, the scope tree selection, what the canvas is currently drawing (post-filter), the current selection, the file open in the editor, or the files a diff changed. One population governs the whole panel — summary, scatters, entity rows, and the file and folder rollups — so two figures in it always count the same Entities. Distinct from **scope**, which decides what is loaded and analysed, and from the **Files** visual filter, which decides what the canvas draws and deliberately leaves the population alone (ADR 0010).
 _Avoid_: Analysis scope (that is the tree), filter, selection.
+
+**Aggregation level**:
+How coarse a node on the canvas is — **Entity** (one node per Entity), **File** (one node per file), or **Folder** (one node per directory, rolling up its whole subtree). The Quality panel's three tabs are the same three levels, so a row there and a circle on the canvas name the same thing. Folder was called *Module* until the name collided with `EntityKind::Module` — the `mod` or Python module a parser surfaces, which reaches the UI as `kind_raw: 'Module'` — and every "is this a directory rollup" test in the UI answered yes for both. It has only ever meant `dirname(file_path)`.
+_Avoid_: Module, package, namespace (all three read as the language construct, which is a different thing that also appears in the graph).
 
 **Folder shape**:
 How readable the picture one folder draws is, scored over exactly what the canvas renders when collapsed to it — its immediate children, with each subfolder standing as a single node (ADR 0012). An *organisation* measure, not a code-quality one: it feeds no composite score, and its sub-scores run 0–1 with **higher meaning better**, the reverse of every other number beside it. Reported for folders only — a file has no children and so draws no graph.
 _Avoid_: Folder quality, structure score, modularity (all three invite reading it on the refactor-pressure scale it deliberately stays off).
 
 **Shape pattern**:
-Which of four tiers a **Folder shape** lands in, each the one below it plus one property: **Cyclic** (children depend on each other in a loop, so the drawing has no reading order), **Tangled** (acyclic, but edges jump levels instead of stepping down one at a time), **Hierarchical** (a clean layered DAG), **Fractal** (hierarchical, branching rather than merging, reached from outside through few doors, and made of children that hold the same shape). `Fractal` is recursive by construction — it is a claim about self-similarity across zoom levels, which is why a folder cannot earn it while sitting on top of a tangle.
+Which of four tiers a **Folder shape** lands in, each the one below it plus one property: **Cyclic** (children depend on each other in a loop, so the drawing has no reading order), **Tangled** (acyclic, but edges jump levels instead of stepping down one at a time), **Hierarchical** (a clean layered DAG), **Fractal** (hierarchical, branching rather than merging, reached from outside through few doors, reaching outward only from its bottom, and made of children that hold the same shape). `Fractal` is recursive by construction — it is a claim about self-similarity across zoom levels, which is why a folder cannot earn it while sitting on top of a tangle.
 _Avoid_: Grade, rating, health (they suggest a continuum; these are four different diagnoses with four different fixes).
 
 **Own-drawing gate**:
@@ -49,17 +53,21 @@ group as unactionable, which `Entry` disproves).
 The share of a folder's drawn edges that would survive in a spanning forest — one arriving at each child. Everything beyond the first edge reaching a child is a *merge*: two siblings leaning on the same third one. Gates `Fractal` and is deliberately outside `compliance` (ADR 0013), so a folder can blend well and still be held back by it. Reads against **Layering** on the same scale and disagrees with it on purpose — a shared helper steps one level cleanly and still converges, so layering scores it 1.00 and this scores it 0.50, and both are correct.
 _Avoid_: Tree-ness (which is what Layering was defined *against*), fan-in, coupling.
 
+**Egress** (out at the bottom):
+The share of a folder's outgoing dependencies that start at a **leaf** — a child with no outgoing edge inside the folder — or at its **Door**. The mirror of **Entry concentration**: that one grades what arrives, this grades what leaves, and together they are what make a collapsed folder an honest single node in both directions. Only the near end is graded; where an exit *lands* stays its target's business (ADR 0031). Gates `Fractal` and is deliberately outside `compliance`, exactly as **Arborescence** is. A middle-layer child reaching outside makes the layering drawn above it a fiction — the drawing says it depends downward on its siblings, the program says it also reaches out of the building.
+_Avoid_: Efferent coupling, fan-out, leak (the first two count edges wherever they start, which is the distinction this exists to draw).
+
 **Folder picture**:
 The evidence behind a **Folder shape**: the same collapsed child graph the verdict is computed over, kept rather than discarded, with each child's level and each edge's **Edge verdict** marked on it, plus the one-hop traffic across the folder's boundary. Produced by the scoring pass itself, never rebuilt alongside it — a second derivation would be free to draw a picture the number denies. Computed for one folder on request, where the four scalars are cheap enough to carry for every folder.
 _Avoid_: Subgraph, snapshot, folder graph.
 
 **Edge verdict**:
-How one line in a **Folder picture** reads. Inside the folder: `step` (down exactly one level — the shape you want), `skip` (jumps a level, which is what `layering` charges for), `back` (inside a loop, which is what `acyclicity` charges for). Across its boundary: `entry` (arrives at a **Door**), `breach` (reaches past one into the interior), `exit` (leaves, which is never a defect — depending outward is what a folder is for). In the shape view an edge's *colour* means this and not its relationship kind, the one place that palette is overridden.
+How one line in a **Folder picture** reads. Inside the folder: `step` (down exactly one level — the shape you want), `skip` (jumps a level, which is what `layering` charges for), `back` (inside a loop, which is what `acyclicity` charges for). Across its boundary: `entry` (arrives at a **Door**), `breach` (reaches past one into the interior), `exit` (leaves; where it *lands* is never a defect, but where it *starts* is what `egress` charges for). In the shape view an edge's *colour* means this and not its relationship kind, the one place that palette is overridden.
 _Avoid_: Edge type, severity, violation kind.
 
 **Door**:
 A file inside a folder that takes the most dependencies from outside it — the numerator of **Entry concentration**, and what an outsider is supposed to arrive at. Every file tied at the maximum is a door, since choosing one of a tie would paint an honest tie as a **Breach**. Identified by measurement, never by name: `mod.rs` conventions do not survive the language boundary.
-_Avoid_: Entry point (which in nao means a program entry), facade, public API.
+_Avoid_: Entry point (which in mezz means a program entry), facade, public API.
 
 **Breach**:
 A dependency from outside a folder landing on a file that is not one of its **Doors** — an outsider reaching past the front door into the interior. What holds `entry_concentration` down, and what the shape view draws so the specific outside file and inside file can both be named. Distinct from an `exit`, which crosses the same boundary the other way and is not a defect.
@@ -84,7 +92,7 @@ Where a run's Effective Schema comes from — the repo's migration files, or a l
 _Avoid_: Backend, provider, driver.
 
 **Fold**:
-The replay pass that applies each file's SchemaOps in filename order to produce the Effective Schema. The one stage in Nao where file order is load-bearing (ADR 0007).
+The replay pass that applies each file's SchemaOps in filename order to produce the Effective Schema. The one stage in Mezzanine where file order is load-bearing (ADR 0007).
 _Avoid_: Merge, squash, compaction.
 
 **Live Introspection**:
@@ -94,7 +102,7 @@ _Avoid_: DB parser, schema import, sync.
 ### Educator
 
 **Educator**:
-A Nao subsystem that surfaces language-specific good-practice guidance in the editor (VS Code hover on Java source, plus a sidebar mirror). Distinct from the **Smell** detector — the Educator teaches at the point of authorship; Smells flag patterns after the fact. Content lives in `content/<lang>/rules/` (in-repo for now, configurable path so it can be extracted later).
+A Mezzanine subsystem that surfaces language-specific good-practice guidance in the editor (VS Code hover on Java source, plus a sidebar mirror). Distinct from the **Smell** detector — the Educator teaches at the point of authorship; Smells flag patterns after the fact. Content lives in `content/<lang>/rules/` (in-repo for now, configurable path so it can be extracted later).
 _Avoid_: Linter, doc tooltip, hint provider.
 
 **Rule** (Educator Rule):

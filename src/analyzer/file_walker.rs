@@ -22,7 +22,7 @@ pub fn is_test_path(path: &Path) -> bool {
 
 /// What a walk is looking for. The spec directory may sit outside the
 /// analyzed root, and walking it must not drag that whole tree's code into
-/// the graph — `nao watch services/api --spec-dir ../..` would otherwise
+/// the graph — `mezz watch services/api --spec-dir ../..` would otherwise
 /// analyze the entire monorepo by accident.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Admit {
@@ -79,7 +79,7 @@ impl Glob {
 /// relative to the repo root.
 ///
 /// Not the string the walk happens to be carrying. That one starts `./src/`
-/// for `nao analyze .`, `src/` for `nao analyze src` and `/home/…/src/` for
+/// for `mezz analyze .`, `src/` for `mezz analyze src` and `/home/…/src/` for
 /// an absolute root, so `src/contracts.d.ts` — the spelling an author would
 /// write down, the one their editor and their `git status` both use — was the
 /// one spelling that could never match, and the base was discoverable only by
@@ -195,7 +195,7 @@ impl<'a> FileWalker<'a> {
     ///
     /// Uses the `ignore` crate (same one ripgrep uses) so `.gitignore`,
     /// `.ignore`, the global gitignore, and hidden-file rules are honored
-    /// out of the box. We then layer the nao-specific filters on top
+    /// out of the box. We then layer the mezz-specific filters on top
     /// (language, test files, explicit exclude patterns from Config).
     pub fn walk(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -237,7 +237,7 @@ impl<'a> FileWalker<'a> {
     /// The walk itself, shared by both entry points, with whatever the tally
     /// has to say said on stderr.
     ///
-    /// stderr and never stdout: `nao mcp` puts protocol JSON on stdout, and a
+    /// stderr and never stdout: `mezz mcp` puts protocol JSON on stdout, and a
     /// diagnostic there is a parse error rather than a warning.
     fn collect(&self, root: &Path, cancel: &Arc<AtomicBool>, admit: Admit) -> Result<Vec<PathBuf>> {
         let (files, unmatched) = self.collect_counting(root, cancel, admit)?;
@@ -312,7 +312,7 @@ impl<'a> FileWalker<'a> {
                 tally.record(&spelled);
             }
 
-            // Apply nao-specific exclude patterns (additive to .gitignore).
+            // Apply mezz-specific exclude patterns (additive to .gitignore).
             if self.should_skip_dir(path, &spelled) {
                 continue;
             }
@@ -597,7 +597,7 @@ mod tests {
     impl TmpDir {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "nao-walker-{}-{}-{}",
+                "mezz-walker-{}-{}-{}",
                 name,
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -626,7 +626,7 @@ mod tests {
     fn repo_with_a_stray_spec(tag: &str) -> TmpDir {
         let dir = TmpDir::new(tag);
         dir.write("src/main.rs", "fn main() {}\n");
-        dir.write("docs/domain/nao.elv", "c.library \"Library\"\n");
+        dir.write("docs/domain/mezz.elv", "c.library \"Library\"\n");
         dir.write("examples/tutorial/toy.elv", "c.toy \"Toy\"\n");
         dir
     }
@@ -652,7 +652,7 @@ mod tests {
         let dir = repo_with_a_stray_spec("no-spec-dir");
         let config = Config::for_path(&dir.0);
         let names = walked_names(&config);
-        assert!(names.contains(&"nao.elv".to_string()));
+        assert!(names.contains(&"mezz.elv".to_string()));
         assert!(names.contains(&"toy.elv".to_string()));
     }
 
@@ -664,7 +664,7 @@ mod tests {
         let mut config = Config::for_path(&dir.0);
         config.analysis.spec_dir = Some(PathBuf::from("docs/domain"));
         let names = walked_names(&config);
-        assert!(names.contains(&"nao.elv".to_string()));
+        assert!(names.contains(&"mezz.elv".to_string()));
         assert!(!names.contains(&"toy.elv".to_string()), "{names:?}");
         // Code is untouched — this filter is about the spec layer only.
         assert!(names.contains(&"main.rs".to_string()));
@@ -687,7 +687,7 @@ mod tests {
         assert!(names.contains(&"api.elv".to_string()), "{names:?}");
         assert!(!names.contains(&"tooling.rs".to_string()), "{names:?}");
         // And the root's own `.elv` files are no longer the spec.
-        assert!(!names.contains(&"nao.elv".to_string()), "{names:?}");
+        assert!(!names.contains(&"mezz.elv".to_string()), "{names:?}");
         assert!(names.contains(&"main.rs".to_string()));
     }
 
@@ -699,7 +699,7 @@ mod tests {
         ".hidden/tool.rs",
         "docs/readme.md",
         "notes.txt",
-        "spec/nao.elv",
+        "spec/mezz.elv",
     ];
 
     /// `would_analyze` has to answer, for one path, exactly what a walk
@@ -747,7 +747,7 @@ mod tests {
         dir.write(".hidden/tool.rs", "fn hidden() {}\n");
         dir.write("docs/readme.md", "# Doc\n\nProse.\n");
         dir.write("notes.txt", "not source\n");
-        dir.write("spec/nao.elv", "c.library \"Library\"\n");
+        dir.write("spec/mezz.elv", "c.library \"Library\"\n");
         dir
     }
 
@@ -907,19 +907,19 @@ mod tests {
     fn every_invocation_of_one_repo_spells_a_file_the_same_way() {
         let dir = checkout_with_a_generated_file("invocations");
         let inside = Some(dir.0.clone());
-        // `nao analyze .`, whose walk carries `./src/contracts.d.ts`.
+        // `mezz analyze .`, whose walk carries `./src/contracts.d.ts`.
         let dot = PatternBase::rooted(Path::new("."), inside.clone());
         assert_eq!(
             dot.spell(Path::new("./src/contracts.d.ts")),
             "src/contracts.d.ts"
         );
-        // `nao analyze src`, whose walk carries `src/contracts.d.ts`.
+        // `mezz analyze src`, whose walk carries `src/contracts.d.ts`.
         let sub = PatternBase::rooted(Path::new("src"), inside);
         assert_eq!(
             sub.spell(Path::new("src/contracts.d.ts")),
             "src/contracts.d.ts"
         );
-        // `nao analyze /abs/repo/src`, from a working directory that has
+        // `mezz analyze /abs/repo/src`, from a working directory that has
         // nothing to do with the repo.
         let absolute = PatternBase::rooted(&dir.0.join("src"), Some(PathBuf::from("/")));
         assert_eq!(
@@ -963,7 +963,7 @@ mod tests {
         let mut config = Config::for_path(&dir.0);
         config.analysis.spec_dir = Some(PathBuf::from("nowhere"));
         let names = walked_names(&config);
-        assert!(names.contains(&"nao.elv".to_string()));
+        assert!(names.contains(&"mezz.elv".to_string()));
         assert!(names.contains(&"toy.elv".to_string()));
     }
 }

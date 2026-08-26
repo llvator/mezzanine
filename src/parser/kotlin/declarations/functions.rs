@@ -1,7 +1,8 @@
-//! Kotlin function parsing — including extension-function detection and
-//! call-extraction wiring.
+//! Kotlin function parsing — including extension-function detection, the
+//! call-extraction wiring, and the body-metrics wiring (KT-002).
 
-use super::super::bodies::calls::extract_calls;
+use super::super::bodies::calls::{extract_calls, CallCtx, Caller};
+use super::super::bodies::complexity::populate_body_metrics;
 use super::super::helpers::{extract_simple_identifier, parse_generics, parse_parameters};
 use super::super::kdoc::extract_kdoc;
 use super::super::modifiers::{parse_modifier_attributes, parse_visibility};
@@ -29,16 +30,15 @@ pub(super) fn handle_function(
         });
         result.add_entity(entity);
         if let Some(body) = find_child_by_kind(node, "function_body") {
-            let mut call_order = 0u32;
-            extract_calls(
-                &body,
+            let caller = Caller {
                 source,
-                &caller_id,
-                &caller_name,
-                parent_class_name.as_deref(),
-                &mut call_order,
-                result,
-            );
+                path,
+                id: &caller_id,
+                name: &caller_name,
+                parent_class: parent_class_name.as_deref(),
+            };
+            let mut ctx = CallCtx::new(caller, result);
+            extract_calls(&body, &mut ctx, None);
         }
     }
 }
@@ -80,6 +80,8 @@ fn parse_function(
     if let Some(params) = find_child_by_kind(node, "function_value_parameters") {
         entity.parameters = parse_parameters(&params, source);
     }
+
+    populate_body_metrics(find_child_by_kind(node, "function_body"), &mut entity);
 
     entity.documentation = extract_kdoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());

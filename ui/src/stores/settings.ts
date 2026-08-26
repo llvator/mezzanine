@@ -193,7 +193,7 @@ export const THEMES: ThemeDefinition[] = [
 ];
 
 // ── Auto-fit view ───────────────────────────────────────────────────────
-const AUTO_FIT_KEY = 'nao-auto-fit';
+const AUTO_FIT_KEY = 'mezz-auto-fit';
 
 function loadAutoFit(): boolean {
   try {
@@ -226,8 +226,8 @@ autoFitView.subscribe((v) => {
 // (the one magnitude metric that rolls up meaningfully at entity, file AND
 // module level), fill = severity (the composite score the Quality panel
 // already ranks by). `colour: kind` reproduces the pre-UI-014 palette.
-const SIZE_CHANNEL_KEY = 'nao-size-channel';
-const COLOR_CHANNEL_KEY = 'nao-color-channel';
+const SIZE_CHANNEL_KEY = 'mezz-size-channel';
+const COLOR_CHANNEL_KEY = 'mezz-color-channel';
 
 function loadChannel<T extends string>(key: string, valid: readonly T[], fallback: T): T {
   try {
@@ -267,8 +267,8 @@ colorChannel.subscribe((v) => {
 // Defaults reproduce the pre-UI-106 picture exactly (`area`, ×1): the old
 // behaviour was a reasonable default and a bad ceiling, so it stays the
 // starting point and stops being the only point.
-const SIZE_CURVE_KEY = 'nao-size-curve';
-const SIZE_BOOST_KEY = 'nao-size-boost';
+const SIZE_CURVE_KEY = 'mezz-size-curve';
+const SIZE_BOOST_KEY = 'mezz-size-boost';
 
 export const sizeCurve = writable<SizeCurveId>(
   loadChannel(SIZE_CURVE_KEY, SIZE_CURVE_IDS, 'area'),
@@ -303,7 +303,7 @@ sizeBoost.subscribe((v) => {
 // measurement and screenshot is of, it discards nothing, and grouping is a
 // deliberate trade — within-group differences for an answerable "which group
 // is this in". A reader who wants classes asks for them.
-const SIZE_BINS_KEY = 'nao-size-bins';
+const SIZE_BINS_KEY = 'mezz-size-bins';
 
 function loadBins(): number {
   try {
@@ -332,7 +332,7 @@ sizeBins.subscribe((v) => {
 // remedy behind a control they have no reason to look for — the same mistake
 // UI-022 fixed for auto-fit. Low is enough to make groups visible without
 // overriding what the relationships say.
-const COHESION_KEY = 'nao-folder-cohesion';
+const COHESION_KEY = 'mezz-folder-cohesion';
 
 export const folderCohesion = writable<CohesionLevel>(
   loadChannel(COHESION_KEY, COHESION_LEVELS, 'low'),
@@ -348,7 +348,7 @@ folderCohesion.subscribe((v) => {
 // the regions is the whole reason the grouping work is visible at all, and a
 // reader who has to discover a toggle to find out what they are looking at
 // has not been told.
-const HULLS_KEY = 'nao-folder-hulls';
+const HULLS_KEY = 'mezz-folder-hulls';
 
 function loadHulls(): boolean {
   try {
@@ -380,7 +380,7 @@ showFolderHulls.subscribe((v) => {
 // which entities reach the canvas, and cohesion and hull depth are both
 // absent for the same reason. See `f.window_mirror` on why layout stays
 // local.
-const GROUP_GRAIN_KEY = 'nao-group-grain';
+const GROUP_GRAIN_KEY = 'mezz-group-grain';
 
 export const groupGrain = writable<GroupGrain>(
   loadChannel(GROUP_GRAIN_KEY, GROUP_GRAINS, 'folder'),
@@ -402,7 +402,7 @@ groupGrain.subscribe((v) => {
 // the file tree in the sidebar. It is capped at 3 rather than left open:
 // past that the outlines are nested closer than the eye separates them, and
 // every tier costs a polygon per group per redraw.
-const HULL_DEPTH_KEY = 'nao-hull-depth';
+const HULL_DEPTH_KEY = 'mezz-hull-depth';
 
 export const HULL_DEPTHS: readonly number[] = [1, 2, 3];
 
@@ -441,8 +441,8 @@ hullDepth.subscribe((v) => {
 // is arranged and annotated, this one *removes edges from the picture* —
 // and a tool that quietly hides relationships on first run has misled the
 // reader before they have had a chance to ask for it.
-const DEMOTE_KEY = 'nao-demote-hubs';
-const HUB_COUNT_KEY = 'nao-hub-count';
+const DEMOTE_KEY = 'mezz-demote-hubs';
+const HUB_COUNT_KEY = 'mezz-hub-count';
 
 function loadDemote(): boolean {
   try { return localStorage.getItem(DEMOTE_KEY) === 'true'; } catch { return false; }
@@ -467,7 +467,7 @@ hubCount.subscribe((v) => {
 });
 
 // ── Theme ───────────────────────────────────────────────────────────────
-const STORAGE_KEY = 'nao-theme';
+const STORAGE_KEY = 'mezz-theme';
 
 function loadTheme(): ThemeId {
   try {

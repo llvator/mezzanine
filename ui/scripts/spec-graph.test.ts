@@ -55,7 +55,7 @@ function node(
     qualified_name: id,
     kind,
     kind_raw: kind,
-    file_path: opts.file ?? 'spec/nao.elv',
+    file_path: opts.file ?? 'spec/mezz.elv',
     line: 1,
     end_line: 1,
     visibility: 'public',
@@ -834,7 +834,7 @@ test('the most specific claim wins over the folder-wide one', () => {
     ],
     links: [],
     files: [],
-    modules: [],
+    folders: [],
   } as unknown as GraphData);
   assert.equal(regionSpecClaim(g, 'ui/src/stores', noDocs)?.name, 'f_tight');
   assert.equal(regionSpecClaim(g, 'ui/src/utils', noDocs)?.name, 'f_wide');

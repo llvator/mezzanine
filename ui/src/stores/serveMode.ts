@@ -1,9 +1,9 @@
 /**
  * Serve-mode detection and repo selection (UI-007).
  *
- * `nao serve` hosts several analyzed repos at once under
+ * `mezz serve` hosts several analyzed repos at once under
  * `/api/repos/{slug}/*`, so the app has to pick one before it can load a
- * graph. `nao watch` and the VS Code webview have exactly one implicit repo
+ * graph. `mezz watch` and the VS Code webview have exactly one implicit repo
  * and never enter this mode.
  *
  * Detection is a single `GET /api/repos` at boot: a 200 with an array means
@@ -26,7 +26,7 @@ export interface RepoSummary {
   relationship_count: number;
 }
 
-/** True when the backend is `nao serve`. Never true inside VS Code. */
+/** True when the backend is `mezz serve`. Never true inside VS Code. */
 export const serveMode = writable<boolean>(false);
 
 /** Repos the server currently has loaded. Empty outside serve mode. */

@@ -2,7 +2,7 @@
 //!
 //! Recovers the shape Obsidian's graph view shows (notes and the links
 //! between them) plus the one it structurally cannot: the links that leave
-//! the docs and land on source code. Nao's own checkout has 670 note→note
+//! the docs and land on source code. Mezzanine's own checkout has 670 note→note
 //! links and 1 549 note→source links, so the second kind is the majority of
 //! the graph and the reason this parser exists.
 //!
@@ -252,7 +252,7 @@ fn classify(link: &Link, from: &Path) -> Target {
     }
 }
 
-/// Links nao has nothing to say about: other protocols, page-local
+/// Links mezz has nothing to say about: other protocols, page-local
 /// anchors, and protocol-relative URLs.
 fn is_external(target: &str) -> bool {
     target.starts_with('#')

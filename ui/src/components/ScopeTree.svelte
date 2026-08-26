@@ -44,7 +44,7 @@
     <button
       type="button"
       class="refresh-btn"
-      title="Reload data from disk (use after re-running nao analyze)"
+      title="Reload data from disk (use after re-running mezz analyze)"
       disabled={$refreshing}
       on:click={refreshData}
     >{$refreshing ? '⟳…' : '⟳'}</button>
@@ -70,7 +70,7 @@
   {#if $indexData}
     <div class="tree-stats" data-probe="scope-tree">
       <div class="totals-row">
-        <span title="Everything nao has indexed across the whole repository.">Indexed:
+        <span title="Everything mezz has indexed across the whole repository.">Indexed:
           {$indexData.total_entities.toLocaleString()} entities,
           {$indexData.total_relationships.toLocaleString()} rels</span>
         <button class="all-btn" on:click={selectAllScope}>Select All</button>

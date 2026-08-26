@@ -21,10 +21,10 @@ import type { SelectionPayload } from './sideViewProvider';
  *   { type: 'filterCommand', command, value }  → Filters / Node controls
  * The two channels are kept distinct because Options commands are handled here
  * (setFollowSelection) or forwarded to the panel, whereas Filters/Node commands
- * always route through `nao.internalFilterCommand`.
+ * always route through `mezz.internalFilterCommand`.
  */
 export class ControlsViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'nao.controls';
+  static readonly viewType = 'mezz.controls';
 
   private view?: vscode.WebviewView;
   private commandHandler?: (command: string, value: unknown) => void;
@@ -94,7 +94,7 @@ export class ControlsViewProvider implements vscode.WebviewViewProvider {
         } else if (msg?.type === 'command' && msg.command) {
           this.commandHandler?.(msg.command, msg.value);
         } else if (msg?.type === 'filterCommand' && msg.command) {
-          vscode.commands.executeCommand('nao.internalFilterCommand', {
+          vscode.commands.executeCommand('mezz.internalFilterCommand', {
             command: msg.command,
             value: msg.value,
           });
@@ -302,7 +302,7 @@ export class ControlsViewProvider implements vscode.WebviewViewProvider {
       <div class="segmented" data-group="graphLevel">
         <button data-value="entity" class="active">Entity</button>
         <button data-value="file">File</button>
-        <button data-value="module">Module</button>
+        <button data-value="folder">Folder</button>
       </div>
     </div>
 

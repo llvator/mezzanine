@@ -25,7 +25,7 @@ struct TmpDir(PathBuf);
 impl TmpDir {
     fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "nao-spec-slice-{}-{}-{}",
+            "mezz-spec-slice-{}-{}-{}",
             name,
             std::process::id(),
             std::time::SystemTime::now()
@@ -65,6 +65,8 @@ fn server_for(dir: &TmpDir) -> McpServer {
         base_cache: std::sync::Mutex::new(HashMap::new()),
         generation: Arc::new(AtomicU64::new(0)),
         shape_baselines: Default::default(),
+        rules_spelled_out: Default::default(),
+        layout_caveat_spelled_out: Default::default(),
     }
 }
 

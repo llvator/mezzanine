@@ -118,7 +118,7 @@ Two properties, both load-bearing:
 
 The first call after a source change pays a full re-analysis; subsequent
 calls come from the warm cache in milliseconds. Underneath sits a
-content-hashed on-disk parse store, so a fresh `nao` process on an
+content-hashed on-disk parse store, so a fresh `mezz` process on an
 already-analyzed repo is warm from call one — editing one file re-parses
 exactly that file.
 
@@ -131,7 +131,7 @@ hits, **1.5 seconds**.
 here. For other projects:
 
 ```bash
-claude mcp add nao -- nao mcp
+claude mcp add mezz -- mezz mcp
 ```
 
 ## Limits

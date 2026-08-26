@@ -19,7 +19,7 @@ import {
  *    'visualScope'      — entities in the Visual Scopes tree (pre-filter)
  *    'visualSelection'  — entities actually drawn on screen right now
  *                         (post-filter, post-search, post-level-aggregation)
- *    'selection'        — what the selected node stands for: a File or Module
+ *    'selection'        — what the selected node stands for: a File or Folder
  *                         node's whole path, any other entity plus what it
  *                         contains
  *    'currentFile'      — only entities in the file focused in the editor
@@ -75,7 +75,7 @@ export {
  *  changed-files narrowing is then layered on top.
  *
  *  Every part of the Quality panel derives from here — the summary, the
- *  entity rows, the scatters, and the file/module rollups — so the panel
+ *  entity rows, the scatters, and the file/folder rollups — so the panel
  *  describes one population and the selector moves all of it at once. */
 export const analysisGraph = derived(
   [analysisGraphData, rawEntityGraph, graphData, displayPlan, qualityAnalysisScope, currentEditorFile, diffData, selectedNode],
@@ -132,11 +132,11 @@ const FALLBACK_THRESHOLDS = {
   methodCount: { warn: 15, bad: 25 },
   publicFieldRatio: { warn: 0.5, bad: 0.8 },
   fileEntityCount: { warn: 15, bad: 30 },
-  moduleEntityCount: { warn: 60, bad: 150 },
+  folderEntityCount: { warn: 60, bad: 150 },
   fileLoc: { warn: 400, bad: 800 },
-  moduleLoc: { warn: 2000, bad: 5000 },
+  folderLoc: { warn: 2000, bad: 5000 },
   fileFanOut: { warn: 10, bad: 20 },
-  moduleFanOut: { warn: 15, bad: 30 },
+  folderFanOut: { warn: 15, bad: 30 },
   cohesion: { warn: 0.6, bad: 0.3 },
 };
 
@@ -156,11 +156,15 @@ function resolveThresholds(bt?: BackendThresholds): typeof FALLBACK_THRESHOLDS {
     methodCount: bt.method_count ?? FALLBACK_THRESHOLDS.methodCount,
     publicFieldRatio: bt.public_field_ratio ?? FALLBACK_THRESHOLDS.publicFieldRatio,
     fileEntityCount: bt.file_entity_count ?? FALLBACK_THRESHOLDS.fileEntityCount,
-    moduleEntityCount: bt.module_entity_count ?? FALLBACK_THRESHOLDS.moduleEntityCount,
+    // `module_*` is the pre-rename backend spelling — read so a UI newer
+    // than the `mezz` binary beside it still gets real thresholds instead of
+    // silently falling back to the hard-coded defaults.
+    folderEntityCount: bt.folder_entity_count ?? bt.module_entity_count
+      ?? FALLBACK_THRESHOLDS.folderEntityCount,
     fileLoc: bt.file_loc ?? FALLBACK_THRESHOLDS.fileLoc,
-    moduleLoc: bt.module_loc ?? FALLBACK_THRESHOLDS.moduleLoc,
+    folderLoc: bt.folder_loc ?? bt.module_loc ?? FALLBACK_THRESHOLDS.folderLoc,
     fileFanOut: bt.file_fan_out ?? FALLBACK_THRESHOLDS.fileFanOut,
-    moduleFanOut: bt.module_fan_out ?? FALLBACK_THRESHOLDS.moduleFanOut,
+    folderFanOut: bt.folder_fan_out ?? bt.module_fan_out ?? FALLBACK_THRESHOLDS.folderFanOut,
     cohesion: bt.cohesion ?? FALLBACK_THRESHOLDS.cohesion,
   };
 }
@@ -272,7 +276,7 @@ export const METRIC_EXPLANATIONS: Record<string, { title: string; body: string }
   cycle: {
     title: 'In cycle',
     body:
-      'True if this entity participates in a dependency cycle (strongly connected component). Cycles make modules impossible to ' +
+      'True if this entity participates in a dependency cycle (strongly connected component). Cycles make folders impossible to ' +
       'understand in isolation and break layering. Typical fix: dependency inversion — both sides depend on an interface instead of each other.',
   },
   field_count: {
@@ -296,37 +300,37 @@ export const METRIC_EXPLANATIONS: Record<string, { title: string; body: string }
   entity_count: {
     title: 'Entity count',
     body:
-      'Number of entities (structs, functions, etc.) declared in this file or module. High counts indicate a grab-bag file that '
-      + "probably wants splitting. File thresholds: ≤15 healthy, ≤30 amber, >30 red. Module thresholds: ≤60 / ≤150.",
+      'Number of entities (structs, functions, etc.) declared in this file or folder. High counts indicate a grab-bag file that '
+      + "probably wants splitting. File thresholds: ≤15 healthy, ≤30 amber, >30 red. Folder thresholds: ≤60 / ≤150.",
   },
   scope_loc: {
     title: 'Lines of code (scope)',
     body:
-      'Total LOC in the file or module. File thresholds: ≤400 / ≤800. Module thresholds: ≤2000 / ≤5000. Weak signal alone — pair '
+      'Total LOC in the file or folder. File thresholds: ≤400 / ≤800. Folder thresholds: ≤2000 / ≤5000. Weak signal alone — pair '
       + 'with entity count and cohesion.',
   },
   cohesion: {
     title: 'Cohesion',
     body:
-      'Fraction of dependency edges that stay inside this file/module (internal / total). High cohesion = a tight module; low cohesion '
+      'Fraction of dependency edges that stay inside this file/folder (internal / total). High cohesion = a tight folder; low cohesion '
       + '= a grab-bag. ≥60% healthy, ≥30% amber, <30% red. Very low values usually mean the scope should be split or re-grouped.',
   },
   scope_fan_in: {
     title: 'Scope fan-in',
     body:
-      'Distinct other files/modules depending on this one. High fan-in is healthy for stable core scopes; risky only when the scope '
+      'Distinct other files/folders depending on this one. High fan-in is healthy for stable core scopes; risky only when the scope '
       + 'also changes frequently.',
   },
   scope_fan_out: {
     title: 'Scope fan-out',
     body:
-      'Distinct other files/modules this one depends on. Classic architectural smell when very high — indicates a leaky or '
-      + 'orchestrating scope. File thresholds: ≤10 / ≤20. Module thresholds: ≤15 / ≤30.',
+      'Distinct other files/folders this one depends on. Classic architectural smell when very high — indicates a leaky or '
+      + 'orchestrating scope. File thresholds: ≤10 / ≤20. Folder thresholds: ≤15 / ≤30.',
   },
   scope_cycle: {
     title: 'In cycle (scope)',
     body:
-      'True when this file or module participates in a cross-scope dependency cycle. Usually a layering violation — a strong signal '
+      'True when this file or folder participates in a cross-scope dependency cycle. Usually a layering violation — a strong signal '
       + 'to apply dependency inversion at the architecture boundary.',
   },
   aggregated_quality: {
@@ -409,6 +413,7 @@ export function shapeBlockerLabel(
     case 'layering': return `layered ${pct(blocker.value)}`;
     case 'merges': return `merges · branching ${pct(blocker.value)}`;
     case 'entry': return `many doors · entry ${pct(blocker.value)}`;
+    case 'egress': return `leaks from the middle · out ${pct(blocker.value)}`;
     case 'child_pattern': return `holds a ${blocker.value} folder`;
     case 'child_compliance': return `children ${pct(blocker.value)}`;
     case 'unstructured': return 'no edges between children';
@@ -485,20 +490,20 @@ export function tierPublicFieldRatio(v: number | undefined): Tier {
 
 // --- Scope-level tiers ---
 
-export function tierEntityCount(v: number, isModule: boolean): Tier {
-  const t = isModule ? THRESHOLDS.moduleEntityCount : THRESHOLDS.fileEntityCount;
+export function tierEntityCount(v: number, isFolder: boolean): Tier {
+  const t = isFolder ? THRESHOLDS.folderEntityCount : THRESHOLDS.fileEntityCount;
   if (v <= t.warn) return 'ok';
   if (v <= t.bad) return 'warn';
   return 'bad';
 }
-export function tierScopeLoc(v: number, isModule: boolean): Tier {
-  const t = isModule ? THRESHOLDS.moduleLoc : THRESHOLDS.fileLoc;
+export function tierScopeLoc(v: number, isFolder: boolean): Tier {
+  const t = isFolder ? THRESHOLDS.folderLoc : THRESHOLDS.fileLoc;
   if (v <= t.warn) return 'ok';
   if (v <= t.bad) return 'warn';
   return 'bad';
 }
-export function tierScopeFanOut(v: number, isModule: boolean): Tier {
-  const t = isModule ? THRESHOLDS.moduleFanOut : THRESHOLDS.fileFanOut;
+export function tierScopeFanOut(v: number, isFolder: boolean): Tier {
+  const t = isFolder ? THRESHOLDS.folderFanOut : THRESHOLDS.fileFanOut;
   if (v <= t.warn) return 'ok';
   if (v <= t.bad) return 'warn';
   return 'bad';
@@ -636,7 +641,7 @@ export const qualityRows = derived(analysisGraph, ($g): QualityRow[] => {
   return rows;
 });
 
-// --- Scope-level rows (files & modules) ---
+// --- Scope-level rows (files & folders) ---
 
 export interface ScopeRow {
   scope: ScopeMetrics;
@@ -660,7 +665,7 @@ export interface ScopeRow {
 const MIN_ENTITIES_FOR_COHESION = 5;
 
 /** File names that are wiring / entry-point by nature — their low cohesion
- * is structural (connecting modules), not a grab-bag smell. */
+ * is structural (connecting folders), not a grab-bag smell. */
 const WIRING_FILES = new Set(['mod.rs', 'main.rs', 'lib.rs', 'index.ts', 'index.js', 'mod.ts', '__init__.py']);
 
 function isWiringFile(path: string): boolean {
@@ -698,25 +703,25 @@ function cohesionPenalty(cohesionValue: number): number {
   return 0;
 }
 
-/** Composite "refactor pressure" for a file or module. Balanced across
+/** Composite "refactor pressure" for a file or folder. Balanced across
  * bloat (entity_count + LOC), coupling (fan-out), cohesion (inverted),
  * and cycle membership.
  *
  * Context-aware adjustments to reduce false positives:
  * - Cohesion is suppressed when entity_count < 5 (sample too small).
  * - Cohesion weight is halved for entry-point / wiring files (mod.rs,
- *   main.rs, etc.) whose job is connecting modules.
+ *   main.rs, etc.) whose job is connecting folders.
  * - Cohesion is suppressed for stable data-model files (high fan-in,
  *   near-zero fan-out, mostly containers) — their 0% cohesion is by
  *   design since their types are consumed elsewhere, not by each other.
- * - LOC penalty is halved when cohesion > 80% — a large focused module
+ * - LOC penalty is halved when cohesion > 80% — a large focused folder
  *   is not the same problem as a large fragmented one.
  *
  * Tunable — not load-bearing. */
-export function scopeCompositeScore(s: ScopeMetrics, isModule: boolean): number {
-  const entityRed = isModule ? THRESHOLDS.moduleEntityCount.bad : THRESHOLDS.fileEntityCount.bad;
-  const locRed = isModule ? THRESHOLDS.moduleLoc.bad : THRESHOLDS.fileLoc.bad;
-  const foRed = isModule ? THRESHOLDS.moduleFanOut.bad : THRESHOLDS.fileFanOut.bad;
+export function scopeCompositeScore(s: ScopeMetrics, isFolder: boolean): number {
+  const entityRed = isFolder ? THRESHOLDS.folderEntityCount.bad : THRESHOLDS.fileEntityCount.bad;
+  const locRed = isFolder ? THRESHOLDS.folderLoc.bad : THRESHOLDS.fileLoc.bad;
+  const foRed = isFolder ? THRESHOLDS.folderFanOut.bad : THRESHOLDS.fileFanOut.bad;
   const entity = Math.min(s.entity_count / entityRed, 2);
   let loc = Math.min(s.loc / locRed, 2);
   const fo = Math.min(s.fan_out / foRed, 2);
@@ -724,7 +729,7 @@ export function scopeCompositeScore(s: ScopeMetrics, isModule: boolean): number 
   const ctx = cohesionContext(s);
   const coh = ctx.meaningful ? cohesionPenalty(s.cohesion!) : 0;
 
-  // LOC penalty halved when cohesion is high (large focused module ≠ large grab-bag).
+  // LOC penalty halved when cohesion is high (large focused folder ≠ large grab-bag).
   if (ctx.meaningful && s.cohesion! >= 0.8) {
     loc *= 0.5;
   }
@@ -735,13 +740,13 @@ export function scopeCompositeScore(s: ScopeMetrics, isModule: boolean): number 
   return (0.25 * entity + 0.2 * loc + 0.25 * fo + ctx.weight * coh) * norm + cycle;
 }
 
-function scopeTiers(s: ScopeMetrics, isModule: boolean): ScopeRow['tiers'] {
+function scopeTiers(s: ScopeMetrics, isFolder: boolean): ScopeRow['tiers'] {
   const ctx = cohesionContext(s);
   return {
-    entity: tierEntityCount(s.entity_count, isModule),
-    loc: tierScopeLoc(s.loc, isModule),
+    entity: tierEntityCount(s.entity_count, isFolder),
+    loc: tierScopeLoc(s.loc, isFolder),
     cohesion: ctx.meaningful ? tierCohesion(s.cohesion) : 'na',
-    fanOut: tierScopeFanOut(s.fan_out, isModule),
+    fanOut: tierScopeFanOut(s.fan_out, isFolder),
   };
 }
 
@@ -749,8 +754,8 @@ function scopeTiers(s: ScopeMetrics, isModule: boolean): ScopeRow['tiers'] {
  * The population's entity rows, keyed by every scope path that holds them:
  * the file itself and each directory above it.
  *
- * One map serves files and modules because a path cannot be both, and
- * building it by walking each row's ancestors once is what keeps the module
+ * One map serves files and folders because a path cannot be both, and
+ * building it by walking each row's ancestors once is what keeps the folder
  * aggregate a subtree rollup — the same shape the engine's `is_descendant`
  * produces — without a rollup × row scan per recompute.
  */
@@ -772,18 +777,18 @@ const rowsByScope = derived(qualityRows, ($rows): Map<string, QualityRow[]> => {
 
 function scopeRowsFrom(
   scopes: ScopeMetrics[],
-  isModule: boolean,
+  isFolder: boolean,
   byScope: Map<string, QualityRow[]>,
 ): ScopeRow[] {
   return scopes.map((s) => ({
     scope: s,
-    score: s.composite_score ?? scopeCompositeScore(s, isModule),
-    tiers: scopeTiers(s, isModule),
+    score: s.composite_score ?? scopeCompositeScore(s, isFolder),
+    tiers: scopeTiers(s, isFolder),
     aggregate: aggregateRows(byScope.get(s.path) ?? []),
   }));
 }
 
-/** File and module rollups for the current population. Derived from
+/** File and folder rollups for the current population. Derived from
  *  `analysisGraph`, not `graphData`: the panel names one population and
  *  every tab in it has to be that population, or the reader is comparing
  *  a summary of one set of files against a table of another. */
@@ -792,9 +797,9 @@ export const fileRows = derived(
   ([$g, $byScope]): ScopeRow[] => scopeRowsFrom($g.files ?? [], false, $byScope),
 );
 
-export const moduleRows = derived(
+export const folderRows = derived(
   [analysisGraph, rowsByScope],
-  ([$g, $byScope]): ScopeRow[] => scopeRowsFrom($g.modules ?? [], true, $byScope),
+  ([$g, $byScope]): ScopeRow[] => scopeRowsFrom($g.folders ?? [], true, $byScope),
 );
 
 // --- Aggregated quality scores (repo / folder / file level) ---

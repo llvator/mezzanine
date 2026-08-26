@@ -112,7 +112,7 @@ fn analyze_with_tests(
     // The settings file is the *repo's*, so it is read at `server.root` and
     // the result re-rooted at whatever subdirectory this call asked for.
     // Building it at `dir` instead would leave `map path="src"` — the
-    // ordinary way an agent narrows — reading a `.nao/settings.json` that
+    // ordinary way an agent narrows — reading a `.mezz/settings.json` that
     // has to sit under `src/` to exist at all (CFG-011).
     //
     // Built before the cache is consulted rather than after, because the
@@ -195,6 +195,36 @@ fn smell_labels(smells: &[SmellKind]) -> String {
 }
 
 /// Compact one-line metric annotation for an entity.
+/// How much of this row's `out` mezz actually identified.
+///
+/// The count a reader wants and `fan_out` hides. On this repo the median
+/// entity with `fan_out >= 5` has **71%** of it landing on names mezz could
+/// not resolve to anything it has seen — a `std` call, a library method, a
+/// link in a chain against an external type. `render_index` scores `out
+/// 98`, of which 6 are things mezz identified.
+///
+/// Written as the identified count rather than as a warning marker,
+/// because a marker needs a threshold and there is no honest one here: the
+/// share runs 0% to 100% across the repo but sits near the top for
+/// *every* high-pressure row, so a threshold fires on all of them and
+/// discriminates nothing. The bare number varies, and it is the one that
+/// answers "how many things must I understand to change this".
+///
+/// Reported and not corrected. Telling a builder chain from four genuine
+/// dependencies on unidentified things needs the receiver, and an external
+/// chain records none (AN-031) — so the correction is a parser change, and
+/// a scoring change made without one would re-rank every repo while
+/// leaving that exact case alone.
+fn unresolved_note(e: &CodeEntity, unresolved: u32) -> String {
+    if e.metrics.fan_out == 0 || unresolved == 0 {
+        return String::new();
+    }
+    format!(
+        ", {} of it identified",
+        e.metrics.fan_out.saturating_sub(unresolved)
+    )
+}
+
 fn metric_suffix(e: &CodeEntity) -> String {
     let m = &e.metrics;
     let mut parts = vec![
@@ -261,6 +291,20 @@ pub(super) fn cap_lines(body: Vec<String>, hint: &str) -> String {
 //  map
 // ------------------------------------------------------------------
 
+/// The listable entities of `path`, out of a graph built over the whole root.
+///
+/// The split is the point: what a report *lists* and what its numbers are
+/// *computed over* are different questions, and answering both with one
+/// scoped analysis is what made `map` report an exported function as
+/// uncoupled while `impact` showed eight dependents on the same entity.
+fn under<'a>(graph: &'a DependencyGraph, path: &Path) -> Vec<&'a CodeEntity> {
+    graph
+        .entities()
+        .filter(|e| is_listed(e))
+        .filter(|e| Path::new(&e.file_path).starts_with(path))
+        .collect()
+}
+
 pub fn map(server: &McpServer, args: &Value) -> Result<String> {
     let path = resolve_path(server, args)?;
     let depth = args
@@ -269,7 +313,14 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
         .unwrap_or(2)
         .clamp(1, 3);
 
-    let graph = analyze(server, &path)?;
+    // The whole root, then filtered to `path` — not an analysis of `path`.
+    // Coupling metrics are computed over whatever graph was built, so a graph
+    // built from one folder cannot see the callers outside it and reports
+    // every exported function there as uncoupled. `impact` avoids this by
+    // always analysing the root, and `dead_code` documents the same trap;
+    // `map` had it, and `map` is the tool people are told to reach for first
+    // on unfamiliar code (MCP-021).
+    let graph = analyze(server, &server.root)?;
     let by_id: HashMap<&str, &CodeEntity> = graph.entities().map(|e| (e.id.as_str(), e)).collect();
 
     // Top-level entities grouped by file, ordered by path then line.
@@ -281,11 +332,9 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
             .unwrap_or(true), // unresolvable parent → treat as top-level
     };
 
+    let listed: Vec<&CodeEntity> = under(&graph, &path);
     let mut files: BTreeMap<String, Vec<&CodeEntity>> = BTreeMap::new();
-    for e in graph.entities() {
-        if !is_listed(e) || !is_top_level(e) {
-            continue;
-        }
+    for e in listed.iter().copied().filter(|e| is_top_level(e)) {
         files
             .entry(rel_path(&e.file_path, &path))
             .or_default()
@@ -297,10 +346,8 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
 
     // Header: totals and a kind breakdown.
     let mut kind_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for e in graph.entities() {
-        if is_listed(e) {
-            *kind_counts.entry(e.kind.display_name()).or_default() += 1;
-        }
+    for e in &listed {
+        *kind_counts.entry(e.kind.display_name()).or_default() += 1;
     }
     let breakdown = kind_counts
         .iter()
@@ -410,6 +457,25 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
     // Top offenders by composite "refactor pressure" score.
     body.push(String::new());
     body.push(format!("## Top {} by refactor pressure", top));
+    // Said here rather than left to the reader, because the shape section
+    // below is the one with the imperative heading and gets read as the plan.
+    body.push(
+        "A ranking, not a verdict: this list does not say which of these are worth \
+         changing. A high score can be inherent to a shape that is fine — a builder \
+         chain scores its every link as a dependency — so read the entity before \
+         acting on its place here. Nothing in this list is excused by the folder \
+         work below, and nothing there covers this."
+            .to_string(),
+    );
+    body.push(
+        "`out N, M of it identified` is what that disclaimer looks like per row: the \
+         other N−M are names mezz could not resolve to anything it has seen — a \
+         library call, a `std` call, a link in a chain against an external type. The \
+         score counts all N. A row whose `out` is large and whose identified count is \
+         small is mentioning a lot of names, not depending on a lot of things."
+            .to_string(),
+    );
+    let unresolved = graph.unresolved_fan_out();
     let mut ranked: Vec<&CodeEntity> = graph
         .entities()
         .filter(|e| is_listed(e) && e.metrics.composite_score > 0.0)
@@ -421,13 +487,14 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
     });
     for e in ranked.iter().take(top) {
         body.push(format!(
-            "- [{:.2}] {} `{}` — {}:{} ({})",
+            "- [{:.2}] {} `{}` — {}:{} ({}{})",
             e.metrics.composite_score,
             e.kind.display_name(),
             e.name,
             rel_path(&e.file_path, &path),
             e.span.start.line + 1,
-            metric_suffix(e)
+            metric_suffix(e),
+            unresolved_note(e, unresolved.get(e.id.as_str()).copied().unwrap_or(0)),
         ));
     }
 
@@ -485,7 +552,7 @@ fn shape_moves(
     // base lives in a worktree, so the raw paths never match.
     let by_folder = |graph: &DependencyGraph, root: &Path| -> HashMap<String, ShapePattern> {
         graph
-            .module_metrics()
+            .folder_metrics()
             .iter()
             .filter_map(|m| {
                 let shape = m.metrics.shape.as_ref()?;
@@ -554,9 +621,299 @@ fn shape_moves(
 /// it reads the parent's drawing. The folders whose blocker is in their
 /// own drawing go first, deepest-first, because clearing a deep one can
 /// clear a parent's child gate as well as its own.
+/// The files that changed place, named as such.
+///
+/// Its own section because a relocation is neither a modification nor an
+/// addition, and the diff deliberately reports it as neither: the entity
+/// pass matches a moved file to its old self so its smells and its history
+/// carry across (see `diff::match_moved`). Without this section the same
+/// fix would leave `assess_change` reporting "0 changed" over a folder
+/// restructure — the one change a reviewer most wants named, and the one
+/// this whole family of tools exists to encourage.
+///
+/// Reported per *file*, not per entity: `git mv` moves files, and twelve
+/// properties of one interface are one move.
+///
+/// Counted over the listed population only. Unfiltered, a single entity no
+/// list shows — a ghost call target, an import, a field — was enough to
+/// assert that a file had moved when nothing a reader could see had. A
+/// claim about the tree has to rest on evidence the reader can check.
+fn moved_files(
+    result: &diff::DiffResult,
+    skip: &dyn Fn(&diff::EntityDiff) -> bool,
+) -> Vec<String> {
+    let mut moves: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
+    for d in result.entities.iter().filter(|d| !skip(d)) {
+        if let Some(was) = d.moved_from.as_deref() {
+            *moves
+                .entry(was)
+                .or_default()
+                .entry(d.file_path.as_str())
+                .or_default() += 1;
+        }
+    }
+    if moves.is_empty() {
+        return Vec::new();
+    }
+    let split = moves.values().filter(|to| to.len() > 1).count();
+    let mut body = vec![
+        String::new(),
+        format!("## Moved ({})", moves.len()),
+        String::new(),
+        "Matched to their old selves — entity by entity, so anything below about \
+         smells, metrics or coupling is a claim about the same entities and not \
+         about their arrival."
+            .to_string(),
+        String::new(),
+    ];
+    body.extend(moves.iter().take(MAX_MOVED_FILES).map(destination_line));
+    if moves.len() > MAX_MOVED_FILES {
+        body.push(format!("- … and {} more.", moves.len() - MAX_MOVED_FILES));
+    }
+    body.extend(split_caveat(split));
+    body
+}
+
+/// A removal and an addition that look like one entity under a new name.
+///
+/// Entity matching pairs a file's contents across a move, and stops at the
+/// name: an entity *renamed* as well as relocated has nothing linking the
+/// two spellings, so it reads as one deletion plus one arrival. Reported
+/// from the field as the boundary the move matching now sits behind — two
+/// function bodies lifted from `copy.ts` into `target.ts` under new names,
+/// showing up as the only two entries in `Removed`.
+///
+/// Suggested, never matched. A rename is a judgement about intent and this
+/// is a fingerprint; pairing them silently would be the mispairing the
+/// split reporting was just fixed for. So the diff keeps calling them an
+/// addition and a removal, and this points at the pair.
+///
+/// Three guards keep it quiet rather than clever: the fingerprint must be
+/// distinctive (a one-line delegate is not), and it must be unique on both
+/// sides — two candidates for one removal is no candidate at all.
+fn possible_renames(
+    result: &diff::DiffResult,
+    base_by_id: &HashMap<&str, &CodeEntity>,
+    head_by_id: &HashMap<&str, &CodeEntity>,
+    skip: &dyn Fn(&diff::EntityDiff) -> bool,
+) -> Vec<String> {
+    let gone = side(result, diff::ChangeStatus::Removed, base_by_id, skip);
+    let came = side(result, diff::ChangeStatus::Added, head_by_id, skip);
+    let pairs: Vec<String> = gone
+        .iter()
+        .filter(|(print, _, _)| only_one(&gone, print) && only_one(&came, print))
+        .filter_map(|(print, d, e)| {
+            let (_, other, _) = came.iter().find(|(p, _, _)| p == print)?;
+            Some(format!(
+                "`{}` — {} → `{}` — {} (same {}, {} lines)",
+                d.name,
+                d.file_path,
+                other.name,
+                other.file_path,
+                e.kind.display_name(),
+                e.metrics.loc,
+            ))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut body = vec![
+        String::new(),
+        format!("## Possibly renamed ({})", pairs.len()),
+        String::new(),
+        "Each of these is listed below as both a removal and an addition, because \
+         nothing links two names. They are paired here by shape alone — same kind, \
+         same parameters, same complexity, same length — which is a hint and not a \
+         match. Read them as one entity if that is what they are."
+            .to_string(),
+        String::new(),
+    ];
+    body.extend(pairs.into_iter().map(|p| format!("- {p}")));
+    body
+}
+
+/// Whether exactly one row on this side carries `print`.
+///
+/// Required on *both* sides before a pair is suggested. Two removals and
+/// one addition sharing a shape is an ambiguity, and picking either would
+/// be the silent mispairing this whole hint is written to avoid.
+fn only_one(
+    rows: &[(Fingerprint, &diff::EntityDiff, &CodeEntity)],
+    print: &Fingerprint,
+) -> bool {
+    rows.iter().filter(|(p, _, _)| p == print).count() == 1
+}
+
+/// What tells two bodies apart when their names cannot.
+///
+/// Metrics rather than source text, because a rename changes the text by
+/// definition — the identifier is in it.
+type Fingerprint = (String, Option<u32>, Option<u32>, Option<u32>, Option<u32>, u32);
+
+/// One side's fingerprinted rows, dropping anything too plain to identify.
+fn side<'a>(
+    result: &'a diff::DiffResult,
+    status: diff::ChangeStatus,
+    by_id: &HashMap<&str, &'a CodeEntity>,
+    skip: &dyn Fn(&diff::EntityDiff) -> bool,
+) -> Vec<(Fingerprint, &'a diff::EntityDiff, &'a CodeEntity)> {
+    result
+        .entities
+        .iter()
+        .filter(|d| d.status == status && !skip(d))
+        .filter_map(|d| {
+            let id = if status == diff::ChangeStatus::Removed {
+                d.base_entity_id.as_deref()?
+            } else {
+                d.entity_id.as_str()
+            };
+            let e = *by_id.get(id)?;
+            Some((fingerprint(e)?, d, e))
+        })
+        .collect()
+}
+
+/// An entity's shape, or `None` when it has too little shape to identify.
+///
+/// A three-line delegate with no branches matches a hundred others, and a
+/// hint that fires on those is one a reader learns to ignore.
+fn fingerprint(e: &CodeEntity) -> Option<Fingerprint> {
+    let distinctive = e.metrics.loc > 3 || e.metrics.cyclomatic.is_some_and(|c| c > 1);
+    distinctive.then(|| {
+        (
+            e.kind.display_name().to_string(),
+            e.metrics.param_count,
+            e.metrics.cyclomatic,
+            e.metrics.cognitive_complexity,
+            e.metrics.max_nesting,
+            e.metrics.loc,
+        )
+    })
+}
+
+/// The counts at the top, taken over the rows the lists below actually
+/// show.
+///
+/// They used to come off `DiffResult::summary`, which counts every row the
+/// diff produced, while every list under them is filtered by `skip_row` —
+/// no fields, no imports, no unresolved call targets, no `File` rows. So
+/// the header said "16 added, 9 removed" over an `Added (11)` and a
+/// `Removed (2)` that were complete and carried no truncation marker.
+/// Reported from the field once the lists got short enough for the gap to
+/// be visible; it had been there all along, hidden behind lists long
+/// enough to look truncated.
+///
+/// Counting the listed population and naming the remainder, rather than
+/// the reverse: the number a reader checks is the one they can check.
+fn headline(result: &diff::DiffResult, skip: &dyn Fn(&diff::EntityDiff) -> bool) -> Vec<String> {
+    let mut shown = Tally::default();
+    let mut hidden = Tally::default();
+    for d in &result.entities {
+        let tally = if skip(d) { &mut hidden } else { &mut shown };
+        tally.count(d);
+    }
+    let mut body = vec![format!(
+        "{} added, {} removed, {} modified ({} source, {} coupling-only), {} unchanged",
+        shown.added,
+        shown.removed,
+        shown.modified,
+        shown.modified_source,
+        shown.modified - shown.modified_source,
+        shown.unchanged,
+    )];
+    if hidden.total() > 0 {
+        body.push(format!(
+            "Counted over what the lists below show. A further {} {} — fields, \
+             imports, unresolved call targets and the file rows their children \
+             already stand for — which no listing here displays.",
+            hidden.total(),
+            if hidden.total() == 1 {
+                "entity changed"
+            } else {
+                "entities changed"
+            },
+        ));
+    }
+    body
+}
+
+/// One population's change counts.
+#[derive(Default)]
+struct Tally {
+    added: usize,
+    removed: usize,
+    modified: usize,
+    modified_source: usize,
+    unchanged: usize,
+}
+
+impl Tally {
+    fn count(&mut self, d: &diff::EntityDiff) {
+        match d.status {
+            diff::ChangeStatus::Added => self.added += 1,
+            diff::ChangeStatus::Removed => self.removed += 1,
+            diff::ChangeStatus::Unchanged => self.unchanged += 1,
+            diff::ChangeStatus::Modified => {
+                self.modified += 1;
+                self.modified_source += usize::from(d.source_changed);
+            }
+        }
+    }
+
+    /// Everything that is not "unchanged" — what a reader is being told
+    /// they cannot see.
+    fn total(&self) -> usize {
+        self.added + self.removed + self.modified
+    }
+}
+
+/// One old file and everywhere its contents ended up.
+///
+/// Every destination, with how many entities went to each — not the
+/// busiest one. A one-into-two split has no single right answer, and the
+/// first version of this picked a half, stated it as a rename and never
+/// mentioned the other. Reported from the field on a case where the half
+/// it picked was the one `git` disagreed with: `generatorSection.ts` was
+/// renamed to `generator/generatorSection.ts` and had
+/// `generator/snowflakeOptions.ts` split out of it, and this claimed the
+/// second as the rename.
+fn destination_line((was, to): (&&str, &BTreeMap<&str, usize>)) -> String {
+    if let Some((only, _)) = to.iter().next().filter(|_| to.len() == 1) {
+        return format!("- `{was}` → `{only}`");
+    }
+    let parts: Vec<String> = to
+        .iter()
+        .map(|(now, count)| format!("`{now}` ({count})"))
+        .collect();
+    format!("- `{was}` → split across {}", parts.join(", "))
+}
+
+/// What the counts on a split line mean, and what they do not.
+fn split_caveat(split: usize) -> Vec<String> {
+    if split == 0 {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        format!(
+            "{} of those went to more than one place. The counts are entities \
+             matched to each destination, which is what this diff knows; they are \
+             not a claim about which half `git` will call the rename, and on a split \
+             the two can disagree.",
+            if split == 1 { "One".to_string() } else { format!("{split}") },
+        ),
+    ]
+}
+
+/// How many moved files get named before the list summarises. Generous,
+/// because a restructure that moves thirty files is precisely the change
+/// whose file list a reviewer reads.
+const MAX_MOVED_FILES: usize = 40;
+
 fn folder_shape_section(graph: &DependencyGraph, base: &Path, top: usize) -> Vec<String> {
     let scored: Vec<(String, &FolderShape)> = graph
-        .module_metrics()
+        .folder_metrics()
         .iter()
         .filter_map(|m| {
             let shape = m.metrics.shape.as_ref()?;
@@ -587,8 +944,8 @@ fn folder_shape_section(graph: &DependencyGraph, base: &Path, top: usize) -> Vec
     here.sort_by(work_order);
     elsewhere.sort_by(worst_first);
 
-    body.extend(start_here_group(&here, top));
-    body.extend(blocked_group(&elsewhere));
+    body.extend(start_here_group(&here, top, graph, base));
+    body.extend(blocked_group(&elsewhere, graph, base));
     body.extend(verdict_hints(here.iter().chain(elsewhere.iter())));
     body
 }
@@ -651,7 +1008,61 @@ fn depth(rel: &str) -> usize {
     Path::new(rel).components().count()
 }
 
-fn start_here_group(here: &[(String, &FolderShape)], top: usize) -> Vec<String> {
+/// What one folder's row says when some of its imports never reached the
+/// graph.
+///
+/// `reshape` already refuses to give a folder a verdict without this caveat.
+/// `quality`'s triage is read *first* — it is the list an agent works from
+/// before calling `reshape` on anything — so a blocker misidentified from a
+/// missing edge sends it to the wrong folder before the caveat is ever seen.
+///
+/// The direction matters and is easy to get backwards: a missing edge does not
+/// only make a folder look worse, it can make it look **better**. A door that
+/// nothing is recorded as reaching is not counted as a door, so
+/// `entry_concentration` reads high and the folder is triaged as fine. Live
+/// case from a field report: `src/uid` reported `one-door-in 0.40`, while two
+/// inbound edges to `bulk.ts` were invisible and a raw read of the imports
+/// found six ways in. The score was flattering it.
+fn unsound_marker(graph: &DependencyGraph, base: &Path, dir: &str) -> String {
+    let folder = if dir.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(dir)
+    };
+    match graph.unresolved_imports_touching(&folder.display().to_string()) {
+        0 => String::new(),
+        n => format!(" · ⚠ {n} unresolved"),
+    }
+}
+
+/// The note under a group holding at least one marked row, and nothing under
+/// a group whose folders all resolved.
+fn unsound_footnote(
+    rows: &[(String, &FolderShape)],
+    graph: &DependencyGraph,
+    base: &Path,
+) -> Vec<String> {
+    let marked = rows
+        .iter()
+        .filter(|(dir, _)| !unsound_marker(graph, base, dir).is_empty())
+        .count();
+    if marked == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "⚠ {marked} of these folders have imports that never reached the graph. Their \
+         numbers are computed over an incomplete drawing and can read better than the \
+         truth — an unrecorded dependency on a file is a door not counted as a door. \
+         Call `reshape` on one before acting on its place in this list."
+    )]
+}
+
+fn start_here_group(
+    here: &[(String, &FolderShape)],
+    top: usize,
+    graph: &DependencyGraph,
+    base: &Path,
+) -> Vec<String> {
     if here.is_empty() {
         return vec![
             String::new(),
@@ -665,18 +1076,38 @@ fn start_here_group(here: &[(String, &FolderShape)], top: usize) -> Vec<String> 
     let mut body = vec![
         String::new(),
         format!(
-            "### Start here — the blocker is in the folder's own drawing ({} of {} shown)",
+            "### Start here *for shape* — the blocker is in the folder's own \
+             drawing ({} of {} shown)",
             here.len().min(top),
             here.len()
         ),
         "Deepest first: clearing one of these can also clear a parent's child gate."
             .to_string(),
+        // The only imperative heading in this report, which is why it has to
+        // say what it is imperative *about*. An agent reporting "no work
+        // warranted" three sessions running, with the codebase's worst
+        // function sitting unlabelled in the pressure list above, is what this
+        // sentence exists to prevent: every folder here was a leave-it, the
+        // section resolved cleanly to "nothing to do", and the search closed.
+        "This covers folder shape only. Entity-level work is the refactor-pressure \
+         list above — a folder can hold its shape perfectly while containing the \
+         worst function in the codebase, and nothing here would say so."
+            .to_string(),
     ];
-    body.extend(here.iter().take(top).map(|(dir, s)| shape_line(dir, s)));
+    body.extend(
+        here.iter()
+            .take(top)
+            .map(|(dir, s)| shape_line(dir, s, &unsound_marker(graph, base, dir))),
+    );
+    body.extend(unsound_footnote(&here[..here.len().min(top)], graph, base));
     body
 }
 
-fn blocked_group(elsewhere: &[(String, &FolderShape)]) -> Vec<String> {
+fn blocked_group(
+    elsewhere: &[(String, &FolderShape)],
+    graph: &DependencyGraph,
+    base: &Path,
+) -> Vec<String> {
     if elsewhere.is_empty() {
         return Vec::new();
     }
@@ -692,11 +1123,12 @@ fn blocked_group(elsewhere: &[(String, &FolderShape)]) -> Vec<String> {
     ];
     body.extend(elsewhere.iter().take(SHAPE_BLOCKED_SHOWN).map(|(dir, s)| {
         format!(
-            "- [{}] {} — held back by {}",
+            "- [{}] {} — held back by {}{}",
             s.pattern.label(),
             if dir.is_empty() { "(root)" } else { dir },
             s.blocker
                 .map_or_else(|| "nothing".to_string(), |b| b.summary()),
+            unsound_marker(graph, base, dir),
         )
     }));
     if elsewhere.len() > SHAPE_BLOCKED_SHOWN {
@@ -711,10 +1143,10 @@ fn blocked_group(elsewhere: &[(String, &FolderShape)]) -> Vec<String> {
 /// The blocker leads: it is the one part of the line that names something
 /// to go and change, where the five numbers behind it leave the reader to
 /// work out which gate failed.
-fn shape_line(dir: &str, shape: &FolderShape) -> String {
+fn shape_line(dir: &str, shape: &FolderShape, unsound: &str) -> String {
     format!(
         "- [{}] {} — held back by {}; compliance {:.2}, acyclic {:.2}, layered {}, \
-         branching {}, one-door-in {}, {} children",
+         branching {}, one-door-in {}, {} children{}",
         shape.pattern.label(),
         if dir.is_empty() { "(root)" } else { dir },
         shape
@@ -726,6 +1158,7 @@ fn shape_line(dir: &str, shape: &FolderShape) -> String {
         ratio(shape.arborescence),
         ratio(shape.entry_concentration),
         shape.child_count,
+        unsound,
     )
 }
 
@@ -904,7 +1337,7 @@ const POSSIBLE_CAP: usize = 15;
 /// resolved the reference to it (MCP-013).
 ///
 /// Unresolved targets become ghost entities keyed by the emitted name, so a
-/// ghost called `foo` is where every reference to `foo` that nao could not
+/// ghost called `foo` is where every reference to `foo` that mezz could not
 /// bind ends up. Its dependents are therefore the closest thing to a reverse
 /// view of the graph's blind spot — suggestive, never confirmed, and kept out
 /// of the `Used by` count for that reason.
@@ -940,7 +1373,7 @@ fn entity_row(e: &CodeEntity, rel_label: &str, root: &Path) -> String {
 
 /// The `Used by` section, plus what it cannot see (MCP-013).
 ///
-/// A reference nao could not resolve attaches to a ghost of the same name,
+/// A reference mezz could not resolve attaches to a ghost of the same name,
 /// never to the target, so `dependents()` is a floor and not a count. The
 /// `Uses` section can report its own blind spot by subtraction; this one
 /// cannot see the misses at all, and so has to say so.
@@ -966,7 +1399,7 @@ fn used_by_section(
         };
         out.push(format!(
             "_No **resolved** dependents, which is not the same as none._ \
-             References nao could not resolve are attached to a ghost of the \
+             References mezz could not resolve are attached to a ghost of the \
              same name, and call sites in a form the parser doesn't reach \
              (Svelte markup, for one) produce no edge at all. Confirm by name \
              before treating this as unused.{pointer}"
@@ -2348,11 +2781,11 @@ pub fn assess_change(server: &McpServer, args: &Value) -> Result<String> {
             hit
         }
         None => {
-            let base_dir = std::env::temp_dir().join(format!("nao-mcp-base-{}", from_sha));
+            let base_dir = std::env::temp_dir().join(format!("mezz-mcp-base-{}", from_sha));
             diff::create_worktree(repo_root, &base_dir, base_ref)?;
             // The working tree's settings decide the scope of both sides.
             // Analyzing the checkout on its own terms would read the
-            // `.nao/settings.json` committed at `base_ref`, and a base that
+            // `.mezz/settings.json` committed at `base_ref`, and a base that
             // excludes a different set of files than the head reports every
             // file the two disagree about as added or removed.
             let scope =
@@ -2492,22 +2925,10 @@ pub(crate) fn render_change_report(
     // root before comparing.
     roots: (&Path, &Path),
 ) -> String {
-    let s = &result.summary;
     let base_by_id: HashMap<&str, &CodeEntity> =
         base_graph.entities().map(|e| (e.id.as_str(), e)).collect();
     let head_by_id: HashMap<&str, &CodeEntity> =
         head_graph.entities().map(|e| (e.id.as_str(), e)).collect();
-
-    let mut body = vec![
-        format!(
-            "# Change assessment: {} ({}) → working tree",
-            base_ref, result.from_ref
-        ),
-        format!(
-            "{} added, {} removed, {} modified ({} source, {} coupling-only), {} unchanged",
-            s.added, s.removed, s.modified, s.modified_source, s.modified_impact, s.unchanged
-        ),
-    ];
 
     // Keep only rows whose underlying entity belongs in an agent-facing
     // listing (compute_diff itself only excludes Parameters): drops File
@@ -2523,6 +2944,12 @@ pub(crate) fn render_change_report(
             .map(|e| !is_listed(e))
             .unwrap_or(d.kind == "File")
     };
+
+    let mut body = vec![format!(
+        "# Change assessment: {} ({}) → working tree",
+        base_ref, result.from_ref
+    )];
+    body.extend(headline(result, &skip_row));
     let row_loc = |d: &diff::EntityDiff| format!("{} `{}` — {}", d.kind, d.name, d.file_path);
 
     // Smell churn, joined across the two graphs by entity id.
@@ -2555,6 +2982,8 @@ pub(crate) fn render_change_report(
         }
     }
     body.extend(shape_moves(base_graph, head_graph, roots));
+    body.extend(moved_files(result, &skip_row));
+    body.extend(possible_renames(result, &base_by_id, &head_by_id, &skip_row));
 
     if !new_smells.is_empty() {
         body.push(String::new());
@@ -2698,7 +3127,7 @@ mod tests {
 
     impl TmpDir {
         fn new(name: &str) -> Self {
-            Self::with_prefix("nao-mcp-test", name)
+            Self::with_prefix("mezz-mcp-test", name)
         }
 
         /// `dead_code` classifies by path, and the default prefix contains
@@ -2744,6 +3173,8 @@ mod tests {
             base_cache: std::sync::Mutex::new(HashMap::new()),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shape_baselines: Default::default(),
+            rules_spelled_out: Default::default(),
+            layout_caveat_spelled_out: Default::default(),
         }
     }
 
@@ -2755,9 +3186,11 @@ mod tests {
             layering: Some(0.80),
             arborescence: Some(0.80),
             entry_concentration: Some(0.80),
+            egress: None,
             child_compliance: Some(0.90),
             child_count: 4,
             blocker: Some(blocker),
+            terms: crate::models::ShapeTerms::default(),
         }
     }
 
@@ -2801,13 +3234,77 @@ mod tests {
         assert_eq!(depth("src/parser/rust"), 3);
     }
 
+    /// The triage is the list an agent works from *before* it calls
+    /// `reshape`, so a folder whose numbers came off an incomplete drawing
+    /// has to say so here — and the note has to name the direction, because a
+    /// missing edge can make a folder read *better*: a door nothing is
+    /// recorded as reaching is not counted as a door.
+    #[test]
+    fn a_folder_with_unresolved_imports_is_marked_in_the_triage() {
+        let entities = vec![
+            crate::models::CodeEntity::new(
+                "usesTwo",
+                EntityKind::Function,
+                "src/a/one.ts",
+                crate::models::Span::from_positions(1, 0, 1, 0),
+            ),
+            crate::models::CodeEntity::new(
+                "fromTwo",
+                EntityKind::Function,
+                "src/b/two.ts",
+                crate::models::Span::from_positions(1, 0, 1, 0),
+            ),
+        ];
+        let graph = DependencyGraph::from_analysis(&crate::analyzer::AnalysisResult {
+            entities,
+            relationships: Vec::new(),
+            files: Vec::new(),
+            import_sites: vec![crate::models::ImportSite {
+                from: std::path::PathBuf::from("src/a/one.ts"),
+                to: std::path::PathBuf::from("src/b/two.ts"),
+                line: 0,
+                is_reexport: false,
+                is_type_only: false,
+            }],
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(
+            unsound_marker(&graph, Path::new(""), "src/a"),
+            " · ⚠ 1 unresolved"
+        );
+        // A folder the unresolved import does not touch is left alone, or the
+        // marker would mean nothing.
+        assert_eq!(unsound_marker(&graph, Path::new(""), "src/z"), "");
+
+        let note = unsound_footnote(&[("src/a".to_string(), &shape_of())], &graph, Path::new(""))
+            .join("\n");
+        assert!(note.contains("read better than the truth"), "{note}");
+    }
+
+    fn shape_of() -> FolderShape {
+        FolderShape {
+            pattern: ShapePattern::Tangled,
+            compliance: 0.5,
+            acyclicity: 1.0,
+            layering: Some(0.5),
+            arborescence: Some(0.5),
+            entry_concentration: Some(0.5),
+            egress: None,
+            child_compliance: None,
+            child_count: 2,
+            blocker: None,
+            terms: crate::models::ShapeTerms::default(),
+        }
+    }
+
     /// An empty work list has to say so rather than print a heading over
     /// nothing: "every remaining folder is waiting on something else" is
     /// a different situation from "there is no work", and an agent that
     /// cannot tell them apart invents work.
     #[test]
     fn an_empty_work_list_says_where_the_work_went() {
-        let out = start_here_group(&[], 10).join("\n");
+        let out = start_here_group(&[], 10, &DependencyGraph::default(), Path::new("")).join("\n");
         assert!(out.contains("Start here — none"), "{out}");
         assert!(out.contains("waiting on something outside"), "{out}");
     }
@@ -2820,7 +3317,7 @@ mod tests {
         let folders: Vec<(String, &FolderShape)> = (0..SHAPE_BLOCKED_SHOWN + 3)
             .map(|i| (format!("src/f{i}"), &blocked))
             .collect();
-        let out = blocked_group(&folders).join("\n");
+        let out = blocked_group(&folders, &DependencyGraph::default(), Path::new("")).join("\n");
         assert!(out.contains(&format!("({})", SHAPE_BLOCKED_SHOWN + 3)), "{out}");
         assert!(out.contains("… and 3 more."), "{out}");
         assert!(!out.contains("src/f7"), "past the cap must not print: {out}");
@@ -2941,10 +3438,10 @@ fu f.protocol.creation {
 
     // ---- settings (CFG-011) ---------------------------------------
 
-    /// CFG-011, end to end. `nao mcp` was the one entry point that never
-    /// opened `.nao/settings.json`, with no warning and no way to tell from
+    /// CFG-011, end to end. `mezz mcp` was the one entry point that never
+    /// opened `.mezz/settings.json`, with no warning and no way to tell from
     /// a response which configuration produced it — so a repo that had asked
-    /// nao to leave a directory out got a `map` listing it.
+    /// mezz to leave a directory out got a `map` listing it.
     #[test]
     fn map_leaves_out_what_the_repo_settings_file_excludes() {
         let dir = TmpDir::new("settings-excludes");
@@ -2954,7 +3451,7 @@ fu f.protocol.creation {
             "pub fn excluded_by_the_file() {}\n",
         );
         dir.write(
-            ".nao/settings.json",
+            ".mezz/settings.json",
             r#"{"exclude_patterns": ["**/generated/**"]}"#,
         );
 
@@ -2982,7 +3479,7 @@ fu f.protocol.creation {
             "pub fn excluded_by_the_file() {}\n",
         );
         dir.write(
-            ".nao/settings.json",
+            ".mezz/settings.json",
             r#"{"exclude_patterns": ["**/generated/**"]}"#,
         );
 
@@ -3102,7 +3599,7 @@ export function reportDiff(state: {
     /// One of each population the tool has to tell apart, in a directory
     /// whose path does not read as test code.
     fn dead_code_fixture(name: &str) -> TmpDir {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", name);
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", name);
         dir.write(
             "app.rs",
             r#"
@@ -3191,7 +3688,7 @@ fn main() {
     /// Five of five candidates on a real plugin were this.
     #[test]
     fn dead_code_spares_overrides_of_a_base_class_outside_the_tree() {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", "dead-code-external-base");
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "dead-code-external-base");
         dir.write(
             "main.ts",
             r#"
@@ -3278,7 +3775,7 @@ function looseHelper() {}
 
     #[test]
     fn dead_code_says_so_when_there_is_nothing_to_report() {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", "dead-code-clean");
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "dead-code-clean");
         dir.write(
             "app.rs",
             "fn live(x: i32) -> i32 { x }\n\nfn main() {\n    live(1);\n}\n",
@@ -3294,7 +3791,7 @@ function looseHelper() {}
     fn test_entities_are_recognized_in_any_test_named_module() {
         // The fixture directory must not itself read as test code — the
         // point is to exercise the ancestor-module rule, not the path one.
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", "dead-code-inline-cases");
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "dead-code-inline-cases");
         dir.write(
             "app.rs",
             r#"
@@ -3321,7 +3818,7 @@ mod locality_tests {
     /// `SessionItem` — which is exactly the blind spot `impact` has to own up
     /// to rather than print "Used by (0)" and stop.
     fn ghost_join_fixture(name: &str, consumers: usize) -> TmpDir {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", name);
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", name);
         dir.write(
             "backend/session.rs",
             "pub struct SessionItem { pub id: String }\n",
@@ -3338,7 +3835,7 @@ mod locality_tests {
 
     #[test]
     fn impact_zero_dependents_says_what_it_does_not_know() {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", "impact-zero");
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-zero");
         dir.write("app.rs", "pub fn lonely(x: i32) -> i32 { x }\n");
         let out = impact(&code_server_for(&dir), &json!({"entity": "lonely"})).unwrap();
 
@@ -3387,7 +3884,7 @@ mod locality_tests {
 
     #[test]
     fn impact_with_real_dependents_gains_neither_note() {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", "impact-normal");
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-normal");
         dir.write(
             "app.rs",
             "pub fn helper(x: i32) -> i32 { x }\npub fn caller() -> i32 { helper(1) }\n",
@@ -3457,7 +3954,7 @@ mod locality_tests {
     /// three-chain budget was spent printing one route twice.
     #[test]
     fn trace_does_not_repeat_a_chain_when_two_edges_join_a_pair() {
-        let dir = TmpDir::with_prefix("nao-mcp-fixture", "trace-parallel-edges");
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "trace-parallel-edges");
         dir.write(
             "app.rs",
             r#"

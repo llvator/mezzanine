@@ -11,12 +11,12 @@ npm-debug.log*
 vscode-extension/dist/
 vscode-extension/*.vsix
 
-# nao's own generated output. `.nao/settings.json` is deliberately NOT
+# mezz's own generated output. `.mezz/settings.json` is deliberately NOT
 # ignored — it describes the repo and is meant to be committed (see
-# .nao.example/README.md); only what nao writes is.
-.nao/data/
+# .mezz.example/README.md); only what mezz writes is.
+.mezz/data/
 
-# Runtime data from `nao` itself
+# Runtime data from `mezz` itself
 data.json
 data.details.json
 data.base-details.json

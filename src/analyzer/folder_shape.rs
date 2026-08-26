@@ -1,6 +1,6 @@
 //! Folder shape — whether the picture a directory draws can be read.
 //!
-//! Nao's premise is that a code graph is understood through its drawing,
+//! Mezzanine's premise is that a code graph is understood through its drawing,
 //! and a drawing is only followable when it has a shape: acyclic, layered,
 //! and holding that shape at whichever level you zoom to. This pass scores
 //! that per folder, over exactly the graph the canvas renders when
@@ -25,7 +25,8 @@
 
 use crate::models::{
     ChildKind, EdgeVerdict, ErasedEdge, FolderPicture, FolderShape, ImportSite, OutsideEdge,
-    OutsideVerdict, PictureChild, PictureEdge, ShapeBlocker, ShapePattern, Thresholds,
+    OutsideVerdict, PictureChild, PictureEdge, ShapeBlocker, ShapePattern, ShapeTerms,
+    Thresholds,
 };
 use petgraph::algo::{condensation, tarjan_scc};
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -77,19 +78,33 @@ pub fn compute<'a>(
     for folder in order {
         let kids = children.get(folder).cloned().unwrap_or_default();
         let no_edges = HashSet::new();
+        let no_entries = HashMap::new();
         let edges = accum.edges.get(folder).unwrap_or(&no_edges);
-        let scores = graph_scores(&kids, &scored(edges, accum.erased_in(folder)));
+        let drawn = scored(edges, accum.erased_in(folder));
+        let scores = graph_scores(&kids, &drawn);
         let inside = subfolders(&kids, folders, &shapes);
+        let (entry, busiest, arrivals) = entry_concentration(accum.entries.get(folder));
+        let doors = doors_of(accum.entries.get(folder).unwrap_or(&no_entries));
+        let (out, exits, middle_exits) =
+            egress(folder, accum.exits.get(folder), &drawn, &doors);
         let shape = FolderShape {
             pattern: ShapePattern::Hierarchical, // replaced below
             compliance: 0.0,
             acyclicity: scores.acyclicity,
             layering: scores.layering,
             arborescence: scores.arborescence,
-            entry_concentration: entry_concentration(accum.entries.get(folder)),
+            entry_concentration: entry,
+            egress: out,
             child_compliance: inside.mean_compliance,
             child_count: kids.len() as u32,
             blocker: None, // replaced below
+            terms: ShapeTerms {
+                busiest,
+                arrivals,
+                exits,
+                middle_exits,
+                ..scores.terms
+            },
         };
         shapes.insert(
             folder.clone(),
@@ -205,6 +220,29 @@ pub fn doors_by_folder(
         .entries
         .iter()
         .map(|(folder, entries)| (folder.clone(), doors_of(entries)))
+        .collect()
+}
+
+/// Every file in a folder that anything outside it depends on — the doors
+/// and everything reached past them, which is to say every way in.
+///
+/// Counted rather than ranked, so unlike [`doors_by_folder`] there is no
+/// maximum to tie at. That is the point of it: a folder where five files each
+/// take one dependency from outside has five doors until one of them takes a
+/// second, at which point it has one — a number that moves without the code
+/// changing shape. This one reads five either way.
+pub fn entered_by_folder(
+    pairs: &[(String, String)],
+    folders: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    accumulate(pairs, &[], folders)
+        .entries
+        .iter()
+        .map(|(folder, entries)| {
+            let mut files: Vec<String> = entries.keys().cloned().collect();
+            files.sort();
+            (folder.clone(), files)
+        })
         .collect()
 }
 
@@ -525,7 +563,18 @@ fn short_of_fractal(
     worst_child: Option<ShapePattern>,
     t: &Thresholds,
 ) -> Option<ShapeBlocker> {
-    own_drawing_gate(s, t).or_else(|| deeper_gate(s, worst_child, t))
+    local_gate(s, t).or_else(|| deeper_gate(s, worst_child, t))
+}
+
+/// Everything a reader can settle without leaving this folder: its own
+/// drawing, then its boundary.
+///
+/// A composition rather than a third branch in [`short_of_fractal`]. The
+/// complexity gate fails on any increase to a function that already exists
+/// (CI-001), so the ladder grows by adding a gate function and composing it,
+/// never by lengthening the chain that dispatches them.
+fn local_gate(s: &FolderShape, t: &Thresholds) -> Option<ShapeBlocker> {
+    own_drawing_gate(s, t).or_else(|| egress_gate(s, t))
 }
 
 /// The gates a reader can settle by looking at the picture in front of
@@ -549,6 +598,24 @@ fn own_drawing_gate(s: &FolderShape, t: &Thresholds) -> Option<ShapeBlocker> {
     s.arborescence
         .filter(|a| *a < t.shape_arborescence)
         .map(ShapeBlocker::Merges)
+}
+
+/// The boundary gate a reader can act on without leaving the folder
+/// (AN-028, ADR 0031).
+///
+/// Sits between the folder's own drawing and everything deeper, and
+/// deliberately apart from [`ShapeBlocker::Entry`] even though both are
+/// about the boundary. The two differ in who can fix them: an exit leaving
+/// from the middle is this folder's own children reaching out, and is
+/// repaired by moving a dependency down or a child to the bottom — work
+/// inside these walls. A folder entered at many points is its *callers*
+/// naming its insides, and no edit here settles it. So this is reported
+/// before the recursive gates, with the rest of the work a reader can do on
+/// the picture in front of them, and `Entry` stays after them.
+fn egress_gate(s: &FolderShape, t: &Thresholds) -> Option<ShapeBlocker> {
+    s.egress
+        .filter(|e| *e < t.shape_egress)
+        .map(ShapeBlocker::Egress)
 }
 
 /// The gates that are about what is *inside* the children, who reaches in
@@ -619,15 +686,143 @@ fn subfolders(
     }
 }
 
-/// Share of the traffic arriving from outside that lands on one file.
-fn entry_concentration(doors: Option<&HashMap<String, u32>>) -> Option<f32> {
-    let doors = doors?;
-    let total: u32 = doors.values().sum();
-    let busiest = doors.values().copied().max()?;
-    if total == 0 {
-        return None;
+/// Share of the traffic arriving from outside that lands on one file,
+/// with the two counts behind it.
+/// Where a folder's outgoing dependencies start, as a ratio and the two
+/// counts behind it (AN-028).
+///
+/// A folder is meant to read as a funnel — traffic in at one door, out from
+/// the bottom — so an exit is charged for only by *where it begins*:
+///
+/// - a **leaf** child, one with no outgoing edge inside the folder, is the
+///   bottom of the funnel and is the shape the rule wants;
+/// - the **door** is structural, because a facade imports what it hands on,
+///   and charging for it would fail a folder for having a facade;
+/// - anything else is a middle-layer child reaching past its siblings, which
+///   is what makes the layering drawn above it a fiction.
+///
+/// Where an exit *lands* is deliberately not part of this. That stays the
+/// target folder's business, exactly as [`OutsideVerdict::Exit`] has always
+/// said — this measures the near end, which is the half the reader of *this*
+/// folder can act on.
+///
+/// `None` for a folder that depends on nothing outside itself: it has no
+/// egress shape rather than a perfect one, the same distinction
+/// [`entry_concentration`] draws for a folder nobody enters.
+///
+/// Leaf-ness is read off the *drawn* graph, so an arrow the build erases
+/// does not stop a child being a leaf (ADR 0026), while the exits
+/// themselves are counted over every dependency written — the same split
+/// [`doors_by_folder`] already makes, and for the same reason.
+fn egress(
+    folder: &str,
+    exits: Option<&HashMap<String, u32>>,
+    drawn: &HashSet<(String, String)>,
+    doors: &[String],
+) -> (Option<f32>, u32, u32) {
+    let Some(exits) = exits.filter(|e| !e.is_empty()) else {
+        return (None, 0, 0);
+    };
+    let bottom = FunnelBottom::of(folder, drawn, doors);
+    let (mut total, mut middle) = (0, 0);
+    for (file, count) in exits {
+        total += count;
+        if bottom.is_middle(folder, file) {
+            middle += count;
+        }
     }
-    Some(busiest as f32 / total as f32)
+    if total == 0 {
+        return (None, 0, 0);
+    }
+    (Some(1.0 - middle as f32 / total as f32), total, middle)
+}
+
+/// Which children of one folder an exit may legitimately start from.
+///
+/// A type rather than two loose tests, because the question is asked from
+/// two places that must not answer it differently: [`egress`] scores it, and
+/// [`middle_exits_by_folder`] enforces it as a rule. One of those drifting
+/// from the other would fail a folder for a shape the tool had just called a
+/// funnel.
+struct FunnelBottom<'a> {
+    /// Children with an outgoing edge to a sibling — everything *not* at the
+    /// bottom of the folder's own drawing.
+    departing: HashSet<&'a str>,
+    /// The children holding a door. A facade imports what it hands on, so
+    /// charging it for reaching outside would fail a folder for having one.
+    doors: HashSet<&'a str>,
+}
+
+impl<'a> FunnelBottom<'a> {
+    fn of(folder: &str, drawn: &'a HashSet<(String, String)>, doors: &'a [String]) -> Self {
+        FunnelBottom {
+            departing: drawn.iter().map(|(from, _)| from.as_str()).collect(),
+            doors: doors
+                .iter()
+                .filter_map(|d| child_holding(folder, d))
+                .collect(),
+        }
+    }
+
+    /// Whether an exit starting at `file` leaves from the middle.
+    ///
+    /// A child that is both a leaf and the door reads as a leaf — the order
+    /// here matches `reshape`'s `ExitOrigin`, and either way it is allowed.
+    fn is_middle(&self, folder: &str, file: &str) -> bool {
+        child_holding(folder, file)
+            .is_some_and(|child| self.departing.contains(child) && !self.doors.contains(child))
+    }
+}
+
+/// Every file in a folder that reaches outside it from the folder's middle —
+/// the rule behind `max_middle_exits_per_folder` (AN-028 step 2).
+///
+/// Counted as distinct *files* rather than edges, for the reason
+/// [`entered_by_folder`] counts files: an edge count moves when a middle
+/// child gains a second outside dependency, without the folder changing
+/// shape, and a rule that fires on that teaches nothing.
+///
+/// Leaf-ness is read here off every dependency written, where [`egress`]
+/// reads it off the drawn graph — the same split [`doors_by_folder`] already
+/// makes against `entry_concentration`, and the one place the rule and the
+/// score can disagree: a child whose only sibling edge is a type-only import
+/// is at the bottom of the drawing (ADR 0026) and not of the program. The
+/// rule takes the stricter reading, because what it guards is the shape of
+/// the source a reader opens rather than of the bundle.
+pub fn middle_exits_by_folder(
+    pairs: &[(String, String)],
+    folders: &HashSet<String>,
+) -> HashMap<String, Vec<String>> {
+    let accum = accumulate(pairs, &[], folders);
+    let no_edges = HashSet::new();
+    let no_entries = HashMap::new();
+    accum
+        .exits
+        .iter()
+        .map(|(folder, exits)| {
+            let drawn = accum.edges.get(folder).unwrap_or(&no_edges);
+            let doors = doors_of(accum.entries.get(folder).unwrap_or(&no_entries));
+            let bottom = FunnelBottom::of(folder, drawn, &doors);
+            let mut files: Vec<String> = exits
+                .keys()
+                .filter(|f| bottom.is_middle(folder, f))
+                .cloned()
+                .collect();
+            files.sort();
+            (folder.clone(), files)
+        })
+        .collect()
+}
+
+fn entry_concentration(doors: Option<&HashMap<String, u32>>) -> (Option<f32>, u32, u32) {
+    let Some(doors) = doors else {
+        return (None, 0, 0);
+    };
+    let total: u32 = doors.values().sum();
+    let Some(busiest) = doors.values().copied().max().filter(|_| total > 0) else {
+        return (None, 0, 0);
+    };
+    (Some(busiest as f32 / total as f32), busiest, total)
 }
 
 // ------------------------------------------------------------------
@@ -640,6 +835,11 @@ struct GraphScores {
     acyclicity: f32,
     layering: Option<f32>,
     arborescence: Option<f32>,
+    /// The counts the three above were taken over, so a reader can be
+    /// shown the arithmetic rather than asked to trust the ratio. Filled
+    /// here, beside the division, because a second pass computing them
+    /// would be a second definition free to drift (see [`ShapeTerms`]).
+    terms: ShapeTerms,
 }
 
 /// The folder's collapsed child graph, node weights being indices back
@@ -672,6 +872,7 @@ fn graph_scores(nodes: &[String], edges: &HashSet<(String, String)>) -> GraphSco
             acyclicity: 1.0,
             layering: None,
             arborescence: None,
+            terms: ShapeTerms::default(),
         };
     }
     let graph = child_graph(nodes, edges);
@@ -688,10 +889,21 @@ fn graph_scores(nodes: &[String], edges: &HashSet<(String, String)>) -> GraphSco
     // would report one defect twice and leave the reader nothing to
     // compare a cyclic folder against.
     let dag = drawn_dag(&condensation(graph, true));
+    let (layering, tight) = layering_of(&dag);
+    let (arborescence, reached, strays) = arborescence_of(&dag);
     GraphScores {
         acyclicity,
-        layering: layering_of(&dag),
-        arborescence: arborescence_of(&dag),
+        layering,
+        arborescence,
+        terms: ShapeTerms {
+            nodes: nodes.len() as u32,
+            looped: tangled as u32,
+            edges: dag.edges as u32,
+            tight,
+            reached,
+            strays,
+            ..ShapeTerms::default()
+        },
     }
 }
 
@@ -755,11 +967,14 @@ fn levels_of(dag: &DrawnDag) -> Vec<u32> {
     level
 }
 
-/// Share of edges that step exactly one level down. `None` when there are
-/// no edges to measure.
-fn layering_of(dag: &DrawnDag) -> Option<f32> {
+/// Share of edges that step exactly one level down, and the count that
+/// share was taken over. `None` when there are no edges to measure.
+///
+/// The numerator travels with the ratio so [`ShapeTerms`] can be filled
+/// from the same division rather than by a second walk over the levels.
+fn layering_of(dag: &DrawnDag) -> (Option<f32>, u32) {
     if dag.edges == 0 {
-        return None;
+        return (None, 0);
     }
     let level = levels_of(dag);
     let mut tight = 0_usize;
@@ -770,7 +985,7 @@ fn layering_of(dag: &DrawnDag) -> Option<f32> {
             }
         }
     }
-    Some(tight as f32 / dag.edges as f32)
+    (Some(tight as f32 / dag.edges as f32), tight as u32)
 }
 
 /// Share of the drawn edges that would survive in a spanning *tree* — one
@@ -795,13 +1010,20 @@ fn layering_of(dag: &DrawnDag) -> Option<f32> {
 /// has the self-similarity the top tier claims, so every root past the
 /// first joins the denominator. One root is what a tree has; the rest are
 /// the folder failing to be one.
-fn arborescence_of(dag: &DrawnDag) -> Option<f32> {
+///
+/// Returns the two counts beside the ratio, for the reason
+/// [`layering_of`] does.
+fn arborescence_of(dag: &DrawnDag) -> (Option<f32>, u32, u32) {
     if dag.edges == 0 {
-        return None;
+        return (None, 0, 0);
     }
     let reached: usize = dag.in_degree.iter().filter(|d| **d > 0).count();
     let strays = dag.in_degree.len() - reached;
-    Some(reached as f32 / (dag.edges + strays.saturating_sub(1)) as f32)
+    (
+        Some(reached as f32 / (dag.edges + strays.saturating_sub(1)) as f32),
+        reached as u32,
+        strays as u32,
+    )
 }
 
 // ------------------------------------------------------------------
@@ -817,6 +1039,11 @@ struct Accum {
     /// Folder → file inside it → how many outside files depend on that
     /// file. The spread of this map is the folder's entry concentration.
     entries: HashMap<String, HashMap<String, u32>>,
+    /// Folder → file inside it → how many files outside the folder that
+    /// file depends on. The exact mirror of `entries`, filled on the same
+    /// walk: where that one answers "who comes in and where do they land",
+    /// this answers "who goes out and where do they start" (AN-028).
+    exits: HashMap<String, HashMap<String, u32>>,
     /// Folder → the child-to-child arrows the build erases (ADR 0026).
     erased: HashMap<String, HashSet<(String, String)>>,
 }
@@ -830,6 +1057,24 @@ impl Accum {
         self.erased
             .get(folder)
             .unwrap_or_else(|| NONE.get_or_init(HashSet::new))
+    }
+}
+
+/// Charge one boundary crossing to every folder that holds `file` and not
+/// the other end of the edge.
+///
+/// Written once and called for both directions rather than inlined twice.
+/// The two sides are the same bookkeeping over opposite ends of the same
+/// edge, and a second copy would be free to disagree about which folders a
+/// crossing counts against — which is the one property `entry_concentration`
+/// and `egress` have to share to be readable on the same scale.
+fn crossings(into: &mut HashMap<String, HashMap<String, u32>>, folders: &[&str], file: &str) {
+    for folder in folders {
+        *into
+            .entry((*folder).to_string())
+            .or_default()
+            .entry(file.to_string())
+            .or_insert(0) += 1;
     }
 }
 
@@ -847,16 +1092,11 @@ fn accumulate(
             let entry = accum.edges.entry(lca.to_string()).or_default();
             entry.insert((child_on(&from, shared, src), child_on(&to, shared, tgt)));
         }
-        // Every folder below the parting point holds the target but not
-        // the source, so this edge crosses each of their boundaries.
-        for folder in &to[shared..] {
-            *accum
-                .entries
-                .entry((*folder).to_string())
-                .or_default()
-                .entry(tgt.clone())
-                .or_insert(0) += 1;
-        }
+        // Every folder below the parting point holds one end of this edge
+        // and not the other, so the edge crosses each of their boundaries —
+        // arriving on the target's side, departing on the source's.
+        crossings(&mut accum.entries, &to[shared..], tgt);
+        crossings(&mut accum.exits, &from[shared..], src);
     }
     accum.erased = erasure(imports, folders);
     accum
@@ -1497,6 +1737,132 @@ mod tests {
             ],
         );
         assert_eq!(at(&once, "src").layering, at(&twice, "src").layering);
+    }
+
+    // --- Egress: where a folder's outgoing dependencies start (AN-028) ---
+
+    #[test]
+    fn an_exit_from_a_leaf_is_the_shape_a_funnel_has() {
+        // `mid.rs → leaf.rs` inside, and the leaf is the one reaching out.
+        // That is the funnel: traffic down through the folder, out at the
+        // bottom.
+        let shapes = run(
+            &["src/db/mid.rs", "src/db/leaf.rs", "src/other.rs"],
+            &[
+                ("src/db/mid.rs", "src/db/leaf.rs"),
+                ("src/db/leaf.rs", "src/other.rs"),
+            ],
+        );
+        assert_eq!(at(&shapes, "src/db").egress, Some(1.0));
+        assert_eq!(at(&shapes, "src/db").terms.middle_exits, 0);
+    }
+
+    #[test]
+    fn an_exit_from_a_middle_child_is_charged_for() {
+        // The same folder, with the *middle* child reaching out instead. It
+        // depends on a sibling and on the outside at once, so the levels
+        // drawn above it are a fiction.
+        let shapes = run(
+            &["src/db/mid.rs", "src/db/leaf.rs", "src/other.rs"],
+            &[
+                ("src/db/mid.rs", "src/db/leaf.rs"),
+                ("src/db/mid.rs", "src/other.rs"),
+            ],
+        );
+        let db = at(&shapes, "src/db");
+        assert_eq!(db.egress, Some(0.0));
+        assert_eq!(db.terms.exits, 1);
+        assert_eq!(db.terms.middle_exits, 1);
+    }
+
+    #[test]
+    fn a_child_with_no_edges_at_all_is_at_the_bottom() {
+        // A stray reaches nothing inside the folder, so it is not in the
+        // drawn edge set at all. It is still at the bottom of the drawing,
+        // and an exit from it is not a leak — the case a leaf test written
+        // over the edge list alone gets wrong.
+        let shapes = run(
+            &["src/db/lone.rs", "src/db/pair.rs", "src/other.rs"],
+            &[("src/db/lone.rs", "src/other.rs")],
+        );
+        assert_eq!(at(&shapes, "src/db").egress, Some(1.0));
+    }
+
+    #[test]
+    fn the_door_may_reach_outside_because_a_facade_imports_what_it_hands_on() {
+        // `api.rs` is the door — the outside depends on it — and it also
+        // depends on a sibling, which would make it a middle child by the
+        // leaf test alone. Charging it would fail a folder for having a
+        // facade.
+        let shapes = run(
+            &["src/db/api.rs", "src/db/impl.rs", "src/caller.rs", "src/other.rs"],
+            &[
+                ("src/caller.rs", "src/db/api.rs"),
+                ("src/db/api.rs", "src/db/impl.rs"),
+                ("src/db/api.rs", "src/other.rs"),
+            ],
+        );
+        assert_eq!(at(&shapes, "src/db").egress, Some(1.0));
+    }
+
+    #[test]
+    fn a_folder_depending_on_nothing_outside_has_no_egress_rather_than_a_perfect_one() {
+        // The same distinction `entry_concentration` draws for a folder
+        // nobody enters: absent is a different answer from 1.00.
+        let shapes = run(
+            &["src/db/a.rs", "src/db/b.rs"],
+            &[("src/db/a.rs", "src/db/b.rs")],
+        );
+        assert_eq!(at(&shapes, "src/db").egress, None);
+        assert_eq!(at(&shapes, "src/db").terms.exits, 0);
+    }
+
+    #[test]
+    fn egress_gates_fractal_and_stays_out_of_compliance() {
+        // ADR 0013's discipline, held for the fifth sub-score: the tier
+        // moves, the blend does not.
+        let leaking = run(
+            &["src/db/mid.rs", "src/db/leaf.rs", "src/other.rs"],
+            &[
+                ("src/db/mid.rs", "src/db/leaf.rs"),
+                ("src/db/mid.rs", "src/other.rs"),
+            ],
+        );
+        let funnel = run(
+            &["src/db/mid.rs", "src/db/leaf.rs", "src/other.rs"],
+            &[
+                ("src/db/mid.rs", "src/db/leaf.rs"),
+                ("src/db/leaf.rs", "src/other.rs"),
+            ],
+        );
+        assert_eq!(at(&leaking, "src/db").compliance, at(&funnel, "src/db").compliance);
+        assert!(matches!(
+            at(&leaking, "src/db").blocker,
+            Some(ShapeBlocker::Egress(_))
+        ));
+        assert_ne!(at(&leaking, "src/db").pattern, ShapePattern::Fractal);
+        assert_eq!(at(&funnel, "src/db").pattern, ShapePattern::Fractal);
+    }
+
+    #[test]
+    fn the_rule_names_the_files_the_score_charges_for() {
+        // `middle_exits_by_folder` and `egress` must not disagree about
+        // which exits are the leak: one fails a build, the other prints a
+        // verdict, and a reader meeting both deserves one answer.
+        let files: Vec<String> = ["src/db/mid.rs", "src/db/leaf.rs", "src/other.rs"]
+            .iter()
+            .map(|f| sep(f))
+            .collect();
+        let pairs: Vec<(String, String)> = [
+            ("src/db/mid.rs", "src/db/leaf.rs"),
+            ("src/db/mid.rs", "src/other.rs"),
+        ]
+        .iter()
+        .map(|(a, b)| (sep(a), sep(b)))
+        .collect();
+        let folders = folders_of(&files);
+        let by_folder = middle_exits_by_folder(&pairs, &folders);
+        assert_eq!(by_folder[&sep("src/db")], vec![sep("src/db/mid.rs")]);
     }
 
     // --- The picture behind the numbers ---

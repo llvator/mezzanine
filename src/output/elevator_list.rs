@@ -8,7 +8,7 @@
 //!
 //! Both deliberately stay text-only. The structure is simple enough
 //! that a script can parse with `grep`/`awk`; if a future consumer
-//! needs structured data, the existing `nao analyze -f json` already
+//! needs structured data, the existing `mezz analyze -f json` already
 //! provides the full graph.
 
 use crate::analyzer::AnalysisResult;

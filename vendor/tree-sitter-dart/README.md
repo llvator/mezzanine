@@ -10,8 +10,8 @@ they are generated. `grammar.js` and `src/scanner.c` are the upstream sources.
 
 ## Why it is vendored
 
-nao pins `tree-sitter` at 0.22, which loads grammar ABI 13–14 and rejects 15
-outright:
+Mezzanine pins `tree-sitter` at 0.22, which loads grammar ABI 13–14 and
+rejects 15 outright:
 
 ```
 Incompatible language version 15. Expected minimum 13, maximum 14
@@ -22,7 +22,7 @@ and the only published ABI-14 release (0.0.4) predates Dart 3 — it cannot
 read `sealed class`, record types, patterns or extension types, and loses the
 whole declaration rather than degrading.
 
-Moving nao to a newer `tree-sitter` would fix that, and it is the right
+Moving Mezzanine to a newer `tree-sitter` would fix that, and it is the right
 eventual move, but it cannot be done one grammar at a time: two `tree-sitter`
 versions in one binary means two copies of the same `ts_*` C symbols. Moving
 all of them together forces `tree-sitter-kotlin` (capped at `<0.23`) onto
@@ -59,4 +59,4 @@ grammar change.
 
 ## Licence
 
-MIT, retained in `LICENSE`. Compatible with nao's AGPL-3.0-only.
+MIT, retained in `LICENSE`. Compatible with Mezzanine's AGPL-3.0-only.

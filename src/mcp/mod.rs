@@ -1,6 +1,6 @@
 //! MCP (Model Context Protocol) server over stdio.
 //!
-//! Exposes Nao's graph to AI agents as callable tools — `overview`
+//! Exposes Mezzanine's graph to AI agents as callable tools — `overview`
 //! (domain-level Elevator shape), `map` (structural map), `quality`
 //! (smells + complexity offenders), `assess_change` (metric deltas of
 //! the working tree vs a git ref), and the rest listed in
@@ -12,7 +12,9 @@
 //! to stdout exclusively; all diagnostics go to stderr.
 
 mod baseline;
+mod boundaries;
 mod format;
+mod layout;
 pub mod push;
 mod recipes;
 mod reshape;
@@ -21,7 +23,7 @@ mod tools;
 
 /// What an entity listing shows: no ghosts, no parameters, no fields.
 ///
-/// Re-exported because `nao check` grades the same entities the listings
+/// Re-exported because `mezz check` grades the same entities the listings
 /// show, and answering "what counts as an entity here" a second time is how
 /// two surfaces of one tool come to disagree (CHK-001).
 pub(crate) use tools::is_listed;
@@ -58,7 +60,7 @@ impl CachedGraph {
     ///
     /// Two conditions rather than one because an analysis goes stale for
     /// two reasons and the watcher only sees the first: it bumps the
-    /// generation on *source* changes, so a `.nao/settings.json` edited
+    /// generation on *source* changes, so a `.mezz/settings.json` edited
     /// between two calls leaves it untouched. Serving a hit on the
     /// generation alone would answer under the scope in force when the
     /// entry was stored while the response footer named the current one
@@ -86,12 +88,33 @@ pub struct McpServer {
     /// [`baseline::ShapeBaselines`], which owns both the record and the
     /// reason the server is the one holding it.
     pub(crate) shape_baselines: baseline::ShapeBaselines,
+    /// Whether `reshape` has already spelled out its rules this session.
+    ///
+    /// The allowed/forbidden list and the closing instruction are the same
+    /// six hundred words on every call, and an agent working through four
+    /// folders reported that they were most of what the tool returned.
+    /// Repetition does not make a rule more binding — it makes the finding
+    /// above it harder to find — so the second call and after get the
+    /// forbidden moves as a checklist and nothing else.
+    ///
+    /// Per process rather than per folder, and deliberately *not* off the
+    /// baseline record, which now outlives the process: a fresh session is
+    /// a fresh reader, and the full text is cheap once.
+    pub(crate) rules_spelled_out: std::sync::atomic::AtomicBool,
+    /// Whether `layout` has already explained what a relayout cannot do.
+    ///
+    /// Same reasoning as [`Self::rules_spelled_out`], and the same agent
+    /// reported that fixing one while adding the other left the total
+    /// boilerplate higher than before: `layout`'s "What a layout cannot
+    /// do" arrived beside `reshape`'s "What counts as a fix", both
+    /// verbatim on every call. A caveat is worth its length once.
+    pub(crate) layout_caveat_spelled_out: std::sync::atomic::AtomicBool,
 }
 
 impl McpServer {
     /// The scope this server is answering under *right now*.
     ///
-    /// Re-read rather than remembered, because `.nao/settings.json` is
+    /// Re-read rather than remembered, because `.mezz/settings.json` is
     /// re-read on every analysis: a value captured at startup would name
     /// the file as it stood when the process began and quietly disagree
     /// with the analysis it was printed beside. `include_tests` and
@@ -132,9 +155,40 @@ pub(crate) fn scope_id(config: &Config) -> String {
 /// reload.
 fn scope_footer(server: &McpServer) -> String {
     format!(
-        "\n\n_scope {} · nao {}_",
+        "\n\n_scope {} · mezz {}{}_",
         server.scope_id(),
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        import_coverage_note(server),
+    )
+}
+
+/// What the footer says when some of what the parsers read did not reach the
+/// graph — and nothing at all when it all did.
+///
+/// Every verdict these tools give is computed over the graph, so a hole in it
+/// becomes a confident wrong answer: a folder is reported as a funnel because
+/// the imports that would have shown otherwise are missing, not because
+/// nothing leaves it. Silence is indistinguishable from cleanliness, and this
+/// is the line that separates them. Reported next to the scope digest for the
+/// same reason that is there (CFG-014): it is a fact about what produced the
+/// answer, not part of the answer.
+///
+/// Quiet when whole, so a sound graph costs no tokens and the line means
+/// something when it appears. The analysis is the warm-cached one the tool
+/// just used; a failure to obtain it says nothing here, because the tool's
+/// own error already has.
+fn import_coverage_note(server: &McpServer) -> String {
+    let Ok(graph) = tools::analyze(server, &server.root) else {
+        return String::new();
+    };
+    let (landed, seen) = graph.import_coverage();
+    if landed >= seen {
+        return String::new();
+    }
+    format!(
+        " · {landed} of {seen} imports in the graph — {} missing, so any verdict \
+         over the folders they cross is unsound",
+        seen - landed,
     )
 }
 
@@ -142,19 +196,21 @@ pub fn run(root: PathBuf, include_tests: bool, languages: Option<Vec<String>>) -
     let root = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("Cannot resolve root path {}: {}", root.display(), e))?;
-    eprintln!("nao MCP server on stdio — root: {}", root.display());
+    eprintln!("mezz MCP server on stdio — root: {}", root.display());
 
     let generation = Arc::new(AtomicU64::new(0));
     spawn_invalidation_watcher(root.clone(), generation.clone());
 
     let server = McpServer {
+        shape_baselines: baseline::ShapeBaselines::rooted_at(&root),
+        rules_spelled_out: std::sync::atomic::AtomicBool::new(false),
+        layout_caveat_spelled_out: std::sync::atomic::AtomicBool::new(false),
         root,
         include_tests,
         languages,
         graph_cache: Mutex::new(HashMap::new()),
         base_cache: Mutex::new(HashMap::new()),
         generation,
-        shape_baselines: baseline::ShapeBaselines::default(),
     };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -230,7 +286,7 @@ fn spawn_invalidation_watcher(root: PathBuf, generation: Arc<AtomicU64>) {
 }
 
 /// True for files whose change should invalidate cached graphs: a
-/// parseable language extension (same by-construction rule as `nao
+/// parseable language extension (same by-construction rule as `mezz
 /// watch`), outside build/VCS directories that churn without changing
 /// source truth (cargo writes generated `.rs` under `target/`).
 fn is_relevant_source_change(path: &Path) -> bool {
@@ -275,9 +331,9 @@ fn initialize_result(server: &McpServer, params: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "nao", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "mezz", "version": env!("CARGO_PKG_VERSION") },
         "instructions": format!(
-            "Nao analyzes the codebase at {} into a typed entity/relationship graph \
+            "Mezzanine analyzes the codebase at {} into a typed entity/relationship graph \
              with per-entity complexity and coupling metrics. Use `overview` for the \
              domain-level shape from the project's Elevator (.elv) specs (if present) \
              before touching code, `map` to get the structural shape of a folder \
@@ -312,6 +368,8 @@ const TOOLS: &[(&str, ToolFn)] = &[
     ("assess_change", tools::assess_change),
     ("spec_slice", slice::spec_slice),
     ("reshape", reshape::reshape),
+    ("layout", layout::layout),
+    ("boundaries", boundaries::boundaries),
 ];
 
 fn handle_tools_call(server: &McpServer, id: Value, params: &Value) -> Value {
@@ -627,7 +685,7 @@ fn tool_definitions() -> Value {
                     },
                     "out": {
                         "type": "string",
-                        "description": "Write the slice here instead of returning it, relative to the project root, e.g. `.nao/spec-slice.elv`. Missing parent directories are created; the path must stay inside the project."
+                        "description": "Write the slice here instead of returning it, relative to the project root, e.g. `.mezz/spec-slice.elv`. Missing parent directories are created; the path must stay inside the project."
                     },
                     "overwrite": {
                         "type": "boolean",
@@ -670,6 +728,81 @@ fn tool_definitions() -> Value {
             },
             // Reads the tree and reports; the restructuring is the caller's
             // to carry out.
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "boundaries",
+            "description": "Which of this folder's own imports reach past another folder's door \
+                into its interior — the cross-folder tangle, asked of the folder that wrote it. \
+                Every other tool grades a folder on what arrives; `reshape` says outright that \
+                where its outgoing dependencies land 'stays their own folder's business', and \
+                since every folder says that, a file deep in one area importing a file deep in \
+                another is a defect nobody owns. This takes the other half: where an import lands \
+                is the target's business, whether you knocked on the front door is yours. Splits \
+                the folder's outgoing dependencies three ways — landed on a door, landed on shared \
+                vocabulary several folders reach (leave alone), or reached past a door (the work \
+                list) — names each offending import with its line, the door it bypassed, and which \
+                of four fixes applies. Use it when asked to untangle cross-folder dependencies, to \
+                enforce that folders talk through their entry points, or after `reshape` and \
+                `layout` have made one folder's own drawing clean and the mess is between folders. \
+                Reads only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Folder whose outgoing dependencies to grade, relative to the project root, e.g. `src/parser`. Omit for the repository root, which has nothing outside it."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "layout",
+            "description": "Where a folder's files would sit if its own dependency drawing decided, \
+                and what that arrangement measures out at — without moving anything. Called with \
+                just a folder, it proposes the subfolders the drawing implies: each headed by the \
+                one child every path into the group passes through, so every folder it proposes \
+                has exactly one way in by construction. Called with `moves`, it scores your \
+                arrangement instead. Either way the 'after' numbers are measured, not estimated — \
+                the paths are rewritten and the same folder pass is re-run over the result, so the \
+                score reported is the score the folder will have once you make the move. Use it \
+                when `reshape` says a level is too wide or its branching is short, when asked to \
+                reorganise or split a folder, or to settle 'what would moving this buy me' before \
+                editing. Answers 'what should this folder look like', where `reshape` answers \
+                'what is the one thing wrong with it'. It writes nothing: the output is a list of \
+                `git mv` lines.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Folder to lay out, relative to the project root, e.g. `src/parser`. Omit for the repository root."
+                    },
+                    "moves": {
+                        "type": "array",
+                        "description": "Score this arrangement instead of proposing one. Omit to have mezz read the layout off the drawing.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "what": {
+                                    "type": "string",
+                                    "description": "File or folder to move, relative to the project root. A folder carries everything under it."
+                                },
+                                "into": {
+                                    "type": "string",
+                                    "description": "Folder it moves into, relative to the project root. Need not exist yet."
+                                }
+                            },
+                            "required": ["what", "into"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "additionalProperties": false
+            },
+            // Proposes and scores; every move is the caller's to make.
             "annotations": { "readOnlyHint": true, "openWorldHint": false }
         }
     ])
@@ -724,6 +857,8 @@ mod tests {
             base_cache: Mutex::new(HashMap::new()),
             generation: Arc::new(AtomicU64::new(0)),
             shape_baselines: Default::default(),
+            rules_spelled_out: Default::default(),
+            layout_caveat_spelled_out: Default::default(),
         };
         let call = json!({ "name": "map", "arguments": { "path": "no-such-folder-here" } });
         let response = handle_tools_call(&server, json!(1), &call);
@@ -731,12 +866,15 @@ mod tests {
             .as_str()
             .expect("a tool response carries text");
         assert_eq!(response["result"]["isError"], json!(true));
+        // `contains`, not `ends_with`: the footer carries a third fact when
+        // the graph is missing imports, and that one is appended after the
+        // version. Both facts this test exists for are still asserted.
         assert!(
-            text.ends_with(&format!(
-                "_scope {} · nao {}_",
+            text.contains(&format!(
+                "_scope {} · mezz {}",
                 server.scope_id(),
                 env!("CARGO_PKG_VERSION")
-            )),
+            )) && text.trim_end().ends_with('_'),
             "the answer does not say what produced it:\n{text}"
         );
     }

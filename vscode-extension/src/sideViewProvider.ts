@@ -32,7 +32,7 @@ export interface SelectionPayload {
  * the sidebar slice so each tab gets the full height instead of half of it.
  */
 export class SelectionViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'nao.selection';
+  static readonly viewType = 'mezz.selection';
 
   private view?: vscode.WebviewView;
   private lastSelection?: SelectionPayload;
@@ -89,7 +89,7 @@ export class SelectionViewProvider implements vscode.WebviewViewProvider {
           webviewView.webview.postMessage({ type: 'selection', payload: this.lastSelection });
         }
       } else if (msg?.type === 'goToDefinition' && msg.filePath) {
-        vscode.commands.executeCommand('nao.internalGoToDefinition', {
+        vscode.commands.executeCommand('mezz.internalGoToDefinition', {
           filePath: msg.filePath,
           line: msg.line,
         });
@@ -156,7 +156,7 @@ export class SelectionViewProvider implements vscode.WebviewViewProvider {
       if (!data) return;
       const text = (data.exports as Record<string, string>)[msg.key];
       if (!text) {
-        vscode.window.showWarningMessage(`Nao: no ${msg.key} context available for this entity.`);
+        vscode.window.showWarningMessage(`Mezzanine: no ${msg.key} context available for this entity.`);
         return;
       }
       await vscode.env.clipboard.writeText(text);
@@ -174,7 +174,7 @@ export class SelectionViewProvider implements vscode.WebviewViewProvider {
         3000
       );
     } catch (err) {
-      vscode.window.showErrorMessage(`Nao: context fetch failed — ${(err as Error).message}`);
+      vscode.window.showErrorMessage(`Mezzanine: context fetch failed — ${(err as Error).message}`);
     }
   }
 
@@ -350,7 +350,7 @@ export class SelectionViewProvider implements vscode.WebviewViewProvider {
       const sourceSection = p.sourceCode
         ? '<div class="section"><div class="section-title">Source</div><pre class="source">' + escapeHtml(p.sourceCode) + '</pre></div>'
         : '';
-      const canDrill = p.kind === 'file' || p.kind === 'module';
+      const canDrill = p.kind === 'file' || p.kind === 'folder';
       const drillButton = canDrill
         ? '<button class="drill-btn" id="drill" title="Narrow the scope to this ' + escapeHtml(p.kind) + ' and show its entities">Drill in ↓</button>'
         : '';

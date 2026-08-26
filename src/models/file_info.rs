@@ -268,12 +268,12 @@ impl Language {
     /// Whether the walker should skip this language unless the user names
     /// it explicitly (`-l <lang>`).
     ///
-    /// Only Markdown qualifies today. Every other extension nao claims
+    /// Only Markdown qualifies today. Every other extension mezz claims
     /// belongs to source code, so finding one is evidence the user wants it
     /// analyzed. `.md` is different: a code repo is full of READMEs, ADRs,
     /// changelogs and issue trackers that are *about* the code rather than
     /// part of it. Claiming them by default would add hundreds of nodes to
-    /// every existing graph — nao's own checkout has 368 `.md` files
+    /// every existing graph — mezz's own checkout has 368 `.md` files
     /// against 175 `.rs` — and change what every current user sees without
     /// them asking. Opt-in keeps the doc layer a deliberate view.
     pub fn is_opt_in(&self) -> bool {

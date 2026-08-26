@@ -74,7 +74,7 @@ export interface D3Node {
   impl_blocks: string[];
   language: string;
   metrics?: EntityMetrics;
-  /** Present only on File/Module nodes produced by `collapseGraph`: the raw
+  /** Present only on File/Folder nodes produced by `collapseGraph`: the raw
    *  scope rollup, kept alongside the promoted `metrics` so severity scoring
    *  can reach fields (`cohesion`, `entity_count`, …) that `EntityMetrics`
    *  has no home for. `collapseGraph` cannot score these itself without
@@ -132,7 +132,7 @@ export interface D3Link {
   incoming_kind: string;
   order: number | null;
   /** Number of underlying entity-level edges this link represents. Always
-   * 1 in entity mode; populated by `collapseGraph` at file/module level
+   * 1 in entity mode; populated by `collapseGraph` at file/folder level
    * to drive stroke-width and the hover breakdown. */
   weight?: number;
   /** Per-kind counts of the underlying edges at scope level. Populated
@@ -174,8 +174,8 @@ export interface GraphData {
   /** Per-file rollup metrics. Populated by the analyzer; scope-filtered
    * alongside nodes so only in-scope files show up in the Quality report. */
   files?: ScopeMetrics[];
-  /** Per-directory (module) rollup metrics. Same scoping rules as `files`. */
-  modules?: ScopeMetrics[];
+  /** Per-directory rollup metrics. Same scoping rules as `files`. */
+  folders?: ScopeMetrics[];
   /** Quality thresholds from the backend. Single source of truth for
    *  tier classification and scoring. */
   thresholds?: BackendThresholds;
@@ -203,9 +203,9 @@ export interface BackendThresholds {
   file_entity_count: WarnBad;
   file_loc: WarnBad;
   file_fan_out: WarnBad;
-  module_entity_count: WarnBad;
-  module_loc: WarnBad;
-  module_fan_out: WarnBad;
+  folder_entity_count: WarnBad;
+  folder_loc: WarnBad;
+  folder_fan_out: WarnBad;
   cohesion: WarnBad;
   [key: string]: unknown;
 }
@@ -242,6 +242,15 @@ export interface FolderShape {
   /** Share of the traffic arriving from outside that lands on one file.
    *  Absent when nothing outside depends on the folder. */
   entry_concentration?: number;
+  /** Share of the dependencies leaving the folder that start at a leaf — a
+   *  child with no outgoing edge inside the folder — or at its door. The
+   *  mirror of `entry_concentration`: that one grades what arrives, this what
+   *  leaves, and together they make a collapsed folder honest in both
+   *  directions. Only the near end is graded; where an exit lands stays its
+   *  target's business (ADR 0031). Gates `fractal` and is NOT a term in
+   *  `compliance`, exactly as `arborescence` is not. Absent when the folder
+   *  depends on nothing outside itself. */
+  egress?: number;
   /** Mean compliance of the subfolders inside. Absent when there are none. */
   child_compliance?: number;
   /** Immediate children, files and subfolders together. Reported, not scored. */
@@ -266,6 +275,8 @@ export type ShapeBlocker =
   | { gate: 'merges'; value: number }
   /** Outsiders reach in at many points; `value` is `entry_concentration`. */
   | { gate: 'entry'; value: number }
+  /** Children reach outside from the folder's middle; `value` is `egress`. */
+  | { gate: 'egress'; value: number }
   /** A subfolder is itself below hierarchical; `value` is its pattern. */
   | { gate: 'child_pattern'; value: ShapePattern }
   /** Subfolders broadly out of order; `value` is `child_compliance`. */
@@ -361,7 +372,7 @@ export interface ShapeResponse {
   picture: FolderPicture;
 }
 
-/** File- or module-level quality rollup (shape shared with Rust side). */
+/** File- or folder-level quality rollup (shape shared with Rust side). */
 export interface ScopeMetrics {
   path: string;
   entity_count: number;
@@ -394,7 +405,7 @@ export interface ScopeMetrics {
   quality_bad?: number;
   /** Composite scope score computed by the backend. */
   composite_score?: number;
-  /** How legible a picture this folder draws. Modules only — a file has
+  /** How legible a picture this folder draws. Folders only — a file has
    *  no children to draw a graph of, so it never carries one. */
   shape?: FolderShape;
 }
@@ -411,8 +422,15 @@ export interface ScopeMetrics {
 export type ViewMode = 'graph' | 'tree' | 'shape';
 
 /** Aggregation level for the graph view: show every entity, collapse to
- * one node per file, or collapse to one node per directory. */
-export type GraphLevel = 'entity' | 'file' | 'module';
+ * one node per file, or collapse to one node per directory.
+ *
+ * `'folder'` was spelled `'module'` until it collided once too often with
+ * `EntityKind::Module` — the language construct a `mod` or a Python module
+ * parses to, which reaches the UI as `kind_raw: 'Module'`. Nothing here
+ * ever meant that: the level has always grouped by the directory holding
+ * the file. Stored views written before the rename are migrated on read —
+ * see `normalizeState` in `savedViews.ts`. */
+export type GraphLevel = 'entity' | 'file' | 'folder';
 
 export type TriState = 'general' | 'on' | 'off';
 
@@ -459,6 +477,10 @@ export const NODE_COLORS: Record<string, string> = {
   Function: '#9C27B0',
   Method: '#9C27B0',
   Module: '#607D8B',
+  /** The directory rollup `collapseGraph` emits, not a `mod` declaration —
+   *  those are `Module` above. Same slate the rollup drew in when the two
+   *  shared one key, so the canvas is unchanged by the split. */
+  Folder: '#607D8B',
   Enum: '#E91E63',
   File: '#795548',
   Constant: '#00BCD4',
@@ -596,6 +618,10 @@ export const KIND_CODES: Record<string, string> = {
   Function: 'Fn',
   Method: 'Me',
   Module: 'Md',
+  /** Was `Md` while the rollup shared a key with `EntityKind::Module` —
+   *  which is what put a "module" badge on a directory and made the two
+   *  hard to tell apart on the canvas in the first place. */
+  Folder: 'Fo',
   Enum: 'En',
   File: 'Fi',
   Constant: 'Const',

@@ -43,7 +43,7 @@ covering the whole query in the name scores 1.00.
 ### The CLI cousin
 
 ```bash
-nao find compute_diff src
+mezz find compute_diff src
 ```
 
 ```
@@ -114,10 +114,10 @@ a name assembled at runtime.
 ## Also useful before a cleanup
 
 ```bash
-nao cycles src      # circular dependencies, as chains
-nao stats src       # entity and relationship counts, most-connected entities
+mezz cycles src      # circular dependencies, as chains
+mezz stats src       # entity and relationship counts, most-connected entities
 ```
 
-`nao stats`' "most connected" list includes unresolved external names
+`mezz stats`' "most connected" list includes unresolved external names
 (`Some`, `String`, `Node`) alongside your own types — read past them to the
 first entity you recognise.

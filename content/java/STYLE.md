@@ -145,7 +145,7 @@ Use this when feeding an LLM the corpus to draft new rules. Replace the
 bracketed parts before sending.
 
 ```
-You are drafting a new educator rule for the Nao project. Read the schema
+You are drafting a new educator rule for the Mezzanine project. Read the schema
 contract, the style guide, and 3 existing rules as exemplars. Produce a
 new rule file (frontmatter + markdown body) that follows the same shape.
 

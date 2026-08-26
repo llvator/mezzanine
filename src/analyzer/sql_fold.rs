@@ -7,7 +7,7 @@
 //! existed: dropped tables still present, renamed tables under every name
 //! they ever had, and columns attached to nothing.
 //!
-//! This is the one place in Nao where file order carries meaning. ADR-0007
+//! This is the one place in Mezzanine where file order carries meaning. ADR-0007
 //! records why it is confined here rather than pushed into the parser: the
 //! parser's per-file output stays content-hash cacheable, so editing one
 //! migration re-runs this replay and nothing else.

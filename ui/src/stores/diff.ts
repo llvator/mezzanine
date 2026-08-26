@@ -1,5 +1,5 @@
 /**
- * Diff store: loads the diff.json produced by `nao diff` and exposes
+ * Diff store: loads the diff.json produced by `mezz diff` and exposes
  * per-entity change status for the graph view and detail panel.
  */
 
@@ -559,8 +559,8 @@ export const diffChurnAt: Readable<(d: D3Node) => number | undefined> = derived(
  *  side by side, the way a review tool shows them. */
 export type DiffViewMode = 'unified' | 'split';
 
-const VIEW_MODE_KEY = 'nao-diff-view-mode';
-const FULL_CONTEXT_KEY = 'nao-diff-full-context';
+const VIEW_MODE_KEY = 'mezz-diff-view-mode';
+const FULL_CONTEXT_KEY = 'mezz-diff-full-context';
 
 function loadStored<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   try {

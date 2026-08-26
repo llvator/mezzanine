@@ -1,6 +1,6 @@
-//! `nao serve` — multi-repo HTTP server (SRV-003).
+//! `mezz serve` — multi-repo HTTP server (SRV-003).
 //!
-//! Where [`super::run`] (`nao watch`) serves exactly one path under a flat
+//! Where [`super::run`] (`mezz watch`) serves exactly one path under a flat
 //! `/api/*` namespace with a file watcher and SSE live-reload, this serves
 //! any number of analyzed repos under `/api/repos/{slug}/*` with neither.
 //! The two route tables are deliberately separate: watch mode's endpoints
@@ -33,17 +33,17 @@ use tokio::sync::{broadcast, RwLock, Semaphore};
 use crate::output::{self, JsonRenderer};
 
 use super::access::{self, AccessOptions, AccessPolicy};
-use super::handlers::git_commits;
+use super::handlers::{git_branch, git_commits};
 use super::jobs::{self, JobConfig, JobLimiter, Submission};
 use super::repo::{
     analyze_repo, is_valid_slug, parse_github_url, rehydrate, unsafe_passes_allowed, RepoRegistry,
     RepoSlot, RepoState, RepoSummary,
 };
 use super::scope_handler::{collect_scope, finish_scope};
-use super::types::{CommitInfo, ScopeRequest, ScopeResponse};
+use super::types::{BranchInfo, CommitInfo, ScopeRequest, ScopeResponse};
 use super::ui_dir;
 
-/// Everything `nao serve` needs from the CLI, in one place so `main.rs`
+/// Everything `mezz serve` needs from the CLI, in one place so `main.rs`
 /// doesn't grow a nine-argument call.
 pub struct ServeOptions {
     pub port: u16,
@@ -58,7 +58,7 @@ pub struct ServeOptions {
     /// Explicit location of the built browser UI; see `ui_dir::resolve`.
     pub ui_dir: Option<PathBuf>,
     /// `ui_dir` from the *user* settings file. Serve never reads a submitted
-    /// repo's `.nao/settings.json` — see [`crate::settings`] — so this is the
+    /// repo's `.mezz/settings.json` — see [`crate::settings`] — so this is the
     /// operator's own preference and nothing else.
     pub settings_ui_dir: Option<PathBuf>,
 }
@@ -246,6 +246,7 @@ fn build_router(
         .route("/api/repos/{slug}/index", get(repo_index))
         .route("/api/repos/{slug}/details", get(repo_details))
         .route("/api/repos/{slug}/details/base", get(repo_base_details))
+        .route("/api/repos/{slug}/branch", get(repo_branch))
         .route("/api/repos/{slug}/commits", get(repo_commits))
         .route("/api/repos/{slug}/scope", post(repo_scope))
         .route("/api/settings", get(settings_report_handler))
@@ -463,6 +464,19 @@ async fn repo_base_details(
     ))
 }
 
+/// GET /api/repos/{slug}/branch — what `HEAD` points at in the clone.
+///
+/// A clone is checked out on the default branch and nobody moves it, so this
+/// is close to a constant — but it is the branch the reader is looking at,
+/// and saying so is the whole point of the endpoint (UI-114).
+async fn repo_branch(
+    State(state): State<ServeState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<BranchInfo>, (StatusCode, String)> {
+    let repo = lookup(&state, &slug).await?;
+    Ok(Json(git_branch(&repo.root_path)))
+}
+
 /// GET /api/repos/{slug}/commits — recent commits of the analyzed checkout.
 /// A shallow clone has one; that's a truthful answer, not an error.
 async fn repo_commits(
@@ -496,10 +510,10 @@ fn print_startup_banner(
     ui: Option<&std::path::Path>,
 ) {
     eprintln!();
-    eprintln!("🚀 nao serve running at http://localhost:{port}");
+    eprintln!("🚀 mezz serve running at http://localhost:{port}");
     eprintln!("   Cache: {}", cache_dir.display());
     if unsafe_passes_allowed() {
-        eprintln!("   ⚠ NAO_SERVE_ALLOW_UNSAFE_PASSES is set — analysis passes that");
+        eprintln!("   ⚠ MEZZ_SERVE_ALLOW_UNSAFE_PASSES is set — analysis passes that");
         eprintln!("     execute code from the analyzed repo (rust-analyzer/build.rs)");
         eprintln!("     are ENABLED. Do not use this on repos you don't trust.");
     } else {

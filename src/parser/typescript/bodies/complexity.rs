@@ -49,7 +49,7 @@ use tree_sitter::Node;
 /// member, an overload signature, a `declare` ambient — gets `Some(1)` /
 /// `Some(0)` / `Some(0)` rather than `None`. It has one straight-through path
 /// by virtue of existing as a signature, and leaving the fields unset would
-/// make `nao quality` skip the entity entirely (the hotspot ranking filters
+/// make `mezz quality` skip the entity entirely (the hotspot ranking filters
 /// on `composite_score > 0.0`, which is the whole reason TS-003 exists).
 pub(in crate::parser::typescript) fn populate_body_metrics(
     body: Option<Node>,

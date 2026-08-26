@@ -44,7 +44,7 @@ test('a file rollup and an entity inside it are the same mark', () => {
 });
 
 test('a module rollup marks its directory', () => {
-  const mod = node({ kind_raw: 'Module', original_id: 'ui/src', file_path: 'ui/src' });
+  const mod = node({ kind_raw: 'Folder', original_id: 'ui/src', file_path: 'ui/src' });
   assert.equal(markPathOf(mod), 'ui/src');
 });
 
@@ -59,7 +59,7 @@ test('a ghost cannot be marked', () => {
 test('the root module cannot be marked', () => {
   // Its path is '', which as a scope is the entire repo: drilling into it is a
   // no-op dressed as a narrowing.
-  const root = node({ kind_raw: 'Module', original_id: '', file_path: '' });
+  const root = node({ kind_raw: 'Folder', original_id: '', file_path: '' });
   assert.equal(markPathOf(root), null);
 });
 
@@ -100,7 +100,7 @@ test('a ghost contributes no live path', () => {
 });
 
 test('a mark on a directory survives a drop to entity level', () => {
-  // Made at Module level, pruned against an entity graph where no node's
+  // Made at Folder level, pruned against an entity graph where no node's
   // file_path is ever a directory. Without the parent-directory rule this is
   // exactly the mark that would vanish on the way to being spent.
   const marks = new Set(['ui/src']);

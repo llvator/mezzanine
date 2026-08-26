@@ -13,7 +13,7 @@
  *
  * **Not persisted, on purpose.** UI-082 drew a line between a reading (what
  * the canvas is drawing) and a position (where the reader is standing), and
- * put only the first in `.nao/views.json`. A history is squarely the second:
+ * put only the first in `.mezz/views.json`. A history is squarely the second:
  * it dies with the tab, the way the camera does. The durable way back to a
  * picture is to have saved it.
  *

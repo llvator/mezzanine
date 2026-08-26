@@ -1,6 +1,6 @@
 //! AN-004 — exact call-edge resolution via rust-analyzer.
 //!
-//! nao's own call resolution is name-heuristic: a `foo()` call resolves to
+//! mezz's own call resolution is name-heuristic: a `foo()` call resolves to
 //! *some* entity named `foo`, which is wrong exactly when it matters (a
 //! same-named method on an unrelated type). This module borrows precision
 //! instead of building it: spawn rust-analyzer in batch mode, ask
@@ -41,7 +41,7 @@ pub struct CallSite {
 
 /// Default overall budget for the whole rust-analyzer batch (spawn → crate
 /// graph ready → all definitions resolved). Override with
-/// `NAO_LSP_TIMEOUT_SECS`. Fixed, not proportional to file count: the cost is
+/// `MEZZ_LSP_TIMEOUT_SECS`. Fixed, not proportional to file count: the cost is
 /// dominated by RA's per-spawn workspace load + `cargo check`, not the
 /// analyzed file count. 180s covers small/medium crates fully and yields a
 /// partial (still-labeled) result on large ones; a big cold workspace can
@@ -51,16 +51,16 @@ const DEFAULT_TIMEOUT_SECS: u64 = 180;
 /// Give-up-if-stuck window: no message from RA for this long ⇒ wedged.
 /// Generous because rust-analyzer runs `cargo check` + build scripts during
 /// startup, a phase that emits no LSP progress and can be silent for tens of
-/// seconds on a cold target. Override with `NAO_LSP_IDLE_SECS`.
+/// seconds on a cold target. Override with `MEZZ_LSP_IDLE_SECS`.
 const IDLE_SECS: u64 = 45;
 
 /// True when exact call tracing is engaged. **Opt-in** (default off): auto-
 /// spawning rust-analyzer on every analysis would re-cost the self-review
-/// hook AN-003 just made cheap, so it's off unless `NAO_LSP_EXACT=1`. When
+/// hook AN-003 just made cheap, so it's off unless `MEZZ_LSP_EXACT=1`. When
 /// enabled and rust-analyzer is on PATH, call edges resolve exact; when
 /// disabled or unavailable, analysis keeps today's heuristic edges.
 pub fn enabled_by_env() -> bool {
-    std::env::var_os("NAO_LSP_EXACT").is_some_and(|v| v == "1" || v == "true")
+    std::env::var_os("MEZZ_LSP_EXACT").is_some_and(|v| v == "1" || v == "true")
 }
 
 /// Resolve `sites` through rust-analyzer, returning a map from relationship
@@ -83,13 +83,13 @@ pub fn resolve_exact_calls(
 
     let deadline = Instant::now()
         + Duration::from_secs(
-            std::env::var("NAO_LSP_TIMEOUT_SECS")
+            std::env::var("MEZZ_LSP_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
         );
     let idle = Duration::from_secs(
-        std::env::var("NAO_LSP_IDLE_SECS")
+        std::env::var("MEZZ_LSP_IDLE_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(IDLE_SECS),
@@ -160,7 +160,7 @@ fn run(
     // answers null immediately while still indexing, so this can't hang.
     let probes: Vec<(String, u32, u32)> = queries.iter().flatten().take(8).cloned().collect();
     let ready = client.poll_until_ready(&probes, deadline, idle);
-    if std::env::var_os("NAO_LSP_DEBUG").is_some() {
+    if std::env::var_os("MEZZ_LSP_DEBUG").is_some() {
         eprintln!("  [lsp] ready => {ready}");
     }
 
@@ -206,7 +206,7 @@ fn run(
             resolved += 1;
         }
     }
-    if std::env::var_os("NAO_LSP_DEBUG").is_some() {
+    if std::env::var_os("MEZZ_LSP_DEBUG").is_some() {
         eprintln!(
             "  [lsp] answers={} non_null={} mapped={}",
             answers.len(),
@@ -269,7 +269,7 @@ struct LspClient {
 
 impl LspClient {
     fn spawn(root: &Path) -> std::io::Result<Self> {
-        let stderr = if std::env::var_os("NAO_LSP_DEBUG").is_some() {
+        let stderr = if std::env::var_os("MEZZ_LSP_DEBUG").is_some() {
             Stdio::inherit()
         } else {
             Stdio::null()
@@ -356,7 +356,7 @@ impl LspClient {
     }
 
     /// Open a document with explicit content so query positions match the
-    /// bytes nao parsed rather than whatever is on disk.
+    /// bytes mezz parsed rather than whatever is on disk.
     fn did_open(&mut self, path: &Path, text: &str) {
         self.notify(
             "textDocument/didOpen",
@@ -445,7 +445,7 @@ impl LspClient {
         idle: Duration,
         mut done: F,
     ) -> bool {
-        let debug = std::env::var_os("NAO_LSP_DEBUG").is_some();
+        let debug = std::env::var_os("MEZZ_LSP_DEBUG").is_some();
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -708,7 +708,7 @@ impl Beta { pub fn ping(&self) -> u32 { 2 } }
 pub fn run_alpha(a: &Alpha) -> u32 { a.ping() }
 ";
         let alpha_ping_line = 2usize;
-        let dir = std::env::temp_dir().join(format!("nao-an004-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-an004-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
@@ -774,7 +774,7 @@ pub fn run_alpha(a: &Alpha) -> u32 { a.ping() }
 
     #[test]
     fn cargo_root_walks_up_and_degrades_gracefully() {
-        let base = std::env::temp_dir().join(format!("nao-cargoroot-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("mezz-cargoroot-{}", std::process::id()));
         let nested = base.join("a/b/c");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&nested).unwrap();

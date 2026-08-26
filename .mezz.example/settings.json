@@ -7,7 +7,7 @@
     "**/generated/**",
     "**/fixtures/**"
   ],
-  "output_dir": ".nao/data",
+  "output_dir": ".mezz/data",
   "port": 3000,
   "debounce_ms": 300
 }

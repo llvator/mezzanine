@@ -74,10 +74,10 @@ export const ORIGIN_LABEL: Record<Origin, string> = {
 
 export const ORIGIN_TITLE: Record<Origin, string> = {
   flag: 'Passed as a flag to the command that started this server.',
-  env: 'From a NAO_* environment variable.',
-  'repo-file': "From this repo's .nao/settings.json.",
-  'user-file': 'From your ~/.config/nao/settings.json.',
-  default: "Nobody set this — it's nao's built-in default.",
+  env: 'From a MEZZ_* environment variable.',
+  'repo-file': "From this repo's .mezz/settings.json.",
+  'user-file': 'From your ~/.config/mezz/settings.json.',
+  default: "Nobody set this — it's mezz's built-in default.",
 };
 
 export const TIER_TITLE: Record<Tier, string> = {

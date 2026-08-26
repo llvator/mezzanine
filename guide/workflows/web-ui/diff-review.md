@@ -24,7 +24,7 @@ Two comparison modes behave differently on purpose:
 | Working tree vs a ref | **Follows the watcher** — every re-analysis recomputes it against the same base, so the overlay describes the tree you are editing now |
 | Commit vs commit | A fixed comparison; never follows |
 
-Pass `--pin-diff` to `nao watch` if you want a working-tree diff frozen at
+Pass `--pin-diff` to `mezz watch` if you want a working-tree diff frozen at
 the moment you computed it instead of tracking your edits.
 
 ## The workflow that pays: review before reading

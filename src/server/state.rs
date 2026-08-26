@@ -27,6 +27,10 @@ pub(crate) enum ReloadKind {
     Graph,
     /// Only the diff overlay moved. Re-fetch `/api/diff`.
     Diff,
+    /// `HEAD` moved — a checkout, a new branch, a commit. No code was
+    /// re-analyzed and no overlay changed; the only thing that is now wrong
+    /// on screen is the label saying which branch this graph is (UI-114).
+    Head,
 }
 
 impl ReloadKind {
@@ -35,6 +39,7 @@ impl ReloadKind {
         match self {
             ReloadKind::Graph => "reload",
             ReloadKind::Diff => "diff",
+            ReloadKind::Head => "head",
         }
     }
 }
@@ -134,7 +139,7 @@ pub(crate) struct AppState {
     /// `analysis_in_progress` mutex, then resets it before launching
     /// its own run.
     pub cancel: Arc<AtomicBool>,
-    /// Educator state — loaded at startup from `NAO_EDUCATOR_CONTENT` or
+    /// Educator state — loaded at startup from `MEZZ_EDUCATOR_CONTENT` or
     /// `<workspace>/content/`. `Educator::empty()` when neither resolves.
     pub educator: Arc<Educator>,
     /// The pairing token, when one was minted. Only the agent-spawn route

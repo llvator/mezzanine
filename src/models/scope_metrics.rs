@@ -1,4 +1,4 @@
-//! Per-file and per-module (directory) code-quality metrics.
+//! Per-file and per-folder (directory) code-quality metrics.
 //!
 //! Rolls entity- and relationship-level data up to coarser scopes so the
 //! UI can answer "which files are bloated?" and "which directories are
@@ -6,10 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Aggregate quality metrics for a single file OR a module (directory).
+/// Aggregate quality metrics for a single file OR a folder (directory).
 /// The shape is shared because the signals are the same at both scopes;
 /// callers distinguish them via the surrounding `FileMetrics` /
-/// `ModuleMetrics` wrapper.
+/// `FolderMetrics` wrapper.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScopeMetrics {
     /// Total non-parameter entities living in this scope.
@@ -19,7 +19,7 @@ pub struct ScopeMetrics {
     /// Subset that are containers (structs / enums / traits / modules).
     pub container_count: u32,
     /// Lines of code summed across the scope. For files this matches the
-    /// raw line count; for modules it's the sum of contained files.
+    /// raw line count; for folders it's the sum of contained files.
     pub loc: u32,
     /// Dependency edges whose source and target are both in this scope.
     pub internal_edges: u32,
@@ -165,6 +165,9 @@ pub enum ShapeBlocker {
     /// Outsiders reach in at many points rather than through one door.
     /// Carries `entry_concentration`.
     Entry(f32),
+    /// Middle-layer children reach out of the folder directly, so the
+    /// layering drawn above them is a fiction. Carries `egress`.
+    Egress(f32),
     /// A subfolder is itself below hierarchical — the recursion breaks one
     /// level down. Carries that child's pattern.
     ChildPattern(ShapePattern),
@@ -216,6 +219,11 @@ impl ShapeBlocker {
     /// Gates settled by the picture in front of the reader. `None` for the
     /// ones that are not.
     fn own_drawing_summary(&self) -> Option<String> {
+        self.picture_summary().or_else(|| self.boundary_summary())
+    }
+
+    /// The gates settled by the arrows drawn between this folder's children.
+    fn picture_summary(&self) -> Option<String> {
         Some(match self {
             ShapeBlocker::Cycles(v) => format!("a loop among its children (acyclic {v:.2})"),
             ShapeBlocker::Layering(v) => format!("edges skipping levels (layered {v:.2})"),
@@ -228,6 +236,20 @@ impl ShapeBlocker {
             ShapeBlocker::Unstructured => "no edges between its children".to_string(),
             _ => return None,
         })
+    }
+
+    /// The gate settled by the arrows leaving this folder. Split from
+    /// [`picture_summary`] rather than added to it, because the complexity
+    /// gate fails on any increase to a function that already exists
+    /// (CI-001) — and because the two answer different questions about the
+    /// same picture: one reads the arrows inside, one reads the arrows out.
+    fn boundary_summary(&self) -> Option<String> {
+        match self {
+            ShapeBlocker::Egress(v) => Some(format!(
+                "children reaching outside from its middle (out-at-the-bottom {v:.2})"
+            )),
+            _ => None,
+        }
     }
 
     /// Gates about what is inside the children, who reaches in from
@@ -302,6 +324,24 @@ pub struct FolderShape {
     /// drawing is hiding traffic. `None` for a folder nothing outside it
     /// depends on.
     pub entry_concentration: Option<f32>,
+    /// Of the dependencies this folder sends *outside* itself, the share
+    /// starting somewhere the funnel allows: a **leaf** child, which has no
+    /// outgoing edge inside the folder, or the **door**, whose job is to
+    /// import what it hands on. Low means middle-layer children reach past
+    /// their siblings out of the building. `None` for a folder that depends
+    /// on nothing outside itself.
+    ///
+    /// The mirror of `entry_concentration`, and the half that was missing
+    /// (AN-028). That one grades what *arrives* and this grades what
+    /// *leaves*, so a folder collapsed to a single node is now an honest
+    /// node in both directions. Until this existed a folder could be
+    /// `Fractal` and still leak from its middle, because nothing asked.
+    ///
+    /// Gates `Fractal` and stays out of `compliance`, exactly as
+    /// `arborescence` does (ADR 0013, ADR 0031). Where an exit *lands*
+    /// stays its target's business and is not scored here; where it
+    /// *starts* is this folder's own, and is.
+    pub egress: Option<f32>,
     /// Mean `compliance` of the subfolders directly inside this one. The
     /// recursive term — it is what makes the measure about self-similarity
     /// rather than about one level in isolation. `None` for a folder with
@@ -323,10 +363,68 @@ pub struct FolderShape {
     /// `None` only for `Fractal`, where there is no tier above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<ShapeBlocker>,
+    /// The counts the ratios above were taken over — see [`ShapeTerms`].
+    #[serde(default)]
+    pub terms: ShapeTerms,
 }
 
-/// File names that are wiring / entry-point by nature.
-const WIRING_FILES: &[&str] = &[
+/// The raw counts each ratio above was computed from.
+///
+/// Carried rather than re-derived by whoever wants to explain a number.
+/// Agents driving `reshape` were reverse-engineering these formulas from
+/// observed scores and getting them wrong — one field report had
+/// `arborescence` down as *children with exactly one parent ÷ (children −
+/// 1)*, which matches on some folders and not others, so the agent picked
+/// between candidate layouts by editing the tree and re-measuring twice.
+/// A ratio a reader cannot decompose is a ratio they can only shop for.
+///
+/// Every field is a count off the pass that produced the score, so
+/// printing `tight ÷ edges` cannot disagree with `layering` the way a
+/// second implementation of the formula eventually would.
+///
+/// Zero throughout for a folder whose graph was never built — the same
+/// state the `Option` ratios report as `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShapeTerms {
+    /// Children in the drawing.
+    pub nodes: u32,
+    /// Children sitting inside a dependency loop. `acyclicity` is
+    /// `1 − looped ÷ nodes`.
+    pub looped: u32,
+    /// Distinct edges after loops are condensed — the denominator
+    /// `layering` and `arborescence` share.
+    pub edges: u32,
+    /// Edges stepping exactly one level down. `layering` is
+    /// `tight ÷ edges`.
+    pub tight: u32,
+    /// Condensed nodes at least one edge arrives at.
+    pub reached: u32,
+    /// Condensed nodes no edge arrives at. `arborescence` is
+    /// `reached ÷ (edges + strays − 1)`, one root being what a tree has
+    /// and the rest being the folder failing to be one (ADR 0022).
+    pub strays: u32,
+    /// Dependencies arriving from outside the folder.
+    pub arrivals: u32,
+    /// How many of them land on the busiest single file.
+    /// `entry_concentration` is `busiest ÷ arrivals`.
+    pub busiest: u32,
+    /// Dependencies leaving the folder for somewhere outside it.
+    pub exits: u32,
+    /// How many of them start at a middle-layer child — one that has an
+    /// outgoing edge inside the folder and is not its door. `egress` is
+    /// `1 − middle_exits ÷ exits`.
+    pub middle_exits: u32,
+}
+
+/// File names that are wiring / entry-point by nature — the folder
+/// speaking rather than a child of it.
+///
+/// Public because two unrelated passes need the same list. `ScopeMetrics`
+/// discounts a wiring file's coupling; `grouping` refuses to let one head
+/// a proposed subfolder, since a folder built behind `mod.rs` is the
+/// folder again under a new name — and in a language whose module system
+/// follows the file tree, `mod.rs` cannot be moved at all.
+pub const WIRING_FILES: &[&str] = &[
     "mod.rs",
     "main.rs",
     "lib.rs",
@@ -337,40 +435,40 @@ const WIRING_FILES: &[&str] = &[
 ];
 
 impl ScopeMetrics {
-    /// Compute the composite scope score. `path` is the file/module path
-    /// (used for wiring-file detection). `is_module` toggles file vs.
-    /// module thresholds.
-    pub fn compute_composite_score(&mut self, path: &str, is_module: bool) {
+    /// Compute the composite scope score. `path` is the file/folder path
+    /// (used for wiring-file detection). `is_folder` toggles file vs.
+    /// folder thresholds.
+    pub fn compute_composite_score(&mut self, path: &str, is_folder: bool) {
         let t = super::thresholds::Thresholds::default();
 
-        // The root module encompasses the entire project — its entity count
+        // The root folder encompasses the entire project — its entity count
         // and LOC will always be at maximum. Penalizing it is not actionable.
         // Detected by: no external edges at all (nothing outside it exists).
-        let is_root_module =
-            is_module && self.fan_in == 0 && self.fan_out == 0 && self.external_edges == 0;
+        let is_root_folder =
+            is_folder && self.fan_in == 0 && self.fan_out == 0 && self.external_edges == 0;
 
-        let entity_red = if is_module {
-            t.module_entity_count.bad
+        let entity_red = if is_folder {
+            t.folder_entity_count.bad
         } else {
             t.file_entity_count.bad
         };
-        let loc_red = if is_module {
-            t.module_loc.bad
+        let loc_red = if is_folder {
+            t.folder_loc.bad
         } else {
             t.file_loc.bad
         };
-        let fo_red = if is_module {
-            t.module_fan_out.bad
+        let fo_red = if is_folder {
+            t.folder_fan_out.bad
         } else {
             t.file_fan_out.bad
         };
 
-        let entity = if is_root_module {
+        let entity = if is_root_folder {
             0.0
         } else {
             (self.entity_count as f32 / entity_red).min(2.0)
         };
-        let mut loc = if is_root_module {
+        let mut loc = if is_root_folder {
             0.0
         } else {
             (self.loc as f32 / loc_red).min(2.0)
@@ -430,7 +528,7 @@ pub struct FileMetrics {
 /// Per-directory rollup. `path` is relative to the analysis root; the
 /// root directory itself is `""`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModuleMetrics {
+pub struct FolderMetrics {
     pub path: String,
     pub metrics: ScopeMetrics,
 }

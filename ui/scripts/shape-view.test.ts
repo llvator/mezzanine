@@ -83,7 +83,7 @@ test('a sibling folder sharing a name prefix is outside', () => {
 
 test('a nested file collapses to the child of the folder holding it', () => {
   // Not to its own parent directory — which is what makes `ScopeOf` need to
-  // be injectable at all, since `moduleOf` can only ever answer the latter.
+  // be injectable at all, since `folderOf` can only ever answer the latter.
   assert.equal(childHolding('src/db', 'src/db/inner/deep/rows.rs'), 'src/db/inner');
   assert.equal(childHolding('src/db', 'src/db/pool.rs'), 'src/db/pool.rs');
   assert.equal(childHolding('src/db', 'src/other/x.rs'), null);
@@ -110,10 +110,10 @@ test('the canvas holds the folder, its neighbours, and nothing else', () => {
   const paths = drawn.nodes.map((n) => n.original_id).sort();
 
   assert.deepEqual(paths, ['src/api.rs', 'src/db/inner', 'src/db/pool.rs']);
-  // The nested file became its subfolder's circle, drawn as a Module — so a
+  // The nested file became its subfolder's circle, drawn as a Folder — so a
   // reader can open it and the rollup carries the subfolder's own metrics.
   const inner = drawn.nodes.find((n) => n.original_id === 'src/db/inner');
-  assert.equal(inner?.kind_raw, 'Module');
+  assert.equal(inner?.kind_raw, 'Folder');
   // Two hops out is most of the repo, so it is not drawn: `unrelated` only
   // touches the folder through `api`.
   assert.ok(!paths.includes('src/util/far.rs'));

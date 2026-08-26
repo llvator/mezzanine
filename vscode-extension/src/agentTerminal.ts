@@ -70,7 +70,7 @@ function fetchRefactorPrompt(port: number, entityId: string): Promise<string> {
  * the prompt byte-identical to what the copy button produces.
  */
 function writePromptFile(entityName: string, prompt: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nao-refactor-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mezz-refactor-'));
   const safe = entityName.replace(/[^\w.-]+/g, '_').slice(0, 60) || 'entity';
   const file = path.join(dir, `${safe}.prompt.md`);
   fs.writeFileSync(file, prompt, 'utf-8');
@@ -136,7 +136,7 @@ export async function spawnAgentTerminal(opts: SpawnAgentOptions): Promise<vscod
   const binary = opts.binary?.trim() || 'claude';
   if (!isOnPath(binary)) {
     throw new AgentLaunchError(
-      `'${binary}' is not on PATH — install Claude Code, or set nao.claudeBinary to its full path`,
+      `'${binary}' is not on PATH — install Claude Code, or set mezz.claudeBinary to its full path`,
       prompt
     );
   }
@@ -144,7 +144,7 @@ export async function spawnAgentTerminal(opts: SpawnAgentOptions): Promise<vscod
   const file = writePromptFile(opts.entityName, prompt);
 
   const terminal = vscode.window.createTerminal({
-    name: `nao: refactor ${opts.entityName}`,
+    name: `mezz: refactor ${opts.entityName}`,
     cwd: opts.cwd,
     // Marks the terminal as ours in the panel's dropdown.
     iconPath: new vscode.ThemeIcon('sparkle'),

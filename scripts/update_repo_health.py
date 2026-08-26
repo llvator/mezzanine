@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate the Repo Health table in README.md.
 
-Runs `nao analyze` over `src/` **as staged**, computes a small set of
+Runs `mezz analyze` over `src/` **as staged**, computes a small set of
 summary metrics, and rewrites the sentinel-bracketed block in `README.md`.
 
 Staged, not on disk: the table travels inside a commit and so has to
@@ -167,8 +167,8 @@ def staged_src(root: Path, dest: Path) -> Path | None:
     return dest / "src"
 
 
-def run_nao(root: Path, target: Path, output: Path) -> None:
-    """Run nao via cargo so cargo decides whether to rebuild.
+def run_mezz(root: Path, target: Path, output: Path) -> None:
+    """Run mezz via cargo so cargo decides whether to rebuild.
 
     Built from the working tree, pointed at `target`. The binary should be
     the newest one available; what it *measures* is the argument.
@@ -176,7 +176,7 @@ def run_nao(root: Path, target: Path, output: Path) -> None:
     with output.open("w") as f:
         subprocess.run(
             [
-                "cargo", "run", "--release", "--quiet", "--bin", "nao", "--",
+                "cargo", "run", "--release", "--quiet", "--bin", "mezz", "--",
                 "analyze", "-f", "json", "-l", "rust", str(target),
             ],
             cwd=root,
@@ -202,7 +202,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             target = root / "src"
-        run_nao(root, target, tmp)
+        run_mezz(root, target, tmp)
 
     metrics = collect_metrics(tmp)
     block = render(metrics)

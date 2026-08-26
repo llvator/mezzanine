@@ -1,0 +1,332 @@
+# Cut a release: prebuilt binaries for every platform we can build natively,
+# plus the packaged VS Code extension, attached to the GitHub Release.
+#
+# Why this exists: until it did, the only way to get mezz was `git clone` +
+# rustup + a five-minute cargo build. That is a toolchain requirement most
+# people will not clear to try a visualizer, and it gated the two channels
+# that actually carry discovery — the Marketplace listing and a one-line
+# install script — because both need a binary that already exists.
+#
+# Native runners only, deliberately. build.rs compiles the vendored Dart
+# grammar with `cc`, so every target needs a working C toolchain for that
+# target; picking a runner whose own architecture matches keeps that the
+# stock compiler rather than a cross-toolchain we would have to install and
+# then debug from a distance. linux-aarch64 is the one popular target this
+# leaves out, and it wants `cross` in its own job rather than a flag here.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # Re-run against an existing tag when a job fails for a reason that has
+  # nothing to do with the code — a runner image change, a flaky download.
+  # Re-pushing a tag to retry would rewrite what people may already have.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach assets to (e.g. v1.3.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The browser UI is platform-independent, so it is built once and reused.
+  # Building it inside each platform job would need node on all four runners
+  # and would produce four byte-different bundles from content-hashed asset
+  # names, which makes the archives pointlessly hard to compare.
+  ui:
+    name: browser UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # `npm install`, not `npm ci`: ui/package-lock.json is out of sync with
+      # its package.json, and `ci` refuses on a drifted lockfile. Every other
+      # path into ui/ makes the same choice — see scripts/install.sh.
+      #
+      # ui/public is emptied first because vite copies whatever it finds there
+      # verbatim into the bundle, and what it usually finds is a developer's
+      # own `mezz watch` output: data.index.json and friends, which carry the
+      # absolute root of the machine that produced them and a listing of every
+      # directory in it. Those files are gitignored, so a clean checkout has
+      # none — this makes that a guarantee rather than a fact about today's
+      # .gitignore.
+      - name: Build UI
+        run: |
+          set -euo pipefail
+          rm -f ui/public/data*.json ui/public/diff.json
+          cd ui
+          npm install
+          npm run build
+
+      # The bundle ships to strangers, so assert the above rather than trust
+      # it: an absolute home path in a release archive is not retractable once
+      # someone has downloaded it.
+      #
+      # The pattern is an alternation rather than two plain -e strings so that
+      # this file does not itself contain the literal path prefix it looks
+      # for. The release snapshot is gated by a check of exactly that shape,
+      # and that check has no whitelist on purpose — a guard written the
+      # obvious way fails the publish it exists to protect.
+      - name: Assert the bundle carries no local paths
+        run: |
+          set -euo pipefail
+          hits=$(grep -rIlE '/(Users|home)/[^/[:space:]]+/' ui/dist 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::built UI contains an absolute home path"
+            printf '%s\n' "$hits" | head
+            exit 1
+          fi
+          echo "ok: no home paths in ui/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          retention-days: 1
+
+  binaries:
+    name: ${{ matrix.target }}
+    needs: ui
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing should not throw away three good archives — the
+      # release job publishes what it gets, and a missing target can be
+      # filled in with a workflow_dispatch re-run.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mezz --bin elevator
+
+      # Layout matters and is not cosmetic: `mezz watch` finds the browser UI
+      # at a `ui/dist` NEXT TO the running executable (src/server/ui_dir.rs).
+      # Shipping the bundle anywhere else in the archive gives a mezz that
+      # starts, serves its API, and has no UI to point anyone at.
+      - name: Stage archive (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="mezz-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$DIR/ui"
+          cp "target/${{ matrix.target }}/release/mezz" "dist/$DIR/"
+          cp "target/${{ matrix.target }}/release/elevator" "dist/$DIR/"
+          cp -R ui/dist "dist/$DIR/ui/dist"
+          cp README.md LICENSE "dist/$DIR/"
+          tar -czf "dist/$DIR.tar.gz" -C dist "$DIR"
+          shasum -a 256 "dist/$DIR.tar.gz" | awk '{print $1"  '"$DIR"'.tar.gz"}' > "dist/$DIR.tar.gz.sha256"
+
+      - name: Stage archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ('${{ github.event.inputs.tag }}') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
+          $dir = "mezz-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$dir/ui" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mezz.exe" "dist/$dir/"
+          Copy-Item "target/${{ matrix.target }}/release/elevator.exe" "dist/$dir/"
+          Copy-Item -Recurse "ui/dist" "dist/$dir/ui/dist"
+          Copy-Item README.md, LICENSE "dist/$dir/"
+          Compress-Archive -Path "dist/$dir" -DestinationPath "dist/$dir.zip"
+          (Get-FileHash "dist/$dir.zip" -Algorithm SHA256).Hash.ToLower() + "  $dir.zip" |
+            Out-File -Encoding ascii "dist/$dir.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          retention-days: 7
+
+      # The bare engine, for the extension packaging job to bundle. Uploaded
+      # separately from the archive so that job does not have to unpack a
+      # tarball to find one file.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/mezz
+            target/${{ matrix.target }}/release/mezz.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # One VSIX per platform, each carrying the matching engine, plus a
+  # universal one that carries none.
+  #
+  # This is what turns the extension from "install Rust first" into a click.
+  # VS Code picks the platform-specific package matching the machine and
+  # falls back to the universal one when there is no match — so the four
+  # targets we build get a zero-prerequisite install, and everyone else
+  # (linux-arm64, alpine) still gets a working extension that looks for the
+  # CLI on PATH, which is exactly the old behaviour.
+  #
+  # One job rather than a matrix: `vsce package --target` only changes what
+  # goes in the zip and which platform is stamped on it, so the expensive
+  # part — npm install and the webview build — is done once and reused for
+  # all five packages instead of five times over.
+  vsix:
+    name: vsix
+    needs: [ui, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: engines
+
+      # build:all rebuilds the webview itself — `build:vscode` is a different
+      # vite config from the browser build, so the ui-dist artifact cannot
+      # stand in for it — and copies content/ into the extension.
+      - name: Build extension once
+        run: |
+          cd vscode-extension
+          npm install
+          npm run build:all
+
+      - name: Package every variant
+        run: |
+          set -euo pipefail
+          cd vscode-extension
+          out=../vsix-out && mkdir -p "$out"
+
+          # Universal first, with no bin/ present, so it cannot pick up an
+          # engine left behind by a previous iteration.
+          rm -rf bin
+          npx --yes @vscode/vsce package --no-dependencies --out "$out/"
+          echo "packaged universal"
+
+          # rust target -> vsce target
+          package_for() {
+            local rust="$1" code="$2" exe="${3:-mezz}"
+            local src="../engines/binary-$rust/$exe"
+            if [ ! -f "$src" ]; then
+              echo "::error::missing engine for $rust ($src)"
+              return 1
+            fi
+            rm -rf bin && mkdir -p bin
+            cp "$src" "bin/$exe"
+            chmod +x "bin/$exe"
+            npx --yes @vscode/vsce package --no-dependencies --target "$code" --out "$out/"
+            echo "packaged $code"
+          }
+
+          package_for aarch64-apple-darwin      darwin-arm64
+          package_for x86_64-apple-darwin       darwin-x64
+          package_for x86_64-unknown-linux-gnu  linux-x64
+          package_for x86_64-pc-windows-msvc    win32-x64      mezz.exe
+
+          rm -rf bin
+          ls -la "$out"
+
+      # Assert the bundling actually happened. A VSIX is a zip, and a silent
+      # `cp` failure would ship a platform package whose whole reason to
+      # exist is the file it is missing — and it would look fine until a
+      # user installed it.
+      - name: Assert each platform package carries its engine
+        run: |
+          set -euo pipefail
+          for f in vsix-out/*.vsix; do
+            case "$f" in
+              *darwin*|*linux*|*win32*)
+                if unzip -l "$f" | grep -qE 'extension/bin/mezz(\.exe)?$'; then
+                  echo "ok   $(basename "$f") carries an engine"
+                else
+                  echo "::error::$(basename "$f") has no engine in bin/"; exit 1
+                fi ;;
+              *)
+                if unzip -l "$f" | grep -qE 'extension/bin/mezz(\.exe)?$'; then
+                  echo "::error::$(basename "$f") is the universal package and must NOT carry one"; exit 1
+                fi
+                echo "ok   $(basename "$f") is universal, no engine as intended" ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: vsix-out/*.vsix
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [binaries, vsix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+
+      # Artifacts arrive one directory per artifact name; the release wants a
+      # flat list of files.
+      - name: Flatten and list
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          find assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' -o -name '*.vsix' \) \
+            -exec cp {} upload/ \;
+          # One combined checksum file is what a reader actually wants; the
+          # per-archive ones stay so a single download can be verified alone.
+          cat upload/*.sha256 > upload/SHA256SUMS.txt
+          ls -la upload
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: upload/*
+          # Keep whatever release notes were written by hand; this workflow
+          # attaches assets and must not overwrite prose.
+          append_body: true
+          body: |
+
+            ---
+            Prebuilt binaries below. Extract, then put `mezz` on your `PATH` —
+            keep the `ui/` directory beside it so `mezz watch` can serve the
+            browser UI. Verify with `SHA256SUMS.txt`.

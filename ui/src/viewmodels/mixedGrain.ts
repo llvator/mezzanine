@@ -21,7 +21,7 @@
  *     drawn over a tree, and the two disagree: a file can easily hold one
  *     entity the focus calls and another nothing reaches. Drawing the first
  *     as a circle while the second is folded into a directory rollup would
- *     put an entity on screen *and* a Module node that contains it — the same
+ *     put an entity on screen *and* a Folder node that contains it — the same
  *     code twice, once inside the other. `promote` is the rule that stops it.
  *
  *   - **Distance is measured on the raw entity graph**, before any collapse.
@@ -30,10 +30,10 @@
  */
 
 import type { D3Link, D3Node, GraphLevel } from '../types/graph';
-import { moduleOf } from './collapseGraph.ts';
+import { folderOf } from './collapseGraph.ts';
 
 /** Coarseness, ascending. `entity` is the finest thing there is. */
-const RANK: Record<GraphLevel, number> = { entity: 0, file: 1, module: 2 };
+const RANK: Record<GraphLevel, number> = { entity: 0, file: 1, folder: 2 };
 
 /** The finer of two grains. */
 function finer(a: GraphLevel, b: GraphLevel): GraphLevel {
@@ -61,14 +61,14 @@ export type RingGrains = readonly [GraphLevel, ...GraphLevel[]];
  * this repo; three is a hairball again on any node with real fan-in, which is
  * the case the reader most wants to look at.
  */
-export const DEFAULT_RINGS: RingGrains = ['entity', 'entity', 'file', 'module'];
+export const DEFAULT_RINGS: RingGrains = ['entity', 'entity', 'file', 'folder'];
 
 /**
  * The rings a reach and an outer grain describe: `reach` hops of entities
  * around the focus, then everything else.
  *
  * Two controls, and the level buttons keep their meaning rather than gaining
- * a fourth entry — with a focus set, Module means *module out there*, and the
+ * a fourth entry — with a focus set, Folder means *folder out there*, and the
  * reach says how far "here" extends. Deliberately no graded file ring in
  * between: it would be a ring the reader never asked for and cannot see in
  * either control, and the promise that the level button says what the rest of
@@ -85,7 +85,7 @@ export function ringsFor(reach: number, outer: GraphLevel): RingGrains {
  * The focus is a path and never an id, for the reason `f.visual_scopes`'
  * marks are: a ring plan's whole job is to survive the level change it
  * causes, and `collapseGraph` mints fresh ids on every one of those. It also
- * means a reader can focus a File or Module rollup and have the rings open it
+ * means a reader can focus a File or Folder rollup and have the rings open it
  * — where seeding from the selected node would delete the node that seeded
  * the plan the moment the plan drew.
  *
@@ -172,7 +172,7 @@ export interface RingPlan {
 /**
  * Assign a grain to every node, from its distance to the focus.
  *
- * `seed` is entity ids, never nodes: when the reader has a File or Module
+ * `seed` is entity ids, never nodes: when the reader has a File or Folder
  * rollup selected the caller resolves it to the entities inside first, and
  * that resolution needs the scope rules this module deliberately does not
  * import.
@@ -194,7 +194,7 @@ export function planRingGrain(
     // A ghost is in no scope at any grain — the same exemption `f.grouping`
     // holds. It is one circle when the picture is drawing entities at all, and
     // `collapseGraph` drops it otherwise, so it counts only in that case.
-    if (n.file_path) scopes.add(g === 'entity' ? n.id : g === 'file' ? n.file_path : moduleOf(n));
+    if (n.file_path) scopes.add(g === 'entity' ? n.id : g === 'file' ? n.file_path : folderOf(n));
     else if (g === 'entity') scopes.add(n.id);
   }
 
@@ -236,7 +236,7 @@ function promoteScopes(
   }
   for (const n of nodes) {
     if (!n.file_path) continue;
-    const mod = moduleOf(n);
+    const mod = folderOf(n);
     const m = modGrain.get(mod);
     const g = fileGrain.get(n.file_path)!;
     modGrain.set(mod, m === undefined ? g : finer(m, g));
@@ -250,14 +250,14 @@ function promoteScopes(
  * A module nobody reached stays one circle however its files were labelled; a
  * module with anything in reach is opened, and then each file inside draws at
  * its own grain — which for a file out of reach is one File circle, never a
- * second Module overlapping the first.
+ * second Folder overlapping the first.
  */
 function clampToScope(
   node: D3Node,
   fileGrain: ReadonlyMap<string, GraphLevel>,
   modGrain: ReadonlyMap<string, GraphLevel>,
 ): GraphLevel {
-  if (modGrain.get(moduleOf(node)) === 'module') return 'module';
+  if (modGrain.get(folderOf(node)) === 'folder') return 'folder';
   return fileGrain.get(node.file_path) === 'entity' ? 'entity' : 'file';
 }
 

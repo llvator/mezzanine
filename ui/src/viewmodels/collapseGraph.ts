@@ -1,6 +1,6 @@
 /**
  * Graph aggregation: collapse entity-level nodes down to one node per file
- * or one node per module (directory), re-routing edges between scopes and
+ * or one node per folder (directory), re-routing edges between scopes and
  * merging weights. Keeps the output shape identical to `GraphData` so the
  * downstream D3 pipeline, filters, and selection flow are unchanged.
  *
@@ -20,10 +20,10 @@ import type { D3Node, D3Link, GraphData, GraphLevel, EntityMetrics, ScopeMetrics
 const EMPTY_EXPANSION: ReadonlySet<string> = new Set<string>();
 
 /** The directory holding a node's file. Exported so `mixedGrain` resolves a
- *  module the same way this does — the two deciding a scope differently is
+ *  folder the same way this does — the two deciding a scope differently is
  *  the one bug a ring plan cannot survive, since the grain it picks and the
  *  scope this collapses into would name different things. */
-export function moduleOf(node: D3Node): string {
+export function folderOf(node: D3Node): string {
   const i = node.file_path.lastIndexOf('/');
   return i >= 0 ? node.file_path.slice(0, i) : '';
 }
@@ -75,7 +75,7 @@ export type GrainOf = (node: D3Node) => GraphLevel;
  * node objects on every level change, so an id-keyed expansion set would
  * silently stop matching the moment the view moved.
  *
- * Expansion opens exactly one level: an expanded module renders as its
+ * Expansion opens exactly one level: an expanded folder renders as its
  * files, an expanded file as its entities. Anything more would make a single
  * gesture unpredictable — the reader would not know how much they were about
  * to add to the canvas. A ring plan (`mixedGrain.ts`) is the deliberate
@@ -84,7 +84,7 @@ export type GrainOf = (node: D3Node) => GraphLevel;
  *
  * A node with no file_path — a ghost — is never expanded, and takes the bare
  * level so `scopeIdFor` drops it below Entity. That is not an optimisation:
- * the root module's path is `''`, so an expanded root would otherwise test
+ * the root folder's path is `''`, so an expanded root would otherwise test
  * `expanded.has('')` against a ghost's empty file_path and promote thousands
  * of external symbols onto the canvas.
  */
@@ -93,7 +93,7 @@ export function grainFromLevel(level: GraphLevel, expanded: ReadonlySet<string>)
     if (level === 'entity') return 'entity';
     if (!node.file_path) return level;
     if (level === 'file') return expanded.has(node.file_path) ? 'entity' : 'file';
-    return expanded.has(moduleOf(node)) ? 'file' : 'module';
+    return expanded.has(folderOf(node)) ? 'file' : 'folder';
   };
 }
 
@@ -105,7 +105,7 @@ export function grainFromLevel(level: GraphLevel, expanded: ReadonlySet<string>)
  * which is enough for every uniform level and for a ring plan. It is not
  * enough for a picture rooted at one folder: a file three directories down
  * has to collapse into the immediate child of that folder holding it, and
- * that is an ancestor `moduleOf` never names — it always answers the file's
+ * that is an ancestor `folderOf` never names — it always answers the file's
  * own parent.
  *
  * `null` drops the node from the canvas entirely, which is what makes this a
@@ -123,7 +123,7 @@ export type ScopeOf = (node: D3Node, grain: GraphLevel) => string | null;
  * carries thousands of them (6 598 against 13 615 real entities on this
  * repo), so they cannot each become a circle at a collapsed level. They used
  * to land on the `''` scope — the same key the repo ROOT directory has at
- * module level — and the edge merge below dropped every edge touching it,
+ * folder level — and the edge merge below dropped every edge touching it,
  * testing `!srcScope` where it meant "no scope at all". A root-level file's
  * relationships disappeared with them: in a doc graph the root holds the hub
  * documents (README, CLAUDE.md, CONTEXT.md), so the reader who selected one
@@ -136,7 +136,7 @@ function scopeIdFor(node: D3Node, grain: GraphLevel): string | null {
   if (grain === 'entity') return node.id;
   if (!node.file_path) return null;
   if (grain === 'file') return node.file_path;
-  return moduleOf(node);
+  return folderOf(node);
 }
 
 /** True when this scope id is a single entity rather than a rollup — i.e.
@@ -157,7 +157,7 @@ function splitPath(p: string): { name: string; dir: string } {
   return { name: p.slice(i + 1), dir: p.slice(0, i) };
 }
 
-/** Promote a file/module `ScopeMetrics` entry to the shape expected by D3Node
+/** Promote a file/folder `ScopeMetrics` entry to the shape expected by D3Node
  * (`EntityMetrics`). Only the fields the UI already renders are populated. */
 function scopeToEntityMetrics(s: ScopeMetrics): EntityMetrics {
   return {
@@ -166,13 +166,13 @@ function scopeToEntityMetrics(s: ScopeMetrics): EntityMetrics {
     fan_out: s.fan_out,
     in_cycle: s.in_cycle,
     method_count: s.callable_count,
-    // CC / nesting / params don't map to a file or module aggregate.
+    // CC / nesting / params don't map to a file or folder aggregate.
     cyclomatic: undefined,
     max_nesting: undefined,
     param_count: undefined,
     field_count: s.entity_count,
     public_field_ratio: undefined,
-    // The scope's OWN composite score, matching `fileRows` / `moduleRows` —
+    // The scope's OWN composite score, matching `fileRows` / `folderRows` —
     // so a node's colour on the canvas and its row in the Quality panel are
     // the same number.
     //
@@ -192,7 +192,7 @@ function scopeToEntityMetrics(s: ScopeMetrics): EntityMetrics {
 /**
  * Collapse `raw` to one node per scope at the requested level. When
  * `level === 'entity'` the input is returned as-is. Scope rollup metrics
- * from `raw.files` / `raw.modules` are attached to the corresponding node
+ * from `raw.files` / `raw.folders` are attached to the corresponding node
  * so the per-entity info panel can display meaningful numbers on a collapsed
  * node.
  */
@@ -214,10 +214,10 @@ export function collapseGraph(
   const scopeFor = scopeOf ?? scopeIdFor;
 
   const fileIndex = new Map((raw.files ?? []).map((f) => [f.path, f]));
-  const moduleIndex = new Map((raw.modules ?? []).map((m) => [m.path, m]));
+  const folderIndex = new Map((raw.folders ?? []).map((m) => [m.path, m]));
 
   // Build one D3Node per unique scope id encountered. We preserve the set of
-  // file paths per scope (mostly 1 for file level, N for module level) so
+  // file paths per scope (mostly 1 for file level, N for folder level) so
   // the detail panel can still show the underlying file list.
   const nodes = new Map<string, D3Node>();
   const entityToScope = new Map<string, string>();
@@ -239,16 +239,20 @@ export function collapseGraph(
       continue;
     }
 
-    // A module expanded to files yields File nodes even though the requested
-    // level is Module; a file expanded to entities is handled above. This is
+    // A folder expanded to files yields File nodes even though the requested
+    // level is Folder; a file expanded to entities is handled above. This is
     // what makes the view *mixed* rather than uniform — and with a ring plan
     // the grain is simply read off the node instead of being reconstructed
     // from the level and the expansion set.
     const isFileNode = grain === 'file';
     const { name, dir } = splitPath(scopeId);
     const id = sanitizeId(scopeId) || '_root_';
-    const kindRaw = isFileNode ? 'File' : 'Module';
-    const metricsSource = isFileNode ? fileIndex.get(scopeId) : moduleIndex.get(scopeId);
+    // 'Folder', not 'Module': `EntityKind::Module` reaches the UI as
+    // `kind_raw: 'Module'` too, and every `kind_raw === 'Module'` test in
+    // the codebase means "is this a directory rollup" — so a `mod`
+    // declaration answered yes to all of them.
+    const kindRaw = isFileNode ? 'File' : 'Folder';
+    const metricsSource = isFileNode ? fileIndex.get(scopeId) : folderIndex.get(scopeId);
 
     nodes.set(scopeId, {
       id,
@@ -348,7 +352,7 @@ export function collapseGraph(
     nodes: nodeList,
     links: linkList,
     files: raw.files,
-    modules: raw.modules,
+    folders: raw.folders,
     thresholds: raw.thresholds,
   };
 }

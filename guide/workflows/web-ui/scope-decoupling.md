@@ -2,7 +2,7 @@
 
 > What does this subsystem depend on, with fan-in still telling the truth?
 
-Nao has two scope controls, and the difference between them is the most
+Mezzanine has two scope controls, and the difference between them is the most
 commonly misused thing in the UI:
 
 | Panel | Controls | Effect |
@@ -71,7 +71,7 @@ Descendants only, so narrowing to one branch still narrows.
 
 ## Cheap version
 
-**Nao: Visualize Current File** gives you a compact view focused on the
+**Mezzanine: Visualize Current File** gives you a compact view focused on the
 entity at your cursor, with the project-wide analysis intact behind it. When
 the question is just "what does this file touch," that is one command instead
 of two panels.

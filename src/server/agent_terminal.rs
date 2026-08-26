@@ -111,11 +111,11 @@ fn is_same_origin(headers: &HeaderMap) -> bool {
 
 /// Resolve the terminal program to launch.
 ///
-/// `NAO_TERMINAL` overrides everything, because terminal choice is personal
+/// `MEZZ_TERMINAL` overrides everything, because terminal choice is personal
 /// and any built-in list will be wrong for someone. Otherwise probe the
 /// platform's usual suspects rather than assuming one is installed.
 fn resolve_terminal() -> Option<String> {
-    if let Ok(explicit) = std::env::var("NAO_TERMINAL") {
+    if let Ok(explicit) = std::env::var("MEZZ_TERMINAL") {
         let explicit = explicit.trim().to_string();
         if !explicit.is_empty() {
             return Some(explicit);
@@ -167,7 +167,7 @@ fn write_launcher(
     prompt: &str,
     claude: &str,
 ) -> std::io::Result<(PathBuf, PathBuf)> {
-    let dir = std::env::temp_dir().join(format!("nao-agent-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mezz-agent-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let prompt_file = dir.join("refactor.prompt.md");
     std::fs::write(&prompt_file, prompt)?;
@@ -279,19 +279,19 @@ pub(crate) async fn terminal_handler(
     // 3. Resolve both programs before launching anything: a terminal that
     //    opens and immediately prints "claude: command not found" is worse
     //    than an error the caller can render.
-    let claude = std::env::var("NAO_CLAUDE_BIN")
+    let claude = std::env::var("MEZZ_CLAUDE_BIN")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "claude".to_string());
     if !which(&claude) {
         return Err((
             StatusCode::PRECONDITION_FAILED,
-            format!("'{claude}' is not on PATH — install Claude Code or set NAO_CLAUDE_BIN"),
+            format!("'{claude}' is not on PATH — install Claude Code or set MEZZ_CLAUDE_BIN"),
         ));
     }
     let terminal = resolve_terminal().ok_or((
         StatusCode::PRECONDITION_FAILED,
-        "No terminal application found — set NAO_TERMINAL to the one you use".to_string(),
+        "No terminal application found — set MEZZ_TERMINAL to the one you use".to_string(),
     ))?;
 
     let (prompt_file, script) = write_launcher(&repo_root, &prompt, &claude).map_err(|e| {
@@ -377,7 +377,7 @@ mod tests {
     /// as a command-line argument would hit `ARG_MAX` and mangle quoting.
     #[test]
     fn launcher_references_the_prompt_file_rather_than_inlining_it() {
-        let dir = std::env::temp_dir().join("nao-launcher-test");
+        let dir = std::env::temp_dir().join("mezz-launcher-test");
         let _ = std::fs::create_dir_all(&dir);
         let big = "x".repeat(200_000);
         let (prompt_file, script) = write_launcher(&dir, &big, "claude").unwrap();
@@ -400,11 +400,11 @@ mod tests {
     /// An explicit choice always wins — any built-in candidate list is wrong
     /// for somebody.
     #[test]
-    fn nao_terminal_overrides_the_probe() {
-        std::env::set_var("NAO_TERMINAL", "my-terminal");
+    fn mezz_terminal_overrides_the_probe() {
+        std::env::set_var("MEZZ_TERMINAL", "my-terminal");
         assert_eq!(resolve_terminal().as_deref(), Some("my-terminal"));
-        std::env::set_var("NAO_TERMINAL", "   ");
+        std::env::set_var("MEZZ_TERMINAL", "   ");
         assert_ne!(resolve_terminal().as_deref(), Some("   "));
-        std::env::remove_var("NAO_TERMINAL");
+        std::env::remove_var("MEZZ_TERMINAL");
     }
 }

@@ -147,7 +147,7 @@
   // rollup, and the before-source from the sidecar, whose file entries are
   // keyed by that identical repo-relative path.
   $: scopePath = entity ? normalizeScopePath(entity.original_id) : '';
-  $: isScopeNode = entity?.kind_raw === 'File' || entity?.kind_raw === 'Module';
+  $: isScopeNode = entity?.kind_raw === 'File' || entity?.kind_raw === 'Folder';
   $: scopeChange = isScopeNode && $diffScopeChanges ? $diffScopeChanges.get(scopePath) : undefined;
   $: scopeTally = isScopeNode && $diffScopeCounts ? $diffScopeCounts.get(scopePath) : undefined;
   /** The entity's own status, or the rolled-up one for a scope node. */
@@ -290,7 +290,7 @@
   $: showPfr = isContainer && metrics?.public_field_ratio != null;
   $: pfrScored = showPfr && (metrics?.method_count ?? 0) > 3;
 
-  /** UI-091. On a File or Module node these two cells are rollups over
+  /** UI-091. On a File or Folder node these two cells are rollups over
    *  dependency edges, and a scope whose relationships are all references
    *  scores `0` on both while the canvas draws arrows out of it. `scope_metrics`
    *  now carries what was passed over, so the cell can say "not measured"
@@ -382,7 +382,7 @@
          row. Outline rather than filled: the accent is light in the nord
          theme, so a fixed foreground on a filled accent would fail there
          (UI-012). -->
-    {#if !compact && (entity.kind_raw === 'File' || entity.kind_raw === 'Module')}
+    {#if !compact && (entity.kind_raw === 'File' || entity.kind_raw === 'Folder')}
       <button
         type="button"
         class="drill-btn"

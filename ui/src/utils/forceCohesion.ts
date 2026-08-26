@@ -47,10 +47,12 @@ export const COHESION_LEVELS: readonly CohesionLevel[] = ['off', 'low', 'medium'
  * cohesive, or a junk drawer?" without inventing a concept or making a new
  * claim about the code.
  *
- * Note the vocabulary trap this feature was reported through: *module* in nao
- * already means the directory — `collapseGraph`'s `scopeIdFor` derives it as
- * `dirname(file_path)` and `folderKeyOf` below deliberately agrees with it —
- * so module grouping is the folder grain, not a third option.
+ * The vocabulary trap this feature was reported through is now gone: the
+ * coarse aggregation level used to be called *module*, which read as the
+ * language construct and made folder grouping look like a third option
+ * beside it. It is called `'folder'` throughout — `collapseGraph`'s
+ * `scopeIdFor` derives it as `dirname(file_path)` and `folderKeyOf` below
+ * deliberately agrees with it — so the two are visibly the same grain.
  */
 export type GroupGrain = 'folder' | 'file';
 
@@ -86,7 +88,7 @@ export const COHESION_LABELS: Record<CohesionLevel, string> = {
  * The group a node belongs to: the directory holding its file.
  *
  * Deliberately the same derivation `collapseGraph`'s `scopeIdFor` uses for
- * Module level, so the force and the module aggregation agree on what a
+ * Folder level, so the force and the folder aggregation agree on what a
  * group *is*. A file at the repo root gets `''` — the root is a real folder
  * and its files really do belong together.
  *
@@ -354,13 +356,13 @@ export function tierWeightFor(
 /**
  * Strength for the current view.
  *
- * Inert at Module level, where every node already *is* a folder: pulling
- * module circles toward the centroid of their parent directory would be a
+ * Inert at Folder level, where every node already *is* a folder: pulling
+ * folder circles toward the centroid of their parent directory would be a
  * second, coarser grouping layered on top of the one the nodes already
  * express, and the reader has no way to tell the two apart.
  */
 export function cohesionStrengthFor(level: GraphLevel, choice: CohesionLevel): number {
-  if (level === 'module') return 0;
+  if (level === 'folder') return 0;
   return COHESION_STRENGTH[choice];
 }
 
@@ -371,7 +373,7 @@ export function cohesionStrengthFor(level: GraphLevel, choice: CohesionLevel): n
  * else. At File level every node already *is* a file, so every file region
  * would hold exactly one member, fall under `MIN_HULL_MEMBERS` and draw
  * nothing — a control that silently does something is worse than one that is
- * plainly unavailable. At Module level the force is inert anyway.
+ * plainly unavailable. At Folder level the force is inert anyway.
  *
  * Deliberately shaped like `cohesionStrengthFor`: the stored choice is what
  * the reader picked and is never overwritten, so returning to Entity level

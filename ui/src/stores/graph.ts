@@ -12,7 +12,7 @@ import type { HoverMode } from '../viewmodels/hoverHighlight';
 export const rawEntityGraph = writable<GraphData>({ nodes: [], links: [] });
 
 // Aggregation level for the graph view. 'entity' is the default (every
-// entity is its own node); 'file' collapses nodes to one-per-file; 'module'
+// entity is its own node); 'file' collapses nodes to one-per-file; 'folder'
 // collapses to one-per-directory.
 export const graphLevel = writable<GraphLevel>('entity');
 
@@ -56,7 +56,7 @@ export function collapseAllScopes(): void {
  * delete the node that seeded them.
  *
  * `markPathOf` is what turns a circle into this: an entity gives its file, a
- * File rollup its own path, a Module rollup its directory — one field meaning
+ * File rollup its own path, a Folder rollup its directory — one field meaning
  * "the narrowest scope this circle is evidence of" at every level.
  */
 export const ringFocusPath = writable<string | null>(null);
@@ -263,11 +263,11 @@ export const generalIncoming = writable(true);
 // below: `generalLanguages` used to be the writable, re-seeded to "every
 // language in the new dataset" on every publish — so unticking Markdown
 // survived until the next level toggle, scope change, or auto-level
-// escalation, all of which republish. Switching Module → File is exactly that
+// escalation, all of which republish. Switching Folder → File is exactly that
 // republish, and it silently restored every language the user had turned off.
 //
 // Language names, not ids, so nothing needs translating between levels — a
-// collapsed File or Module node carries the language of the entities it rolls
+// collapsed File or Folder node carries the language of the entities it rolls
 // up. `generalLanguages` is derived from this, next to `visibleFiles`, since
 // it needs `allLanguages`.
 export const hiddenLanguages = writable<Set<string>>(new Set());
@@ -282,9 +282,9 @@ export const hiddenLanguages = writable<Set<string>>(new Set());
 // dataset can imply it, so it is the thing that has to persist; the visible
 // set is derived and can be recomputed from whatever is on screen.
 //
-// Paths only, never ids: `collapseGraph` rewrites node ids at File and Module
+// Paths only, never ids: `collapseGraph` rewrites node ids at File and Folder
 // level but carries `file_path` through, so a path-keyed exclusion needs no
-// translation between levels. At Module level the aggregated nodes carry a
+// translation between levels. At Folder level the aggregated nodes carry a
 // *directory* path, so nothing matches and nothing hides — correct, since
 // there is no per-file node there to hide, and dropping back to File or
 // Entity level restores the exclusions intact.

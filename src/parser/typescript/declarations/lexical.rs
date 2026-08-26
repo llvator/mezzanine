@@ -65,11 +65,44 @@ fn handle_variable_declarator(
         "object" => {
             let owner_id = emit_constant(decl_node, node, &name, parent_id, ctx);
             emit_object_members(&value_node, &owner_id, &name, ctx);
+            calls_in_initializer(&value_node, &owner_id, &name, self_type, ctx);
         }
         _ => {
-            emit_constant(decl_node, node, &name, parent_id, ctx);
+            let owner_id = emit_constant(decl_node, node, &name, parent_id, ctx);
+            calls_in_initializer(&value_node, &owner_id, &name, self_type, ctx);
         }
     }
+}
+
+/// Walk a constant's initializer for calls, attributed to the constant.
+///
+/// An arrow-function initializer already gets this through [`emit_function`],
+/// which walks its body. Every other initializer did not, and the gap is not
+/// small: `export const x = derived([…], () => f(…))` is how a Svelte store
+/// file is written, and in `ui/src` 125 of 348 top-level `export const`s are
+/// initialised by a call. Their entities existed, with spans, owning the very
+/// lines the calls were written on — and no edge was produced, because nothing
+/// looked inside (TS-007).
+///
+/// The consequence was not a slightly thin graph. A folder whose logic lives
+/// in store initialisers read as nearly inert, drew a clean shape, and was
+/// reported as a funnel with nothing leaving it — a confident wrong verdict,
+/// since every verdict is computed over these edges.
+///
+/// Its own function rather than two more lines in the match, because the
+/// complexity gate fails on any metric increase to a function that already
+/// exists (CI-001).
+fn calls_in_initializer(
+    value_node: &Node,
+    owner_id: &str,
+    owner_name: &str,
+    self_type: Option<&str>,
+    ctx: &mut ExtractCtx<'_>,
+) {
+    // The whole initializer is the body: a call can sit at its top level
+    // (`derived(…)`), inside an argument, or inside a callback several levels
+    // down, and all three are things this constant does.
+    extract_body_calls(value_node, owner_id, owner_name, None, self_type, ctx);
 }
 
 /// Emit a Constant entity for a non-function binding and return its id, so an

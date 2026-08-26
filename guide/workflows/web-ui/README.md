@@ -20,13 +20,13 @@ notice rather than a value you read.
 Either surface works for every workflow here.
 
 ```bash
-# VS Code: Command Palette → "Nao: Open Code Visualizer"
+# VS Code: Command Palette → "Mezzanine: Open Code Visualizer"
 
 # Browser, engine serves the UI:
-nao watch . --port 3200        # then open http://localhost:3200
+mezz watch . --port 3200        # then open http://localhost:3200
 
 # Browser, UI served separately:
-nao watch . --port 3200 --allow-origin http://localhost:4173
+mezz watch . --port 3200 --allow-origin http://localhost:4173
 ```
 
 ## The keymap

@@ -1,10 +1,10 @@
-//! Nao CLI
+//! Mezzanine CLI
 //!
 //! A tool for visualizing code relationships and dependencies.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use nao::{
+use mezz::{
     analyzer::Analyzer,
     config::{Config, LayoutDirection},
     graph::DependencyGraph,
@@ -14,8 +14,8 @@ use nao::{
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "nao")]
-#[command(author = "Nao Team")]
+#[command(name = "mezz")]
+#[command(author = "llvator")]
 #[command(version)]
 #[command(about = "Visualize code relationships, dependencies, and quality metrics", long_about = None)]
 struct Cli {
@@ -25,28 +25,47 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Set a repo up for nao: write `.nao/settings.json` with the languages
+    /// Set a repo up for mezz: write `.mezz/settings.json` with the languages
     /// the tree is actually written in, and optionally add the VS Code tasks
-    /// that start, open and stop the browser UI.
+    /// that start, open and stop the browser UI, and the `.mcp.json` entry
+    /// that gives an agent working here the code graph.
     Init {
         /// Repo to set up (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Also add the Nao tasks to `.vscode/tasks.json`, creating it or
+        /// Also add the Mezzanine tasks to `.vscode/tasks.json`, creating it or
         /// merging into what is already there.
         #[arg(long)]
         vscode: bool,
 
+        /// Also register `mezz mcp` in `.mcp.json`, creating it or adding to
+        /// the servers already there.
+        #[arg(long)]
+        mcp: bool,
+
+        /// Every optional file above — the same as `--vscode --mcp`.
+        #[arg(long)]
+        all: bool,
+
+        /// Add a fourth VS Code task that starts the engine with
+        /// `--allow-agent-spawn`, so the browser UI's quality tables offer a
+        /// Refactor button that opens a Claude Code terminal. Implies
+        /// `--vscode`, and is deliberately outside `--all`: it writes the one
+        /// task that runs code on this machine rather than serving data.
+        #[arg(long)]
+        allow_agent_spawn: bool,
+
         /// Replace what is already there. Without it, an existing settings
-        /// file is left alone and existing tasks keep their current bodies.
+        /// file is left alone, existing tasks keep their current bodies, and
+        /// an existing `mezz` MCP entry is not rewritten.
         #[arg(long)]
         force: bool,
     },
 
     /// Grade the tree against the rules the repo declared in
-    /// `.nao/rules.json`: exit 0 when every one holds, 1 when one does not,
-    /// 2 when no verdict could be computed. Nao declares no rules of its
+    /// `.mezz/rules.json`: exit 0 when every one holds, 1 when one does not,
+    /// 2 when no verdict could be computed. Mezzanine declares no rules of its
     /// own, so a repo without that file passes and says so.
     Check {
         /// Path to check (defaults to current directory)
@@ -97,7 +116,7 @@ enum Commands {
         /// Keep local and module-level assignments as entities. Off by
         /// default because they are most of a graph and nothing lists them;
         /// worth turning on for a focused reading of a few files. The durable
-        /// answer for a repo is `include_locals` in `.nao/settings.json`.
+        /// answer for a repo is `include_locals` in `.mezz/settings.json`.
         #[arg(long)]
         include_locals: bool,
 
@@ -228,7 +247,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Content root for rule corpus (defaults to NAO_EDUCATOR_CONTENT or `<cwd>/content`)
+        /// Content root for rule corpus (defaults to MEZZ_EDUCATOR_CONTENT or `<cwd>/content`)
         #[arg(long)]
         content: Option<PathBuf>,
     },
@@ -258,7 +277,7 @@ enum Commands {
         output: Option<PathBuf>,
 
         /// Content root holding `<language>/{rules,lessons}/`. Defaults to
-        /// `NAO_EDUCATOR_CONTENT` or `<cwd>/content`.
+        /// `MEZZ_EDUCATOR_CONTENT` or `<cwd>/content`.
         #[arg(long)]
         content: Option<PathBuf>,
 
@@ -312,7 +331,7 @@ enum Commands {
         debounce_ms: Option<u64>,
 
         /// Fallback Educator content root, used when neither
-        /// `NAO_EDUCATOR_CONTENT` nor `<workspace>/content/` resolves. The
+        /// `MEZZ_EDUCATOR_CONTENT` nor `<workspace>/content/` resolves. The
         /// VS Code extension passes its bundled `content/` directory here
         /// so rules and lessons work in workspaces that don't ship their
         /// own corpus.
@@ -336,7 +355,7 @@ enum Commands {
         no_token: bool,
 
         /// Directory holding the built browser UI. Falls back to
-        /// `NAO_UI_DIR`, then a `ui/dist` beside the `nao` binary, then
+        /// `MEZZ_UI_DIR`, then a `ui/dist` beside the `mezz` binary, then
         /// `./ui/dist`. Without any of them the server still runs and the
         /// root page explains how to connect a UI hosted elsewhere.
         #[arg(long, value_name = "PATH")]
@@ -346,8 +365,8 @@ enum Commands {
         /// refactor an entity. Off by default: it is the one route that runs
         /// code rather than serving data, so it does not exist unless you ask
         /// for it, and it always requires the pairing token — including from
-        /// loopback, where reading the graph does not. Set `NAO_TERMINAL` to
-        /// choose the terminal and `NAO_CLAUDE_BIN` for a non-PATH install.
+        /// loopback, where reading the graph does not. Set `MEZZ_TERMINAL` to
+        /// choose the terminal and `MEZZ_CLAUDE_BIN` for a non-PATH install.
         #[arg(long)]
         allow_agent_spawn: bool,
 
@@ -379,7 +398,7 @@ enum Commands {
 
         /// Where submitted repos are cloned and their analyses cached.
         /// Repos found here are restored at startup instead of re-analyzed.
-        /// Defaults to `$XDG_CACHE_HOME/nao/serve` or `~/.cache/nao/serve`.
+        /// Defaults to `$XDG_CACHE_HOME/mezz/serve` or `~/.cache/mezz/serve`.
         #[arg(long, value_name = "PATH")]
         cache_dir: Option<PathBuf>,
 
@@ -405,22 +424,22 @@ enum Commands {
         language: Option<Vec<String>>,
 
         /// Let a browser page on this origin read this server's responses.
-        /// Repeatable. See `nao watch --help` for why it is needed.
+        /// Repeatable. See `mezz watch --help` for why it is needed.
         #[arg(long, value_name = "URL")]
         allow_origin: Vec<String>,
 
         /// Don't require a pairing token from non-loopback origins.
-        /// See `nao watch --help`.
+        /// See `mezz watch --help`.
         #[arg(long)]
         no_token: bool,
 
         /// Directory holding the built browser UI. Same resolution order as
-        /// `nao watch --ui-dir`.
+        /// `mezz watch --ui-dir`.
         #[arg(long, value_name = "PATH")]
         ui_dir: Option<PathBuf>,
     },
 
-    /// Serve Nao as an MCP (Model Context Protocol) server over stdio,
+    /// Serve Mezzanine as an MCP (Model Context Protocol) server over stdio,
     /// exposing `map`, `quality`, and `assess_change` tools to AI agents
     Mcp {
         /// Root directory the server analyzes (defaults to current directory)
@@ -436,7 +455,7 @@ enum Commands {
         language: Option<Vec<String>>,
     },
 
-    /// Push-mode hooks: emit nao's structural signal without being asked.
+    /// Push-mode hooks: emit mezz's structural signal without being asked.
     /// Designed to run from a Claude Code Stop/PostToolUse hook.
     Hook {
         #[command(subcommand)]
@@ -490,7 +509,7 @@ enum HookAction {
         min_severity: String,
 
         /// Hard cap on output lines before pointing at `assess_change`.
-        #[arg(long, default_value_t = nao::mcp::push::DEFAULT_LINE_CAP)]
+        #[arg(long, default_value_t = mezz::mcp::push::DEFAULT_LINE_CAP)]
         cap: usize,
 
         /// Include test files
@@ -500,6 +519,30 @@ enum HookAction {
         /// Filter by language
         #[arg(short, long)]
         language: Option<Vec<String>>,
+    },
+
+    /// Report only the `.mezz/rules.json` violations the working tree
+    /// introduced, quiet-when-clean and once-per-session (MCP-019). Not
+    /// every violation — that is `mezz check`, which answers a different
+    /// question and is the one to run by hand.
+    Check {
+        /// Root directory to grade (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Git ref the working tree is judged against. Defaults to HEAD.
+        #[arg(long, default_value = "HEAD")]
+        base_ref: String,
+
+        /// Session state file (violations already surfaced). Defaults to
+        /// a temp-dir file keyed by repo + base SHA, which resets
+        /// naturally when a new commit moves the base.
+        #[arg(long)]
+        state: Option<PathBuf>,
+
+        /// Hard cap on output lines before pointing at `mezz check`.
+        #[arg(long, default_value_t = mezz::mcp::push::DEFAULT_LINE_CAP)]
+        cap: usize,
     },
 }
 
@@ -526,7 +569,7 @@ impl From<OutputFormatArg> for OutputFormat {
     }
 }
 
-/// `nao check`'s two renderings. Its own enum rather than a reuse of
+/// `mezz check`'s two renderings. Its own enum rather than a reuse of
 /// [`OutputFormatArg`]: a verdict has no DOT or Mermaid rendering, and
 /// offering one would promise a drawing that does not exist.
 #[derive(Clone, Copy, ValueEnum)]
@@ -535,11 +578,11 @@ enum CheckFormatArg {
     Json,
 }
 
-impl From<CheckFormatArg> for nao::check::Format {
+impl From<CheckFormatArg> for mezz::check::Format {
     fn from(arg: CheckFormatArg) -> Self {
         match arg {
-            CheckFormatArg::Human => nao::check::Format::Human,
-            CheckFormatArg::Json => nao::check::Format::Json,
+            CheckFormatArg::Human => mezz::check::Format::Human,
+            CheckFormatArg::Json => mezz::check::Format::Json,
         }
     }
 }
@@ -598,7 +641,7 @@ fn main() -> Result<()> {
     // Dispatch is grouped so that adding a subcommand touches a small
     // function instead of one match over every command in the tool. Each
     // arm returns its group's `Result` directly rather than `?;`-ing it,
-    // because nao counts `?` as a branch and a bare delegation has nothing
+    // because mezz counts `?` as a branch and a bare delegation has nothing
     // to recover from. See CI-001.
     //
     // The match is exhaustive over `Commands`, so the compiler — not a
@@ -609,15 +652,22 @@ fn main() -> Result<()> {
         Commands::Init {
             path,
             vscode,
+            mcp,
+            all,
+            allow_agent_spawn,
             force,
-        } => nao::init::run(&path, vscode, force),
+        } => mezz::init::run(
+            &path,
+            mezz::init::Targets::new(vscode, mcp, all).with_agent_spawn(allow_agent_spawn),
+            force,
+        ),
 
         // Its own arm rather than a group: `check` is the one subcommand
         // whose exit code is a verdict on the tree, so it ends the process
-        // itself instead of returning a `Result` that only says whether nao
+        // itself instead of returning a `Result` that only says whether mezz
         // ran (ADR 0024).
         Commands::Check { path, format } => {
-            std::process::exit(nao::check::run(&path, format.into()))
+            std::process::exit(mezz::check::run(&path, format.into()))
         }
 
         c @ (Commands::Analyze { .. }
@@ -731,11 +781,11 @@ fn dispatch_server(command: Commands) -> Result<()> {
             // Watch analyzes a path the operator chose, so both scopes apply.
             // Kept unmerged: `/api/settings` reports which file each value
             // came from, and merging is where that is lost.
-            let loaded = nao::settings::load_scoped(&path);
+            let loaded = mezz::settings::load_scoped(&path);
             let settings = loaded.merged();
             // What the command line named, so the report can say a flag won
             // rather than guessing from a value it cannot distinguish.
-            let flags_named = nao::settings::report::named(&[
+            let flags_named = mezz::settings::report::named(&[
                 ("output_dir", output_dir.is_some()),
                 ("port", port.is_some()),
                 ("include_tests", include_tests),
@@ -746,13 +796,13 @@ fn dispatch_server(command: Commands) -> Result<()> {
                 ("content_fallback", content_fallback.is_some()),
                 ("ui_dir", ui_dir.is_some()),
             ]);
-            nao::server::run(nao::server::WatchOptions {
+            mezz::server::run(mezz::server::WatchOptions {
                 output_dir: output_dir
                     .or_else(|| settings.output_dir.clone())
                     .unwrap_or_else(|| PathBuf::from("ui/public")),
                 port: port
                     .or(settings.port)
-                    .unwrap_or(nao::settings::DEFAULT_PORT),
+                    .unwrap_or(mezz::settings::DEFAULT_PORT),
                 include_tests: include_tests || settings.include_tests.unwrap_or(false),
                 include_docs: include_docs || settings.include_docs.unwrap_or(false),
                 languages: language.or_else(|| settings.language.clone()),
@@ -762,7 +812,7 @@ fn dispatch_server(command: Commands) -> Result<()> {
                 spec_dir: spec_dir.or(settings.spec_dir.clone()),
                 debounce_ms: debounce_ms.or(settings.debounce_ms).unwrap_or(300),
                 content_fallback: content_fallback.or_else(|| settings.content_fallback.clone()),
-                access: nao::server::AccessOptions {
+                access: mezz::server::AccessOptions {
                     allow_origin,
                     no_token,
                 },
@@ -792,11 +842,11 @@ fn dispatch_server(command: Commands) -> Result<()> {
             // User scope only: a repo submitted to `serve` arrived from a URL
             // a stranger pasted, and does not get to configure the server
             // analyzing it.
-            let settings = nao::settings::user();
+            let settings = mezz::settings::user();
             run_serve(ServeArgs {
                 port: port
                     .or(settings.port)
-                    .unwrap_or(nao::settings::DEFAULT_PORT),
+                    .unwrap_or(mezz::settings::DEFAULT_PORT),
                 seed,
                 cache_dir,
                 jobs,
@@ -804,7 +854,7 @@ fn dispatch_server(command: Commands) -> Result<()> {
                 max_repo_mb,
                 include_tests: include_tests || settings.include_tests.unwrap_or(false),
                 languages: language.or_else(|| settings.language.clone()),
-                access: nao::server::AccessOptions {
+                access: mezz::server::AccessOptions {
                     allow_origin,
                     no_token,
                 },
@@ -851,27 +901,9 @@ fn dispatch_agent(command: Commands) -> Result<()> {
             path,
             include_tests,
             language,
-        } => nao::mcp::run(path, include_tests, language),
+        } => mezz::mcp::run(path, include_tests, language),
 
-        Commands::Hook { action } => match action {
-            HookAction::SelfReview {
-                path,
-                base_ref,
-                state,
-                min_severity,
-                cap,
-                include_tests,
-                language,
-            } => run_hook_self_review(
-                path,
-                base_ref,
-                state,
-                min_severity,
-                cap,
-                include_tests,
-                language,
-            ),
-        },
+        Commands::Hook { action } => dispatch_hook(action),
 
         Commands::PrReport {
             path,
@@ -896,7 +928,7 @@ fn run_hook_self_review(
     include_tests: bool,
     language: Option<Vec<String>>,
 ) -> Result<()> {
-    use nao::mcp::push::{self, Severity};
+    use mezz::mcp::push::{self, Severity};
 
     let root = path.canonicalize().unwrap_or(path);
     let min = Severity::parse(&min_severity).ok_or_else(|| {
@@ -914,6 +946,55 @@ fn run_hook_self_review(
     Ok(())
 }
 
+/// The push-mode legs, dispatched apart from everything else so adding one
+/// does not widen `dispatch_agent` — the complexity gate fails on any metric
+/// increase to a function that already exists (CI-001).
+fn dispatch_hook(action: HookAction) -> Result<()> {
+    match action {
+        HookAction::SelfReview {
+            path,
+            base_ref,
+            state,
+            min_severity,
+            cap,
+            include_tests,
+            language,
+        } => run_hook_self_review(
+            path,
+            base_ref,
+            state,
+            min_severity,
+            cap,
+            include_tests,
+            language,
+        ),
+        HookAction::Check {
+            path,
+            base_ref,
+            state,
+            cap,
+        } => run_hook_check(path, base_ref, state, cap),
+    }
+}
+
+/// MCP-019: emit only the rule violations this edit introduced, and
+/// nothing at all when it introduced none.
+fn run_hook_check(
+    path: PathBuf,
+    base_ref: String,
+    state: Option<PathBuf>,
+    cap: usize,
+) -> Result<()> {
+    let root = path.canonicalize().unwrap_or(path);
+    let output = mezz::mcp::push::check_new(&root, &base_ref, state, cap)?;
+    // Quiet-when-clean, and advisory: a hook that fails a stop is a hook
+    // that gets removed.
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
 /// MCP-008: render the PR comment body to stdout. Always exits 0 so a CI
 /// job wiring this in stays non-blocking (signals, not gates).
 fn run_pr_report(
@@ -922,16 +1003,16 @@ fn run_pr_report(
     include_tests: bool,
     language: Option<Vec<String>>,
 ) -> Result<()> {
-    use nao::mcp::push;
+    use mezz::mcp::push;
 
     let root = path.canonicalize().unwrap_or(path);
     match push::pr_report(&root, &base_ref, include_tests, &language) {
         Ok(body) => println!("{body}"),
         Err(e) => {
             // Non-blocking: surface the reason but do not fail the build.
-            eprintln!("nao pr-report: {e:#}");
+            eprintln!("mezz pr-report: {e:#}");
             println!(
-                "{}\n**nao:** report unavailable ({e}).",
+                "{}\n**mezz:** report unavailable ({e}).",
                 push::PR_COMMENT_MARKER
             );
         }
@@ -941,13 +1022,13 @@ fn run_pr_report(
 
 fn run_educate(file: PathBuf, json: bool, content: Option<PathBuf>) -> Result<()> {
     use colored::Colorize;
-    use nao::educator::Educator;
+    use mezz::educator::Educator;
 
     let cwd = std::env::current_dir()?;
     let content_root = content
         .or_else(|| Educator::resolve_content_root(&cwd))
         .ok_or_else(|| anyhow::anyhow!(
-            "no Educator content found — pass --content <dir>, set NAO_EDUCATOR_CONTENT, or run from a workspace with a content/ directory"
+            "no Educator content found — pass --content <dir>, set MEZZ_EDUCATOR_CONTENT, or run from a workspace with a content/ directory"
         ))?;
     let educator = Educator::load(&content_root)?;
     let response = educator.scan_file(&file)?;
@@ -1011,23 +1092,23 @@ fn run_educator_index(
     content: Option<PathBuf>,
     check: bool,
 ) -> Result<()> {
-    use nao::educator::Educator;
+    use mezz::educator::Educator;
 
     let cwd = std::env::current_dir()?;
     let content_root = content
         .or_else(|| Educator::resolve_content_root(&cwd))
         .ok_or_else(|| anyhow::anyhow!(
-            "no Educator content found — pass --content <dir>, set NAO_EDUCATOR_CONTENT, or run from a workspace with a content/ directory"
+            "no Educator content found — pass --content <dir>, set MEZZ_EDUCATOR_CONTENT, or run from a workspace with a content/ directory"
         ))?;
     let educator = Educator::load(&content_root)?;
-    let rendered = nao::educator::index::render_index(&educator, language);
+    let rendered = mezz::educator::index::render_index(&educator, language);
     let target = output.unwrap_or_else(|| content_root.join(format!("{}/INDEX.md", language)));
 
     if check {
         let current = std::fs::read_to_string(&target).unwrap_or_default();
         if current != rendered {
             anyhow::bail!(
-                "{} is out of date — run `nao educator-index {}` to regenerate",
+                "{} is out of date — run `mezz educator-index {}` to regenerate",
                 target.display(),
                 language
             );
@@ -1044,7 +1125,7 @@ fn run_educator_index(
     Ok(())
 }
 
-/// `nao serve`'s flags exactly as clap parsed them.
+/// `mezz serve`'s flags exactly as clap parsed them.
 ///
 /// A struct rather than eleven positional arguments, and separate from
 /// `ServeOptions` because two of these still need work — the seeds are raw
@@ -1059,26 +1140,26 @@ struct ServeArgs {
     max_repo_mb: u64,
     include_tests: bool,
     languages: Option<Vec<String>>,
-    access: nao::server::AccessOptions,
+    access: mezz::server::AccessOptions,
     ui_dir: Option<PathBuf>,
     settings_ui_dir: Option<PathBuf>,
 }
 
-/// `nao serve` — parse the `--seed` pairs, resolve the cache directory, and
+/// `mezz serve` — parse the `--seed` pairs, resolve the cache directory, and
 /// hand off to the server. Kept out of `main`'s match so the dispatch stays a
 /// thin delegation, like every other subcommand.
 fn run_serve(args: ServeArgs) -> Result<()> {
     let seeds = args
         .seed
         .iter()
-        .map(|s| nao::server::parse_seed(s))
+        .map(|s| mezz::server::parse_seed(s))
         .collect::<Result<Vec<_>>>()?;
-    nao::server::serve(nao::server::ServeOptions {
+    mezz::server::serve(mezz::server::ServeOptions {
         port: args.port,
         seeds,
         cache_dir: args
             .cache_dir
-            .unwrap_or_else(nao::server::default_cache_dir),
+            .unwrap_or_else(mezz::server::default_cache_dir),
         jobs: args.jobs,
         clone_timeout_secs: args.clone_timeout_secs,
         max_repo_mb: args.max_repo_mb,
@@ -1091,7 +1172,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 }
 
 fn run_construct_kinds(language: &str, output: Option<PathBuf>, check: bool) -> Result<()> {
-    use nao::educator::catalog;
+    use mezz::educator::catalog;
 
     let specs = catalog::for_language(language).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1107,7 +1188,7 @@ fn run_construct_kinds(language: &str, output: Option<PathBuf>, check: bool) -> 
         let current = std::fs::read_to_string(&target).unwrap_or_default();
         if current != rendered {
             anyhow::bail!(
-                "{} is out of date — run `nao construct-kinds {}` to regenerate",
+                "{} is out of date — run `mezz construct-kinds {}` to regenerate",
                 target.display(),
                 language
             );
@@ -1184,11 +1265,11 @@ fn run_analyze(
     // Last: the settings file fills only what the flags above left alone.
     // `depth` travels separately because a defaulted `max_depth` and a typed
     // one are the same number by the time the config gets here.
-    let flags = nao::settings::Flags {
+    let flags = mezz::settings::Flags {
         max_depth: depth,
         ..Default::default()
     };
-    nao::settings::load(&path).apply_with(&mut config, flags);
+    mezz::settings::load(&path).apply_with(&mut config, flags);
 
     // Run analysis
     eprintln!("Analyzing {}...", path.display());
@@ -1235,7 +1316,7 @@ fn run_analyze(
     Ok(())
 }
 
-/// `deps` traverses shallower than the rest of nao — two hops, not three —
+/// `deps` traverses shallower than the rest of mezz — two hops, not three —
 /// because it answers "what does this file touch" rather than "what shape is
 /// this repo". That 2 is the bottom of the chain, under both the flag and the
 /// settings file.
@@ -1251,11 +1332,11 @@ fn run_deps(
     let mut config = Config::for_path(root)
         .with_output_format(format)
         .with_max_depth(DEPS_DEFAULT_DEPTH);
-    let flags = nao::settings::Flags {
+    let flags = mezz::settings::Flags {
         max_depth: depth,
         ..Default::default()
     };
-    nao::settings::load(root).apply_with(&mut config, flags);
+    mezz::settings::load(root).apply_with(&mut config, flags);
     // The settled depth, whichever link of the chain supplied it. The
     // report below walks that many levels out of the file.
     let depth = config.analysis.max_depth;
@@ -1267,7 +1348,7 @@ fn run_deps(
 
     print!(
         "{}",
-        nao::output::deps_report::render(&graph, &target, depth, reverse)
+        mezz::output::deps_report::render(&graph, &target, depth, reverse)
     );
 
     Ok(())
@@ -1275,7 +1356,7 @@ fn run_deps(
 
 fn run_find(pattern: &str, path: PathBuf, kind: Option<EntityKindArg>) -> Result<()> {
     let mut config = Config::for_path(&path);
-    nao::settings::load(&path).apply_to_config(&mut config);
+    mezz::settings::load(&path).apply_to_config(&mut config);
 
     let mut analyzer = Analyzer::new(config);
     let result = analyzer.analyze()?;
@@ -1320,7 +1401,7 @@ fn run_find(pattern: &str, path: PathBuf, kind: Option<EntityKindArg>) -> Result
 
 fn run_cycles(path: PathBuf, format: OutputFormat) -> Result<()> {
     let mut config = Config::for_path(&path).with_output_format(format);
-    nao::settings::load(&path).apply_to_config(&mut config);
+    mezz::settings::load(&path).apply_to_config(&mut config);
 
     let mut analyzer = Analyzer::new(config);
     let result = analyzer.analyze()?;
@@ -1356,7 +1437,7 @@ fn run_cycles(path: PathBuf, format: OutputFormat) -> Result<()> {
 
 fn run_stats(path: PathBuf, json: bool) -> Result<()> {
     let mut config = Config::for_path(&path);
-    nao::settings::load(&path).apply_to_config(&mut config);
+    mezz::settings::load(&path).apply_to_config(&mut config);
 
     let mut analyzer = Analyzer::new(config);
     let result = analyzer.analyze()?;
@@ -1444,7 +1525,7 @@ fn run_diff(
     include_tests: bool,
     languages: Option<Vec<String>>,
 ) -> Result<()> {
-    use nao::diff::{
+    use mezz::diff::{
         analyze_with, build_analysis_config, compute_diff, create_worktree, remove_worktree,
         render_base_details, resolve_git_ref, rooted_at, verify_git_repo, write_diff_outputs,
     };
@@ -1458,11 +1539,11 @@ fn run_diff(
 
     // Create + analyze base worktree.
     let tmp = std::env::temp_dir();
-    let base_dir = tmp.join(format!("nao-diff-base-{}", from_sha));
-    let head_dir = tmp.join(format!("nao-diff-head-{}", to_sha));
+    let base_dir = tmp.join(format!("mezz-diff-base-{}", from_sha));
+    let head_dir = tmp.join(format!("mezz-diff-head-{}", to_sha));
 
     // One scope for both sides, settled from the working tree. Each
-    // worktree carries the `.nao/settings.json` committed at its own ref,
+    // worktree carries the `.mezz/settings.json` committed at its own ref,
     // so building a config per checkout would let a settings change between
     // the two refs read as every file it excludes being added or removed.
     let scope = build_analysis_config(&repo_root, include_tests, &languages);

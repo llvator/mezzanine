@@ -13,7 +13,7 @@ c server {
 }
 
 f local_serve {
-    d: "`nao serve` / `nao watch`: analyze one root, hold it in AppState, serve the UI and stream changes over SSE. spawn_file_watcher re-analyzes on save, gated by is_source_extension and has_source_change so editor noise and non-source writes do not trigger a pass; it takes a second watched root when spec_dir sits outside the first, a spec being something people edit. handle_reanalysis publishes the watched root's config but reads the analysis scope back from the shared one, or the next keystroke would silently undo a narrowing the reader made from the browser. build_router wires the routes; write_json_with_cancel lets an in-flight response abandon work when a newer analysis supersedes it. resolve_startup checks the flags that can fail before any analysis begins, so a typo costs a second rather than a full parse."
+    d: "`mezz serve` / `mezz watch`: analyze one root, hold it in AppState, serve the UI and stream changes over SSE. spawn_file_watcher re-analyzes on save, gated by is_source_extension and has_source_change so editor noise and non-source writes do not trigger a pass; it takes a second watched root when spec_dir sits outside the first, a spec being something people edit. handle_reanalysis publishes the watched root's config but reads the analysis scope back from the shared one, or the next keystroke would silently undo a narrowing the reader made from the browser. build_router wires the routes; write_json_with_cancel lets an in-flight response abandon work when a newer analysis supersedes it. resolve_startup checks the flags that can fail before any analysis begins, so a typo costs a second rather than a full parse."
     cr: "src/server/mod.rs", "src/server/state.rs"
 }
 

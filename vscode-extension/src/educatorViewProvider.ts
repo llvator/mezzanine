@@ -10,12 +10,12 @@ import {
 /**
  * Sidebar mirror of the Educator hover (design Q11). Subscribes to the active
  * editor's cursor and renders the same Specific/General buckets the hover
- * shows. Lives behind `nao.educator.sidebarEnabled` (default off) so users
+ * shows. Lives behind `mezz.educator.sidebarEnabled` (default off) so users
  * who hate hover popups have an opt-in alternative without losing the
  * educator entirely.
  */
 export class EducatorViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'nao.educator';
+  static readonly viewType = 'mezz.educator';
 
   private view?: vscode.WebviewView;
   private debounceTimer: NodeJS.Timeout | undefined;
@@ -87,7 +87,7 @@ export class EducatorViewProvider implements vscode.WebviewViewProvider {
     const root = this.getWorkspaceRoot();
     if (!port || !root) {
       this.log(`refresh skipped — port=${port} root=${root ? 'set' : 'unset'}`);
-      this.postIdle('Open the Nao visualizer to start the server.');
+      this.postIdle('Open the Mezzanine visualizer to start the server.');
       return;
     }
     const rel = relativeToWorkspace(editor.document.uri.fsPath, root);

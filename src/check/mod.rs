@@ -1,14 +1,14 @@
-//! `nao check`: grade a tree against the rules its project declared.
+//! `mezz check`: grade a tree against the rules its project declared.
 //!
-//! Nao ships **no rules of its own**. Every failure this command can produce
+//! Mezzanine ships **no rules of its own**. Every failure this command can produce
 //! traces to a line somebody in the checked repo wrote down, in
-//! `<repo>/.nao/rules.json`, and a repo with no such file passes and says so
-//! ([ADR 0024](../../docs/adr/0024-a-check-fails-on-the-projects-rules-not-naos.md)).
+//! `<repo>/.mezz/rules.json`, and a repo with no such file passes and says so
+//! ([ADR 0024](../../docs/adr/0024-a-check-fails-on-the-projects-rules-not-mezzs.md)).
 //!
 //! That line is the whole design, and it holds because of *who chose the
-//! bar*. Rules are expressed over nao's measurements, but the threshold is
-//! the project's — arbitrary, arguable and theirs to argue over. When nao
-//! calls a folder `tangled`, the tier is nao's, and ADRs 0014, 0017 and 0023
+//! bar*. Rules are expressed over mezz's measurements, but the threshold is
+//! the project's — arbitrary, arguable and theirs to argue over. When mezz
+//! calls a folder `tangled`, the tier is mezz's, and ADRs 0014, 0017 and 0023
 //! have each conceded that its gates can be wrong about a specific folder. A
 //! tool may hand you a diagnosis you are free to disagree with; it may not
 //! fail your build with one. So `min_shape: fractal` is not a rule anybody
@@ -72,7 +72,7 @@ pub struct Violation {
     pub line: Option<u32>,
     /// The entity that broke the rule; absent when the subject is the path.
     pub subject: Option<String>,
-    /// What nao counted.
+    /// What mezz counted.
     pub measured: u32,
     /// The places behind the count, in path order — every importer, every
     /// door. Empty for the rules whose measurement is already a property of
@@ -157,9 +157,23 @@ pub fn run(path: &Path, format: Format) -> i32 {
 /// configures it: the repo's settings file decides what is walked, and the
 /// rules file decides only what is asserted about what was walked.
 fn evaluate(path: &Path) -> Outcome {
+    verdict(path, scope_for(path))
+}
+
+/// The analysis configuration `check` grades a tree under: the path's own,
+/// with the settings file applied. Public because MCP-019 has to grade a
+/// base-ref worktree under *this* scope rather than the one committed at that
+/// ref, and rebuilding it there would be a second definition of what `check`
+/// looks at.
+pub fn scope_for(path: &Path) -> Config {
     let mut config = Config::for_path(path);
     settings::load(path).apply_to_config(&mut config);
-    verdict(path, config)
+    config
+}
+
+/// One violation as the human report prints it. See [`report::line`].
+pub fn violation_line(v: &Violation) -> String {
+    report::line(v)
 }
 
 /// [`evaluate`] with the analysis configuration handed in, so a test can
@@ -188,7 +202,18 @@ fn verdict(path: &Path, config: Config) -> Outcome {
             path: tidy(&rules.path),
         };
     }
+    graded(path, config, &rules)
+}
 
+/// [`verdict`] with the rules handed in rather than read from `path`.
+///
+/// Split out for MCP-019, which grades a base-ref worktree against the
+/// *working tree's* rules. The worktree carries the `rules.json` committed at
+/// that ref, and grading each side against its own file would report a
+/// newly-tightened bar as something the edit introduced — true in a useless
+/// sense, since the code did not change and the standard did. The same
+/// argument the diff makes for using one analysis scope on both sides.
+pub fn graded(path: &Path, config: Config, rules: &Rules) -> Outcome {
     let result = match Analyzer::new(config).analyze() {
         Ok(result) => result,
         Err(e) => {
@@ -198,12 +223,12 @@ fn verdict(path: &Path, config: Config) -> Outcome {
         }
     };
     let repo_root = settings::repo_root(path);
-    let (files_checked, files_exempt) = tally_files(&result.files, &rules, &repo_root);
+    let (files_checked, files_exempt) = tally_files(&result.files, rules, &repo_root);
     let graph = DependencyGraph::from_analysis(&result);
     Outcome::Checked {
         rules_file: tidy(&rules.path),
         declared: rules.declared().collect(),
-        violations: violations(&graph, &rules, &repo_root),
+        violations: violations(&graph, rules, &repo_root),
         files_checked,
         files_exempt,
     }
@@ -246,7 +271,7 @@ fn tally_files(files: &[FileInfo], rules: &Rules, repo_root: &Path) -> (usize, u
 ///
 /// Relative to the *repo* rather than to the analyzed path, deliberately.
 /// The rules file sits at the repo root and is written once, so
-/// `nao check src` and `nao check .` have to agree about whether
+/// `mezz check src` and `mezz check .` have to agree about whether
 /// `src/vendor/**` is exempt — an exemption that held or lapsed depending on
 /// which directory the author was standing in would be worse than none
 /// (CFG-013).
@@ -258,7 +283,7 @@ pub(crate) fn repo_relative(repo_root: &Path, path: &Path) -> String {
 }
 
 /// A path with its `./` components dropped, which is what makes
-/// `nao check .` and `nao check /abs/repo` print the same lines.
+/// `mezz check .` and `mezz check /abs/repo` print the same lines.
 fn plain(path: &Path) -> PathBuf {
     path.components()
         .filter(|c| !matches!(c, Component::CurDir))

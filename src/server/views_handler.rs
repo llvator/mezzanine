@@ -1,14 +1,14 @@
 //! `GET` / `PUT /api/views` — the reader's **saved views**, stored at
-//! `<analyzed-root>/.nao/views.json`.
+//! `<analyzed-root>/.mezz/views.json`.
 //!
 //! A saved view is a named record of what the canvas is drawing: a scope, an
 //! aggregation level, the kind/language/file filters, the spec cross-filter.
 //! It is repo-scope by ADR 0008's line — it is a set of paths, languages and
 //! kinds *of this repo*, true no matter who clones it, and worth committing
 //! beside the code it describes. That also puts the browser UI and the VS Code
-//! webview on one list, since both talk HTTP to the same `nao watch`.
+//! webview on one list, since both talk HTTP to the same `mezz watch`.
 //!
-//! `nao serve` deliberately does not register these routes. There the tree
+//! `mezz serve` deliberately does not register these routes. There the tree
 //! arrived from a URL a stranger pasted, and ADR 0008 already forbids reading
 //! a repo-scope file in that mode; the UI treats the resulting 404 as "this
 //! server has no view store" and keeps its views in the browser instead.
@@ -138,7 +138,7 @@ pub(crate) async fn get_views_handler(
 /// Whole-list replace rather than per-view routes: the client holds the list
 /// it is editing, and two clients editing one repo's views at the same instant
 /// is not a case this tool has. The cost of the simpler contract is that the
-/// later save wins outright, which is the same bargain `.nao/settings.json`
+/// later save wins outright, which is the same bargain `.mezz/settings.json`
 /// already makes.
 pub(crate) async fn put_views_handler(
     State(state): State<AppState>,
@@ -166,7 +166,7 @@ mod tests {
     impl TempRoot {
         fn new(tag: &str) -> Self {
             let dir =
-                std::env::temp_dir().join(format!("nao-views-test-{}-{}", std::process::id(), tag));
+                std::env::temp_dir().join(format!("mezz-views-test-{}-{}", std::process::id(), tag));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)

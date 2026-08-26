@@ -39,7 +39,7 @@ export const appliedAnalysisLanguages = writable<Set<string> | null>(null);
 export const stagedAnalysisLanguages = writable<Set<string> | null>(null);
 
 /** Whether Markdown is currently analyzed — the widening switch, the same
- *  one `--include-docs` and `nao.includeDocs` set. Distinct from ticking
+ *  one `--include-docs` and `mezz.includeDocs` set. Distinct from ticking
  *  `markdown` in the language list, which *restricts* to a set that happens
  *  to contain it; this one survives whatever the list says. */
 export const appliedIncludeDocs = writable<boolean>(false);
@@ -50,9 +50,9 @@ export const stagedIncludeDocs = writable<boolean>(false);
  *  text field and `null` would need special-casing at every use.
  *
  *  A session override, not a saved setting: the durable answer is `spec_dir`
- *  in the repo's `.nao/settings.json`, and this field is seeded from it. The
+ *  in the repo's `.mezz/settings.json`, and this field is seeded from it. The
  *  browser deliberately does not write that file back — a page should not be
- *  able to edit the file that decides which directories nao reads. */
+ *  able to edit the file that decides which directories mezz reads. */
 export const appliedSpecDir = writable<string>('');
 export const stagedSpecDir = writable<string>('');
 
@@ -165,13 +165,13 @@ export const analysisScopeSaved = writable<boolean>(false);
 
 /**
  * Promote the *applied* scope to this repo's default, by writing the
- * analysis keys into `<root>/.nao/settings.json` (CFG-010).
+ * analysis keys into `<root>/.mezz/settings.json` (CFG-010).
  *
  * The applied scope, not the staged one: saving something the reader has not
  * yet seen the graph for would make the button a second, quieter Apply. It
  * also means saving never re-analyzes — there is nothing to recompute.
  *
- * Not offered in serve mode. `nao serve` never reads a submitted repo's
+ * Not offered in serve mode. `mezz serve` never reads a submitted repo's
  * settings file, so a file written there would be one nothing will ever read
  * (ADR-0008); the route does not exist there either.
  */

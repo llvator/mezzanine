@@ -1,21 +1,21 @@
-# Nao: capabilities and roadmap
+# Mezzanine: capabilities and roadmap
 
-What Nao does today, how its tools are organized, why they make human
+What Mezzanine does today, how its tools are organized, why they make human
 coders and coding agents more effective, and where it could go next.
 
-Nao builds a single typed graph — Entities and Relationships with
+Mezzanine builds a single typed graph — Entities and Relationships with
 per-entity metrics — from heterogeneous source files. Twelve languages have
 dedicated parsers (Rust, Python, TypeScript, Svelte, Java, Go, Kotlin, Dart,
 Groovy, Impex, Ansible, Elevator specs); everything else falls back to a generic
 parser with reduced fidelity. See the README for what each tier gives you.
 Everything below is a different way of asking that graph a question.
 
-## The altitude Nao occupies
+## The altitude Mezzanine occupies
 
 Existing tooling clusters at two extremes. LSP is **precise but
 pointwise**: exact go-to-definition for one symbol at a time.
 Grep/reading is **flexible but structureless**: text, not entities.
-Documentation is **high-level but stale**. Nao sits in the unoccupied
+Documentation is **high-level but stale**. Mezzanine sits in the unoccupied
 middle: **holistic, structural, always derived from the code as it is**.
 That mid-altitude view is precisely what doesn't fit in an agent's
 context window and what a newcomer lacks for their first weeks.
@@ -50,7 +50,7 @@ Four roles cover the surface. Each role answers one kind of question.
 | MCP `impact` | Blast radius of one entity: what it uses, direct dependents, transitive dependents level by level — exact at the type level via `UsesType` edges (Rust, TypeScript/Svelte, Java, Go, Kotlin, Dart, Python) |
 | MCP `tests_for` | Which tests reach an entity (direct or transitive), including Rust inline `mod tests` |
 | MCP `assess_change` | Working tree vs a git ref: per-entity metric deltas, added/removed entities, smell churn |
-| `nao diff` / UI diff overlay | The same change intelligence, visually |
+| `mezz diff` / UI diff overlay | The same change intelligence, visually |
 
 ### 4. Implementation support — "help me write this"
 
@@ -79,7 +79,7 @@ Four roles cover the surface. Each role answers one kind of question.
 ## Why this makes coding agents more effective
 
 Agents have a specific economics: every token of context costs, and the
-global view never fits. Nao's MCP tools are built for that economics —
+global view never fits. Mezzanine's MCP tools are built for that economics —
 compact ranked text, capped with explicit truncation, filtered of noise
 (ghosts, parameters, imports), every tool `readOnlyHint: true`.
 
@@ -94,7 +94,7 @@ A typical agent loop, each step one tool call:
    signatures, no file-hopping.
 5. **Check reach** — `impact` for who breaks; `trace` for how the flow
    arrives here.
-6. **Edit** — with LSP or plain edits; Nao doesn't replace the precise
+6. **Edit** — with LSP or plain edits; Mezzanine doesn't replace the precise
    pointwise layer.
 7. **Verify** — `tests_for` to run the relevant tests, not the suite.
 8. **Self-review** — `assess_change` before presenting: metric deltas
@@ -131,7 +131,7 @@ empty result as proof — see the limitations below.
   the entity's name as *possible* dependents (MCP-013). Re-measure with
   [`scripts/call_edge_recall.py`](../scripts/call_edge_recall.py).
 - **That measurement is one corpus in one language.** The figures above are
-  Rust-only, on nao itself, because rust-analyzer is the only oracle wired up.
+  Rust-only, on mezz itself, because rust-analyzer is the only oracle wired up.
   The other parsers are unmeasured — assume they are worse, not equal.
 - What is still missed, and why: closure parameters (`|e| e.kind.is_callable()`,
   whose type is the iterator's item type), locals bound to non-constructor

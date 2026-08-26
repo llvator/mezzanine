@@ -216,12 +216,12 @@ function normalizeAttention(raw: unknown): Attention {
 /**
  * The channel name two windows have to agree on.
  *
- * Keyed by which repo is being read, so `nao serve` — one origin hosting many
+ * Keyed by which repo is being read, so `mezz serve` — one origin hosting many
  * repos — does not sync a window reading one project into a window reading
  * another. Two windows on the same repo is exactly the case this is for; two
  * windows on different repos is two unrelated sessions and should stay that
  * way.
  */
 export function channelName(repoKey: string): string {
-  return `nao-mirror:${repoKey}`;
+  return `mezz-mirror:${repoKey}`;
 }

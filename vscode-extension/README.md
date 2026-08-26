@@ -1,7 +1,7 @@
-# Nao — Code Visualizer
+# Mezzanine — Code Visualizer
 
 A VS Code extension that visualises code relationships and dependencies
-directly in your editor. Built on top of the `nao` Rust backend which
+directly in your editor. Built on top of the `mezz` Rust backend which
 parses Rust, Python, JavaScript/TypeScript, Java, Go, Kotlin and Dart via
 tree-sitter.
 
@@ -11,22 +11,22 @@ Requirements: `git`, Rust toolchain (`rustup`), Node.js 18+, VS Code CLI
 (`code` on your PATH).
 
 ```bash
-git clone https://github.com/llvator/nao.git
-cd nao
+git clone https://github.com/llvator/mezzanine.git
+cd mezz
 ./scripts/install.sh      # backend binaries + extension, in one step
 ```
 
 Or run the steps yourself:
 
 ```bash
-cargo install --path .    # the Rust backend (nao, elevator)
+cargo install --path .    # the Rust backend (mezz, elevator)
 cd vscode-extension
 npm install
 npm run install:local     # packages the .vsix and installs it into VS Code
 ```
 
-Reload VS Code. A "Nao" icon appears in the activity bar. Open a folder
-and run **Nao: Open Code Visualizer** from the command palette.
+Reload VS Code. A "Mezzanine" icon appears in the activity bar. Open a folder
+and run **Mezzanine: Open Code Visualizer** from the command palette.
 
 If `rustup` isn't installed yet:
 
@@ -56,21 +56,21 @@ If you'd rather not think about which command matches which change,
 and takes VS Code profile names as arguments (`./scripts/install.sh Work`).
 
 Note that `build:all` builds the Svelte UI into `webview-dist/` for the
-webview only. The browser UI served by `nao watch` is a separate build into
+webview only. The browser UI served by `mezz watch` is a separate build into
 `ui/dist/` — refresh it with `./scripts/build.sh --ui`.
 
 ## Prerequisites (for developers editing the extension)
 
-- The `nao` binary must be on your `PATH`, or set `nao.binaryPath` in
+- The `mezz` binary must be on your `PATH`, or set `mezz.binaryPath` in
   VS Code settings to its absolute location.
 
 ## Commands
 
-- **Nao: Open Code Visualizer** — opens the full visualiser panel.
-- **Nao: Visualize Current File** — opens a compact view focused on the
+- **Mezzanine: Open Code Visualizer** — opens the full visualiser panel.
+- **Mezzanine: Visualize Current File** — opens a compact view focused on the
   file and entity at your cursor.
 
-## Views (Nao activity bar)
+## Views (Mezzanine activity bar)
 
 - **Scopes** — native tree with checkboxes; check folders/files to scope
   the visualisation.
@@ -82,9 +82,9 @@ webview only. The browser UI served by `nao watch` is a separate build into
 
 ## Settings
 
-- `nao.binaryPath` — override the nao binary location.
-- `nao.serverPort` — port for the internal nao watch server
+- `mezz.binaryPath` — override the mezz binary location.
+- `mezz.serverPort` — port for the internal mezz watch server
   (default 3200).
-- `nao.includeTests` — include test files in the analysis.
-- `nao.autoVisualize` — automatically sync when switching files / moving
+- `mezz.includeTests` — include test files in the analysis.
+- `mezz.autoVisualize` — automatically sync when switching files / moving
   the cursor.

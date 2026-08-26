@@ -33,7 +33,7 @@ export interface DescriptionPayload {
  * Details for the same sidebar slice.
  */
 export class DescriptionViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'nao.description';
+  static readonly viewType = 'mezz.description';
 
   private view?: vscode.WebviewView;
   /** Replayed on `ready`: VS Code tears the webview down whenever the view
@@ -66,7 +66,7 @@ export class DescriptionViewProvider implements vscode.WebviewViewProvider {
             webviewView.webview.postMessage({ type: 'description', payload: this.last });
           }
         } else if (msg?.type === 'goToDefinition' && msg.filePath) {
-          vscode.commands.executeCommand('nao.internalGoToDefinition', {
+          vscode.commands.executeCommand('mezz.internalGoToDefinition', {
             filePath: msg.filePath,
             line: msg.line,
           });

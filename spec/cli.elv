@@ -6,21 +6,21 @@ import "server.elv"
 import "visualizer.elv"
 
 c cli {
-    d: "Two binaries over the same library: `nao` for the code graph, `elevator` for the .elv spec layer. Both are thin — argument parsing and dispatch only, with the work living in the analyzer and output modules."
+    d: "Two binaries over the same library: `mezz` for the code graph, `elevator` for the .elv spec layer. Both are thin — argument parsing and dispatch only, with the work living in the analyzer and output modules."
     cr: "src/main.rs", "src/bin/elevator.rs", "src/lib.rs"
-    f nao_cli
+    f mezz_cli
     f elevator_cli
     f config
     f init
 }
 
-f nao_cli {
+f mezz_cli {
     d: "One Commands enum, four dispatchers so no single match grows without bound: dispatch_analysis (Analyze, Deps, Find, Cycles, Stats, Diff), dispatch_server (Watch, Serve), dispatch_educator (Educate, ConstructKinds, EducatorIndex) and dispatch_agent (Mcp, Hook, PrReport). The split is a complexity-gate constraint, not taste — CI fails on any metric increase to an existing function, which makes one growing dispatcher unextendable. Init sits outside the four: it writes the repo's configuration instead of reading its code."
     cr: "src/main.rs"
 }
 
 f init {
-    d: "`nao init` scaffolds the two files a repo would otherwise hand-write. The settings file carries only what the tree proves — the languages holding at least a twentieth of the walked files, Elevator exempt because a spec is outnumbered by design, Markdown excluded because a pinned list is where opt-in docs would stop being opt-in, plus spec_dir when every .elv sits in one directory. Never a defaulted key: spelling out today's defaults would freeze them into every repo that ran it. --vscode adds the start/open/stop tasks for the browser UI, merging by label into an existing tasks.json and refusing outright to rewrite one it cannot parse, since a tasks.json with comments is valid to VS Code and rewriting it would delete them."
+    d: "`mezz init` scaffolds the two files a repo would otherwise hand-write. The settings file carries only what the tree proves — the languages holding at least a twentieth of the walked files, Elevator exempt because a spec is outnumbered by design, Markdown excluded because a pinned list is where opt-in docs would stop being opt-in, plus spec_dir when every .elv sits in one directory. Never a defaulted key: spelling out today's defaults would freeze them into every repo that ran it. --vscode adds the start/open/stop tasks for the browser UI, merging by label into an existing tasks.json and refusing outright to rewrite one it cannot parse, since a tasks.json with comments is valid to VS Code and rewriting it would delete them."
     cr: "src/init.rs"
 }
 
@@ -30,7 +30,7 @@ f elevator_cli {
 }
 
 f config {
-    d: "The one knob object the CLI, the server and the MCP tools all build before analyzing: AnalysisConfig (roots, languages, spec_dir, allow_unsafe_passes), FilterConfig (include/exclude globs, test and vendor skipping) and DisplayConfig (LayoutDirection, ColorScheme, depth caps). Built per-invocation and passed down rather than read from a global, so two analyses in one process cannot contaminate each other. Settings fills what the flags left alone, from two files scoped by what they describe — the installation (ui_dir, content_fallback) or the repo (output_dir, spec_dir) — and names back every key it refuses rather than dropping it. Refusal is the point of the module: allow_agent_spawn, no_token, allow_origin and allow_unsafe_passes are not fields at either scope, and a repo-scope spec_dir may not be absolute or climb out with .., since a cloned file does not get to choose which directories nao reads. Naming one outside the repo takes an operator — --spec-dir, or the browser UI's scope panel. The module is a folder: mod.rs loads and refuses, report.rs answers which link of the chain won."
+    d: "The one knob object the CLI, the server and the MCP tools all build before analyzing: AnalysisConfig (roots, languages, spec_dir, allow_unsafe_passes), FilterConfig (include/exclude globs, test and vendor skipping) and DisplayConfig (LayoutDirection, ColorScheme, depth caps). Built per-invocation and passed down rather than read from a global, so two analyses in one process cannot contaminate each other. Settings fills what the flags left alone, from two files scoped by what they describe — the installation (ui_dir, content_fallback) or the repo (output_dir, spec_dir) — and names back every key it refuses rather than dropping it. Refusal is the point of the module: allow_agent_spawn, no_token, allow_origin and allow_unsafe_passes are not fields at either scope, and a repo-scope spec_dir may not be absolute or climb out with .., since a cloned file does not get to choose which directories mezz reads. Naming one outside the repo takes an operator — --spec-dir, or the browser UI's scope panel. The module is a folder: mod.rs loads and refuses, report.rs answers which link of the chain won."
     cr: "src/config.rs", "src/settings/"
     fu resolve
     fu report
@@ -39,7 +39,7 @@ f config {
 }
 
 fu f.config.resolve {
-    d: "Flag beats env beats repo file beats user file beats default, first hit wins — and the two keys that could not express that. apply_to_config guards spec_dir on is_none and languages on is_empty, because an unset value has a spelling there; max_depth and min_weight have none, a 3 the caller typed and a 3 Config::default chose being the same usize. Assigning them unconditionally therefore ran the chain backwards: `nao analyze --depth 7` against a file saying 3 traversed 3. The flag is now passed in rather than inferred — Flags carries max_depth and min_weight, apply_with takes it, apply_scalars resolves flag.or(file) in one expression, and apply_to_config is the no-flag caller's door. `nao deps --depth` carried clap's default_value = 2, which hid the same distinction inside the flag itself; it is Option<usize> now with DEPS_DEFAULT_DEPTH applied underneath both links. min_weight has no flag at all — its slot in Flags exists so that adding one stays a change to main.rs. The four include_* switches are deliberately outside this rule: they merge with |=, so the file can turn one on and never off."
+    d: "Flag beats env beats repo file beats user file beats default, first hit wins — and the two keys that could not express that. apply_to_config guards spec_dir on is_none and languages on is_empty, because an unset value has a spelling there; max_depth and min_weight have none, a 3 the caller typed and a 3 Config::default chose being the same usize. Assigning them unconditionally therefore ran the chain backwards: `mezz analyze --depth 7` against a file saying 3 traversed 3. The flag is now passed in rather than inferred — Flags carries max_depth and min_weight, apply_with takes it, apply_scalars resolves flag.or(file) in one expression, and apply_to_config is the no-flag caller's door. `mezz deps --depth` carried clap's default_value = 2, which hid the same distinction inside the flag itself; it is Option<usize> now with DEPS_DEFAULT_DEPTH applied underneath both links. min_weight has no flag at all — its slot in Flags exists so that adding one stays a change to main.rs. The four include_* switches are deliberately outside this rule: they merge with |=, so the file can turn one on and never off."
     cr: "src/settings/mod.rs", "src/main.rs"
 }
 

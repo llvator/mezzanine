@@ -42,7 +42,7 @@
 
 <div class="picker">
   <header>
-    <h1>Nao</h1>
+    <h1>Mezzanine</h1>
     <p class="tagline">Pick a repository to explore its code graph.</p>
   </header>
 

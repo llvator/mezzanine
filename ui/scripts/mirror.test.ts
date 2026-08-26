@@ -271,5 +271,5 @@ test('two windows on the same repo share a channel, two on different repos do no
 });
 
 test('the single-repo case has a name of its own', () => {
-  assert.equal(channelName(''), 'nao-mirror:');
+  assert.equal(channelName(''), 'mezz-mirror:');
 });

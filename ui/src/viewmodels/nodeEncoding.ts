@@ -160,7 +160,7 @@ export function radiusRange(boost: number): { rMin: number; rMax: number; rNoDat
 export function kindRadius(kindRaw: string): number {
   switch (kindRaw) {
     case 'Class': case 'Dataclass': case 'AbstractClass': case 'Struct': case 'Interface': case 'Trait': return 15;
-    case 'Module': case 'File': return 18;
+    case 'Folder': case 'File': return 18;
     case 'Function': case 'Method': return 10;
     case 'Parameter': return 7;
     case 'Branch': case 'Loop': return 6;
@@ -269,7 +269,7 @@ export interface SizeChannelDef {
   unit: string;
   /** Aggregation levels at which this metric has a meaningful value. A
    *  metric absent from a level is not offered there rather than silently
-   *  reading zero — `collapseGraph` genuinely has no file/module rollup for
+   *  reading zero — `collapseGraph` genuinely has no file/folder rollup for
    *  the per-callable complexity metrics. */
   levels: GraphLevel[];
   /** True for a channel that only means anything while a diff is loaded. It
@@ -281,7 +281,7 @@ export interface SizeChannelDef {
   value(d: D3Node, ctx: SizeContext): number | undefined;
 }
 
-const ALL_LEVELS: GraphLevel[] = ['entity', 'file', 'module'];
+const ALL_LEVELS: GraphLevel[] = ['entity', 'file', 'folder'];
 /** Metrics `collapseGraph`'s `scopeToEntityMetrics` leaves undefined. */
 const ENTITY_ONLY: GraphLevel[] = ['entity'];
 
@@ -388,15 +388,15 @@ export function severityScore(d: D3Node): number | undefined {
   const m = d.metrics;
   if (!m) return undefined;
   if (m.composite_score != null) return m.composite_score;
-  // File/Module nodes are scope rollups, and the two formulas are not
+  // File/Folder nodes are scope rollups, and the two formulas are not
   // interchangeable. `compositeScore` is the *per-entity* one; run on
   // `collapseGraph`'s promoted fields (entity_count posing as field_count,
   // callable_count as method_count) it would return a confident number that
-  // means nothing. Score them the way `fileRows` / `moduleRows` do, off the
+  // means nothing. Score them the way `fileRows` / `folderRows` do, off the
   // raw rollup, so canvas and Quality panel never disagree.
-  if (d.kind_raw === 'File' || d.kind_raw === 'Module') {
+  if (d.kind_raw === 'File' || d.kind_raw === 'Folder') {
     return d.scope_metrics
-      ? scopeCompositeScore(d.scope_metrics, d.kind_raw === 'Module')
+      ? scopeCompositeScore(d.scope_metrics, d.kind_raw === 'Folder')
       : undefined;
   }
   return compositeScore(m, d.kind_raw);

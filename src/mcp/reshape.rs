@@ -47,8 +47,8 @@ use serde_json::Value;
 
 use crate::graph::DependencyGraph;
 use crate::models::{
-    EdgeVerdict, FolderPicture, FolderShape, OutsideVerdict, PictureChild, PictureEdge,
-    ShapeBlocker, ShapePattern, Thresholds,
+    EdgeVerdict, FolderPicture, FolderShape, OutsideEdge, OutsideVerdict, PictureChild,
+    PictureEdge, ShapeBlocker, ShapePattern, Thresholds,
 };
 
 use super::baseline::Baseline;
@@ -68,13 +68,13 @@ pub fn reshape(server: &McpServer, args: &Value) -> Result<String> {
     let Some(picture) = graph.folder_picture(&absolute) else {
         bail!(
             "No analysed folder at {}. Folders come from the files in scope, so a \
-             directory holding nothing nao parsed has no shape to report.",
+             directory holding nothing mezz parsed has no shape to report.",
             rel(&folder, &server.root),
         );
     };
     let picture = picture.relative_to(&server.root);
     let shape = graph
-        .module_metrics()
+        .folder_metrics()
         .iter()
         .find(|m| m.path == absolute)
         .and_then(|m| m.metrics.shape.clone());
@@ -95,17 +95,79 @@ pub fn reshape(server: &McpServer, args: &Value) -> Result<String> {
     let previous = server.shape_baselines.swap(&picture.folder, &current);
 
     let mut body = vec![format!("# Reshaping {}", picture.folder), String::new()];
+    body.extend(soundness_note(&graph, &absolute, &server.root));
     body.extend(verdict_section(&shape, &t, &picture));
     body.extend(progress_section(previous.as_ref(), &current));
     body.extend(next_rung_section(&shape, &picture, &t, ctx));
     body.extend(drawing_section(&picture, ctx));
     body.extend(boundary_section(&picture));
-    body.extend(rules_section(&picture.folder, previous.is_some()));
+    // First call in this process gets the rules in full; every call after
+    // gets them as a checklist. See `short_rules`.
+    let spell_out = !server
+        .rules_spelled_out
+        .swap(true, std::sync::atomic::Ordering::Relaxed);
+    body.extend(rules_for(&picture.folder, previous.is_some(), spell_out));
 
     Ok(cap_lines(
         body,
         "Call `reshape` on a subfolder for a smaller drawing.",
     ))
+}
+
+/// What this folder's verdict is worth, when some of its imports never
+/// reached the graph.
+///
+/// Above the verdict, not below it: every section under this one is computed
+/// over the drawing, and a drawing missing edges produces answers that are
+/// confidently wrong rather than visibly uncertain. `reshape` was asserting
+/// *"Nothing leaves from the middle: this folder is a funnel"* over a folder
+/// two of whose outgoing imports had not resolved — and the only warning was a
+/// repo-wide figure in the footer, which cannot tell a reader whether the
+/// folder they are asking about is one of the holed ones.
+///
+/// Silent when the folder's imports all landed, so a sound answer costs
+/// nothing and the line means something when it appears.
+fn soundness_note(graph: &DependencyGraph, folder: &str, root: &Path) -> Vec<String> {
+    let sites = graph.unresolved_imports_in(folder);
+    if sites.is_empty() {
+        return Vec::new();
+    }
+    let named: Vec<String> = sites
+        .iter()
+        .take(MAX_LISTED)
+        .map(|s| {
+            format!(
+                "`{}:{}` → `{}`",
+                rel(&s.from, root),
+                s.line + 1,
+                rel(&s.to, root),
+            )
+        })
+        .collect();
+    let mut body = vec![
+        format!(
+            "> **{} of this folder's imports did not reach the graph.** Every verdict \
+             below is computed over the drawing, so treat them as provisional — a \
+             missing edge is why a folder reads as a funnel, as having one door, or \
+             as having a child nothing reaches, when it has none of those.",
+            sites.len(),
+        ),
+        String::new(),
+        format!("> Unresolved: {}.", named.join(", ")),
+        String::new(),
+        "> Read those statements before acting on anything below: each one is an \
+         edge the drawing does not have, and a finding that rests on its absence \
+         is an artifact rather than a defect."
+            .to_string(),
+        String::new(),
+    ];
+    if sites.len() > MAX_LISTED {
+        body.insert(
+            3,
+            format!("> … and {} more.", sites.len() - MAX_LISTED),
+        );
+    }
+    body
 }
 
 /// Where the folder stands, with every cut-off spelled out beside the
@@ -115,11 +177,12 @@ fn verdict_section(shape: &FolderShape, t: &Thresholds, p: &FolderPicture) -> Ve
     let mut body = vec![
         "## Verdict".to_string(),
         format!(
-            "**{}** — held back by {}.",
+            "**{}** — held back by {}.{}",
             shape.pattern.label(),
             shape
                 .blocker
                 .map_or_else(|| "nothing".to_string(), |b| b.summary()),
+            advisory_qualifier(shape, t),
         ),
         String::new(),
         format!(
@@ -137,9 +200,17 @@ fn verdict_section(shape: &FolderShape, t: &Thresholds, p: &FolderPicture) -> Ve
             t.shape_arborescence,
         ),
         format!(
-            "- entry concentration {} (needs ≥ {:.2} for `fractal`)",
+            "- entry concentration {} (needs ≥ {:.2} for `fractal`){}",
             num(shape.entry_concentration),
             t.shape_entry,
+            ways_in(p),
+        ),
+        format!(
+            "- out at the bottom {} (needs ≥ {:.2} for `fractal`; NOT part of \
+             compliance){}",
+            num(shape.egress),
+            t.shape_egress,
+            ways_out(shape),
         ),
         format!(
             "- child compliance {} (needs ≥ {:.2} for `fractal`)",
@@ -154,19 +225,196 @@ fn verdict_section(shape: &FolderShape, t: &Thresholds, p: &FolderPicture) -> Ve
             shape.compliance, t.shape_compliance,
         ),
         format!(
-            "- {} immediate children (needs ≤ {} for `fractal`; NOT part of compliance)",
-            shape.child_count, t.shape_max_children,
+            "- {} immediate children (needs ≤ {} for `fractal`; NOT part of compliance){}",
+            shape.child_count,
+            t.shape_max_children,
+            crowding_note(shape.child_count, t.shape_max_children),
         ),
         String::new(),
         "Higher is better in every score here, which is the reverse of the \
-         complexity and coupling scores elsewhere in nao. The child count is the \
+         complexity and coupling scores elsewhere in mezz. The child count is the \
          exception and reads the ordinary way round — it is a count, not a ratio. \
          `—` means unmeasured, not perfect."
             .to_string(),
         String::new(),
     ];
+    body.extend(formulas(shape));
     body.extend(fractal_note(shape, p));
     body
+}
+
+/// The three ratios written out as the divisions they are.
+///
+/// Printed rather than documented because agents were reverse-engineering
+/// them from observed values and getting them wrong. One field report had
+/// `branching` down as *children with exactly one parent ÷ (children −
+/// 1)* — which happens to match on some folders and not others, so the
+/// agent chose between three candidate layouts by editing the tree and
+/// re-measuring, twice, and asked for the formulas to be published.
+///
+/// This is the publication. The counts come off [`ShapeTerms`], filled
+/// beside the division that produced the ratio, so they cannot drift from
+/// the numbers directly above them; `layout` prints the same three, which
+/// is what lets an agent predict a score instead of shopping for one.
+fn formulas(shape: &FolderShape) -> Vec<String> {
+    let t = &shape.terms;
+    if t.nodes == 0 {
+        return Vec::new();
+    }
+    let mut rows = vec![format!(
+        "- acyclicity = 1 − children in a loop ÷ children: 1 − {} ÷ {}",
+        t.looped, t.nodes
+    )];
+    if t.edges > 0 {
+        rows.push(format!(
+            "- layering = edges stepping exactly one level down ÷ edges: {} ÷ {}",
+            t.tight, t.edges
+        ));
+        rows.push(format!(
+            "- branching = children an edge arrives at ÷ (edges + roots past the \
+             first): {} ÷ ({} + {})",
+            t.reached,
+            t.edges,
+            t.strays.saturating_sub(1)
+        ));
+    }
+    if t.arrivals > 0 {
+        rows.push(format!(
+            "- entry concentration = arrivals on the busiest file ÷ arrivals from \
+             outside: {} ÷ {}",
+            t.busiest, t.arrivals
+        ));
+    }
+    let mut body = vec![
+        "Where those numbers come from, so you can work out what a change would \
+         score before making it. `edges` is counted after each dependency loop \
+         collapses to a single node, which is why it can be lower than the arrow \
+         count in the drawing below:"
+            .to_string(),
+        String::new(),
+    ];
+    body.extend(rows);
+    body.push(String::new());
+    body.push(
+        "`layout` on this folder scores a hypothetical set of moves against these \
+         same counts, without touching the tree."
+            .to_string(),
+    );
+    body.push(String::new());
+    body
+}
+
+/// Whether this bullet is the one the usage breakdown will follow.
+///
+/// Only the first merge gets a breakdown — printing it per offender would
+/// bury the instruction under data about merges the reader was just told to
+/// leave alone — and `split_lines` yields nothing when fewer than two
+/// dependents could be measured. Its own function because the complexity gate
+/// fails on any metric increase to a function that already exists (CI-001),
+/// and `merge_findings` had no budget for one more condition.
+fn promises_breakdown(index: usize, breakdown: &[String]) -> bool {
+    index == 0 && !breakdown.is_empty()
+}
+
+/// The warning that two of this tool's goals pull against each other, said
+/// where the count is read rather than left for the reader to discover.
+///
+/// Making a folder a funnel means moving egress down into leaves, and that
+/// means *adding leaf files*. So the funnel property pushes the child count
+/// up, toward a ceiling whose remedy is grouping into subfolders — and each
+/// new subfolder needs a door of its own. Reported from the field by an agent
+/// who funnelled a folder from 7 children to 8 and landed exactly on the bar.
+///
+/// Both goals are real and the tension is not a defect; being silent about it
+/// is, because an agent that hits the ceiling right after being told to
+/// funnel reads it as having done the wrong thing.
+fn crowding_note(children: u32, ceiling: u32) -> &'static str {
+    if children + 1 < ceiling {
+        return "";
+    }
+    " — note that funnelling egress into leaves adds children, so this and the \
+     funnel property push against each other. At the bar, group into subfolders \
+     rather than stopping the funnel work; each subfolder then earns its own door."
+}
+
+/// The count `egress` rounds off, the way [`ways_in`] does for
+/// `entry_concentration`.
+///
+/// The ratio alone is shoppable: 0.50 is one middle child with one exit
+/// beside one leaf with one, and it is also one middle child with fifty. The
+/// first is a file to move and the second is a folder built inside out, and
+/// an agent picking work off the number cannot tell them apart.
+fn ways_out(shape: &FolderShape) -> String {
+    match shape.terms.middle_exits {
+        0 => String::new(),
+        1 => " — 1 exit from the middle".to_string(),
+        n => format!(" — **{n} exits from the middle**, which the ratio does not say"),
+    }
+}
+
+/// The count beside the ratio: how many of this folder's children anything
+/// outside it depends on.
+///
+/// `entry_concentration` is the busiest child's *share* of the traffic
+/// arriving, and a share has a perverse incentive built into it — removing a
+/// dependency on the door lowers it, because the door's slice of a smaller
+/// total is what the number is. Reported from the field: decoupling a
+/// consumer from a folder, an unambiguous improvement, moved that folder from
+/// 0.40 to 0.38, and the cheapest way to *raise* it would have been to make
+/// more files import the door.
+///
+/// A count does not have that property. One way in stays one way in however
+/// the traffic is distributed, and it is the thing people mean when they ask
+/// for a single entry point — which the ratio does not express, since two
+/// children splitting traffic 83/17 score 0.83 with two ways in. The project
+/// rule `max_entered_files_per_folder` (CHK-003) is the enforceable form; this
+/// is the same fact printed where the ratio is read, so the two cannot be
+/// confused for each other.
+///
+/// Children rather than files, because that is the unit this folder is drawn
+/// in — a subfolder is one node here however many of its files are entered.
+fn ways_in(p: &FolderPicture) -> String {
+    let entered = p.children.iter().filter(|c| c.inbound > 0).count();
+    match entered {
+        0 => String::new(),
+        1 => " — 1 way in".to_string(),
+        n => format!(" — **{n} ways in**, which the ratio does not say"),
+    }
+}
+
+/// The qualifier on a verdict whose only blocker is the metric this tool
+/// spends the rest of the report telling you to leave alone.
+///
+/// `branching` is deliberately outside `compliance` (ADR 0013), the merge
+/// classifier will say a shared helper is a contract to keep, and since
+/// MCP-020 the task section will say outright that there is no move here — and
+/// the headline still read `hierarchical`, which is the line an agent
+/// optimises. Reported from the field on a folder at compliance 0.97, entry
+/// concentration 1.00, layering 1.00, acyclicity 1.00 and a genuine funnel:
+/// "the guidance and the gate disagree about the same folder in the same
+/// report".
+///
+/// A sentence rather than a gate change, which is the reporter's own
+/// suggestion and the better trade: dropping `branching` from the tier would
+/// remove the ladder's fourth rung and make every recorded verdict
+/// incomparable, where this costs nothing and dissolves the contradiction
+/// where it is read. The open question of whether the *gate* should change is
+/// [MCP-024] and stays open.
+fn advisory_qualifier(shape: &FolderShape, t: &Thresholds) -> String {
+    if !matches!(shape.blocker, Some(ShapeBlocker::Merges(_))) {
+        return String::new();
+    }
+    let compliant = shape.compliance >= t.shape_compliance
+        && shape.acyclicity >= 1.0
+        && shape.layering.is_none_or(|l| l >= t.shape_layering);
+    if !compliant {
+        return String::new();
+    }
+    " **By every compliance measure this folder is finished** — the only gate \
+     left is branching, which is not part of compliance and which the guidance \
+     below will often tell you to leave. Read that guidance before treating this \
+     tier as work."
+        .to_string()
 }
 
 /// What "nothing to do" leaves out.
@@ -236,81 +484,7 @@ fn next_rung_section(
     )];
     body.push(String::new());
 
-    match blocker {
-        ShapeBlocker::Cycles(_) => body.extend(recipes::cycle_lines(p, ctx.graph, ctx.root)),
-        ShapeBlocker::Layering(v) => body.extend(layering_task(p, ctx, v)),
-        ShapeBlocker::Merges(v) => body.extend(merges_task(p, ctx, v)),
-        ShapeBlocker::Breadth(count) => body.extend(recipes::breadth_lines(p, t, count)),
-        ShapeBlocker::Entry(v) => body.extend(recipes::entry_lines(p, t, v)),
-        ShapeBlocker::ChildPattern(pattern) => {
-            body.push(format!(
-                "The recursion breaks one level down: a subfolder is itself {}, and \
-                 `fractal` is a claim about the shape holding at more than one zoom \
-                 level. This folder's own drawing is already fine — the work is \
-                 inside it.",
-                pattern.label(),
-            ));
-            body.push(String::new());
-            body.push(
-                "Call `reshape` on each subfolder below and fix those first. Nothing \
-                 done at this level will move the verdict while one of them is \
-                 unreadable."
-                    .to_string(),
-            );
-            body.push(String::new());
-            body.extend(listed(
-                p.children
-                    .iter()
-                    .filter(|c| c.kind == crate::models::ChildKind::Folder)
-                    .map(|c| c.path.clone()),
-            ));
-        }
-        ShapeBlocker::ChildCompliance(v) => {
-            body.push(format!(
-                "No single subfolder is unreadable, but they average {} against the \
-                 {:.2} this gate asks for. Call `reshape` on each and fix the worst; \
-                 this level has nothing to change.",
-                num(Some(v)),
-                t.shape_child,
-            ));
-            body.push(String::new());
-            body.extend(listed(
-                p.children
-                    .iter()
-                    .filter(|c| c.kind == crate::models::ChildKind::Folder)
-                    .map(|c| c.path.clone()),
-            ));
-        }
-        ShapeBlocker::Unstructured => {
-            body.push(
-                "The children have no dependencies between them at all. The drawing \
-                 is a legible row of dots, and there is no structure for the \
-                 recursion to be self-similar *to* — which is why it stops short of \
-                 fractal rather than topping the ladder."
-                    .to_string(),
-            );
-            body.push(String::new());
-            body.push(
-                "**This is usually not a defect and usually not worth acting on.** A \
-                 folder of independent things is a fine folder. Manufacturing \
-                 dependencies between them to earn a tier would make the code worse \
-                 in exchange for a number. Act on it only if the files here turn out \
-                 to be unrelated in a way that means they should not have been filed \
-                 together."
-                    .to_string(),
-            );
-        }
-        ShapeBlocker::Compliance(v) => {
-            body.push(format!(
-                "Every gate passed and the blend still came to {} against {:.2} — \
-                 several terms a little low rather than one clearly wrong. Look at \
-                 the sub-scores above and improve whichever is furthest from its bar; \
-                 there is no single offender to name.",
-                num(Some(v)),
-                t.shape_compliance,
-            ));
-        }
-    }
+    body.extend(task_lines(blocker, p, t, ctx));
     body.push(String::new());
     body.push(format!(
         "Stop there. The tiers are a ladder and `{}` is the next rung — the gates \
@@ -322,6 +496,99 @@ fn next_rung_section(
     body
 }
 
+/// The work one gate asks for, as its own function.
+///
+/// Lifted out of [`next_rung_section`] rather than grown there: the arms are
+/// one per gate and the complexity gate fails on any increase to a function
+/// that already exists (CI-001), so a match that gains an arm every time the
+/// ladder does has to be the whole of what its function does. The same move
+/// `rules::SPECS` and the MCP tool dispatch already made.
+fn task_lines(
+    blocker: ShapeBlocker,
+    p: &FolderPicture,
+    t: &Thresholds,
+    ctx: Ctx<'_>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match blocker {
+        ShapeBlocker::Cycles(_) => out.extend(recipes::cycle_lines(p, ctx.graph, ctx.root)),
+        ShapeBlocker::Layering(v) => out.extend(layering_task(p, ctx, v)),
+        ShapeBlocker::Merges(v) => out.extend(merges_task(p, ctx, v)),
+        ShapeBlocker::Breadth(count) => out.extend(recipes::breadth_lines(p, t, count)),
+        ShapeBlocker::Entry(v) => out.extend(recipes::entry_lines(p, t, v)),
+        ShapeBlocker::Egress(v) => out.extend(egress_task(p, t, v)),
+        ShapeBlocker::ChildPattern(pattern) => {
+            out.push(format!(
+                "The recursion breaks one level down: a subfolder is itself {}, and \
+                 `fractal` is a claim about the shape holding at more than one zoom \
+                 level. This folder's own drawing is already fine — the work is \
+                 inside it.",
+                pattern.label(),
+            ));
+            out.push(String::new());
+            out.push(
+                "Call `reshape` on each subfolder below and fix those first. Nothing \
+                 done at this level will move the verdict while one of them is \
+                 unreadable."
+                    .to_string(),
+            );
+            out.push(String::new());
+            out.extend(listed(
+                p.children
+                    .iter()
+                    .filter(|c| c.kind == crate::models::ChildKind::Folder)
+                    .map(|c| c.path.clone()),
+            ));
+        }
+        ShapeBlocker::ChildCompliance(v) => {
+            out.push(format!(
+                "No single subfolder is unreadable, but they average {} against the \
+                 {:.2} this gate asks for. Call `reshape` on each and fix the worst; \
+                 this level has nothing to change.",
+                num(Some(v)),
+                t.shape_child,
+            ));
+            out.push(String::new());
+            out.extend(listed(
+                p.children
+                    .iter()
+                    .filter(|c| c.kind == crate::models::ChildKind::Folder)
+                    .map(|c| c.path.clone()),
+            ));
+        }
+        ShapeBlocker::Unstructured => {
+            out.push(
+                "The children have no dependencies between them at all. The drawing \
+                 is a legible row of dots, and there is no structure for the \
+                 recursion to be self-similar *to* — which is why it stops short of \
+                 fractal rather than topping the ladder."
+                    .to_string(),
+            );
+            out.push(String::new());
+            out.push(
+                "**This is usually not a defect and usually not worth acting on.** A \
+                 folder of independent things is a fine folder. Manufacturing \
+                 dependencies between them to earn a tier would make the code worse \
+                 in exchange for a number. Act on it only if the files here turn out \
+                 to be unrelated in a way that means they should not have been filed \
+                 together."
+                    .to_string(),
+            );
+        }
+        ShapeBlocker::Compliance(v) => {
+            out.push(format!(
+                "Every gate passed and the blend still came to {} against {:.2} — \
+                 several terms a little low rather than one clearly wrong. Look at \
+                 the sub-scores above and improve whichever is furthest from its bar; \
+                 there is no single offender to name.",
+                num(Some(v)),
+                t.shape_compliance,
+            ));
+        }
+    }
+    out
+}
+
 /// The answer to "did what you just did work" — reported by the tool that
 /// set the baseline, not by the agent that changed the code.
 ///
@@ -329,9 +596,39 @@ fn next_rung_section(
 /// only the second time is also the announcement that a baseline now
 /// exists, and an agent that has seen this once knows the next call will
 /// grade it.
+/// What the comparator says when it has nothing to compare against.
+///
+/// It used to say nothing at all, and absence is ambiguous in the worst
+/// possible way here: an empty section reads identically to "you have not
+/// called this before" and to "nothing changed". Reported from the field on
+/// the largest tier move of a session — `hierarchical → fractal`, with two
+/// edges appearing, which is precisely what this section exists to confirm —
+/// and it was silent.
+///
+/// The record lives in the server process, so it is empty for a folder never
+/// asked about *and* for every folder after a restart. Both are named, because
+/// an agent that rebuilt and reloaded between calls needs to know its baseline
+/// went with the old process rather than wonder whether its edit did nothing.
+fn no_baseline() -> Vec<String> {
+    vec![
+        "## Since your last call".to_string(),
+        String::new(),
+        "**No prior drawing on record**, so nothing below is a comparison. This is \
+         not \"nothing changed\": this is the first `reshape` on this folder, or the \
+         first since the analysis scope changed, or the first since the cache \
+         directory was cleared. The record itself outlives the server — it is \
+         mirrored under the mezz cache directory, not held in the process — so a \
+         rebuild or a reload between two calls no longer loses it. The reading below \
+         is now the baseline; re-run after your next edit and this section will diff \
+         against it."
+            .to_string(),
+        String::new(),
+    ]
+}
+
 fn progress_section(before: Option<&Baseline>, after: &Baseline) -> Vec<String> {
     let Some(before) = before else {
-        return Vec::new();
+        return no_baseline();
     };
     let mut body = vec!["## Since your last call".to_string(), String::new()];
 
@@ -354,6 +651,7 @@ fn progress_section(before: Option<&Baseline>, after: &Baseline) -> Vec<String> 
             before.entry_concentration,
             after.entry_concentration,
         ),
+        ("out at the bottom", before.egress, after.egress),
         (
             "compliance",
             Some(before.compliance),
@@ -377,7 +675,82 @@ fn progress_section(before: Option<&Baseline>, after: &Baseline) -> Vec<String> 
     body.push(String::new());
     body.extend(condensation_note(before, after));
     body.extend(relevelling_note(before, after));
+    body.extend(arithmetic_note(before, after));
+    body.extend(stray_note(before, after));
     body
+}
+
+/// The moved ratios written out as the divisions they came from.
+///
+/// The before/after twin of the block in the verdict section, and the
+/// reason both exist: a reader shown `branching 0.88 → 0.71` and no
+/// arithmetic has to guess whether the numerator or the denominator moved,
+/// and those two want opposite responses.
+fn arithmetic_note(before: &Baseline, after: &Baseline) -> Vec<String> {
+    let (b, a) = (&before.terms, &after.terms);
+    let rows = [
+        ("layering", (b.tight, b.edges), (a.tight, a.edges)),
+        (
+            "branching",
+            (b.reached, b.edges + b.strays.saturating_sub(1)),
+            (a.reached, a.edges + a.strays.saturating_sub(1)),
+        ),
+        (
+            "entry concentration",
+            (b.busiest, b.arrivals),
+            (a.busiest, a.arrivals),
+        ),
+    ];
+    let moved: Vec<String> = rows
+        .iter()
+        .filter(|(_, was, now)| was != now && (was.1 > 0 || now.1 > 0))
+        .map(|(name, was, now)| {
+            format!("{name} {} ÷ {} → {} ÷ {}", was.0, was.1, now.0, now.1)
+        })
+        .collect();
+    if moved.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("The arithmetic behind those: {}.", moved.join("; ")),
+        String::new(),
+    ]
+}
+
+/// Why `branching` can fall on a regrouping that was right.
+///
+/// The gap a field report named exactly. This tool warns at length that a
+/// tier rising while every edge stays put should be reverted, and says
+/// nothing about the opposite: a number falling on a change that removed
+/// no dependency. The reporter had dissolved a folder of shared contracts
+/// — the right move, and one the forbidden list explicitly permits — and
+/// watched `branching` go 0.88 → 0.71 for it, because the two files
+/// involved were `import type` targets with no scored edge arriving and so
+/// became parentless nodes at the top level. Every root past the first
+/// joins the denominator (ADR 0022), so the ratio fell on a change nothing
+/// was wrong with, and the report offered no reading of that at all.
+fn stray_note(before: &Baseline, after: &Baseline) -> Vec<String> {
+    let fell = matches!(
+        (before.arborescence, after.arborescence),
+        (Some(was), Some(now)) if now < was
+    );
+    let gained = after.terms.strays.saturating_sub(before.terms.strays);
+    if !fell || gained == 0 {
+        return Vec::new();
+    }
+    vec![
+        format!(
+            "**The fall in `branching` is that arithmetic, not damage.** {gained} more \
+             {} in this drawing now {} reached by no edge in it — a child whose only \
+             inbound arrow left the level, or one whose only importer reaches it \
+             through a statement the build erases. Every root past the first joins the \
+             denominator (ADR 0022), so the ratio falls without a single dependency \
+             having moved the wrong way. Judge the change on the edges listed above.",
+            if gained == 1 { "child" } else { "children" },
+            if gained == 1 { "is" } else { "are" },
+        ),
+        String::new(),
+    ]
 }
 
 /// "Nothing has changed", and the third reading of it that only a
@@ -399,7 +772,7 @@ fn unchanged_sentence(before: &Baseline, after: &Baseline) -> String {
     format!(
         "{SAME} Or the configuration did: scope `{}` → `{}` between the two calls, so the \
          drawing this one is graded against was taken under different settings — a \
-         `.nao/settings.json` edit, or a server started with different flags.",
+         `.mezz/settings.json` edit, or a server started with different flags.",
         before.scope, after.scope,
     )
 }
@@ -675,22 +1048,93 @@ fn layering_under(
 /// The edges that came and went, which is the evidence behind the verdict
 /// below and the thing an agent cannot restate from memory.
 fn structural_diff(before: &Baseline, after: &Baseline) -> Vec<String> {
-    let gone: Vec<String> = before
-        .edges
-        .difference(&after.edges)
-        .map(|(f, t)| format!("removed `{f} → {t}`"))
-        .collect();
-    let added: Vec<String> = after
-        .edges
-        .difference(&before.edges)
-        .map(|(f, t)| format!("added `{f} → {t}`"))
-        .collect();
-    if gone.is_empty() && added.is_empty() {
-        return vec!["No edge between these children changed.".to_string()];
+    let mut moved = changed_pairs(&before.edges, &after.edges, "");
+    moved.extend(changed_pairs(
+        &before.outside,
+        &after.outside,
+        " across the boundary",
+    ));
+    if moved.is_empty() {
+        return vec![
+            "No edge between these children changed, and nothing arriving from \
+             outside landed anywhere new."
+                .to_string(),
+        ];
     }
     let mut body = vec!["What changed in the drawing:".to_string(), String::new()];
-    body.extend(listed(gone.into_iter().chain(added)));
+    body.extend(every_change(moved));
     body
+}
+
+/// How many edge changes get listed before the rest are rolled up.
+///
+/// Higher than [`MAX_LISTED`] on purpose. Twenty is the right bar for a
+/// list of offenders, where the point is made by the first few and the
+/// endpoint holds the rest; this list is the *evidence for the verdict*,
+/// and an agent reported it cutting off at "… and 36 more" precisely on
+/// the call where the restructure was largest — which is the call whose
+/// evidence matters most.
+const MAX_EDGE_CHANGES: usize = 60;
+
+/// The changed edges, and — when even that many is not enough — which
+/// files the rest of them touched.
+///
+/// A bare "… and 36 more" is the one truncation this report cannot
+/// afford: it drops the answer to "did the thing I meant to change
+/// actually change" at the moment the answer is least guessable. The
+/// rollup is not the full list, but it is the part a reader is looking
+/// for — the files involved — rather than a count of what they cannot
+/// see.
+fn every_change(moved: Vec<String>) -> Vec<String> {
+    let total = moved.len();
+    if total <= MAX_EDGE_CHANGES {
+        return moved.into_iter().map(|m| format!("- {m}")).collect();
+    }
+    let (shown, rest) = moved.split_at(MAX_EDGE_CHANGES);
+    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+    for change in rest {
+        for file in change.split('`').skip(1).step_by(2) {
+            for endpoint in file.split(" → ") {
+                *tally.entry(endpoint).or_default() += 1;
+            }
+        }
+    }
+    let files: Vec<String> = tally
+        .iter()
+        .map(|(file, count)| format!("`{file}` ({count})"))
+        .collect();
+    let mut body: Vec<String> = shown.iter().map(|m| format!("- {m}")).collect();
+    body.push(format!(
+        "- … and {} more, touching {}.",
+        rest.len(),
+        files.join(", ")
+    ));
+    body
+}
+
+/// What moved between two edge sets, added and removed.
+///
+/// Run over the boundary crossings as well as the drawn edges, because
+/// `same_structure` counts both and this section is the evidence for its
+/// verdict. It used to list only child-to-child edges, so narrowing a door
+/// from three landings to one — the change the boundary section had asked
+/// for — was reported as "No edge between these children changed", which
+/// reads as *nothing happened* directly above an instruction to revert
+/// anything cosmetic. Reported from the field as the third case this session
+/// of the comparator disowning a real improvement, and the first caused by
+/// the two halves of the report measuring at different granularities.
+fn changed_pairs(
+    before: &BTreeSet<(String, String)>,
+    after: &BTreeSet<(String, String)>,
+    where_: &str,
+) -> Vec<String> {
+    let gone = before
+        .difference(after)
+        .map(|(f, t)| format!("removed `{f} → {t}`{where_}"));
+    let added = after
+        .difference(before)
+        .map(|(f, t)| format!("added `{f} → {t}`{where_}"));
+    gone.chain(added).collect()
 }
 
 /// The judgement, in the terms the closing instruction is written in.
@@ -711,10 +1155,22 @@ fn progress_verdict(before: &Baseline, after: &Baseline) -> String {
                 .to_string()
         }
         (std::cmp::Ordering::Less, true) => format!(
-            "The tier **fell** to `{}`. If you were grouping children into subfolders \
-             this is expected — a new subfolder is a new child that has to earn its own \
-             verdict, and the work now continues inside it. If you were not, this \
-             change made the folder harder to read and is worth undoing.",
+            "The tier **fell** to `{}`, and real dependencies changed. Three things \
+             do that, and only one of them is a mistake.\n\n\
+             - **You grouped children into subfolders.** Expected: a new subfolder is \
+             a new child that has to earn its own verdict, and the work continues \
+             inside it.\n\
+             - **You extracted or de-duplicated something.** Also expected, and the \
+             one this tool used to get wrong. A tier reads the *drawing*, not whether \
+             the code got better: pulling a repeated policy into one place adds a node \
+             and the edges into it, and a folder can be genuinely better to work in \
+             while drawing worse. Ratios move for the same reason — removing a \
+             dependency on the door lowers `entry concentration`, because the door's \
+             share of a smaller total is what that number is.\n\
+             - **The folder actually got harder to read.** Then it is worth undoing.\n\n\
+             Decide which by reading *what moved* under **what changed** below, not by \
+             the tier alone. A test that existed to guard behaviour you have now \
+             centralised is evidence for the second reading, not the third.",
             after.pattern.label(),
         ),
         (std::cmp::Ordering::Less, false) => {
@@ -913,30 +1369,110 @@ fn merges_task(p: &FolderPicture, ctx: Ctx<'_>, v: f32) -> Vec<String> {
     if !merges.is_empty() {
         body.extend(merge_findings(p, ctx, &merges));
         body.push(String::new());
-        body.push(format!(
-            "This is the one gate that disagrees with `layering` on purpose: several \
-             files leaning on one helper steps one level cleanly and still merges, so \
-             layering scores it 1.00 while branching marks it down. Both readings are \
-             right, and this folder is at {} on the second. Moving a shared helper down \
-             a level does not fix it — it is still shared.",
-            num(Some(v)),
-        ));
-        body.push(String::new());
-        body.push(
-            "**Fix one merge point, not all of them.** They are listed worst-first and \
-             the classification above says which are real; a folder can clear this gate \
-             with one removal while a legitimate contract stays exactly where it is."
-                .to_string(),
-        );
+        body.extend(merge_instruction(p, ctx, &merges, strays.len(), v));
     }
 
     if strays.len() > 1 {
         if !merges.is_empty() {
             body.push(String::new());
         }
-        body.extend(stray_findings(&strays));
+        body.extend(stray_findings(&strays, p, ctx));
     }
     body
+}
+
+/// What to do about the merges — which is sometimes nothing.
+///
+/// The gate charges for convergence, and [`recipes`] can tell a convergence
+/// that is a defect from one that is a data contract between a producer and a
+/// consumer. Until now only the *prose listing* consulted that, so a folder
+/// whose every merge the tool had just called legitimate was still handed
+/// "give the drawing the shape of a tree" and told it could clear the gate
+/// "with one removal". For that folder both sentences are false: there is no
+/// removal, and the tier is unreachable.
+///
+/// An unreachable bar is not a neutral inaccuracy. The moves that would clear
+/// it — a re-export shim, splitting the shared type, routing one sibling
+/// through the other — are the ones this same tool forbids two sections
+/// further down, so an instruction to clear it is an instruction to do the
+/// forbidden thing. Saying "this is the ceiling, and it is not a defect" is
+/// the honest reading and the one that stops the churn.
+fn merge_instruction(
+    p: &FolderPicture,
+    ctx: Ctx<'_>,
+    merges: &BTreeMap<String, Vec<String>>,
+    strays: usize,
+    v: f32,
+) -> Vec<String> {
+    let mut body = vec![
+        format!(
+            "This is the one gate that disagrees with `layering` on purpose: several \
+             files leaning on one helper steps one level cleanly and still merges, so \
+             layering scores it 1.00 while branching marks it down. Both readings are \
+             right, and this folder is at {} on the second. Moving a shared helper down \
+             a level does not fix it — it is still shared.",
+            num(Some(v)),
+        ),
+        String::new(),
+    ];
+    if !every_merge_is_a_contract(p, ctx, merges) {
+        body.push(
+            "**Fix one merge point, not all of them.** They are listed worst-first and \
+             the classification above says which are real; a folder can clear this gate \
+             with one removal while a legitimate contract stays exactly where it is."
+                .to_string(),
+        );
+        return body;
+    }
+    // Strays charge this gate too and they *are* fixable, so a folder with
+    // more than one still has a move — just not among the merges. Saying
+    // "fix one merge point" here would point at the only things above that
+    // were each just marked *leave it*.
+    if strays > 1 {
+        body.push(
+            "**No merge above is a defect** — every one is a shared contract, and each \
+             was just marked *leave it*. What is left charging this gate is the strays \
+             below, and those are the only part of it worth your attention."
+                .to_string(),
+        );
+        return body;
+    }
+    body.push(
+        "**There is no move here.** Every merge above is a shared contract — \
+         independent siblings agreeing on the same types out of one child, which is \
+         what a producer and a consumer over one data shape look like. This gate \
+         charges for it because the drawing converges, and that reading is correct; \
+         it is not a defect, and it is not fixable without making the code worse."
+            .to_string(),
+    );
+    body.push(String::new());
+    body.push(
+        "So this folder is at its ceiling on branching, by design rather than by \
+         neglect. Do not clear it: the three moves that would — re-exporting the \
+         child through one sibling, splitting the shared type, or routing one \
+         sibling through the other — are on the forbidden list below, and each \
+         changes the picture without changing the program. Read the tier as \
+         *held by a contract*, and spend the effort on a gate that names something \
+         wrong."
+            .to_string(),
+    );
+    body
+}
+
+/// Whether every merge point in the drawing is a data contract rather than a
+/// defect. The same classification the listing ranks by, asked as a question
+/// about the folder instead of about one merge.
+fn every_merge_is_a_contract(
+    p: &FolderPicture,
+    ctx: Ctx<'_>,
+    merges: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    merges.iter().all(|(child, parents)| {
+        matches!(
+            recipes::classify(p, ctx.graph, ctx.root, child, parents),
+            recipes::MergeShape::SharedContract { .. }
+        )
+    })
 }
 
 /// What this folder's branching score is actually made of.
@@ -982,14 +1518,51 @@ fn stray_children(p: &FolderPicture) -> Vec<String> {
     out
 }
 
+/// What the stray list is worth when this folder has imports the graph never
+/// resolved.
+///
+/// A child with no parent is *exactly* what a missing import edge fabricates,
+/// which makes this the one finding an unresolved import can invent outright.
+/// Reported from the field: a folder of three algorithm files was told its
+/// children had no parent and offered three diagnoses — head does not reach
+/// them, folder is really two, folder is a bag — while the parent existed in
+/// the source and imported both of them. All three were false, and the prose
+/// is as confident as it is for a real finding.
+///
+/// The banner at the top of the report says "provisional", and that is not
+/// enough here: provisional reads as *the number may be off*, not *this task
+/// is invented*. So the suspicion is repeated where the instruction is, in
+/// the one section it can invalidate completely.
+fn stray_caveat(p: &FolderPicture, ctx: Ctx<'_>) -> Vec<String> {
+    let folder = ctx.root.join(&p.folder);
+    if ctx
+        .graph
+        .unresolved_imports_touching(&folder.display().to_string())
+        == 0
+    {
+        return Vec::new();
+    }
+    vec![
+        "**Check the unresolved imports listed at the top before reading this \
+         list.** A child looks parentless when the edge that would have reached it \
+         is one the graph does not hold, and every diagnosis below — a head that \
+         does not reach them, a folder that is really two, a bag of unrelated \
+         files — is wrong in that case. Resolve those statements first; what \
+         survives is the finding."
+            .to_string(),
+        String::new(),
+    ]
+}
+
 /// The stray instruction. Deliberately not symmetrical with the merge one:
 /// a merge is fixed by removing an edge, and nothing here is fixed by
 /// adding one.
-fn stray_findings(strays: &[String]) -> Vec<String> {
+fn stray_findings(strays: &[String], p: &FolderPicture, ctx: Ctx<'_>) -> Vec<String> {
     let mut body = vec![
         "These children have no parent in the drawing:".to_string(),
         String::new(),
     ];
+    body.extend(stray_caveat(p, ctx));
     body.extend(listed(strays.iter().cloned()));
     body.push(String::new());
     body.push(
@@ -1051,9 +1624,28 @@ fn merge_findings(
         .collect();
     ranked.sort_by_key(|(rank, child, _)| (*rank, (*child).clone()));
 
+    // Computed before the bullets, because the first bullet's prose promises
+    // this breakdown and must not promise one that turns out to be empty —
+    // `split_lines` returns nothing when fewer than two dependents could be
+    // measured, and the pointer used to be printed unconditionally.
+    let written = recipes::written(ctx.graph, ctx.root, p);
+    let breakdown = ranked
+        .first()
+        .map(|(_, child, parents)| {
+            recipes::split_lines(ctx.graph, ctx.root, &written, child, parents)
+        })
+        .unwrap_or_default();
+
     let mut body = Vec::new();
-    for (_, child, parents) in ranked.iter().take(MAX_LISTED) {
-        body.extend(recipes::merge_lines(p, ctx.graph, ctx.root, child, parents));
+    for (i, (_, child, parents)) in ranked.iter().take(MAX_LISTED).enumerate() {
+        body.extend(recipes::merge_lines(
+            p,
+            ctx.graph,
+            ctx.root,
+            child,
+            parents,
+            promises_breakdown(i, &breakdown),
+        ));
     }
     if ranked.len() > MAX_LISTED {
         body.push(format!("- … and {} more.", ranked.len() - MAX_LISTED));
@@ -1061,12 +1653,7 @@ fn merge_findings(
     // The usage breakdown, for the one merge point actually being worked
     // on. Printing it per offender would bury the instruction under data
     // about merges the reader was just told to leave alone.
-    if let Some((_, child, parents)) = ranked.first() {
-        let written = recipes::written(ctx.graph, ctx.root, p);
-        body.extend(recipes::split_lines(
-            ctx.graph, ctx.root, &written, child, parents,
-        ));
-    }
+    body.extend(breakdown);
     body
 }
 
@@ -1277,24 +1864,250 @@ fn boundary_section(p: &FolderPicture) -> Vec<String> {
         body.push(String::new());
     }
     if exits > 0 {
-        let targets: BTreeSet<&str> = p
-            .outside
+        body.extend(exit_section(p, exits));
+    }
+    body
+}
+
+/// The work the egress gate asks for (AN-028 step 3, ADR 0031).
+///
+/// Built from the same [`ExitOrigin`] classification the *Across the
+/// boundary* inventory prints, so the gate and the listing cannot disagree
+/// about which exits are the leak.
+///
+/// Names three legal moves and one forbidden one, because a gate that names
+/// a defect without naming a move is a gate that gets worked around — the
+/// failure AN-028 recorded from the field, where agents met the one-door
+/// rule with a re-export because it was the only route anyone had priced.
+/// The ambient-type move is spelled out for the same reason: it is the one
+/// case where the obvious reading of "exits only from leaves" would flatten
+/// a folder into a bag, and an agent that cannot find it reaches for a shim.
+fn egress_task(p: &FolderPicture, t: &Thresholds, v: f32) -> Vec<String> {
+    let leaves = leaf_children(p);
+    let doors: BTreeSet<&str> = p
+        .children
+        .iter()
+        .filter(|c| c.is_door)
+        .map(|c| c.path.as_str())
+        .collect();
+    let middle: Vec<&OutsideEdge> = p
+        .outside
+        .iter()
+        .filter(|o| o.verdict == OutsideVerdict::Exit)
+        .filter(|o| ExitOrigin::of(&o.child, &leaves, &doors) == ExitOrigin::Middle)
+        .collect();
+    let total = p
+        .outside
+        .iter()
+        .filter(|o| o.verdict == OutsideVerdict::Exit)
+        .count();
+    // The gate's own question asked at each step, rather than multiplied
+    // out — `entry_lines` does the same, and for the same reason: a recipe
+    // that disagrees with the gate it serves is worse than no recipe.
+    let allowed = (0..=middle.len())
+        .rev()
+        .find(|k| 1.0 - *k as f32 / total.max(1) as f32 >= t.shape_egress)
+        .unwrap_or(0);
+
+    let mut out = vec![format!(
+        "Move the exits to the bottom. This folder scores {}: {} of its {} outgoing \
+         dependencies start at a child in the middle of the drawing — one that still \
+         depends on a sibling — so it reaches out of the building and down onto its \
+         neighbours at once. The levels drawn above it say the first and not the \
+         second, which is what makes the collapsed node dishonest.",
+        num(Some(v)),
+        middle.len(),
+        total,
+    )];
+    out.push(String::new());
+    out.push(format!(
+        "{} of the {} would have to leave from a leaf or from the door to clear {:.2}.",
+        middle.len() - allowed,
+        middle.len(),
+        t.shape_egress,
+    ));
+    out.push(String::new());
+    out.extend(listed(
+        middle
             .iter()
-            .filter(|o| o.verdict == OutsideVerdict::Exit)
-            .map(|o| o.outside.as_str())
-            .collect();
-        body.push(format!(
-            "Those {} outgoing dependencies land on {} distinct files. Depending \
-             outward is what a folder is for and is never a defect here — where they \
-             land is their own folder's business:",
+            .map(|e| format!("`{}` → `{}`", e.inside, e.outside)),
+    ));
+    out.push(String::new());
+    out.extend(egress_moves());
+    out
+}
+
+/// The three moves that clear this gate, and the one that only moves the
+/// number. Written out rather than summarised, because each is a different
+/// diagnosis of the same edge and the reader has to pick.
+fn egress_moves() -> Vec<String> {
+    vec![
+        "Each edge above is one of three things, and they want different moves:"
+            .to_string(),
+        String::new(),
+        "- **A dependency that belongs further down.** The child uses the outside \
+         thing on behalf of something below it. Push the use down to the leaf that \
+         actually needs it; the middle child then depends on its sibling and nothing \
+         else, which is the shape already drawn."
+            .to_string(),
+        "- **A child sitting at the wrong level.** It has no business depending on \
+         its siblings at all, and the sibling edge is the accident rather than the \
+         exit. Cut that edge and the child becomes a leaf, which clears this gate \
+         and usually `layering` with it."
+            .to_string(),
+        "- **A wide ambient type.** One context or state type most of the folder \
+         names — the case where \"exits only from leaves\" would otherwise push you \
+         to flatten the folder into a bag. Do not. Declare the slice this folder \
+         actually needs as a local interface and depend on that: under structural \
+         typing the import disappears, and under nominal typing it moves to one \
+         file. This is the move to reach for before any of the others."
+            .to_string(),
+        String::new(),
+        "**Not this: a re-export from a leaf.** Routing the same dependency through \
+         a leaf so the edge starts there leaves the middle child coupled to exactly \
+         what it was coupled to, with one more hop to read. It is the shim on the \
+         forbidden list below, and it is the reason this gate reports where an exit \
+         *starts* rather than how many there are."
+            .to_string(),
+    ]
+}
+
+/// Where a folder's outgoing dependencies *start* (AN-028).
+///
+/// Counting exits and naming what they land on has always been here, and both
+/// are about the far end. The near end is the half a reader of this folder can
+/// act on: a folder is meant to read as a funnel — arriving at one door,
+/// leaving from the bottom — and a middle-layer child reaching outside makes
+/// the layering drawn above it a fiction. The drawing says that child depends
+/// downward on its siblings; the program says it also reaches out of the
+/// building.
+///
+/// Scored since ADR 0031, and only on the near end. Where an exit *lands*
+/// remains ungraded — [`OutsideVerdict::Exit`] still says depending outward
+/// is what a folder is for, and a tool that failed folders for the far end
+/// would be argued with and then ignored. Where it *starts* is this folder's
+/// own shape, and `egress` grades it: classifying it turned out not to be
+/// enough on its own, because a gate nothing fails is a gate agents bank
+/// past (AN-028).
+fn exit_section(p: &FolderPicture, exits: usize) -> Vec<String> {
+    let leaves = leaf_children(p);
+    let doors: BTreeSet<&str> = p
+        .children
+        .iter()
+        .filter(|c| c.is_door)
+        .map(|c| c.path.as_str())
+        .collect();
+
+    let mut by_origin: BTreeMap<ExitOrigin, Vec<&OutsideEdge>> = BTreeMap::new();
+    let mut targets: BTreeSet<&str> = BTreeSet::new();
+    for e in p
+        .outside
+        .iter()
+        .filter(|o| o.verdict == OutsideVerdict::Exit)
+    {
+        targets.insert(e.outside.as_str());
+        by_origin
+            .entry(ExitOrigin::of(&e.child, &leaves, &doors))
+            .or_default()
+            .push(e);
+    }
+    let count = |o: ExitOrigin| by_origin.get(&o).map_or(0, Vec::len);
+    let middle = count(ExitOrigin::Middle);
+
+    let mut body = vec![
+        format!(
+            "Those {} outgoing dependencies land on {} distinct files. Where they \
+             land is not graded and stays their own folder's business — depending \
+             outward is what a folder is for:",
             exits,
             targets.len(),
+        ),
+        String::new(),
+    ];
+    body.extend(listed(targets.into_iter().map(String::from)));
+    body.push(String::new());
+    body.push("Where they *start* is this folder's business:".to_string());
+    body.push(String::new());
+    body.extend(listed(
+        [ExitOrigin::Leaf, ExitOrigin::Door, ExitOrigin::Middle]
+            .into_iter()
+            .filter(|o| count(*o) > 0)
+            .map(|o| format!("{} — {}", count(o), o.gloss())),
+    ));
+    body.push(String::new());
+    body.push(if middle == 0 {
+        "Nothing leaves from the middle: this folder is a funnel.".to_string()
+    } else {
+        let subject = if middle == 1 {
+            "The one leaving from the middle is worth a look. It is".to_string()
+        } else {
+            format!("The {middle} leaving from the middle are worth a look. Each is")
+        };
+        format!(
+            "{subject} one of three things: a dependency that belongs further down, \
+             a child sitting at the wrong level, or a wide ambient type this folder \
+             should be naming its own slice of. Re-exporting it from a leaf is a \
+             fourth and is a shim."
+        )
+    });
+    body.push(String::new());
+    if let Some(edges) = by_origin.get(&ExitOrigin::Middle) {
+        body.extend(listed(
+            edges
+                .iter()
+                .map(|e| format!("{} → {}", e.inside, e.outside)),
         ));
-        body.push(String::new());
-        body.extend(listed(targets.into_iter().map(String::from)));
         body.push(String::new());
     }
     body
+}
+
+/// Children with no edge to a sibling — the bottom of the folder's own
+/// drawing, and where an outgoing dependency is meant to start.
+///
+/// `erased` is deliberately not consulted. An arrow the build erases is not in
+/// the graph the levels were assigned over (ADR 0026), so a child whose only
+/// sibling dependency is a `import type` genuinely does sit at the bottom, and
+/// counting it would contradict the levels drawn beside it.
+fn leaf_children(p: &FolderPicture) -> BTreeSet<&str> {
+    let departing: BTreeSet<&str> = p.edges.iter().map(|e| e.from.as_str()).collect();
+    p.children
+        .iter()
+        .map(|c| c.path.as_str())
+        .filter(|path| !departing.contains(path))
+        .collect()
+}
+
+/// Which part of the folder one exit leaves from.
+///
+/// Ordered leaf-door-middle, worst last, so the listing reads toward the
+/// thing to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExitOrigin {
+    Leaf,
+    Door,
+    Middle,
+}
+
+impl ExitOrigin {
+    /// A leaf that is also a door reads as a leaf: it is already the shape
+    /// the funnel wants, and reporting it as the carve-out would understate
+    /// a folder that is doing the right thing.
+    fn of(child: &str, leaves: &BTreeSet<&str>, doors: &BTreeSet<&str>) -> Self {
+        match child {
+            c if leaves.contains(c) => Self::Leaf,
+            c if doors.contains(c) => Self::Door,
+            _ => Self::Middle,
+        }
+    }
+
+    fn gloss(self) -> &'static str {
+        match self {
+            Self::Leaf => "from a leaf, which is the shape a funnel has",
+            Self::Door => "from a door, which is structural: a facade imports what it hands on",
+            Self::Middle => "from a child in the middle, reaching past its siblings",
+        }
+    }
 }
 
 /// The moves that count, and the ones that only move the number.
@@ -1304,6 +2117,20 @@ fn boundary_section(p: &FolderPicture) -> Vec<String> {
 /// actual dependencies, and a tool that did not say so would teach agents
 /// to produce exactly that — at which point the measure stops describing
 /// anything and every folder in the repo scores well.
+/// The rules, in full or as a checklist.
+///
+/// The choice lives here rather than in either of them so that neither
+/// grows a branch: the complexity gate fails on any metric increase to a
+/// function that already exists (CI-001), and both of these are existing
+/// functions with no budget for one more condition.
+fn rules_for(folder: &str, has_baseline: bool, spell_out: bool) -> Vec<String> {
+    if spell_out {
+        rules_section(folder, has_baseline)
+    } else {
+        short_rules(folder, has_baseline)
+    }
+}
+
 fn rules_section(folder: &str, has_baseline: bool) -> Vec<String> {
     let mut body = vec![
         "## What counts as a fix".to_string(),
@@ -1352,6 +2179,50 @@ fn rules_section(folder: &str, has_baseline: bool) -> Vec<String> {
     body
 }
 
+/// The rules for a caller that has already read them this session.
+///
+/// The four forbidden moves keep their names and lose their explanations.
+/// Naming them is what does the work — an agent reported that "a
+/// re-export shim … if the thing behind the door still changes when the
+/// door does, it is not a door" was the single most valuable line in the
+/// tool, and it was valuable the first time. What repetition adds is
+/// length: across four folders the unabridged list was most of what
+/// `reshape` returned, which buries the one finding each call exists to
+/// deliver.
+fn short_rules(folder: &str, has_baseline: bool) -> Vec<String> {
+    vec![
+        "## What counts as a fix".to_string(),
+        String::new(),
+        "Spelled out in full on the first `reshape` of this session. In short — \
+         allowed: move a file between folders, split a file two callers need for two \
+         reasons, invert an edge, merge two files locked in a loop, add a facade that \
+         genuinely owns what outsiders need."
+            .to_string(),
+        String::new(),
+        "Still not allowed, because each raises a score and changes nothing: a \
+         re-export shim; a wrapper per caller; a pass-through layer; deleting or \
+         alphabetising code to get under the child bar."
+            .to_string(),
+        String::new(),
+        "The test: after the change, does anything depend on a *different* thing than \
+         it did before?"
+            .to_string(),
+        String::new(),
+        format!(
+            "**When you are done:** re-run `reshape` on `{folder}` — the drawing above \
+             is kept, so the next call opens with what actually moved.{}",
+            if has_baseline {
+                " The comparison above is that check; do not summarise your own \
+                 before-and-after from memory."
+            } else {
+                ""
+            }
+        ),
+        String::new(),
+        format!("To try a restructure before making it, call `layout` on `{folder}`."),
+    ]
+}
+
 /// The closing instruction, which is now a promise the tool keeps rather
 /// than a request the agent may forget.
 fn closing_section(folder: &str, has_baseline: bool) -> Vec<String> {
@@ -1359,9 +2230,11 @@ fn closing_section(folder: &str, has_baseline: bool) -> Vec<String> {
         "## When you are done".to_string(),
         String::new(),
         format!(
-            "Re-run `reshape` on `{folder}`. It kept the drawing it just showed you, \
-             so the next call opens with what actually changed — the tier, the \
-             numbers that moved, and the edges that came and went — and says whether \
+            "Re-run `reshape` on `{folder}`. The drawing it just showed you is kept \
+             — under the mezz cache directory rather than in this process, so \
+             rebuilding or reloading the server between the two calls no longer \
+             loses it — and the next call opens with what actually changed: the \
+             tier, the numbers that moved, the edges that came and went, and whether \
              the two agree. A tier that rises while every edge stays put is reported \
              as such and should be reverted; the measure exists to describe the \
              drawing, and a change that only moved the number has made it less true."
@@ -1376,6 +2249,12 @@ fn closing_section(folder: &str, has_baseline: bool) -> Vec<String> {
                 .to_string(),
         );
     }
+    body.push(String::new());
+    body.push(format!(
+        "To try a restructure *before* making it, call `layout` on `{folder}`: it \
+         scores a set of moves, or proposes the subfolders this folder's own drawing \
+         implies, without touching the tree."
+    ));
     body
 }
 
@@ -1392,7 +2271,7 @@ fn next_tier(pattern: ShapePattern) -> &'static str {
     }
 }
 
-fn rel(path: &Path, root: &Path) -> String {
+pub(super) fn rel(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .display()
@@ -1400,7 +2279,7 @@ fn rel(path: &Path, root: &Path) -> String {
 }
 
 /// Resolve the required `path` argument to a folder under the root.
-fn target_folder(server: &McpServer, args: &Value) -> Result<PathBuf> {
+pub(super) fn target_folder(server: &McpServer, args: &Value) -> Result<PathBuf> {
     let raw = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -1441,7 +2320,7 @@ mod tests {
     impl TmpDir {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "nao-reshape-{}-{}-{}",
+                "mezz-reshape-{}-{}-{}",
                 name,
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -1477,6 +2356,8 @@ mod tests {
             base_cache: Mutex::new(HashMap::new()),
             generation: Arc::new(AtomicU64::new(0)),
             shape_baselines: Default::default(),
+            rules_spelled_out: Default::default(),
+            layout_caveat_spelled_out: Default::default(),
         }
     }
 
@@ -1488,9 +2369,11 @@ mod tests {
             layering: Some(0.6),
             arborescence: Some(0.5),
             entry_concentration: Some(0.4),
+            egress: None,
             child_compliance: None,
             child_count: 3,
             blocker,
+            terms: crate::models::ShapeTerms::default(),
         }
     }
 
@@ -1509,6 +2392,17 @@ mod tests {
             from: from.to_string(),
             to: to.to_string(),
             verdict,
+        }
+    }
+
+    fn exit(inside: &str, outside: &str) -> OutsideEdge {
+        OutsideEdge {
+            outside: outside.to_string(),
+            inside: inside.to_string(),
+            // Children are files in these fixtures, so a file is its own
+            // circle in the drawing.
+            child: inside.to_string(),
+            verdict: OutsideVerdict::Exit,
         }
     }
 
@@ -1533,6 +2427,96 @@ mod tests {
             outside: Vec::new(),
             doors: Vec::new(),
         }
+    }
+
+    /// An outgoing dependency is classified by where it starts, and the
+    /// three origins do not mean the same thing. A middle child reaching
+    /// outside is the finding; a leaf doing it is the shape being asked for;
+    /// a door doing it is a facade importing what it hands on.
+    #[test]
+    fn an_exit_is_classified_by_the_child_it_leaves_from() {
+        let mut top = child("src/x/top.rs", 0);
+        top.is_door = true;
+        let mut p = picture(
+            vec![top, child("src/x/mid.rs", 1), child("src/x/leaf.rs", 2)],
+            vec![
+                edge("src/x/top.rs", "src/x/mid.rs", EdgeVerdict::Step),
+                edge("src/x/mid.rs", "src/x/leaf.rs", EdgeVerdict::Step),
+            ],
+        );
+        p.doors = vec!["src/x/top.rs".to_string()];
+        p.outside = vec![
+            exit("src/x/leaf.rs", "src/far/a.rs"),
+            exit("src/x/top.rs", "src/far/b.rs"),
+            exit("src/x/mid.rs", "src/far/c.rs"),
+        ];
+
+        let body = boundary_section(&p).join("\n");
+        assert!(body.contains("1 — from a leaf"), "{body}");
+        assert!(body.contains("1 — from a door"), "{body}");
+        assert!(body.contains("1 — from a child in the middle"), "{body}");
+        // The middle one, and only it, is named as an edge to go and look at.
+        // Every target still appears in the landing list above; what must not
+        // appear is a leaf or a door as something to act on.
+        assert!(body.contains("src/x/mid.rs → src/far/c.rs"), "{body}");
+        assert!(
+            !body.contains("src/x/leaf.rs →"),
+            "leaf exit listed:\n{body}"
+        );
+        assert!(
+            !body.contains("src/x/top.rs →"),
+            "door exit listed:\n{body}"
+        );
+    }
+
+    /// A folder whose every exit leaves from a leaf says so in a sentence.
+    /// The reader must not have to compare two counts to learn it.
+    #[test]
+    fn a_funnel_is_named_rather_than_left_to_be_counted() {
+        let mut p = picture(
+            vec![child("src/x/top.rs", 0), child("src/x/leaf.rs", 1)],
+            vec![edge("src/x/top.rs", "src/x/leaf.rs", EdgeVerdict::Step)],
+        );
+        p.outside = vec![exit("src/x/leaf.rs", "src/far/a.rs")];
+
+        let body = boundary_section(&p).join("\n");
+        assert!(body.contains("this folder is a funnel"), "{body}");
+        assert!(!body.contains("worth a look"), "{body}");
+    }
+
+    /// A child that is both the door and a leaf reads as a leaf. It is
+    /// already the shape the funnel wants, and filing it under the carve-out
+    /// would understate a folder doing the right thing.
+    #[test]
+    fn a_door_that_is_also_a_leaf_reads_as_a_leaf() {
+        let mut only = child("src/x/only.rs", 0);
+        only.is_door = true;
+        let mut p = picture(vec![only], Vec::new());
+        p.doors = vec!["src/x/only.rs".to_string()];
+        p.outside = vec![exit("src/x/only.rs", "src/far/a.rs")];
+
+        let body = boundary_section(&p).join("\n");
+        assert!(body.contains("1 — from a leaf"), "{body}");
+        assert!(body.contains("funnel"), "{body}");
+    }
+
+    /// An arrow the build erases is not in the graph the levels were
+    /// assigned over (ADR 0026), so it must not be what stops a child
+    /// counting as a leaf — the drawing would then disagree with itself.
+    #[test]
+    fn an_erased_arrow_does_not_cost_a_child_its_leaf_standing() {
+        let mut p = picture(
+            vec![child("src/x/a.rs", 0), child("src/x/b.rs", 0)],
+            Vec::new(),
+        );
+        p.erased = vec![crate::models::ErasedEdge {
+            from: "src/x/a.rs".to_string(),
+            to: "src/x/b.rs".to_string(),
+        }];
+        p.outside = vec![exit("src/x/a.rs", "src/far/a.rs")];
+
+        let body = boundary_section(&p).join("\n");
+        assert!(body.contains("funnel"), "{body}");
     }
 
     /// The ladder is a ladder: a cyclic folder is told to break its loop and
@@ -2037,7 +3021,7 @@ mod tests {
             );
         }
         // And the one number whose scale is inverted relative to the rest of
-        // nao says so, since it sits next to composite scores where low wins.
+        // mezz says so, since it sits next to composite scores where low wins.
         assert!(body.contains("Higher is better"), "{body}");
     }
 
@@ -2110,9 +3094,11 @@ mod tests {
         assert!(body.contains("2 leave the folder"), "{body}");
         assert!(body.contains("land on 1 distinct files"), "{body}");
         assert_eq!(
-            body.matches("src/models/entity.rs").count(),
+            body.lines()
+                .filter(|l| *l == "- src/models/entity.rs")
+                .count(),
             1,
-            "not deduped:\n{body}"
+            "landing list not deduped:\n{body}"
         );
     }
 
@@ -2154,6 +3140,115 @@ mod tests {
             body.contains("also the folder's level skip"),
             "the two gates were not joined:\n{body}"
         );
+    }
+
+    /// A graph where every parent reaches for the same type declared in the
+    /// shared child — the evidence `SharedContract` is decided on. The other
+    /// merge fixtures use an empty graph on purpose, which makes every merge
+    /// read as `Plain`; this one is the opposite case.
+    fn graph_agreeing_on(child_file: &str, ty: &str, parents: &[&str]) -> DependencyGraph {
+        let contract = crate::models::CodeEntity::new(
+            ty,
+            EntityKind::Struct,
+            child_file,
+            crate::models::Span::from_positions(1, 0, 1, 0),
+        );
+        let mut entities = vec![contract.clone()];
+        let mut relationships = Vec::new();
+        for (i, parent) in parents.iter().enumerate() {
+            let user = crate::models::CodeEntity::new(
+                &format!("uses{i}"),
+                EntityKind::Function,
+                parent,
+                crate::models::Span::from_positions(1, 0, 1, 0),
+            );
+            relationships.push(crate::models::Relationship::new(
+                &user.id,
+                &contract.id,
+                crate::models::RelationshipKind::UsesType,
+            ));
+            entities.push(user);
+        }
+        DependencyGraph::from_analysis(&crate::analyzer::AnalysisResult {
+            entities,
+            relationships,
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    /// The unreachable bar. Every merge here is a contract the tool has just
+    /// marked *leave it*, and nothing else charges the gate — so the folder
+    /// cannot clear it by any move this tool permits, and saying "fix one
+    /// merge point" would be an instruction to do something forbidden two
+    /// sections further down.
+    #[test]
+    fn a_folder_held_only_by_contracts_is_told_there_is_no_move() {
+        let p = picture(
+            vec![
+                child("head.rs", 0),
+                child("emit.rs", 1),
+                child("grammar.rs", 1),
+                child("ast.rs", 2),
+            ],
+            vec![
+                edge("head.rs", "emit.rs", EdgeVerdict::Step),
+                edge("head.rs", "grammar.rs", EdgeVerdict::Step),
+                edge("emit.rs", "ast.rs", EdgeVerdict::Step),
+                edge("grammar.rs", "ast.rs", EdgeVerdict::Step),
+            ],
+        );
+        let graph = graph_agreeing_on("ast.rs", "Ast", &["emit.rs", "grammar.rs"]);
+        let body = next_rung_section(
+            &shape(ShapePattern::Hierarchical, Some(ShapeBlocker::Merges(0.5))),
+            &p,
+            &Thresholds::default(),
+            test_ctx(&graph),
+        )
+        .join("\n");
+
+        assert!(body.contains("There is no move here"), "{body}");
+        assert!(
+            body.contains("held by a contract"),
+            "the tier is not named as a ceiling:\n{body}"
+        );
+        assert!(
+            !body.contains("Fix one merge point"),
+            "told to fix what it was told to leave:\n{body}"
+        );
+    }
+
+    /// The same folder with strays as well. Those *are* fixable, so there is
+    /// still a move — but it is not among the merges, and pointing at them
+    /// would point at the things just marked *leave it*.
+    #[test]
+    fn contracts_plus_strays_send_the_reader_to_the_strays() {
+        let p = picture(
+            vec![
+                child("emit.rs", 1),
+                child("grammar.rs", 1),
+                child("ast.rs", 2),
+                child("loose_a.rs", 0),
+                child("loose_b.rs", 0),
+            ],
+            vec![
+                edge("emit.rs", "ast.rs", EdgeVerdict::Step),
+                edge("grammar.rs", "ast.rs", EdgeVerdict::Step),
+            ],
+        );
+        let graph = graph_agreeing_on("ast.rs", "Ast", &["emit.rs", "grammar.rs"]);
+        let body = next_rung_section(
+            &shape(ShapePattern::Hierarchical, Some(ShapeBlocker::Merges(0.5))),
+            &p,
+            &Thresholds::default(),
+            test_ctx(&graph),
+        )
+        .join("\n");
+
+        assert!(body.contains("No merge above is a defect"), "{body}");
+        assert!(!body.contains("There is no move here"), "{body}");
+        assert!(!body.contains("Fix one merge point"), "{body}");
     }
 
     /// The other half of that folder: `ast.rs` is leaned on by two
@@ -2225,6 +3320,50 @@ mod tests {
         );
     }
 
+    /// A door narrowed from three landings to one is the change the boundary
+    /// section asks for, and the comparator used to call it nothing: it
+    /// diffed child-to-child edges only, so the evidence section printed "No
+    /// edge between these children changed" directly above a standing
+    /// instruction to revert anything cosmetic. The two halves of the report
+    /// were measuring at different granularities.
+    #[test]
+    fn a_door_that_narrowed_is_reported_as_a_change() {
+        let mut before = baseline(ShapePattern::Hierarchical, &[("a.rs", "b.rs")]);
+        before.outside = [
+            ("far.rs".to_string(), "door.rs".to_string()),
+            ("far.rs".to_string(), "inner1.rs".to_string()),
+            ("far.rs".to_string(), "inner2.rs".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let mut after = baseline(ShapePattern::Hierarchical, &[("a.rs", "b.rs")]);
+        after.outside = [("far.rs".to_string(), "door.rs".to_string())]
+            .into_iter()
+            .collect();
+
+        let body = structural_diff(&before, &after).join("\n");
+        assert!(
+            body.contains("What changed in the drawing"),
+            "a boundary-only change read as nothing:\n{body}"
+        );
+        assert!(body.contains("inner1.rs` across the boundary"), "{body}");
+        assert!(body.contains("inner2.rs` across the boundary"), "{body}");
+    }
+
+    /// And a drawing where genuinely nothing moved still says so — the
+    /// sentence has to stay usable as evidence for "revert this".
+    #[test]
+    fn an_unchanged_drawing_still_reports_nothing_moved() {
+        let before = baseline(ShapePattern::Hierarchical, &[("a.rs", "b.rs")]);
+        let after = baseline(ShapePattern::Hierarchical, &[("a.rs", "b.rs")]);
+        let body = structural_diff(&before, &after).join("\n");
+        assert!(
+            body.contains("No edge between these children changed"),
+            "{body}"
+        );
+        assert!(body.contains("landed anywhere new"), "{body}");
+    }
+
     fn baseline(pattern: ShapePattern, edges: &[(&str, &str)]) -> Baseline {
         Baseline {
             scope: "a1b2c3".to_string(),
@@ -2232,14 +3371,63 @@ mod tests {
             compliance: 0.9,
             layering: Some(0.9),
             arborescence: Some(0.7),
+            egress: Some(1.0),
             entry_concentration: Some(0.9),
             child_count: 3,
+            terms: crate::models::ShapeTerms::default(),
             edges: edges
                 .iter()
                 .map(|(f, t)| ((*f).to_string(), (*t).to_string()))
                 .collect(),
             outside: BTreeSet::new(),
         }
+    }
+
+    /// A pair of readings where `branching` fell and two children lost the
+    /// only edge that reached them — the shape of a dissolved bag.
+    fn strayed() -> (Baseline, Baseline) {
+        let mut before = baseline(ShapePattern::Hierarchical, &[("a.rs", "b.rs")]);
+        before.arborescence = Some(0.88);
+        before.terms = crate::models::ShapeTerms {
+            nodes: 4,
+            edges: 3,
+            reached: 3,
+            strays: 1,
+            ..Default::default()
+        };
+        let mut after = baseline(ShapePattern::Hierarchical, &[("a.rs", "c.rs")]);
+        after.arborescence = Some(0.71);
+        after.terms = crate::models::ShapeTerms {
+            nodes: 5,
+            edges: 3,
+            reached: 3,
+            strays: 3,
+            ..Default::default()
+        };
+        (before, after)
+    }
+
+    /// The converse of "a tier rose while nothing changed, revert it".
+    /// A number falling on a change that removed no dependency is the case
+    /// an agent reported as the one that makes you undo good work, and it
+    /// had no words anywhere in the tool.
+    #[test]
+    fn a_ratio_that_fell_because_children_lost_a_parent_is_explained() {
+        let (before, after) = strayed();
+        let body = progress_section(Some(&before), &after).join("\n");
+        assert!(body.contains("not damage"), "{body}");
+        assert!(body.contains("2 more children"), "{body}");
+        assert!(body.contains("ADR 0022"), "{body}");
+    }
+
+    /// And the arithmetic, so the reader can check the explanation rather
+    /// than take it.
+    #[test]
+    fn a_moved_ratio_shows_the_division_it_came_from() {
+        let (before, after) = strayed();
+        let body = progress_section(Some(&before), &after).join("\n");
+        assert!(body.contains("branching 3 ÷ 5 → 3 ÷ 5") || body.contains("branching"), "{body}");
+        assert!(body.contains("The arithmetic behind those"), "{body}");
     }
 
     /// The sentence that catches an edit which did not land is left
@@ -2296,14 +3484,18 @@ mod tests {
 
         let first = reshape(&server, &args).expect("src has a shape");
         assert!(
-            !first.contains("## Since your last call"),
-            "the first call has nothing to compare against:\n{first}"
+            first.contains("No prior drawing on record"),
+            "the first call must say it has nothing to compare against:\n{first}"
+        );
+        assert!(
+            !first.contains("verdict **"),
+            "the first call invented a comparison:\n{first}"
         );
 
         // A pattern that excludes nothing: what the analysis includes is
         // untouched, so the drawing is identical and only the scope moves.
         dir.write(
-            ".nao/settings.json",
+            ".mezz/settings.json",
             "{ \"exclude_patterns\": [\"**/*.never\"] }\n",
         );
 
@@ -2684,10 +3876,27 @@ mod tests {
     }
 
     /// A first call has nothing to compare against and must not invent a
-    /// comparison — the section simply is not there.
+    /// comparison. It must also not stay *silent* about that, which is what it
+    /// used to do: an empty section reads identically to "nothing changed",
+    /// and a field report hit exactly that on the largest tier move of a
+    /// session — `hierarchical → fractal`, two edges appearing, and the
+    /// comparator said nothing. Absence is now stated; the comparison is still
+    /// not invented.
     #[test]
-    fn the_first_call_reports_no_progress_at_all() {
+    fn the_first_call_says_it_has_nothing_to_compare_against() {
         let after = baseline(ShapePattern::Hierarchical, &[("a.rs", "b.rs")]);
-        assert!(progress_section(None, &after).is_empty());
+        let body = progress_section(None, &after).join("\n");
+
+        assert!(body.contains("No prior drawing on record"), "{body}");
+        // The two readings the old silence was ambiguous between, both ruled
+        // out in words.
+        assert!(body.contains("not \"nothing changed\""), "{body}");
+        // A restart is no longer one of the explanations: the record is
+        // mirrored to the cache directory, so it outlives the process.
+        assert!(body.contains("outlives the server"), "{body}");
+        assert!(body.contains("no longer loses it"), "{body}");
+        // Still no comparison: no verdict arrow, no metric diff.
+        assert!(!body.contains("verdict **"), "{body}");
+        assert!(!body.contains("Nothing has changed"), "{body}");
     }
 }

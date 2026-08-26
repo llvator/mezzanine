@@ -2,7 +2,9 @@
 //!
 //! The two halves of the walk each have a folder:
 //! - [`declarations`] — what the file declares, and the dispatcher over it
-//! - [`bodies`] — what a function body yields once its declaration is placed
+//! - [`bodies`] — what a function body yields once its declaration is placed:
+//!   its calls, the Branch / Loop entities their arms become, and the
+//!   complexity metrics the body scores
 //!
 //! What both of them read from a grammar node, and write their findings into,
 //! sits here beside them:

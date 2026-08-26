@@ -5,7 +5,9 @@
 //! can find them.
 
 use super::super::ctx::ExtractCtx;
-use super::inference::{infer_local_types, infer_param_types, ReceiverPath, TypeEnv};
+use super::inference::{
+    closure_bindings, infer_local_types, infer_param_types, ReceiverPath, TypeEnv,
+};
 use super::stdlib::is_stdlib_function;
 use crate::models::{Relationship, RelationshipKind};
 use crate::parser::language_parser::{node_text, ParseResult};
@@ -32,6 +34,7 @@ pub(in crate::parser::rust) fn extract_body_calls(
     let mut locals = infer_param_types(decl, ctx.source);
     locals.extend(infer_local_types(body, ctx.source));
     let env = TypeEnv {
+        closures: closure_bindings(body, ctx.source),
         locals,
         fields: ctx.struct_fields,
         self_type,
@@ -76,7 +79,7 @@ fn extract_calls(
         record_fn_values(&child, source, caller_id, env, result);
         match child.kind() {
             "call_expression" => {
-                if let Some(callee) = extract_callee_name(&child, source, env) {
+                if let Some(callee) = callee_of(&child, source, env) {
                     *call_order += 1;
                     if callee.callee != caller_name && !is_stdlib_function(&callee.callee) {
                         let mut rel = Relationship::new(
@@ -348,6 +351,25 @@ fn lsp_ident_node<'a>(function_node: &Node<'a>) -> Node<'a> {
 /// Returns qualified `Type::method` when the call site provides the type,
 /// with `Self::` substituted by the enclosing impl's type when known.
 /// `local_types` is used to resolve variable receivers to their inferred types.
+/// [`extract_callee_name`], minus the calls that name a closure bound in this
+/// body (AN-029).
+///
+/// A wrapper rather than a branch inside either neighbour: the complexity gate
+/// fails on any metric increase to a function that already exists (CI-001),
+/// and both of those are walkers with no room left.
+///
+/// Dropping the edge loses nothing real. The closure's body sits inside this
+/// one, so whatever it calls is already attributed to this caller by the same
+/// walk; what goes is only the edge naming the local binding itself. It is the
+/// argument [`member_callee`] already makes for an unresolved receiver —
+/// staying visibly unresolved beats collapsing onto a same-named stranger —
+/// carried one step further.
+fn callee_of(call_node: &Node, source: &str, env: &TypeEnv<'_>) -> Option<MemberCallee> {
+    let callee = extract_callee_name(call_node, source, env)?;
+    let names_a_local_closure = callee.deferred.is_none() && env.closures.contains(&callee.callee);
+    (!names_a_local_closure).then_some(callee)
+}
+
 fn extract_callee_name(call_node: &Node, source: &str, env: &TypeEnv<'_>) -> Option<MemberCallee> {
     let func_node = call_node.child_by_field_name("function")?;
 

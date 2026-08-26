@@ -12,9 +12,9 @@
  *
  *   - `GET /api/hello` answers every origin unconditionally (see
  *     `src/server/access.rs`), so reading it proves the thing on that port is
- *     nao and not something else on the same port.
+ *     mezz and not something else on the same port.
  *   - a `mode: 'no-cors'` request resolves opaquely when *something* is
- *     listening and rejects when nothing is, which separates "not nao" from
+ *     listening and rejects when nothing is, which separates "not mezz" from
  *     "not there".
  */
 
@@ -33,12 +33,12 @@ export type Connection =
        *  the probe perfectly well and must keep booting the app. */
       version?: string; commit?: string;
     }
-  /** nao, reachable, but it will not answer *this* page. */
+  /** mezz, reachable, but it will not answer *this* page. */
   | { kind: 'refused' }
-  /** nao, reachable, and it wants the pairing token from its banner. */
+  /** mezz, reachable, and it wants the pairing token from its banner. */
   | { kind: 'token-required' }
-  /** Something is listening there. It is not nao. */
-  | { kind: 'not-nao' }
+  /** Something is listening there. It is not mezz. */
+  | { kind: 'not-mezz' }
   /** Nothing answered at all. */
   | { kind: 'unreachable' };
 
@@ -52,9 +52,9 @@ export const probing = writable(false);
 export async function probe(base: string, token: string | null): Promise<Connection> {
   const hello = await sayHello(base);
   if (hello.kind === 'absent') return { kind: 'unreachable' };
-  if (hello.kind === 'stranger') return { kind: 'not-nao' };
+  if (hello.kind === 'stranger') return { kind: 'not-mezz' };
 
-  // It is nao, and it is up. Whether *we* may read it is a separate
+  // It is mezz, and it is up. Whether *we* may read it is a separate
   // question, and the endpoint that answers it is one the allowlist and the
   // token gate both apply to.
   const path = hello.mode === 'serve' ? '/api/repos' : '/api/root';
@@ -64,13 +64,13 @@ export async function probe(base: string, token: string | null): Promise<Connect
   try {
     const resp = await fetch(url, { cache: 'no-store' });
     if (resp.status === 401) return { kind: 'token-required' };
-    if (!resp.ok) return { kind: 'not-nao' };
+    if (!resp.ok) return { kind: 'not-mezz' };
     return {
       kind: 'ok', mode: hello.mode, tokenRequired: hello.tokenRequired,
       agentSpawn: hello.agentSpawn, version: hello.version, commit: hello.commit,
     };
   } catch {
-    // `/api/hello` came back, so the server is there and is nao. The only
+    // `/api/hello` came back, so the server is there and is mezz. The only
     // thing that can block this one is the origin allowlist.
     return { kind: 'refused' };
   }
@@ -78,7 +78,7 @@ export async function probe(base: string, token: string | null): Promise<Connect
 
 type Hello =
   | {
-      kind: 'nao'; mode: EngineMode; tokenRequired: boolean; agentSpawn: boolean;
+      kind: 'mezz'; mode: EngineMode; tokenRequired: boolean; agentSpawn: boolean;
       version?: string; commit?: string;
     }
   | { kind: 'stranger' }
@@ -89,9 +89,9 @@ async function sayHello(base: string): Promise<Hello> {
     const resp = await fetch(`${base}/api/hello`, { cache: 'no-store' });
     if (!resp.ok) return { kind: 'stranger' };
     const body = await resp.json();
-    if (body?.server !== 'nao') return { kind: 'stranger' };
+    if (body?.server !== 'mezz') return { kind: 'stranger' };
     return {
-      kind: 'nao',
+      kind: 'mezz',
       mode: body.mode === 'serve' ? 'serve' : 'watch',
       tokenRequired: !!body.token_required,
       // Advertised rather than probed: with the flag off the route is not

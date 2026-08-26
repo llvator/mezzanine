@@ -456,7 +456,7 @@ mod tests {
     impl TmpDir {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "nao-drift-{}-{}-{}",
+                "mezz-drift-{}-{}-{}",
                 name,
                 std::process::id(),
                 std::time::SystemTime::now()

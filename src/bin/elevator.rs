@@ -3,7 +3,7 @@
 //! Reads every `.elv` file under a directory, resolves imports, and
 //! emits a low-token text artifact suitable for LLM consumption (or
 //! for piping into a docs page, prompt, etc.). Same engine as
-//! `nao analyze -l elevator -f elevator-text` — this binary just
+//! `mezz analyze -l elevator -f elevator-text` — this binary just
 //! exposes the relevant slice with a focused command line.
 //!
 //! ```text
@@ -13,7 +13,7 @@
 //! ```
 
 use clap::Parser;
-use nao::{
+use mezz::{
     analyzer::Analyzer,
     config::Config,
     graph::DependencyGraph,
@@ -312,7 +312,7 @@ fn main() -> ExitCode {
 /// Render the requested slice and write it out, reporting its shape
 /// on stderr so a caller piping the slice to stdout still sees what
 /// it got.
-fn run_extract(result: &nao::analyzer::AnalysisResult, cli: &Cli) -> ExitCode {
+fn run_extract(result: &mezz::analyzer::AnalysisResult, cli: &Cli) -> ExitCode {
     let source = cli.path.display().to_string();
     let slice = match elevator_extract::extract(result, &cli.extract, &source) {
         Ok(s) => s,
@@ -367,7 +367,7 @@ fn write_out(text: &str, path: Option<&Path>) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("write failed: {}", e))
 }
 
-fn run_check(result: &nao::analyzer::AnalysisResult) -> ExitCode {
+fn run_check(result: &mezz::analyzer::AnalysisResult) -> ExitCode {
     let findings = elevator_check::check(result);
     if findings.is_empty() {
         println!("✓ No issues.");

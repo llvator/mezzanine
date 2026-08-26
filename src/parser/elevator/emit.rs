@@ -89,7 +89,7 @@ fn build_entity(path: &Path, source: &str, def: &DefStmt, id: String) -> CodeEnt
     entity.tags.insert("elevator".to_string());
     entity.documentation = def.description.clone();
     // The statement's own text, same as the tree-sitter parsers
-    // capture. Without it `nao diff` / `assess_change` hash `None` for
+    // capture. Without it `mezz diff` / `assess_change` hash `None` for
     // every spec entity and can never report a reworded `d:` as a
     // change, and the MCP `context` tool has nothing to quote.
     entity.source_code = source.get(def.source_range()).map(str::to_string);

@@ -16,7 +16,7 @@
  * are what the file declares. A Rust `impl` method has a parent and is
  * surface; a `Branch` inside a free function has a parent and is not. That is
  * why this is an ancestry walk rather than `parent_id === null`, which would
- * erase every method in the repo (measured on nao's own graph: 1 689 of
+ * erase every method in the repo (measured on mezz's own graph: 1 689 of
  * 10 831 callables carry a parent, and every one of them is a declaration).
  *
  * ## The half that is not filtering

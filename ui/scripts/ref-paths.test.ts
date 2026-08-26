@@ -3,7 +3,7 @@
  *
  * These exist because the bug they pin was invisible. `buildPathUniverse`
  * compared raw `file_path`s against refs that had already been normalized,
- * so under a bare `nao watch` — root `.`, paths emitted as `./src/…` — the
+ * so under a bare `mezz watch` — root `.`, paths emitted as `./src/…` — the
  * universe matched nothing and the UI marked every reference in the graph as
  * drift. A healthy-looking panel full of wrong badges; nothing crashed and
  * nothing was slow.

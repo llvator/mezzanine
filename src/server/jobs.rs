@@ -286,8 +286,8 @@ mod tests {
     /// disclose where the server keeps its files.
     #[test]
     fn sanitize_redacts_the_clone_path_wherever_it_appears() {
-        let dir = Path::new("/home/op/.cache/nao/serve/a__b/repo");
-        let stderr = "fatal: could not create work tree dir '/home/op/.cache/nao/serve/a__b/repo': Permission denied";
+        let dir = Path::new("/home/op/.cache/mezz/serve/a__b/repo");
+        let stderr = "fatal: could not create work tree dir '/home/op/.cache/mezz/serve/a__b/repo': Permission denied";
         let out = sanitize_git_stderr(stderr, dir);
         assert!(!out.contains("/home/op"), "leaked a path: {out}");
         assert!(out.contains("<clone-dir>"), "{out}");
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn dir_size_measures_a_real_directory() {
-        let dir = std::env::temp_dir().join("nao-jobs-size-test");
+        let dir = std::env::temp_dir().join("mezz-jobs-size-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f"), vec![0u8; 40_000]).unwrap();

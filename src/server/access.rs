@@ -1,6 +1,6 @@
 //! Who is allowed to talk to the HTTP servers (SRV-007).
 //!
-//! Both `nao watch` and `nao serve` bind loopback, which is not a security
+//! Both `mezz watch` and `mezz serve` bind loopback, which is not a security
 //! boundary against a *browser*: the browser is on the same machine, so any
 //! page the user has open can issue `fetch('http://localhost:3000/api/details')`
 //! and read back entity source code. The only thing standing between a
@@ -190,7 +190,7 @@ impl AccessPolicy {
 
 /// `GET /api/hello` — the one endpoint any origin may read.
 ///
-/// Exists for UI-034's error messages. From a browser, "nao refused this
+/// Exists for UI-034's error messages. From a browser, "mezz refused this
 /// origin" and "that port is a `python3 -m http.server`" are the same opaque
 /// network error: neither sends `access-control-allow-origin`, and the page
 /// cannot see why. The connect screen has to tell them apart, because only
@@ -214,9 +214,9 @@ pub fn hello_route(
             // not move between rebuilds. The UI shows both so "am I talking
             // to the engine I just installed" is answerable by looking.
             format!(
-                r#"{{"server":"nao","mode":"{mode}","token_required":{token_required},"agent_spawn":{agent_spawn},"version":"{version}","commit":"{commit}"}}"#,
+                r#"{{"server":"mezz","mode":"{mode}","token_required":{token_required},"agent_spawn":{agent_spawn},"version":"{version}","commit":"{commit}"}}"#,
                 version = env!("CARGO_PKG_VERSION"),
-                commit = env!("NAO_GIT_COMMIT"),
+                commit = env!("MEZZ_GIT_COMMIT"),
             ),
         )
     })
@@ -249,7 +249,7 @@ async fn require_token(State(policy): State<AccessPolicy>, req: Request, next: N
         Some(_) => token_error("token_invalid", "That pairing token is not this server's."),
         None => token_error(
             "token_required",
-            "This origin needs the pairing token printed in the nao startup banner.",
+            "This origin needs the pairing token printed in the mezz startup banner.",
         ),
     }
 }

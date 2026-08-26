@@ -75,7 +75,7 @@ impl Renderer for JsonRenderer {
             })
             .collect();
 
-        // Project-root-relative display paths for files and modules.
+        // Project-root-relative display paths for files and folders.
         // The graph stores full paths; stripping here keeps the UI stable
         // across build machines.
         let root = &config.root_path;
@@ -93,8 +93,8 @@ impl Renderer for JsonRenderer {
             .iter()
             .map(|f| JsonScopeMetrics::from_file(&f.path, &f.metrics, &rel))
             .collect();
-        let modules: Vec<JsonScopeMetrics> = graph
-            .module_metrics()
+        let folders: Vec<JsonScopeMetrics> = graph
+            .folder_metrics()
             .iter()
             .map(|m| JsonScopeMetrics::from_file(&m.path, &m.metrics, &rel))
             .collect();
@@ -109,7 +109,8 @@ impl Renderer for JsonRenderer {
             relationships,
             metrics: graph.metrics().into(),
             files,
-            modules,
+            modules: folders.clone(),
+            folders,
             thresholds: crate::models::Thresholds::default(),
         };
 
@@ -125,7 +126,16 @@ struct JsonOutput {
     relationships: Vec<JsonRelationship>,
     metrics: JsonMetrics,
     files: Vec<JsonScopeMetrics>,
+    /// Deprecated spelling of `folders`, kept so a consumer pinned to the
+    /// old key keeps reading. A directory rollup was called a "module"
+    /// until the name collided with `EntityKind::Module` — the language
+    /// construct — once often enough. Identical content; drop this field
+    /// (and the `.clone()` feeding it) one minor release after the UI and
+    /// the extension stop reading it. `metadata.version` says which
+    /// release a payload came from.
     modules: Vec<JsonScopeMetrics>,
+    /// Per-directory rollups. The name the rest of the tool uses.
+    folders: Vec<JsonScopeMetrics>,
     thresholds: crate::models::Thresholds,
 }
 
@@ -135,8 +145,10 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
-/// File- or module-level rollup for JSON. Path is project-root-relative.
-#[derive(Serialize)]
+/// File- or folder-level rollup for JSON. Path is project-root-relative.
+/// `Clone` so the deprecated `modules` key can carry the same rows as
+/// `folders` without recomputing them.
+#[derive(Serialize, Clone)]
 struct JsonScopeMetrics {
     path: String,
     entity_count: u32,
@@ -290,7 +302,7 @@ struct JsonRelationship {
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     metadata: std::collections::HashMap<String, String>,
     /// Resolution precision (AN-004): `exact` when a language server resolved
-    /// the call site, `heuristic` when nao's name-based resolver did. Omitted
+    /// the call site, `heuristic` when mezz's name-based resolver did. Omitted
     /// where precision doesn't apply. Exposed here for AN-005: an unchanged
     /// target between an exact-mode and a heuristic-mode run is otherwise
     /// ambiguous — it could mean the oracle confirmed the guess, or that the
@@ -801,7 +813,7 @@ impl JsonRenderer {
             let source = content.map(|mut source| {
                 if source.len() > MAX_FILE_BYTES {
                     source.truncate(MAX_FILE_BYTES);
-                    source.push_str("\n\n/* … truncated by nao (file exceeds 256 KB) */\n");
+                    source.push_str("\n\n/* … truncated by mezz (file exceeds 256 KB) */\n");
                 }
                 source
             });
@@ -892,22 +904,35 @@ mod scope_metrics_payload_tests {
         serde_json::from_str(&json).expect("valid json")
     }
 
-    fn module<'a>(v: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
-        v["modules"]
+    fn folder<'a>(v: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        v["folders"]
             .as_array()
-            .expect("modules")
+            .expect("folders")
             .iter()
             .find(|m| m["path"] == path)
-            .expect("the module")
+            .expect("the folder")
     }
 
     #[test]
     fn a_referencing_folder_ships_its_reference_counts() {
         let v = rendered(RelationshipKind::References);
-        let docs = module(&v, "docs");
+        let docs = folder(&v, "docs");
         assert_eq!(docs["fan_out"], 0);
         assert_eq!(docs["ref_fan_out"], 1);
-        assert_eq!(module(&v, "guide")["ref_fan_in"], 1);
+        assert_eq!(folder(&v, "guide")["ref_fan_in"], 1);
+    }
+
+    /// The old key is a promise to consumers pinned to it, and a promise
+    /// nothing asserts is one a later edit can quietly drop. Same rows,
+    /// not just a present key.
+    #[test]
+    fn the_deprecated_modules_key_still_mirrors_folders() {
+        let v = rendered(RelationshipKind::References);
+        assert_eq!(v["modules"], v["folders"]);
+        assert!(
+            v["folders"].as_array().is_some_and(|a| !a.is_empty()),
+            "a graph with two folders in it should ship folder rollups"
+        );
     }
 
     #[test]
@@ -915,7 +940,7 @@ mod scope_metrics_payload_tests {
         // Omitted when zero, so nothing new appears in a graph that has no
         // references to report.
         let v = rendered(RelationshipKind::Calls);
-        let docs = module(&v, "docs");
+        let docs = folder(&v, "docs");
         assert_eq!(docs["fan_out"], 1);
         assert!(docs.get("ref_fan_out").is_none());
         assert!(docs.get("ref_fan_in").is_none());

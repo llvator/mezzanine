@@ -13,15 +13,15 @@ after the initial setup it costs nothing per use.
 
 In VS Code:
 
-1. Open the Nao panel — Command Palette → **Nao: Open Code Visualizer**.
+1. Open the Mezzanine panel — Command Palette → **Mezzanine: Open Code Visualizer**.
 2. **View Options** → turn on **Follow selection to editor**.
-3. Settings → enable `nao.autoVisualize`.
+3. Settings → enable `mezz.autoVisualize`.
 
 The sync is bidirectional. Moving the cursor re-centres the graph; clicking a
-node reveals the source. `nao watch` re-analyzes on save, so the graph tracks
+node reveals the source. `mezz watch` re-analyzes on save, so the graph tracks
 the code you are actually writing rather than the code you opened with.
 
-For a compact single-file view, **Nao: Visualize Current File** focuses on the
+For a compact single-file view, **Mezzanine: Visualize Current File** focuses on the
 entity at the cursor rather than the whole project.
 
 ## Why ambient beats intentional

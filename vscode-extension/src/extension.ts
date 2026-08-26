@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { NaoServer } from './server';
+import { MezzServer } from './server';
+import { resolveMezzBinary, startupFailureMessage } from './mezzBinary';
 import { VisualizerPanel } from './panel';
 import { SelectionViewProvider } from './sideViewProvider';
 import type { SelectionPayload } from './sideViewProvider';
@@ -15,35 +16,35 @@ import * as http from 'http';
 import * as path from 'path';
 import * as fs from 'fs';
 
-let server: NaoServer | undefined;
+let server: MezzServer | undefined;
 
 /** Per-workspace override for the analyzed/git root, chosen via
- *  "Nao: Select Git Repository…". Needed when the git repository is a
+ *  "Mezzanine: Select Git Repository…". Needed when the git repository is a
  *  subfolder of the opened workspace: git commands walk *up* from the
  *  analyzed root, so a repo *below* the workspace root is invisible and
  *  the Diff panel fails. Persisted in workspaceState across reloads. */
 let projectRootOverride: string | undefined;
 
 /** Memento key persisting `projectRootOverride`. */
-const PROJECT_ROOT_KEY = 'nao.projectRoot';
+const PROJECT_ROOT_KEY = 'mezz.projectRoot';
 
 /** Toggle: when true, selecting a node auto-opens the file at its line. */
 let followSelection = false;
 
 /** Toggle: when true, the analysis-scope tree (and the visual scope) track the
- *  active editor — file or folder depending on `nao.analysisScopeFollowMode`.
- *  Distinct from `nao.autoVisualize`, which only narrows the visual scope. */
+ *  active editor — file or folder depending on `mezz.analysisScopeFollowMode`.
+ *  Distinct from `mezz.autoVisualize`, which only narrows the visual scope. */
 let followActiveAnalysisScope = false;
 
 /** Memento key persisting `followActiveAnalysisScope` across reloads. */
-const FOLLOW_STATE_KEY = 'nao.analysisScopes.followActive';
+const FOLLOW_STATE_KEY = 'mezz.analysisScopes.followActive';
 
 /** Timestamp (ms) until which editor-change events should be ignored to
  *  prevent ping-pong when we programmatically open a file from a node click. */
 let suppressEditorEventsUntil = 0;
 
 export function activate(context: vscode.ExtensionContext) {
-  const outputChannel = vscode.window.createOutputChannel('Nao Code Visualizer');
+  const outputChannel = vscode.window.createOutputChannel('Mezzanine Code Visualizer');
   // Restore the user's project-root choice; drop it if the folder is gone.
   projectRootOverride = context.workspaceState.get<string>(PROJECT_ROOT_KEY);
   if (projectRootOverride && !fs.existsSync(projectRootOverride)) {
@@ -52,7 +53,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
   // Educator content (rules + lessons) ships with the extension under
   // `<extensionPath>/content/`. The watch server uses it as a fallback so the
-  // educator works in any workspace, not just the nao repo itself.
+  // educator works in any workspace, not just the mezz repo itself.
   const bundledContentPath = path.join(context.extensionPath, 'content');
   const selectionProvider = new SelectionViewProvider(context.extensionUri);
   const descriptionProvider = new DescriptionViewProvider(context.extensionUri);
@@ -98,7 +99,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Diff state broker + commit picker
   context.subscriptions.push(
-    VisualizerPanel.onDiffChanged((state) => diffProvider.update(state))
+    VisualizerPanel.onDiffChanged((state) => diffProvider.update(state)),
+    // The branch the graph is, reported separately because it is true whether
+    // or not a diff is loaded (UI-114).
+    VisualizerPanel.onBranchChanged((label) => diffProvider.updateBranch(label))
   );
   diffProvider.onCurrentChanges(() => {
     VisualizerPanel.currentPanel?.sendCommand('triggerDiff', { fromRef: 'HEAD', toRef: 'WORKING' });
@@ -106,7 +110,7 @@ export function activate(context: vscode.ExtensionContext) {
   diffProvider.onPickCommits(async () => {
     const s = server;
     if (!s) {
-      vscode.window.showWarningMessage('Nao: start the visualizer first (Nao: Open Code Visualizer).');
+      vscode.window.showWarningMessage('Mezzanine: start the visualizer first (Mezzanine: Open Code Visualizer).');
       return;
     }
     await pickAndTriggerDiff(s.port);
@@ -119,7 +123,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      'nao.internalFilterCommand',
+      'mezz.internalFilterCommand',
       (args: { command: string; value: unknown }) => {
         VisualizerPanel.currentPanel?.sendCommand(args.command, args.value);
       }
@@ -148,7 +152,7 @@ export function activate(context: vscode.ExtensionContext) {
     VisualizerPanel.currentPanel?.sendCommand(command, value);
   });
 
-  const scopeTreeView = vscode.window.createTreeView('nao.scopes', {
+  const scopeTreeView = vscode.window.createTreeView('mezz.scopes', {
     treeDataProvider: scopeTreeProvider,
     showCollapseAll: true,
     canSelectMany: false,
@@ -156,7 +160,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
   context.subscriptions.push(scopeTreeView);
 
-  const analysisScopeTreeView = vscode.window.createTreeView('nao.analysisScopes', {
+  const analysisScopeTreeView = vscode.window.createTreeView('mezz.analysisScopes', {
     treeDataProvider: analysisScopeTreeProvider,
     showCollapseAll: true,
     canSelectMany: false,
@@ -184,71 +188,71 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Tree view title-bar commands
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.scopes.refresh', () =>
+    vscode.commands.registerCommand('mezz.scopes.refresh', () =>
       scopeTreeProvider.refresh()
     ),
-    vscode.commands.registerCommand('nao.scopes.selectAll', () =>
+    vscode.commands.registerCommand('mezz.scopes.selectAll', () =>
       scopeTreeProvider.selectAll()
     ),
-    vscode.commands.registerCommand('nao.scopes.clear', () =>
+    vscode.commands.registerCommand('mezz.scopes.clear', () =>
       scopeTreeProvider.clear()
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.refresh', () =>
+    vscode.commands.registerCommand('mezz.analysisScopes.refresh', () =>
       analysisScopeTreeProvider.refresh()
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.selectAll', () =>
+    vscode.commands.registerCommand('mezz.analysisScopes.selectAll', () =>
       analysisScopeTreeProvider.selectAll()
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.clear', () =>
+    vscode.commands.registerCommand('mezz.analysisScopes.clear', () =>
       analysisScopeTreeProvider.clear()
     ),
     // Widen: replace each selected path with its own parent folder. Pairs
     // with "Visualize Current File" — start from one file, grow the scope
     // one level per click.
-    vscode.commands.registerCommand('nao.scopes.extendToParent', () =>
+    vscode.commands.registerCommand('mezz.scopes.extendToParent', () =>
       scopeTreeProvider.extendToParents()
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.extendToParent', () =>
+    vscode.commands.registerCommand('mezz.analysisScopes.extendToParent', () =>
       analysisScopeTreeProvider.extendToParents()
     ),
     // Tree filtering (substring on the full path) + fuzzy QuickPick — the
     // fast paths for scoping in large repos where checkbox navigation is slow.
-    vscode.commands.registerCommand('nao.scopes.filter', () =>
-      promptScopeFilter(scopeTreeProvider, scopeTreeView, 'nao.scopesFiltered')
+    vscode.commands.registerCommand('mezz.scopes.filter', () =>
+      promptScopeFilter(scopeTreeProvider, scopeTreeView, 'mezz.scopesFiltered')
     ),
-    vscode.commands.registerCommand('nao.scopes.clearFilter', () =>
-      applyScopeFilter(scopeTreeProvider, scopeTreeView, 'nao.scopesFiltered', '')
+    vscode.commands.registerCommand('mezz.scopes.clearFilter', () =>
+      applyScopeFilter(scopeTreeProvider, scopeTreeView, 'mezz.scopesFiltered', '')
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.filter', () =>
-      promptScopeFilter(analysisScopeTreeProvider, analysisScopeTreeView, 'nao.analysisScopesFiltered')
+    vscode.commands.registerCommand('mezz.analysisScopes.filter', () =>
+      promptScopeFilter(analysisScopeTreeProvider, analysisScopeTreeView, 'mezz.analysisScopesFiltered')
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.clearFilter', () =>
-      applyScopeFilter(analysisScopeTreeProvider, analysisScopeTreeView, 'nao.analysisScopesFiltered', '')
+    vscode.commands.registerCommand('mezz.analysisScopes.clearFilter', () =>
+      applyScopeFilter(analysisScopeTreeProvider, analysisScopeTreeView, 'mezz.analysisScopesFiltered', '')
     ),
-    vscode.commands.registerCommand('nao.scopes.pick', () =>
-      pickScopes(scopeTreeProvider, 'Nao: Pick Visual Scopes')
+    vscode.commands.registerCommand('mezz.scopes.pick', () =>
+      pickScopes(scopeTreeProvider, 'Mezzanine: Pick Visual Scopes')
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.pick', () =>
-      pickScopes(analysisScopeTreeProvider, 'Nao: Pick Analysis Scopes')
+    vscode.commands.registerCommand('mezz.analysisScopes.pick', () =>
+      pickScopes(analysisScopeTreeProvider, 'Mezzanine: Pick Analysis Scopes')
     ),
-    vscode.commands.registerCommand('nao.analysisScopes.followActive', async () => {
+    vscode.commands.registerCommand('mezz.analysisScopes.followActive', async () => {
       await setFollowActive(context, true);
       // Apply immediately so the user sees the scope narrow without
       // having to switch editors first.
       applyFollow(analysisScopeTreeProvider, vscode.window.activeTextEditor);
     }),
-    vscode.commands.registerCommand('nao.analysisScopes.unfollowActive', async () => {
+    vscode.commands.registerCommand('mezz.analysisScopes.unfollowActive', async () => {
       // Per spec: turning follow off leaves both scopes wherever the
       // editor last placed them. No restore of prior selection.
       await setFollowActive(context, false);
     }),
-    vscode.commands.registerCommand('nao.analysisScopes.followFile', async () => {
+    vscode.commands.registerCommand('mezz.analysisScopes.followFile', async () => {
       await setFollowMode('file');
       if (followActiveAnalysisScope) {
         applyFollow(analysisScopeTreeProvider, vscode.window.activeTextEditor);
       }
     }),
-    vscode.commands.registerCommand('nao.analysisScopes.followFolder', async () => {
+    vscode.commands.registerCommand('mezz.analysisScopes.followFolder', async () => {
       await setFollowMode('folder');
       if (followActiveAnalysisScope) {
         applyFollow(analysisScopeTreeProvider, vscode.window.activeTextEditor);
@@ -261,12 +265,12 @@ export function activate(context: vscode.ExtensionContext) {
   followActiveAnalysisScope = context.workspaceState.get<boolean>(FOLLOW_STATE_KEY, false);
   void vscode.commands.executeCommand(
     'setContext',
-    'nao.followActiveAnalysisScope',
+    'mezz.followActiveAnalysisScope',
     followActiveAnalysisScope
   );
   void vscode.commands.executeCommand(
     'setContext',
-    'nao.analysisScopeFollowModeIsFile',
+    'mezz.analysisScopeFollowModeIsFile',
     getFollowMode() === 'file'
   );
   // If follow was on from a previous session, seed the scope from the
@@ -279,10 +283,10 @@ export function activate(context: vscode.ExtensionContext) {
   // directly (Settings UI / settings.json).
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('nao.analysisScopeFollowMode')) {
+      if (e.affectsConfiguration('mezz.analysisScopeFollowMode')) {
         void vscode.commands.executeCommand(
           'setContext',
-          'nao.analysisScopeFollowModeIsFile',
+          'mezz.analysisScopeFollowModeIsFile',
           getFollowMode() === 'file'
         );
         if (followActiveAnalysisScope) {
@@ -297,14 +301,14 @@ export function activate(context: vscode.ExtensionContext) {
     await ctx.workspaceState.update(FOLLOW_STATE_KEY, on);
     await vscode.commands.executeCommand(
       'setContext',
-      'nao.followActiveAnalysisScope',
+      'mezz.followActiveAnalysisScope',
       on
     );
   }
 
   async function setFollowMode(mode: 'file' | 'folder'): Promise<void> {
     await vscode.workspace
-      .getConfiguration('nao')
+      .getConfiguration('mezz')
       .update('analysisScopeFollowMode', mode, vscode.ConfigurationTarget.Workspace);
     // The onDidChangeConfiguration listener above will update the
     // context key. Apply happens at the command call site.
@@ -361,14 +365,14 @@ export function activate(context: vscode.ExtensionContext) {
   // Internal command used by the side view's "Go to Source" button.
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      'nao.internalGoToDefinition',
+      'mezz.internalGoToDefinition',
       async (args: { filePath: string; line?: number }) => {
         await openAtLine(resolveWorkspacePath(args.filePath), args.line);
       }
     )
   );
 
-  const onServerReady = (s: NaoServer) => {
+  const onServerReady = (s: MezzServer) => {
     selectionProvider.setServerPort(s.port);
     qualityProvider.setServerPort(s.port);
     scopeTreeProvider.setServerPort(s.port);
@@ -380,14 +384,14 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: open the visualizer panel (starts server if needed)
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.openVisualizer', async () => {
+    vscode.commands.registerCommand('mezz.openVisualizer', async () => {
       const workspaceRoot = getProjectRoot();
       if (!workspaceRoot) {
-        vscode.window.showErrorMessage('Nao: Open a folder or workspace first.');
+        vscode.window.showErrorMessage('Mezzanine: Open a folder or workspace first.');
         return;
       }
 
-      server = await ensureServer(workspaceRoot, outputChannel, bundledContentPath, onServerReady);
+      server = await ensureServer(context, workspaceRoot, outputChannel, bundledContentPath, onServerReady);
       if (!server) return;
 
       const panel = VisualizerPanel.createOrShow(context, server.port, workspaceRoot);
@@ -401,14 +405,14 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: visualize the currently active file in a compact (no-sidebar) view
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.visualizeCurrentFile', async () => {
+    vscode.commands.registerCommand('mezz.visualizeCurrentFile', async () => {
       const workspaceRoot = getProjectRoot();
       if (!workspaceRoot) {
-        vscode.window.showErrorMessage('Nao: Open a folder or workspace first.');
+        vscode.window.showErrorMessage('Mezzanine: Open a folder or workspace first.');
         return;
       }
 
-      server = await ensureServer(workspaceRoot, outputChannel, bundledContentPath, onServerReady);
+      server = await ensureServer(context, workspaceRoot, outputChannel, bundledContentPath, onServerReady);
       if (!server) return;
 
       const panel = VisualizerPanel.createOrShow(context, server.port, workspaceRoot);
@@ -426,29 +430,29 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Command: stop the running nao server (and close the visualizer, since
+  // Command: stop the running mezz server (and close the visualizer, since
   // its webview is pinned to the now-dead port).
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.stopServer', () => {
+    vscode.commands.registerCommand('mezz.stopServer', () => {
       if (!server) {
-        vscode.window.showInformationMessage('Nao: Server is not running.');
+        vscode.window.showInformationMessage('Mezzanine: Server is not running.');
         return;
       }
       server.stop();
       server = undefined;
       VisualizerPanel.dispose();
-      vscode.window.showInformationMessage('Nao: Server stopped.');
+      vscode.window.showInformationMessage('Mezzanine: Server stopped.');
     })
   );
 
-  // Command: restart the nao server. Disposes the visualizer panel because
+  // Command: restart the mezz server. Disposes the visualizer panel because
   // its serverPort is captured at construction time and would otherwise
   // point at the old process; reopens it when the new server is ready.
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.restartServer', async () => {
+    vscode.commands.registerCommand('mezz.restartServer', async () => {
       const workspaceRoot = getProjectRoot();
       if (!workspaceRoot) {
-        vscode.window.showErrorMessage('Nao: Open a folder or workspace first.');
+        vscode.window.showErrorMessage('Mezzanine: Open a folder or workspace first.');
         return;
       }
       const hadPanel = VisualizerPanel.currentPanel !== undefined;
@@ -457,23 +461,23 @@ export function activate(context: vscode.ExtensionContext) {
         server = undefined;
       }
       VisualizerPanel.dispose();
-      server = await ensureServer(workspaceRoot, outputChannel, bundledContentPath, onServerReady);
+      server = await ensureServer(context, workspaceRoot, outputChannel, bundledContentPath, onServerReady);
       if (!server) return;
       if (hadPanel) {
         const panel = VisualizerPanel.createOrShow(context, server.port, workspaceRoot);
         const editor = vscode.window.activeTextEditor;
         if (editor) panel.setCurrentEditorFile(editor.document.uri.fsPath);
       }
-      vscode.window.showInformationMessage('Nao: Server restarted.');
+      vscode.window.showInformationMessage('Mezzanine: Server restarted.');
     })
   );
 
-  // Command: pick the git repository (= project root) Nao works against.
+  // Command: pick the git repository (= project root) Mezzanine works against.
   // Covers the "workspace root is not the git repo" case: the repo lives in
   // a subfolder, git commands at the workspace root fail, and the Diff panel
   // can't list commits or build worktrees.
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.selectGitRepo', async () => {
+    vscode.commands.registerCommand('mezz.selectGitRepo', async () => {
       const repos = discoverGitRepos();
       const current = getProjectRoot();
       type RepoItem = vscode.QuickPickItem & { repoPath?: string; browse?: boolean };
@@ -491,7 +495,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       const pick = await vscode.window.showQuickPick(items, {
         placeHolder: repos.length
-          ? 'Select the git repository Nao should analyze and diff against'
+          ? 'Select the git repository Mezzanine should analyze and diff against'
           : 'No git repositories found in the workspace — browse to one',
         matchOnDetail: true,
       });
@@ -503,7 +507,7 @@ export function activate(context: vscode.ExtensionContext) {
           canSelectFiles: false,
           canSelectFolders: true,
           canSelectMany: false,
-          openLabel: 'Use as Nao project root',
+          openLabel: 'Use as Mezzanine project root',
         });
         chosen = uris?.[0]?.fsPath;
       }
@@ -511,7 +515,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       if (!fs.existsSync(path.join(chosen, '.git'))) {
         const proceed = await vscode.window.showWarningMessage(
-          `Nao: "${path.basename(chosen)}" is not a git repository — the Diff panel needs one. Use it anyway?`,
+          `Mezzanine: "${path.basename(chosen)}" is not a git repository — the Diff panel needs one. Use it anyway?`,
           'Use Anyway',
           'Cancel'
         );
@@ -523,7 +527,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       if (!server?.running) {
         vscode.window.showInformationMessage(
-          `Nao: project root set to ${chosen}. It will be used when the visualizer starts.`
+          `Mezzanine: project root set to ${chosen}. It will be used when the visualizer starts.`
         );
         return;
       }
@@ -535,7 +539,7 @@ export function activate(context: vscode.ExtensionContext) {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Nao: re-analyzing ${path.basename(chosen)}…`,
+          title: `Mezzanine: re-analyzing ${path.basename(chosen)}…`,
         },
         async () => {
           try {
@@ -544,16 +548,16 @@ export function activate(context: vscode.ExtensionContext) {
               void scopeTreeProvider.refresh();
               void analysisScopeTreeProvider.refresh();
               vscode.window.showInformationMessage(
-                `Nao: now using ${chosen}${resp.message ? ` — ${resp.message}` : ''}`
+                `Mezzanine: now using ${chosen}${resp.message ? ` — ${resp.message}` : ''}`
               );
             } else {
               vscode.window.showErrorMessage(
-                `Nao: failed to change project root — ${resp.message ?? 'unknown error'}`
+                `Mezzanine: failed to change project root — ${resp.message ?? 'unknown error'}`
               );
             }
           } catch (err) {
             vscode.window.showErrorMessage(
-              `Nao: failed to change project root — ${(err as Error).message}`
+              `Mezzanine: failed to change project root — ${(err as Error).message}`
             );
           }
         }
@@ -579,7 +583,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       if (!VisualizerPanel.currentPanel) return;
       if (Date.now() < suppressEditorEventsUntil) return;
-      const config = vscode.workspace.getConfiguration('nao');
+      const config = vscode.workspace.getConfiguration('mezz');
       if (!config.get<boolean>('autoVisualize', true)) return;
 
       VisualizerPanel.currentPanel.focusFile(
@@ -631,9 +635,9 @@ export function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine(`[cursor-sync] SKIPPED — no visualizer panel open`);
         return;
       }
-      const config = vscode.workspace.getConfiguration('nao');
+      const config = vscode.workspace.getConfiguration('mezz');
       if (!config.get<boolean>('autoVisualize', true)) {
-        outputChannel.appendLine(`[cursor-sync] SKIPPED — nao.autoVisualize is false`);
+        outputChannel.appendLine(`[cursor-sync] SKIPPED — mezz.autoVisualize is false`);
         return;
       }
 
@@ -670,9 +674,9 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Educator hover provider — surfaces Nao educator rules on the editor.
+  // Educator hover provider — surfaces Mezzanine educator rules on the editor.
   // The provider is registered eagerly; it self-gates on the
-  // `nao.educator.hoverEnabled` setting and the server's running state,
+  // `mezz.educator.hoverEnabled` setting and the server's running state,
   // and returns no contribution when zero rules match (design Q11).
   const educatorHover = new EducatorHoverProvider(
     () => (server?.running ? server.port : undefined),
@@ -708,7 +712,7 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Educator Problems — dedicated TreeView under the Nao sidebar that lists
+  // Educator Problems — dedicated TreeView under the Mezzanine sidebar that lists
   // scan hits per file. Replaces the earlier DiagnosticCollection integration
   // so Educator findings stay out of the shared Problems view (which would
   // otherwise mix them with Java/SonarQube/compiler diagnostics).
@@ -745,7 +749,7 @@ export function activate(context: vscode.ExtensionContext) {
     void educatorProblems.refresh(doc);
   }
   context.subscriptions.push(
-    vscode.commands.registerCommand('nao.educator.refreshProblems', () => {
+    vscode.commands.registerCommand('mezz.educator.refreshProblems', () => {
       for (const doc of vscode.workspace.textDocuments) {
         void educatorProblems.refresh(doc);
       }
@@ -753,7 +757,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Click handler for tree-item navigation — used by the `command` field
     // on each hit's `TreeItem`. Opens the file and selects the hit range.
     vscode.commands.registerCommand(
-      'nao.educator.openHit',
+      'mezz.educator.openHit',
       async (args: { file: string; line: number; col: number }) => {
         const uri = vscode.Uri.file(args.file);
         const pos = new vscode.Position(args.line, args.col);
@@ -766,7 +770,7 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  outputChannel.appendLine('Nao Code Visualizer extension activated.');
+  outputChannel.appendLine('Mezzanine Code Visualizer extension activated.');
 }
 
 export function deactivate() {
@@ -778,7 +782,7 @@ export function deactivate() {
 }
 
 /** Effective project root: the git repository the user selected via
- *  "Nao: Select Git Repository…" when set, else the first workspace folder.
+ *  "Mezzanine: Select Git Repository…" when set, else the first workspace folder.
  *  The server analyzes and runs git at this root, and every path it returns
  *  is relative to it — so all path resolution must go through here too. */
 function getProjectRoot(): string | undefined {
@@ -871,33 +875,33 @@ function activeJavaUri(editor: vscode.TextEditor | undefined): vscode.Uri | unde
 }
 
 async function ensureServer(
+  context: vscode.ExtensionContext,
   workspaceRoot: string,
   outputChannel: vscode.OutputChannel,
   contentFallback: string,
-  onReady?: (server: NaoServer) => void
-): Promise<NaoServer | undefined> {
+  onReady?: (server: MezzServer) => void
+): Promise<MezzServer | undefined> {
   if (server?.running) {
     onReady?.(server);
     return server;
   }
 
-  const config = vscode.workspace.getConfiguration('nao');
-  const binaryPath = config.get<string>('binaryPath', '') || 'nao';
+  const config = vscode.workspace.getConfiguration('mezz');
+  const binary = resolveMezzBinary(context, outputChannel);
+  outputChannel.appendLine(`[mezz] engine: ${binary.command} (${binary.source})`);
   const port = config.get<number>('serverPort', 3200);
   const includeTests = config.get<boolean>('includeTests', false);
   const includeDocs = config.get<boolean>('includeDocs', false);
   const language = config.get<string>('language', '');
 
-  server = new NaoServer(binaryPath, workspaceRoot, port, includeTests, includeDocs, outputChannel, contentFallback, language);
+  server = new MezzServer(binary.command, workspaceRoot, port, includeTests, includeDocs, outputChannel, contentFallback, language);
 
   try {
     await server.start();
     onReady?.(server);
     return server;
   } catch (err) {
-    vscode.window.showErrorMessage(
-      `Nao: Failed to start the nao server. Make sure 'nao' is installed and on your PATH.\n${err}`
-    );
+    vscode.window.showErrorMessage(startupFailureMessage(binary, err));
     return undefined;
   }
 }
@@ -915,11 +919,11 @@ async function pickAndTriggerDiff(port: number): Promise<void> {
     // The usual cause: the analyzed root isn't inside a git repository
     // (e.g. the repo is a subfolder of the workspace). Offer the fix inline.
     const action = await vscode.window.showErrorMessage(
-      `Nao: could not fetch commits — ${(err as Error).message}. ` +
+      `Mezzanine: could not fetch commits — ${(err as Error).message}. ` +
         'If your git repository is a subfolder of the workspace, select it explicitly.',
       'Select Git Repository…'
     );
-    if (action) void vscode.commands.executeCommand('nao.selectGitRepo');
+    if (action) void vscode.commands.executeCommand('mezz.selectGitRepo');
     return [] as CommitItemApi[];
   });
   if (commits.length === 0) return;
@@ -1003,7 +1007,7 @@ function resolveWorkspacePath(filePath: string): string {
  *
  * Two selections must not, and neither is a failure worth reporting:
  *
- *  • Module nodes. At module aggregation `collapseGraph` sets `file_path` to
+ *  • Folder nodes. At folder aggregation `collapseGraph` sets `file_path` to
  *    the *directory* the entities share, and `openTextDocument` rejects on a
  *    directory. There is no sensible file to pick, so don't try.
  *  • A selection the caret is already inside. Cursor-sync turns a click in the
@@ -1013,7 +1017,7 @@ function resolveWorkspacePath(filePath: string): string {
  *    `onDidChangeTextEditorSelection` blocks, reached by a plain click.
  */
 function isOpenableSelection(payload: SelectionPayload): boolean {
-  if (payload.kind === 'module') return false;
+  if (payload.kind === 'folder') return false;
   const editor = vscode.window.activeTextEditor;
   if (!editor) return true;
   if (editor.document.uri.fsPath !== resolveWorkspacePath(payload.filePath)) return true;
@@ -1100,7 +1104,7 @@ async function pickScopes(provider: ScopeTreeProvider, title: string): Promise<v
 
 function getFollowMode(): 'file' | 'folder' {
   const v = vscode.workspace
-    .getConfiguration('nao')
+    .getConfiguration('mezz')
     .get<string>('analysisScopeFollowMode', 'folder');
   return v === 'file' ? 'file' : 'folder';
 }

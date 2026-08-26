@@ -10,7 +10,7 @@
  * drawn over a graph and a picture is drawn over a tree, and the two
  * disagree: a file can hold one entity the focus calls and another nothing
  * reaches. Drawing the first as a circle and folding the second into a
- * directory would put an entity on screen and a Module node containing it —
+ * directory would put an entity on screen and a Folder node containing it —
  * the same code twice, once inside the other.
  *
  *   npm run test:rings
@@ -114,27 +114,27 @@ test('the focus and one hop out stay entities, the rest coarsens', () => {
   assert.equal(g.a1, 'entity');
   assert.equal(g.b1, 'entity');
   assert.equal(g.c1, 'file');
-  assert.equal(g.d1, 'module');
+  assert.equal(g.d1, 'folder');
 });
 
 test('a file with one entity in reach opens whole', () => {
   // b2 is unreachable and would ask for the outermost ring on its own. Its
   // file is open, so it draws as an entity beside b1 — anything else puts b2
-  // inside a Module rollup that also contains the b1 already on screen.
+  // inside a Folder rollup that also contains the b1 already on screen.
   assert.equal(hopDistances(LINKS, seed, 3).has('b2'), false);
   assert.equal(grains().b2, 'entity');
 });
 
-test('a file out of reach inside an opened module is a File, never a Module', () => {
+test('a file out of reach inside an opened folder is a File, never a Folder', () => {
   // lib is opened because c1 is in reach at file grain. e1 is in no ring at
-  // all, but folding it to `lib` would draw a Module node overlapping the
+  // all, but folding it to `lib` would draw a Folder node overlapping the
   // lib/c.ts File node beside it.
   assert.equal(grains().e1, 'file');
   assert.equal(grains().c1, 'file');
 });
 
 test('a module nothing reaches stays one circle', () => {
-  assert.equal(grains().d1, 'module');
+  assert.equal(grains().d1, 'folder');
 });
 
 test('a ghost takes its ring and belongs to no scope', () => {
@@ -142,7 +142,7 @@ test('a ghost takes its ring and belongs to no scope', () => {
   // drops it, which is the exemption `f.grouping` holds at every grain.
   assert.equal(grains().ghost, 'entity');
   const far = planRingGrain(NODES, LINKS, new Set(['d1']), DEFAULT_RINGS);
-  assert.equal(far.grainById.get('ghost'), 'module');
+  assert.equal(far.grainById.get('ghost'), 'folder');
 });
 
 test('the cost of a ring plan is known before it is drawn', () => {
@@ -151,7 +151,7 @@ test('the cost of a ring plan is known before it is drawn', () => {
   // fixture; what matters is that it is counted, not drawn, to get it.
   const p = plan();
   assert.equal(p.drawnCount, 8);
-  const budgeted = planRingGrain(NODES, LINKS, seed, ['entity', 'module']);
+  const budgeted = planRingGrain(NODES, LINKS, seed, ['entity', 'folder']);
   assert.ok(budgeted.drawnCount < p.drawnCount);
 });
 
@@ -164,10 +164,10 @@ test('grainFromLevel reproduces a uniform level exactly', () => {
 
   assert.equal(at('entity').a1, 'entity');
   assert.equal(at('file').a1, 'file');
-  assert.equal(at('module').a1, 'module');
+  assert.equal(at('folder').a1, 'folder');
   // Expansion opens exactly one level, and never two.
   assert.equal(at('file', new Set(['ui/src/a.ts'])).a1, 'entity');
-  assert.equal(at('module', new Set(['ui/src'])).a1, 'file');
+  assert.equal(at('folder', new Set(['ui/src'])).a1, 'file');
 });
 
 test('an expanded root never promotes ghosts onto the canvas', () => {
@@ -175,7 +175,7 @@ test('an expanded root never promotes ghosts onto the canvas', () => {
   // membership before the file_path guard would open every external symbol in
   // the repo the moment the reader expanded the root.
   const rootExpanded = new Set(['']);
-  assert.equal(grainFromLevel('module', rootExpanded)(node('ghost', '')), 'module');
+  assert.equal(grainFromLevel('folder', rootExpanded)(node('ghost', '')), 'folder');
   assert.equal(grainFromLevel('file', rootExpanded)(node('ghost', '')), 'file');
   const collapsed = collapseGraph(GRAPH, 'file', rootExpanded);
   assert.equal(collapsed.nodes.some((n) => n.original_id === ''), false);
@@ -190,7 +190,7 @@ test('a ring plan draws one picture at three grains', () => {
 
   assert.equal(kinds['a1'], 'Function');
   assert.equal(kinds['lib/c.ts'], 'File');
-  assert.equal(kinds['far'], 'Module');
+  assert.equal(kinds['far'], 'Folder');
 });
 
 test('an edge between two drawn entities keeps its own kind', () => {
@@ -219,7 +219,7 @@ test('the drawn count is what the canvas actually gets', () => {
 test('a node the plan never saw falls outward, not to Entity', () => {
   const p = plan();
   const stranger = node('late', 'brand/new.ts');
-  assert.equal(grainFromPlan(p, DEFAULT_RINGS)(stranger), 'module');
+  assert.equal(grainFromPlan(p, DEFAULT_RINGS)(stranger), 'folder');
 });
 
 // ------------------------------------------------ the focus, and the controls
@@ -245,15 +245,15 @@ test('a ghost is never a seed', () => {
 });
 
 test('reach says how far entities extend, the level says what the rest is', () => {
-  assert.deepEqual(ringsFor(0, 'module'), ['entity', 'module']);
+  assert.deepEqual(ringsFor(0, 'folder'), ['entity', 'folder']);
   assert.deepEqual(ringsFor(2, 'file'), ['entity', 'entity', 'entity', 'file']);
 });
 
 test('the two controls compose: same focus, wider reach, more detail', () => {
   const seedA = seedFromPath(NODES, 'ui/src/a.ts');
-  const tight = planRingGrain(NODES, LINKS, seedA, ringsFor(0, 'module'));
-  const wide = planRingGrain(NODES, LINKS, seedA, ringsFor(2, 'module'));
-  assert.equal(tight.grainById.get('c1'), 'module');
+  const tight = planRingGrain(NODES, LINKS, seedA, ringsFor(0, 'folder'));
+  const wide = planRingGrain(NODES, LINKS, seedA, ringsFor(2, 'folder'));
+  assert.equal(tight.grainById.get('c1'), 'folder');
   assert.equal(wide.grainById.get('c1'), 'entity');
 });
 
@@ -261,7 +261,7 @@ test('the focus itself is always drawn at the finest grain', () => {
   // The invariant the whole control rests on: `ringsFor` puts Entity in ring
   // 0, so focusing a scope can never fold away the thing being focused. A
   // reader whose focus vanished from the canvas would have no way back to it.
-  for (const outer of ['entity', 'file', 'module'] as GraphLevel[]) {
+  for (const outer of ['entity', 'file', 'folder'] as GraphLevel[]) {
     const p = planRingGrain(NODES, LINKS, seedFromPath(NODES, 'ui/src/a.ts'), ringsFor(0, outer));
     assert.equal(p.grainById.get('a1'), 'entity', `outer=${outer}`);
     assert.equal(p.grainById.get('a2'), 'entity', `outer=${outer}`);

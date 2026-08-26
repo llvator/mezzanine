@@ -11,7 +11,7 @@
  * Zero dependencies: Node's built-in WebSocket (Node >= 22) speaking CDP to
  * an already-installed Chrome. Nothing added to package.json.
  *
- *   Terminal 1:  nao watch . --port 3000
+ *   Terminal 1:  mezz watch . --port 3000
  *   Terminal 2:  cd ui && npm run dev -- --port 5199 --strictPort
  *   Terminal 3:  node ui/scripts/ux-probe.mjs --all
  *                node ui/scripts/ux-probe.mjs ui-011 ui-020
@@ -46,7 +46,7 @@ const CDP_PORT = Number(process.env.PROBE_CDP_PORT ?? 9222);
 const CDP = `http://127.0.0.1:${CDP_PORT}`;
 const APP = process.env.PROBE_URL ?? 'http://localhost:5199/';
 /** The engine, addressed directly rather than through the dev-server proxy.
- *  UI-034's suite needs a *cross-origin* nao to make a refusal happen. */
+ *  UI-034's suite needs a *cross-origin* mezz to make a refusal happen. */
 const ENGINE = process.env.PROBE_ENGINE ?? 'http://localhost:3000';
 
 const CHROME = [
@@ -141,7 +141,7 @@ async function ensureChrome() {
   const proc = spawn(CHROME, [
     '--headless=new', '--disable-gpu', '--hide-scrollbars',
     `--remote-debugging-port=${CDP_PORT}`,
-    '--user-data-dir=/tmp/nao-ux-probe-profile',
+    '--user-data-dir=/tmp/mezz-ux-probe-profile',
     'about:blank',
   ], { stdio: 'ignore', detached: true });
   proc.unref();
@@ -1493,6 +1493,31 @@ function installProbeLib() {
       return el.getAttribute('class');
     },
 
+    /** A client point that really lands on a region's *name*, and the path
+     *  that name focuses (UI-115).
+     *
+     *  Sampled across the box rather than taken from its centre. The names are
+     *  tracked wide, so the middle of `SRC` is the gap between the S and the
+     *  R, where `elementFromPoint` returns whatever is drawn behind it — and a
+     *  probe that dispatched on the text element directly would pass on a
+     *  label no reader can hit. Innermost outward, for the same reason
+     *  `regionProbePoint` is. */
+    regionLabelPoint() {
+      const labels = [...document.querySelectorAll('g.folder-hull text.hull-label')];
+      for (let i = labels.length - 1; i >= 0; i--) {
+        const t = labels[i];
+        const r = t.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const y = r.top + r.height / 2;
+        for (let s = 1; s < 20; s++) {
+          const x = r.left + (r.width * s) / 20;
+          if (document.elementFromPoint(x, y) !== t) continue;
+          return { x, y, path: t.closest('g.folder-hull')?.getAttribute('data-path') ?? '' };
+        }
+      }
+      return null;
+    },
+
     /** The folder of every drawn node that has one — what a focused view is
      *  allowed to contain.
      *
@@ -1507,6 +1532,16 @@ function installProbeLib() {
         .map((g) => g.__data__?.file_path ?? '')
         .filter((p) => p !== '')
         .map((p) => this.folderOfPath(p));
+    },
+
+    /** The same set one level down: the file of every drawn node that has
+     *  one. What a view focused on a *file* region (UI-115) is allowed to
+     *  contain. Ghosts excluded for the reason `drawnFolders` gives. */
+    drawnFiles() {
+      return [...document.querySelectorAll('g.node')]
+        .filter((g) => g.style.display !== 'none' && !g.classList.contains('ghost'))
+        .map((g) => (g.__data__?.file_path ?? '').replace(/^\.\//, ''))
+        .filter((p) => p !== '');
     },
 
     /** UI-092. The wayback's two controls, plus how deep the stack is.
@@ -1567,7 +1602,7 @@ function installProbeLib() {
      *  and the gesture every other one in UI-092 is measured against. */
     drillFirstCollapsed() {
       const g = [...document.querySelectorAll('g.node')].find(
-        (n) => n.style.display !== 'none' && ['File', 'Module'].includes(n.__data__?.kind_raw),
+        (n) => n.style.display !== 'none' && ['File', 'Folder'].includes(n.__data__?.kind_raw),
       );
       if (!g) return null;
       g.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
@@ -1607,7 +1642,7 @@ function installProbeLib() {
 
     /** Widen the diff to its top rung, and report whether a diff was active.
      *
-     *  Originally a workaround: with a diff loaded, File and Module
+     *  Originally a workaround: with a diff loaded, File and Folder
      *  aggregation drew nothing at all, so a layout suite measured an empty
      *  canvas. UI-064 fixed that — collapsed nodes now resolve through a
      *  scope rollup instead of missing an entity-keyed lookup.
@@ -1739,16 +1774,16 @@ function installProbeLib() {
     /** Persisted like the theme — raw, not JSON (settings.ts). Set this
      *  before a reload to control the strength the next load starts at. */
     storeCohesion(level) {
-      try { localStorage.setItem('nao-folder-cohesion', level); } catch { /* ignore */ }
-      return localStorage.getItem('nao-folder-cohesion') === level;
+      try { localStorage.setItem('mezz-folder-cohesion', level); } catch { /* ignore */ }
+      return localStorage.getItem('mezz-folder-cohesion') === level;
     },
 
     /** Set the grain before a load, so a measurement gets the UI-053 seed for
      *  that grain rather than inheriting the previous grain's settle — the
      *  same reason `storeCohesion` exists. */
     storeGrain(grain) {
-      try { localStorage.setItem('nao-group-grain', grain); } catch { /* ignore */ }
-      return localStorage.getItem('nao-group-grain') === grain;
+      try { localStorage.setItem('mezz-group-grain', grain); } catch { /* ignore */ }
+      return localStorage.getItem('mezz-group-grain') === grain;
     },
 
     // ── actions ──────────────────────────────────────────────────────────
@@ -1788,15 +1823,15 @@ function installProbeLib() {
      *  JSON. Writing `"light"` with quotes silently falls back to the
      *  default theme and every contrast measurement then reads llvator. */
     setTheme(id) {
-      try { localStorage.setItem('nao-theme', id); } catch { /* ignore */ }
-      return localStorage.getItem('nao-theme') === id;
+      try { localStorage.setItem('mezz-theme', id); } catch { /* ignore */ }
+      return localStorage.getItem('mezz-theme') === id;
     },
 
     /** Which theme the app actually applied, read back off :root. */
     activeTheme() {
       const s = getComputedStyle(document.documentElement);
       return {
-        stored: (() => { try { return localStorage.getItem('nao-theme'); } catch { return null; } })(),
+        stored: (() => { try { return localStorage.getItem('mezz-theme'); } catch { return null; } })(),
         bgBody: s.getPropertyValue('--bg-body').trim(),
         text: s.getPropertyValue('--text').trim(),
       };
@@ -2522,7 +2557,7 @@ const SUITES = {
         async run(page) {
           // Assert on the TRANSITION. A check that merely looked for `.active`
           // somewhere in the toolbar would pass on Auto-Fit and the
-          // Entity/File/Module group, which already have it.
+          // Entity/File/Folder group, which already have it.
           const results = [];
           for (const label of ['Node Labels', 'Kind Labels', 'Link Labels']) {
             const before = (await page.eval((l) => window.__probe.toggleState([l]), label))[0];
@@ -2570,7 +2605,7 @@ const SUITES = {
     async setup(page) {
       await page.viewport(1600, 1000);
       await page.goto(APP);
-      await page.eval(() => { try { localStorage.removeItem('nao-auto-fit'); } catch { /* ignore */ } });
+      await page.eval(() => { try { localStorage.removeItem('mezz-auto-fit'); } catch { /* ignore */ } });
       await page.goto(APP); await ready(page);
     },
     checks: [
@@ -2956,9 +2991,9 @@ const SUITES = {
      * blocked clipboard look identical to a user), so the button encodes its
      * own outcome in its glyph and these checks read that back.
      *
-     * ⚠ Point `nao watch` at a FROZEN copy of the repo, not the working tree:
+     * ⚠ Point `mezz watch` at a FROZEN copy of the repo, not the working tree:
      *
-     *     git archive HEAD | tar -x -C /tmp/snap && nao watch /tmp/snap -p 3000
+     *     git archive HEAD | tar -x -C /tmp/snap && mezz watch /tmp/snap -p 3000
      *
      * These checks span several seconds each. Watching a tree you are still
      * editing means re-analysis and live-reload rebuild the quality table
@@ -2977,7 +3012,7 @@ const SUITES = {
         criterion: 'Every entity row offers a labelled copy-prompt button',
         async run(page) {
           // Scoped to rows that carry the per-entity copy cell. The Quality
-          // tab renders three tables (summary, entities, files/modules) and
+          // tab renders three tables (summary, entities, files/folders) and
           // a bare `tbody tr` sweep counts all of them — only the entity
           // leaderboard takes an entity_id, which is what the prompt needs.
           const r = await page.eval(() => {
@@ -3130,7 +3165,7 @@ const SUITES = {
      * asserts *is* a different page load, and a connect screen that only
      * appears on a cold boot cannot be driven into view from a booted app.
      *
-     * `ENGINE` is a `nao watch` started without `--allow-origin`, which is
+     * `ENGINE` is a `mezz watch` started without `--allow-origin`, which is
      * the default and is exactly the refusal being tested — pointing this
      * page at it must produce the actionable message rather than a blank
      * graph.
@@ -3141,8 +3176,8 @@ const SUITES = {
       await sleep(1500);
       // A stored endpoint from an earlier run would pre-empt every check.
       await page.eval(() => {
-        window.localStorage.removeItem('nao.apiBase');
-        window.localStorage.removeItem('nao.apiToken');
+        window.localStorage.removeItem('mezz.apiBase');
+        window.localStorage.removeItem('mezz.apiToken');
         return true;
       });
     },
@@ -3179,7 +3214,7 @@ const SUITES = {
             && state.remedy.includes(state.origin);
           return ok(state.kind === 'refused' && namesFlag, state,
             state.kind !== 'refused'
-              ? `diagnosed as "${state.kind}" — a reachable nao that blocked us must read as refused`
+              ? `diagnosed as "${state.kind}" — a reachable mezz that blocked us must read as refused`
               : 'the remedy must be a copy-pasteable command naming this origin');
         },
       },
@@ -3350,7 +3385,7 @@ const SUITES = {
       await page.eval((n) => window.__probe.pickScope(n), 'ui');
       await sleep(6000);
       // Pin File level. `ui` is well past RENDER_BUDGET, so auto-level lands
-      // on Module — where the collapsed nodes carry a *directory* path and
+      // on Folder — where the collapsed nodes carry a *directory* path and
       // there are no per-file rows to assert on at all. That is correct
       // behaviour (nothing to hide at module granularity), but it makes the
       // panel untestable, and clicking a level button also switches
@@ -3770,6 +3805,62 @@ const SUITES = {
           const differs = a.cohesion !== b.cohesion || a.regions !== b.regions;
           return ok(differs, { folder: a, file: b },
             differs ? '' : 'both grains settled identically — is Entity level actually being set?');
+        },
+      },
+      {
+        id: 'a-file-regions-name-focuses-that-file',
+        criterion: "One click on a file region's name narrows the view to that file",
+        async run(page) {
+          // UI-115 at this grain. The gesture is grain-blind by construction —
+          // it hands the drill whatever `groupChainOf` called the region — so
+          // what this really checks is that a *file* path is a scope the rest
+          // of the pipeline accepts, which is the half no folder-grain check
+          // can reach.
+          //
+          // It builds its own picture instead of reusing `settledGrain`. That
+          // helper takes the *widest* scope to Entity level, which on a repo
+          // this size is far over the draw ceiling and settles to zero drawn
+          // regions — there is then no name to click, and the check would
+          // report a broken gesture when what is broken is the scope it was
+          // handed. A middling scope is the smallest change that gives this
+          // one a canvas.
+          await page.eval(() => window.__probe.storeGrain('file'));
+          await page.eval(() => window.__probe.storeCohesion('high'));
+          await page.goto(APP); await ready(page);
+          const rows = (await page.eval(() => window.__probe.scopeRowCounts()))
+            .filter((r) => r.path && r.entities >= 120)
+            .sort((a, b) => a.entities - b.entities);
+          if (!rows.length) return ok(false, null, 'no scope row big enough to draw a region');
+          const scope = rows[0].path;
+          const state = await page.eval((x) => window.__probe.scopeRowState(x), scope);
+          if (!state?.checked) await page.eval((x) => window.__probe.toggleScopePath(x), scope);
+          await sleep(2000);
+          await clearDiff(page);
+          await page.eval(() => window.__probe.setLevel('Entity'));
+          await page.eval(() => window.__probe.setHulls(true));
+          await waitSettled(page);
+          const isFile = (x) => /\.[a-z]+$/i.test(x ?? '');
+          let hit = null;
+          for (let i = 0; i < 10 && !isFile(hit?.path); i++) {
+            hit = await page.eval(() => window.__probe.regionLabelPoint());
+            if (isFile(hit?.path)) break;
+            await sleep(800);
+          }
+          if (!isFile(hit?.path)) {
+            return ok(false, { scope, hit }, 'no file earned a named region to click — see the sibling outline check');
+          }
+          const on = await page.eval(([x, y]) => window.__probe.clickPoint(x, y), [hit.x, hit.y]);
+          let files = [];
+          for (let i = 0; i < 12; i++) {
+            await sleep(700);
+            files = await page.eval(() => window.__probe.drawnFiles());
+            if (files.length > 0 && files.every((f) => f === hit.path)) break;
+          }
+          const outside = [...new Set(files.filter((f) => f !== hit.path))];
+          const pass = files.length > 0 && outside.length === 0;
+          await page.eval(() => window.__probe.setGroupGrain('folder'));
+          return ok(pass, { scope, on, focused: hit.path, drawn: files.length, outside: outside.slice(0, 6) },
+            pass ? '' : 'the view still holds files other than the one whose name was clicked');
         },
       },
     ],
@@ -4455,14 +4546,48 @@ const SUITES = {
             after = await page.eval(() => window.__probe.drawnFolders());
           }
           const outside = outsideOf(after);
-          // Not a node count: focusing re-enables auto-level, so a small
-          // region legitimately opens at entity level and draws *more* nodes
-          // than the file-level view it came from. Narrower means narrower in
-          // what the view is *about*, which is the folder test below.
+          // Not a node count: focusing keeps the reader's grain, so a region
+          // whose files each hold several entities can draw about as many
+          // nodes as the view it came from. Narrower means narrower in what
+          // the view is *about*, which is the folder test below.
           const widerBefore = before.some((f) => f !== p.tightest && !f.startsWith(`${p.tightest}/`));
           const pass = after.length > 0 && outside.length === 0 && widerBefore;
           return ok(pass, { on, focused: p.tightest, before: before.length, after: after.length, outside: [...new Set(outside)].slice(0, 8) },
             pass ? '' : (widerBefore ? 'the view still holds folders from outside the region that was focused' : 'the view was already only that region — nothing was narrowed'));
+        },
+      },
+      {
+        id: 'single-click-on-the-name-focuses-the-region',
+        criterion: "One click on a region's name narrows the view to it",
+        async run(page) {
+          // The check above left the view inside one region, and "narrows"
+          // needs somewhere to narrow from. Same dance as the suite setup.
+          const scope = await widestScope(page);
+          for (let i = 0; i < 6; i++) {
+            const state = await page.eval((p) => window.__probe.scopeRowState(p), scope);
+            if (state?.checked) break;
+            await page.eval((p) => window.__probe.toggleScopePath(p), scope);
+            await sleep(1500);
+          }
+          await waitSettled(page);
+          const p = await page.eval(() => window.__probe.regionLabelPoint());
+          if (!p) return ok(false, null, 'no region name to click');
+          const before = await page.eval(() => window.__probe.drawnFolders());
+          const on = await page.eval(([x, y]) => window.__probe.clickPoint(x, y), [p.x, p.y]);
+          // Polled for the same reason the double-click check is: focusing is
+          // a scope change and a re-level, and settled positions only say the
+          // *old* picture stopped moving.
+          const outsideOf = (fs) => fs.filter((f) => f !== p.path && !f.startsWith(`${p.path}/`));
+          let after = await page.eval(() => window.__probe.drawnFolders());
+          for (let i = 0; i < 10 && (after.length === 0 || outsideOf(after).length > 0); i++) {
+            await sleep(600);
+            after = await page.eval(() => window.__probe.drawnFolders());
+          }
+          const outside = outsideOf(after);
+          const widerBefore = before.some((f) => f !== p.path && !f.startsWith(`${p.path}/`));
+          const pass = on?.on?.includes('hull-label') && after.length > 0 && outside.length === 0 && widerBefore;
+          return ok(pass, { on, focused: p.path, before: before.length, after: after.length, outside: [...new Set(outside)].slice(0, 8) },
+            pass ? '' : (widerBefore ? 'a click on the name did not narrow the view to it' : 'the view was already only that region — nothing was narrowed'));
         },
       },
     ],
@@ -4628,7 +4753,7 @@ const SUITES = {
 
   'ui-064': {
     ticket: 'UI-064', title: 'A loaded diff must not blank the collapsed canvas',
-    // Needs a diff. `nao watch` picks up an existing diff.json at boot; if
+    // Needs a diff. `mezz watch` picks up an existing diff.json at boot; if
     // there isn't one, compute HEAD → working first:
     //   curl -XPOST localhost:3000/api/diff -H 'content-type: application/json' \
     //        -d '{"from_ref":"HEAD","to_ref":"WORKING"}'
@@ -4689,7 +4814,7 @@ const SUITES = {
   'ui-088': {
     ticket: 'UI-088', title: 'The diff ladder draws what changed, edges included',
     // Needs a diff loaded. Against your own engine, not the one you are using:
-    //   nao watch <repo> --port 3010 --allow-origin http://localhost:5210
+    //   mezz watch <repo> --port 3010 --allow-origin http://localhost:5210
     //   curl -XPOST localhost:3010/api/diff -H 'content-type: application/json' \
     //        -d '{"from_ref":"HEAD~1","to_ref":"WORKING"}'
     async setup(page) {
@@ -5010,7 +5135,7 @@ const SUITES = {
     async setup(page) {
       await page.viewport(1600, 1000);
       await page.goto(APP); await ready(page);
-      // `src` is big enough that auto-level lands on Module, which is where
+      // `src` is big enough that auto-level lands on Folder, which is where
       // opening one scope in place has something to prove.
       await page.eval((n) => window.__probe.pickScope(n), 'src');
       await clearDiff(page);
@@ -5033,9 +5158,9 @@ const SUITES = {
           // Whichever level auto-level picked, the claim is the same: after
           // opening one scope the canvas carries *two* granularities at once.
           // Targeting the level that is actually on screen keeps this honest
-          // on any repo — `src` here collapses to File, not Module.
+          // on any repo — `src` here collapses to File, not Folder.
           const before = await page.eval(() => window.__probe.drawnNodeKinds());
-          const rollup = (before.Module ?? 0) > 0 ? 'Module' : 'File';
+          const rollup = (before.Folder ?? 0) > 0 ? 'Folder' : 'File';
           const target = await page.eval((k) => window.__probe.firstNodeOfKind(k), rollup);
           if (!target) return ok(false, { before, rollup }, `no ${rollup} node to open`);
           await page.eval((n) => window.__probe.expandNode(n), target);
@@ -5070,7 +5195,7 @@ const SUITES = {
           // The scope line reports what is *loaded*. Expansion is a drawing
           // decision (ADR 0010) and must not move it.
           const before = await page.eval(() => window.__probe.scopeEntities());
-          const target = await page.eval(() => window.__probe.firstNodeOfKind('Module'));
+          const target = await page.eval(() => window.__probe.firstNodeOfKind('Folder'));
           await page.eval((n) => window.__probe.expandNode(n), target);
           await waitSettled(page);
           const after = await page.eval(() => window.__probe.scopeEntities());
@@ -5109,7 +5234,7 @@ const SUITES = {
         criterion: 'Inside an opened file, edges keep the kind they really are',
         async run(page) {
           const kinds0 = await page.eval(() => window.__probe.drawnNodeKinds());
-          const rollup = (kinds0.Module ?? 0) > 0 ? 'Module' : 'File';
+          const rollup = (kinds0.Folder ?? 0) > 0 ? 'Folder' : 'File';
           const target = await page.eval((k) => window.__probe.firstNodeOfKind(k), rollup);
           if (!target) return ok(false, { kinds0 }, `no ${rollup} node to open`);
           await page.eval((n) => window.__probe.expandNode(n), target);
@@ -5936,14 +6061,14 @@ const wanted = argv.includes('--all')
   : argv.filter((a) => !a.startsWith('--')).map((a) => a.toLowerCase());
 
 if (!wanted.length) {
-  console.log(`ux-probe — layout assertions for the nao web UI
+  console.log(`ux-probe — layout assertions for the mezz web UI
 
 usage: node ui/scripts/ux-probe.mjs <suite...> | --all [--keep-open] [--verbose]
 
 suites:
 ${Object.entries(SUITES).map(([k, s]) => `  ${k.padEnd(8)} ${s.ticket} — ${s.title}`).join('\n')}
 
-requires: nao watch . --port 3000   and   cd ui && npm run dev -- --port 5199
+requires: mezz watch . --port 3000   and   cd ui && npm run dev -- --port 5199
 env:      PROBE_URL (default ${APP}), PROBE_CDP_PORT (default ${CDP_PORT}),
           PROBE_ENGINE (default ${ENGINE}) — the engine's own origin, used by
           ui-034 to provoke a cross-origin refusal`);
@@ -5959,7 +6084,7 @@ if (unknown.length) {
 try {
   await fetch(APP);
 } catch {
-  console.error(`Cannot reach ${APP} — start the Vite dev server and \`nao watch\` first.`);
+  console.error(`Cannot reach ${APP} — start the Vite dev server and \`mezz watch\` first.`);
   process.exit(1);
 }
 

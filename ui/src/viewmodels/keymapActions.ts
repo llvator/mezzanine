@@ -188,7 +188,7 @@ function runView(command: Command, ctx: KeymapContext): boolean {
     case 'view.toggleMode': ctx.graphView?.toggleViewMode(); return true;
     case 'view.level.entity': setLevel('entity'); return true;
     case 'view.level.file': setLevel('file'); return true;
-    case 'view.level.module': setLevel('module'); return true;
+    case 'view.level.folder': setLevel('folder'); return true;
     case 'view.autoFit': autoFitView.update((v) => !v); return true;
     case 'view.spacing': cycleTreeDensity(); return true;
     case 'view.highlightDepth': hoverDepth.update((d) => (d % 3) + 1); return true;

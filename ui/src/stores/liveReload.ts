@@ -1,5 +1,5 @@
 /**
- * Live-reload listener: connects to the `nao watch` SSE endpoint and
+ * Live-reload listener: connects to the `mezz watch` SSE endpoint and
  * triggers a data refresh whenever the backend signals that files changed.
  *
  * Once the endpoint can point at another origin (UI-032), this is the one
@@ -18,6 +18,7 @@
 import { get, writable } from 'svelte/store';
 import { refreshData } from './scope';
 import { loadDiff } from './diff';
+import { fetchBranch } from './branch';
 import { refreshShape } from './shape';
 import { apiUrl, isVscode } from '../vscodeAdapter';
 import { endpoint } from '../endpoint';
@@ -66,7 +67,7 @@ let attempt = 0;
 /** Try to connect to the watch server's SSE endpoint.
  *  Falls back silently if the endpoint isn't available. */
 export function connectLiveReload(url?: string): void {
-  // `nao serve` has no `/events` and never will — its repos are analyzed
+  // `mezz serve` has no `/events` and never will — its repos are analyzed
   // once, not watched. Without this guard the retry loop below would
   // re-request a 404 every few seconds for the life of the page.
   if (isServeMode()) {
@@ -112,6 +113,15 @@ export function connectLiveReload(url?: string): void {
     eventSource.addEventListener('diff', async () => {
       console.log('[liveReload] diff signal received — reloading the overlay');
       await loadDiff({ baseDetails: false });
+    });
+
+    // HEAD moved — a checkout, a new branch, a commit — and nothing else
+    // did. Re-fetching the graph here would restart a canvas whose code has
+    // not changed; the only thing that went stale is the label saying which
+    // branch that canvas is (UI-114).
+    eventSource.addEventListener('head', () => {
+      console.log('[liveReload] head signal received — re-reading the branch');
+      void fetchBranch();
     });
 
     eventSource.onerror = () => {
@@ -206,7 +216,7 @@ async function diagnose(): Promise<LiveStopReason | null> {
       return attempt >= RETRY_DELAYS.length ? 'no-stream' : null;
     default:
       // Same-origin, an unreachable server is very often one that has not
-      // started yet: opening the UI before running `nao watch` is a real
+      // started yet: opening the UI before running `mezz watch` is a real
       // workflow, and it is what the retry loop is for.
       return crossOrigin ? 'unreachable' : null;
   }

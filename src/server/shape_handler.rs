@@ -74,7 +74,7 @@ pub(crate) async fn shape_handler(
             StatusCode::NOT_FOUND,
             format!(
                 "No analysed folder at {:?}. Folders come from the files in scope, \
-                 so a directory holding nothing nao parsed has no shape.",
+                 so a directory holding nothing mezz parsed has no shape.",
                 params.path
             ),
         )
@@ -84,7 +84,7 @@ pub(crate) async fn shape_handler(
     // be a second answer free to disagree with the one the Quality panel
     // and the MCP tools are printing.
     let shape = graph
-        .module_metrics()
+        .folder_metrics()
         .iter()
         .find(|m| m.path == absolute)
         .and_then(|m| m.metrics.shape.clone());

@@ -66,7 +66,7 @@ impl Educator {
         issues.extend(lesson_issues);
 
         // Surface the issue list to the operator's terminal at startup so a
-        // broken rule or lesson is impossible to miss when running `nao watch`.
+        // broken rule or lesson is impossible to miss when running `mezz watch`.
         log_issues(&issues);
 
         let mut by_kind: HashMap<(String, String), Vec<usize>> = HashMap::new();
@@ -98,12 +98,12 @@ impl Educator {
     }
 
     /// Resolve the content root in priority order:
-    /// 1. `NAO_EDUCATOR_CONTENT` env var, if set.
+    /// 1. `MEZZ_EDUCATOR_CONTENT` env var, if set.
     /// 2. `<workspace>/content/` — content checked in alongside the project being analyzed.
     ///
     /// Returns `None` if neither resolves to an existing directory.
     pub fn resolve_content_root(workspace: &Path) -> Option<PathBuf> {
-        if let Ok(path) = std::env::var("NAO_EDUCATOR_CONTENT") {
+        if let Ok(path) = std::env::var("MEZZ_EDUCATOR_CONTENT") {
             let p = PathBuf::from(path);
             if p.exists() {
                 return Some(p);

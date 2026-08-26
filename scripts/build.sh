@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Recompile Nao in place, without installing anything.
+# Recompile Mezzanine in place, without installing anything.
 #
 #   ./scripts/build.sh                # binaries only (release)
 #   ./scripts/build.sh --debug        # binaries only (debug — much faster)
@@ -32,13 +32,13 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-echo "==> cargo build ($PROFILE): nao, elevator"
+echo "==> cargo build ($PROFILE): mezz, elevator"
 if [[ "$PROFILE" == "release" ]]; then
   cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
 else
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
-echo "    binaries at $REPO_ROOT/target/$PROFILE/{nao,elevator}"
+echo "    binaries at $REPO_ROOT/target/$PROFILE/{mezz,elevator}"
 
 # Both frontend builds share ui/'s node_modules, so install once if needed.
 if [[ $BUILD_UI -eq 1 || $BUILD_WEBVIEW -eq 1 ]]; then
@@ -49,7 +49,7 @@ if [[ $BUILD_UI -eq 1 || $BUILD_WEBVIEW -eq 1 ]]; then
 fi
 
 if [[ $BUILD_UI -eq 1 ]]; then
-  # Served by `nao watch` as the relative path ui/dist (src/server/mod.rs),
+  # Served by `mezz watch` as the relative path ui/dist (src/server/mod.rs),
   # so it only resolves when the server is started from the repo root.
   echo "==> Building browser UI -> ui/dist"
   (cd "$REPO_ROOT/ui" && npm run build)
@@ -63,4 +63,4 @@ if [[ $BUILD_WEBVIEW -eq 1 ]]; then
 fi
 
 echo
-echo "Done. Run the local binary with: $REPO_ROOT/target/$PROFILE/nao"
+echo "Done. Run the local binary with: $REPO_ROOT/target/$PROFILE/mezz"

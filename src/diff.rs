@@ -101,12 +101,38 @@ fn loose_key(key: &EntityKey) -> EntityKey {
     }
 }
 
+/// The key with the file dropped — what is left of an entity's identity
+/// when it has been moved rather than edited.
+///
+/// Arity is deliberately kept, unlike [`loose_key`]. A move preserves the
+/// signature exactly; dropping both discriminators at once would let one
+/// overload in a moved file pair with a different overload of the same
+/// name in an unrelated one.
+fn moved_key(key: &EntityKey) -> EntityKey {
+    EntityKey {
+        file_path: String::new(),
+        ..key.clone()
+    }
+}
+
 /// Pair head entities with their base counterparts.
 ///
 /// Returns the rows for everything on the head side, where each survivor
 /// landed (the relationship pass hangs its deltas off those indices), and the
 /// base entities nothing claimed — the removals.
 ///
+/// Everything [`match_entities`] works out in one walk over the two graphs:
+/// the head-side rows, where each survivor landed (the relationship pass
+/// hangs its deltas off those indices), the base entities nothing claimed
+/// — the removals — and base key → head key for every entity that changed
+/// file, which is what [`follow_moves`] re-keys the edge diff through.
+type Matched<'a> = (
+    Vec<EntityDiff>,
+    HashMap<EntityKey, usize>,
+    Vec<&'a CodeEntity>,
+    HashMap<EntityKey, EntityKey>,
+);
+
 /// Two passes, because arity has to be in the key and cannot be the last word:
 ///
 /// 1. **Exact key, arity included.** This is what keeps overloads apart, and
@@ -117,16 +143,16 @@ fn loose_key(key: &EntityKey) -> EntityKey {
 ///    plus an unrelated removal loses the before/after the reader came for.
 ///    Only entities that failed pass 1 on *both* sides are in play here, so
 ///    an overload group that merely exists cannot reach it.
+/// 3. **Key minus the file path, over what pass 2 left.** A moved file
+///    keeps every name and signature it had, and reporting it as a
+///    wholesale removal plus a wholesale addition made every restructure
+///    read as a regression — see [`match_moved`].
 fn match_entities<'a>(
     base_graph: &'a DependencyGraph,
     head_graph: &'a DependencyGraph,
     base_root: &std::path::Path,
     head_root: &std::path::Path,
-) -> (
-    Vec<EntityDiff>,
-    HashMap<EntityKey, usize>,
-    Vec<&'a CodeEntity>,
-) {
+) -> Matched<'a> {
     // A key holds a *list*, not a single entity: overloads that survive the
     // arity split (same name, same arity, different types) still share one,
     // and a map that keeps only the last of them is what made unedited files
@@ -162,6 +188,8 @@ fn match_entities<'a>(
     for (key, group) in exact {
         loose.entry(loose_key(&key)).or_default().extend(group);
     }
+    let mut relocated = Vec::new();
+    let mut moves: HashMap<EntityKey, EntityKey> = HashMap::new();
     for (e, key, file_path) in pending {
         match loose
             .get_mut(&loose_key(&key))
@@ -171,12 +199,75 @@ fn match_entities<'a>(
                 survivors.insert(key, diffs.len());
                 diffs.push(diff_matched(e, base_e, file_path));
             }
+            None => relocated.push((e, key, file_path)),
+        }
+    }
+    let unclaimed = match_moved(
+        &mut diffs,
+        &mut survivors,
+        &mut moves,
+        relocated,
+        loose,
+        base_root,
+    );
+    (diffs, survivors, unclaimed, moves)
+}
+
+/// Pass 3: pair what is left across files, so a moved file reads as moved.
+///
+/// The first two passes key on the file path, so relocating a file makes
+/// every entity in it a removal *and* an addition. Nothing downstream can
+/// tell that apart from a rewrite: `assess_change` joins smells through
+/// `base_entity_id`, an addition has none, and so a file that was moved
+/// intact was reported as arriving with brand-new smells. An agent
+/// restructuring a folder saw "⚠ New smells (2)" for a type whose smell it
+/// had actually *improved* — in a tool whose entire subject is moving
+/// files, which made every rename look like a regression.
+///
+/// Runs last, and only over what the file-keyed passes could not place, so
+/// it can never steal a pairing from them: a name that exists in both the
+/// old and the new location is matched in place by pass 1, and only a name
+/// with no counterpart where it used to be is offered here.
+///
+/// Returns the base entities nothing claimed — the genuine removals.
+fn match_moved<'a>(
+    diffs: &mut Vec<EntityDiff>,
+    survivors: &mut HashMap<EntityKey, usize>,
+    moves: &mut HashMap<EntityKey, EntityKey>,
+    relocated: Vec<(&CodeEntity, EntityKey, String)>,
+    loose: HashMap<EntityKey, Vec<&'a CodeEntity>>,
+    base_root: &std::path::Path,
+) -> Vec<&'a CodeEntity> {
+    // Re-keyed from the entities, not from `loose`'s keys. Those have
+    // already been through `loose_key`, which drops arity — so indexing
+    // them under `moved_key` produced a map whose keys all carried
+    // `arity: None`, while every lookup below carries the head entity's
+    // real arity. The two never met, and *every callable* in a moved file
+    // stayed an addition plus a removal underneath a `## Moved` header
+    // promising otherwise. Only non-callables, which have no arity on
+    // either side, were matched.
+    let mut anywhere: HashMap<EntityKey, Vec<&CodeEntity>> = HashMap::new();
+    for e in loose.into_values().flatten() {
+        anywhere
+            .entry(moved_key(&entity_key(e, base_root)))
+            .or_default()
+            .push(e);
+    }
+    for (e, key, file_path) in relocated {
+        match anywhere
+            .get_mut(&moved_key(&key))
+            .and_then(|group| match_group(group, e))
+        {
+            Some(base_e) => {
+                moves.insert(entity_key(base_e, base_root), key.clone());
+                survivors.insert(key, diffs.len());
+                let was = rel_path(base_e, base_root);
+                diffs.push(diff_matched_from(e, base_e, file_path, Some(was)));
+            }
             None => diffs.push(diff_unmatched(e, file_path, ChangeStatus::Added)),
         }
     }
-
-    let unclaimed = loose.into_values().flatten().collect();
-    (diffs, survivors, unclaimed)
+    anywhere.into_values().flatten().collect()
 }
 
 /// Change status for a single entity.
@@ -263,6 +354,17 @@ pub struct EntityDiff {
     /// Entity ID in the base (from) graph, if it existed there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_entity_id: Option<String>,
+    /// The file this entity used to live in, when that is not the file it
+    /// lives in now.
+    ///
+    /// Carried so a relocation can be *reported* rather than merely
+    /// forgiven. Matching a moved file to its old self is what stops a
+    /// restructure reading as a regression, but a report that then says
+    /// "0 changed" over a `git mv` has swapped one wrong answer for
+    /// another — the files did move, and a folder restructure is exactly
+    /// the change a reviewer most wants named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
 }
 
 /// Full diff output: the head graph + per-entity change annotations.
@@ -428,6 +530,39 @@ fn index_endpoints(
     (key_of, endpoints)
 }
 
+/// Re-key the base side so a relocated entity is the same node it is on the
+/// head side.
+///
+/// Edges are keyed by the entity keys at their ends, and those keys carry
+/// the file path — so moving one file rewrites the key at one end of every
+/// edge touching it, and the set difference reports each of them as one
+/// removal plus one addition. On a pure `git mv` that produced "14
+/// entities with fan-in/out shifts" over a change where no dependency
+/// moved at all, which is the same lie the entity pass was telling one
+/// level up.
+///
+/// Applied to the base side only, and only to keys the entity matching
+/// already paired: this cannot invent a pairing, it can only stop the edge
+/// diff from disagreeing with one that was made.
+fn follow_moves(
+    (mut keys, ends): (HashMap<String, EntityKey>, HashMap<EntityKey, Endpoint>),
+    moves: &HashMap<EntityKey, EntityKey>,
+) -> (HashMap<String, EntityKey>, HashMap<EntityKey, Endpoint>) {
+    if moves.is_empty() {
+        return (keys, ends);
+    }
+    for key in keys.values_mut() {
+        if let Some(head) = moves.get(key) {
+            *key = head.clone();
+        }
+    }
+    let ends = ends
+        .into_iter()
+        .map(|(key, end)| (moves.get(&key).cloned().unwrap_or(key), end))
+        .collect();
+    (keys, ends)
+}
+
 /// The graph's edges as stable keys. Edges touching an entity that isn't in
 /// the key index (parameters) are dropped, and parallel edges of the same kind
 /// collapse — this set answers "is there a `calls` edge here", which is the
@@ -520,12 +655,13 @@ fn attach_edge(
 fn attach_rel_deltas(
     diffs: &mut [EntityDiff],
     survivors: &HashMap<EntityKey, usize>,
+    moves: &HashMap<EntityKey, EntityKey>,
     base_graph: &DependencyGraph,
     head_graph: &DependencyGraph,
     base_root: &std::path::Path,
     head_root: &std::path::Path,
 ) -> (usize, usize) {
-    let (base_keys, base_ends) = index_endpoints(base_graph, base_root, false);
+    let (base_keys, base_ends) = follow_moves(index_endpoints(base_graph, base_root, false), moves);
     let (head_keys, mut endpoints) = index_endpoints(head_graph, head_root, true);
     // Head descriptions win; the base fills in the entities that are gone.
     for (key, end) in base_ends {
@@ -588,6 +724,17 @@ fn rel_path(e: &CodeEntity, root: &std::path::Path) -> String {
 /// nothing but the relational metrics (`fan_in`/`fan_out`) moved, which
 /// happens when *other* entities changed around this one.
 fn diff_matched(head: &CodeEntity, base: &CodeEntity, file_path: String) -> EntityDiff {
+    diff_matched_from(head, base, file_path, None)
+}
+
+/// [`diff_matched`] for a pair the file-keyed passes could not make —
+/// same entity, different file.
+fn diff_matched_from(
+    head: &CodeEntity,
+    base: &CodeEntity,
+    file_path: String,
+    moved_from: Option<String>,
+) -> EntityDiff {
     let source_code_changed = source_hash(head) != source_hash(base);
     let (metric_deltas, intrinsic_metrics_changed) = compare_metrics(&base.metrics, &head.metrics);
     let is_core_change = source_code_changed || intrinsic_metrics_changed;
@@ -606,6 +753,7 @@ fn diff_matched(head: &CodeEntity, base: &CodeEntity, file_path: String) -> Enti
         metric_deltas,
         rel_deltas: Vec::new(),
         base_entity_id: Some(base.id.clone()),
+        moved_from,
     }
 }
 
@@ -622,6 +770,7 @@ fn diff_unmatched(e: &CodeEntity, file_path: String, status: ChangeStatus) -> En
         metric_deltas: Vec::new(),
         rel_deltas: Vec::new(),
         base_entity_id: (status == ChangeStatus::Removed).then(|| e.id.clone()),
+        moved_from: None,
     }
 }
 
@@ -668,7 +817,7 @@ pub fn compute_diff(
 ) -> DiffResult {
     // `survivors` remembers where each entity that exists on both sides
     // landed, so the relationship pass can hang its deltas off the right rows.
-    let (mut diffs, survivors, unclaimed) =
+    let (mut diffs, survivors, unclaimed, moves) =
         match_entities(base_graph, head_graph, base_root, head_root);
     let total_base = base_graph
         .entities()
@@ -682,7 +831,7 @@ pub fn compute_diff(
     }
 
     let (rel_added, rel_removed) = attach_rel_deltas(
-        &mut diffs, &survivors, base_graph, head_graph, base_root, head_root,
+        &mut diffs, &survivors, &moves, base_graph, head_graph, base_root, head_root,
     );
     // An entity that swapped one call for another has identical metrics on
     // both sides — including `fan_out`. Rewiring is a change; say so, as an
@@ -738,7 +887,7 @@ pub fn resolve_git_ref(repo_root: &Path, git_ref: &str) -> AnyhowResult<String> 
 
 /// The subject on the commit that names the index, so anything that comes
 /// across one loose in the object database can tell what wrote it and why.
-const STAGED_COMMIT_SUBJECT: &str = "nao: the staged tree";
+const STAGED_COMMIT_SUBJECT: &str = "mezz: the staged tree";
 
 /// Name the git index as a commit, so the staged tree can be checked out like
 /// any other ref. `None` when nothing is staged.
@@ -757,7 +906,7 @@ const STAGED_COMMIT_SUBJECT: &str = "nao: the staged tree";
 /// The index is copied and `GIT_INDEX_FILE` aimed at the copy rather than
 /// running `write-tree` in place. `git write-tree` updates the cache-tree
 /// extension of whichever index it reads, so in place it would write to the
-/// user's `.git/index`. The tree that comes out is identical either way — nao
+/// user's `.git/index`. The tree that comes out is identical either way — mezz
 /// only ever reads the repository it watches, and racing a concurrent
 /// `git add` for the microsecond is not a trade worth making.
 ///
@@ -779,7 +928,7 @@ pub fn staged_commit(repo_root: &Path) -> AnyhowResult<Option<String>> {
     // it names are in a different object database.
     static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let scratch = std::env::temp_dir().join(format!(
-        "nao-staged-index-{}-{}",
+        "mezz-staged-index-{}-{}",
         std::process::id(),
         SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
@@ -919,7 +1068,7 @@ pub fn ignored_paths(repo_root: &Path, paths: &[String]) -> HashSet<String> {
 /// The checkout carries committed state alone, so the working tree's *local*
 /// ignore rules do not reach it — see [`mirror_local_ignores`], which is
 /// called here rather than at each of the four call sites so that no worktree
-/// nao creates can be analyzed under a different ignore ruleset than the tree
+/// mezz creates can be analyzed under a different ignore ruleset than the tree
 /// it will be compared against.
 pub fn create_worktree(repo_root: &Path, dir: &Path, git_ref: &str) -> AnyhowResult<()> {
     let dir_str = dir.to_str().unwrap();
@@ -1118,10 +1267,10 @@ pub fn remove_worktree(repo_root: &Path, dir: &Path) {
 ///
 /// Reading the file here rather than at each call site is what CFG-011 was:
 /// this was the one config builder that never called `settings::load`, and
-/// `nao mcp` is its only entry point — so an agent, the caller with no flags
+/// `mezz mcp` is its only entry point — so an agent, the caller with no flags
 /// to pass and therefore the one most dependent on the file, got the single
 /// code path where the file was inert. `exclude_patterns` named in a repo's
-/// `.nao/settings.json` were honoured by every CLI command and by nothing
+/// `.mezz/settings.json` were honoured by every CLI command and by nothing
 /// served over MCP.
 ///
 /// The file is read from `root`'s *checkout* rather than from `root` itself
@@ -1196,7 +1345,7 @@ pub fn analyze_with(config: Config, label: &str) -> AnyhowResult<(DependencyGrap
 /// graph + config.
 ///
 /// For a directory that stands alone. **Not for the base side of a diff:**
-/// since [`build_analysis_config`] reads `.nao/settings.json` from the root
+/// since [`build_analysis_config`] reads `.mezz/settings.json` from the root
 /// it is handed, calling this once per worktree gives each side the settings
 /// committed at its own ref, and a scope the two sides disagree about reads
 /// as every excluded file being added or removed. Both sides of a diff take
@@ -1303,6 +1452,131 @@ mod tests {
             .expect("entity in diff")
     }
 
+    /// A file that moved, with its contents untouched, must read as the
+    /// same entities in a new place — not as a wholesale removal plus a
+    /// wholesale addition. Everything downstream joins the two sides
+    /// through `base_entity_id`, so an addition carries no history and
+    /// `assess_change` reported a moved type's existing smells as new
+    /// ones. In a tool whose subject is moving files, that made every
+    /// restructure look like a regression.
+    #[test]
+    fn a_moved_file_keeps_its_entities_rather_than_replacing_them() {
+        let base = graph_of(
+            vec![
+                entity("/repo/src/uid/model/context.rs", 1, "UidContext", EntityKind::Struct),
+                entity("/repo/src/uid/model/context.rs", 9, "read", EntityKind::Function),
+            ],
+            &[],
+        );
+        let head = graph_of(
+            vec![
+                entity("/repo/src/uid/context.rs", 1, "UidContext", EntityKind::Struct),
+                entity("/repo/src/uid/context.rs", 9, "read", EntityKind::Function),
+            ],
+            &[],
+        );
+        let d = diff_of(&base, &head);
+
+        assert!(
+            d.entities.iter().all(|e| e.status != ChangeStatus::Added),
+            "{:?}",
+            d.entities.iter().map(|e| (&e.name, e.status)).collect::<Vec<_>>()
+        );
+        assert!(d.entities.iter().all(|e| e.status != ChangeStatus::Removed));
+        // The join every downstream report needs.
+        assert!(row(&d, "UidContext").base_entity_id.is_some());
+        assert_eq!(row(&d, "UidContext").file_path, "src/uid/context.rs");
+    }
+
+    /// A callable is exactly what the fixtures above are not: synthetic
+    /// entities leave `param_count` unset, so they carry no arity and
+    /// sailed through a lookup that arity was silently breaking. Every
+    /// function and method in a moved file was still reported as an
+    /// addition plus a removal, under a `## Moved` header promising the
+    /// opposite — reported from the field, and invisible to the tests that
+    /// were supposed to cover it.
+    #[test]
+    fn a_moved_functions_arity_does_not_stop_it_being_matched() {
+        let with_arity = |file: &str, line: usize, name: &str, params: u32| {
+            let mut e = entity(file, line, name, EntityKind::Function);
+            e.metrics.param_count = Some(params);
+            e
+        };
+        let base = graph_of(
+            vec![
+                with_arity("/repo/src/settings/section.ts", 1, "renderScope", 2),
+                with_arity("/repo/src/settings/section.ts", 9, "renderFolderList", 1),
+            ],
+            &[],
+        );
+        let head = graph_of(
+            vec![
+                with_arity("/repo/src/autoGeneration/section.ts", 1, "renderScope", 2),
+                with_arity("/repo/src/autoGeneration/section.ts", 9, "renderFolderList", 1),
+            ],
+            &[],
+        );
+        let d = diff_of(&base, &head);
+        assert!(
+            d.entities.iter().all(|e| e.status == ChangeStatus::Unchanged),
+            "{:?}",
+            d.entities
+                .iter()
+                .map(|e| (&e.name, e.status))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            row(&d, "renderScope").moved_from.as_deref(),
+            Some("src/settings/section.ts")
+        );
+    }
+
+    /// The move pass runs last and only over leftovers, so a name present
+    /// in both the old and the new location is still matched in place.
+    /// Otherwise moving one file could re-pair an unrelated same-named
+    /// entity somewhere else in the tree.
+    #[test]
+    fn a_name_that_exists_in_both_places_is_matched_where_it_stands() {
+        let base = graph_of(
+            vec![
+                entity("/repo/src/a.rs", 1, "parse", EntityKind::Function),
+                entity("/repo/src/b.rs", 1, "parse", EntityKind::Function),
+            ],
+            &[],
+        );
+        let head = graph_of(
+            vec![
+                entity("/repo/src/a.rs", 1, "parse", EntityKind::Function),
+                entity("/repo/src/b.rs", 1, "parse", EntityKind::Function),
+            ],
+            &[],
+        );
+        let d = diff_of(&base, &head);
+        assert!(d.entities.iter().all(|e| e.status == ChangeStatus::Unchanged));
+        for e in &d.entities {
+            // The base id carries the file it was matched against; each
+            // row must point at its own file, not at its namesake's.
+            let base = e.base_entity_id.as_deref().unwrap_or_default();
+            assert!(base.contains(&e.file_path), "{base} vs {}", e.file_path);
+        }
+    }
+
+    /// A file that was moved *and* edited is still one entity with a
+    /// history, reported as modified rather than as a swap.
+    #[test]
+    fn a_file_that_moved_and_changed_reads_as_modified() {
+        let mut moved = entity("/repo/src/pack/note.rs", 1, "note", EntityKind::Function);
+        moved.metrics.cyclomatic = Some(9);
+        let base = graph_of(
+            vec![entity("/repo/src/note.rs", 1, "note", EntityKind::Function)],
+            &[],
+        );
+        let head = graph_of(vec![moved], &[]);
+        let d = diff_of(&base, &head);
+        assert_eq!(row(&d, "note").status, ChangeStatus::Modified);
+        assert!(row(&d, "note").base_entity_id.is_some());
+    }
+
     fn fns(names: &[&str]) -> Vec<CodeEntity> {
         names
             .iter()
@@ -1318,7 +1592,7 @@ mod tests {
     /// directory is skipped entirely and the analysis comes back empty.
     fn temp_checkout(tag: &str) -> std::path::PathBuf {
         let root =
-            std::env::temp_dir().join(format!("nao-diff-details-{}-{}", std::process::id(), tag));
+            std::env::temp_dir().join(format!("mezz-diff-details-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(
@@ -1333,7 +1607,7 @@ mod tests {
     /// `temp_checkout`: no "test" in the directory name.
     fn git_repo(tag: &str) -> std::path::PathBuf {
         let root =
-            std::env::temp_dir().join(format!("nao-diff-repo-{}-{}", std::process::id(), tag));
+            std::env::temp_dir().join(format!("mezz-diff-repo-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn hello() -> u32 { 1 }\n").unwrap();
@@ -1348,9 +1622,9 @@ mod tests {
         git(&["add", "-A"]);
         git(&[
             "-c",
-            "user.email=nao@example.com",
+            "user.email=mezz@example.com",
             "-c",
-            "user.name=Nao",
+            "user.name=Mezzanine",
             "commit",
             "-qm",
             "init",
@@ -1362,15 +1636,15 @@ mod tests {
     /// Same naming rule as `temp_checkout`: no "test" in the directory name.
     fn root_with_settings(tag: &str, json: &str) -> std::path::PathBuf {
         let root =
-            std::env::temp_dir().join(format!("nao-diff-cfg-{}-{}", std::process::id(), tag));
+            std::env::temp_dir().join(format!("mezz-diff-cfg-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".nao")).unwrap();
-        std::fs::write(root.join(".nao/settings.json"), json).unwrap();
+        std::fs::create_dir_all(root.join(".mezz")).unwrap();
+        std::fs::write(root.join(".mezz/settings.json"), json).unwrap();
         root
     }
 
     /// CFG-011. Every other entry point settles its config through
-    /// `settings::load`; this builder did not, and `nao mcp` is its only
+    /// `settings::load`; this builder did not, and `mezz mcp` is its only
     /// caller — so the audience with no flags to pass got the one code path
     /// where the repo's file was inert.
     #[test]
@@ -1393,7 +1667,7 @@ mod tests {
     }
 
     /// The order the file is applied in, not just the fact of it: a
-    /// `--language` on the `nao mcp` command line is a narrowing the caller
+    /// `--language` on the `mezz mcp` command line is a narrowing the caller
     /// typed, and the file underneath it must not widen it back.
     #[test]
     fn a_language_on_the_command_line_outranks_the_file() {
@@ -1420,11 +1694,11 @@ mod tests {
             .exclude_patterns
             .push("**/generated/**".to_string());
 
-        let base = rooted_at(&live, Path::new("/tmp/nao-diff-base-abc"));
+        let base = rooted_at(&live, Path::new("/tmp/mezz-diff-base-abc"));
 
         assert_eq!(
             base.root_path,
-            std::path::PathBuf::from("/tmp/nao-diff-base-abc")
+            std::path::PathBuf::from("/tmp/mezz-diff-base-abc")
         );
         assert!(
             base.analysis.include_docs,
@@ -1445,11 +1719,11 @@ mod tests {
     fn a_relative_spec_dir_follows_the_re_rooted_config() {
         let mut live = Config::for_path("/repo");
         live.analysis.spec_dir = Some(std::path::PathBuf::from("docs/domain"));
-        let base = rooted_at(&live, Path::new("/tmp/nao-diff-base-abc"));
+        let base = rooted_at(&live, Path::new("/tmp/mezz-diff-base-abc"));
         assert_eq!(
             base.spec_root(),
             Some(std::path::PathBuf::from(
-                "/tmp/nao-diff-base-abc/docs/domain"
+                "/tmp/mezz-diff-base-abc/docs/domain"
             )),
         );
     }
@@ -1565,7 +1839,7 @@ mod tests {
         std::fs::write(repo.join("src/vendor/.ignore"), "*.min.js\n").unwrap();
 
         let work =
-            std::env::temp_dir().join(format!("nao-diff-wt-{}-uncommitted", std::process::id()));
+            std::env::temp_dir().join(format!("mezz-diff-wt-{}-uncommitted", std::process::id()));
         create_worktree(&repo, &work, "HEAD").unwrap();
 
         assert_eq!(
@@ -1598,16 +1872,16 @@ mod tests {
         git(&["add", "-A"]);
         git(&[
             "-c",
-            "user.email=nao@example.com",
+            "user.email=mezz@example.com",
             "-c",
-            "user.name=Nao",
+            "user.name=Mezzanine",
             "commit",
             "-qm",
             "ignore",
         ]);
         std::fs::write(repo.join(".gitignore"), "edited/\n").unwrap();
 
-        let work = std::env::temp_dir().join(format!("nao-diff-wt-{}-edited", std::process::id()));
+        let work = std::env::temp_dir().join(format!("mezz-diff-wt-{}-edited", std::process::id()));
         create_worktree(&repo, &work, "HEAD").unwrap();
 
         assert_eq!(
@@ -2062,7 +2336,7 @@ mod tests {
 
     /// A fresh repository with one commit, at a path unique to this test.
     fn repo(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nao-stash-{}-{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-stash-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q", "--initial-branch=main", "."]);
@@ -2228,7 +2502,7 @@ mod tests {
         cleanup(&dir);
     }
 
-    /// nao reads the repository it watches and does not write to it. `git
+    /// mezz reads the repository it watches and does not write to it. `git
     /// write-tree` updates the cache-tree extension of the index it is given,
     /// so it is given a copy — asserted on the bytes, because the tree that
     /// comes out is the same either way and would not show the difference.

@@ -1,6 +1,6 @@
 # Terminal workflows
 
-Driven from a shell: the `nao` and `elevator` binaries, plus the MCP tools a
+Driven from a shell: the `mezz` and `elevator` binaries, plus the MCP tools a
 coding agent calls in the same session. Output is text — pipeable, diffable,
 and quotable in a commit message or a review.
 
@@ -22,12 +22,12 @@ command that does not exist:
 
 | Capability | CLI | MCP tool |
 | --- | --- | --- |
-| Whole-graph analysis, any output format | `nao analyze` | — |
-| Dependencies of a file/entity | `nao deps` | `impact`, `trace` |
-| Find an entity by name | `nao find` | `similar` |
-| Circular dependencies | `nao cycles` | part of `quality` |
-| Counts and totals | `nao stats` | part of `map` |
-| Structural diff of two commits | `nao diff` | `assess_change` (working tree vs a ref) |
+| Whole-graph analysis, any output format | `mezz analyze` | — |
+| Dependencies of a file/entity | `mezz deps` | `impact`, `trace` |
+| Find an entity by name | `mezz find` | `similar` |
+| Circular dependencies | `mezz cycles` | part of `quality` |
+| Counts and totals | `mezz stats` | part of `map` |
+| Structural diff of two commits | `mezz diff` | `assess_change` (working tree vs a ref) |
 | Churn × complexity risk | — | `hotspots` |
 | Smells and refactor pressure | — | `quality` |
 | Folder shape with metrics | — | `map` |

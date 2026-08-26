@@ -72,7 +72,7 @@
   $: depthLabels = hullDepthLabels(grainInForce);
 
   function grainTitle(grain: GroupGrain): string {
-    if (grain === 'folder') return 'A region is the directory holding the file — the same grouping Module level aggregates by';
+    if (grain === 'folder') return 'A region is the directory holding the file — the same grouping Folder level aggregates by';
     return $graphLevel === 'entity'
       ? 'A region is the file itself, so a region’s traffic says whether that file is cohesive'
       : 'Files group entities, so this applies at Entity level only — at this level every node already is a file or coarser';
@@ -229,7 +229,7 @@
     </span>
   </div>
 {:else}
-  <h1>Nao</h1>
+  <h1>Mezzanine</h1>
 {/if}
 
 <!--
@@ -295,7 +295,7 @@
 
 <div class="filter-block">
   <h2 class="block-title"><span class="block-step">1</span>Analysis</h2>
-  <p class="block-note">What nao parses and loads. Changing these re-runs analysis or refetches.</p>
+  <p class="block-note">What mezz parses and loads. Changing these re-runs analysis or refetches.</p>
 </div>
 
 {#if !$serveMode}
@@ -474,8 +474,8 @@
       {/if}
     </p>
   {/if}
-  {#if $graphLevel === 'module'}
-    <p class="layer-note">No effect at Module level — each node is already a folder.</p>
+  {#if $graphLevel === 'folder'}
+    <p class="layer-note">No effect at Folder level — each node is already a folder.</p>
   {/if}
 </div>
 

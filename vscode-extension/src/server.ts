@@ -9,11 +9,11 @@ const POLL_INTERVAL_MS = 500;
 const PORT_SCAN_LIMIT = 50;
 
 /**
- * Manages the nao watch server as a child process.
+ * Manages the mezz watch server as a child process.
  * Reuses the existing Axum HTTP server — the extension just spawns it
  * and the webview talks to it over HTTP (same protocol as the standalone app).
  */
-export class NaoServer {
+export class MezzServer {
   private process: ChildProcess | undefined;
   private _running = false;
   // Mutable: starts as the configured/preferred port, may shift to a free
@@ -26,16 +26,16 @@ export class NaoServer {
     private readonly workspaceRoot: string,
     preferredPort: number,
     private readonly includeTests: boolean,
-    /** Analyze Markdown too, passed as `nao watch --include-docs`. Widens the
+    /** Analyze Markdown too, passed as `mezz watch --include-docs`. Widens the
      *  analysis, so it survives a `language` filter — see the engine's
      *  `AnalysisConfig::accepts_language`. */
     private readonly includeDocs: boolean,
     private readonly output: vscode.OutputChannel,
     /** Path to the Educator content corpus shipped with the extension. Passed
-     *  to `nao watch` as `--content-fallback` so rules/lessons work in
+     *  to `mezz watch` as `--content-fallback` so rules/lessons work in
      *  workspaces that don't have their own `content/` directory. */
     private readonly contentFallback?: string,
-    /** Optional single-language filter, passed to `nao watch --language`.
+    /** Optional single-language filter, passed to `mezz watch --language`.
      *  Empty/undefined means analyze all detected languages. */
     private readonly language?: string
   ) {
@@ -49,14 +49,14 @@ export class NaoServer {
   async start(): Promise<void> {
     if (this._running) return;
 
-    // Only reuse an existing server when it is nao AND is analyzing this
+    // Only reuse an existing server when it is mezz AND is analyzing this
     // exact workspace. Otherwise pick a free port so each VS Code window
     // can run its own instance against its own folder.
     if (await isPortReachable(this.port)) {
       const remoteRoot = await fetchRemoteRoot(this.port);
       if (remoteRoot && pathsMatch(remoteRoot, this.workspaceRoot)) {
         this.output.appendLine(
-          `Port ${this.port} is already serving nao for this workspace — reusing it.`
+          `Port ${this.port} is already serving mezz for this workspace — reusing it.`
         );
         this._running = true;
         return;
@@ -64,7 +64,7 @@ export class NaoServer {
 
       const detail = remoteRoot
         ? `serving a different workspace (${remoteRoot})`
-        : 'occupied by a non-nao process';
+        : 'occupied by a non-mezz process';
       const freePort = await findFreePort(this.port + 1);
       this.output.appendLine(
         `Port ${this.port} is ${detail}; switching to free port ${freePort}.`
@@ -75,7 +75,7 @@ export class NaoServer {
     // Show output panel so the user sees analysis progress
     this.output.show(true);
     this.output.appendLine('─────────────────────────────────────────────');
-    this.output.appendLine(`Starting nao server for: ${this.workspaceRoot}`);
+    this.output.appendLine(`Starting mezz server for: ${this.workspaceRoot}`);
 
     const args = ['watch', this.workspaceRoot, '--port', String(this.port)];
     if (this.includeTests) args.push('--include-tests');
@@ -108,7 +108,7 @@ export class NaoServer {
 
       this.process.on('exit', (code, signal) => {
         this._running = false;
-        this.output.appendLine(`\n[nao exited: code=${code} signal=${signal}]`);
+        this.output.appendLine(`\n[mezz exited: code=${code} signal=${signal}]`);
       });
 
       // Give the process a tick to either fail fast (e.g. ENOENT) or get going
@@ -116,10 +116,10 @@ export class NaoServer {
     });
 
     if (spawnError) {
-      throw new Error(
-        `Could not launch '${this.binaryPath}': ${spawnError.message}. ` +
-        `Set 'nao.binaryPath' in settings or install nao on your PATH.`
-      );
+      // Deliberately does not advise a fix: the caller knows where this
+      // binary came from and says something accurate about it, whereas from
+      // here every install looks the same. See startupFailureMessage.
+      throw new Error(`Could not launch '${this.binaryPath}': ${spawnError.message}.`);
     }
 
     // Poll the HTTP endpoint until the server responds
@@ -127,8 +127,8 @@ export class NaoServer {
     while (Date.now() < deadline) {
       if (this.process?.exitCode !== null && this.process?.exitCode !== undefined) {
         throw new Error(
-          `nao process exited with code ${this.process.exitCode} before the server became ready. ` +
-          `See the "Nao Code Visualizer" output panel for details.`
+          `mezz process exited with code ${this.process.exitCode} before the server became ready. ` +
+          `See the "Mezzanine Code Visualizer" output panel for details.`
         );
       }
       if (await isPortReachable(this.port)) {
@@ -141,7 +141,7 @@ export class NaoServer {
 
     this.stop();
     throw new Error(
-      `nao server did not become ready within ${STARTUP_TIMEOUT_MS / 1000}s. ` +
+      `mezz server did not become ready within ${STARTUP_TIMEOUT_MS / 1000}s. ` +
       `The initial analysis may take longer on large codebases — check the output panel for progress.`
     );
   }
@@ -180,8 +180,8 @@ function isPortReachable(port: number): Promise<boolean> {
   });
 }
 
-/** Asks a presumed-nao server which workspace it is analyzing.
- *  Returns undefined if the response shape is not recognizable as nao's. */
+/** Asks a presumed-mezz server which workspace it is analyzing.
+ *  Returns undefined if the response shape is not recognizable as mezz's. */
 function fetchRemoteRoot(port: number): Promise<string | undefined> {
   return new Promise((resolve) => {
     const req = http.request(

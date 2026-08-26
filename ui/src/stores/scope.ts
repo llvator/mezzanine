@@ -14,6 +14,7 @@ import { clearMarks, markedPaths, pruneMarks } from './marks';
 export type { ScopeRule } from '../utils/scopeRules';
 export { isInScope, isDirectRule } from '../utils/scopeRules';
 import { resetDetailsCache } from './details';
+import { fetchBranch } from './branch';
 import { apiUrl } from '../vscodeAdapter';
 
 /** Selection size at which the scope tree starts flagging rows as large.
@@ -32,7 +33,7 @@ export const ENTITY_THRESHOLD = 2000;
 
 /** Target node count the d3 simulation + DOM can keep responsive. When a
  *  scope's entity count exceeds this, the graph auto-escalates to file
- *  (and then module) aggregation via `pickLevel`. The user can still drill
+ *  (and then folder) aggregation via `pickLevel`. The user can still drill
  *  in by clicking a collapsed node, which narrows the scope and usually
  *  drops the count back below the budget. */
 export const RENDER_BUDGET = 400;
@@ -44,13 +45,13 @@ export const autoLevel = writable<boolean>(true);
 
 /** Pick the lowest aggregation level that fits `budget`. Counts mirror the
  *  grouping in `collapseGraph`: entity = one per node, file = unique
- *  file_paths, module = unique parent directories.
+ *  file_paths, folder = unique parent directories.
  *
  *  Ghosts (external/stdlib references, `file_path=""`) are excluded from
  *  the count: they all collapse to a single hidden bucket node whose
  *  visibility is controlled by the ghost toggle, not by the scope, so
  *  letting their count pressure the level toggle would wrongly force the
- *  view to file/module even when only a handful of real entities are in
+ *  view to file/folder even when only a handful of real entities are in
  *  scope (e.g. single-file drill-in).
  *
  *  Elevator entities (Category / Feature / Functionality / Concept / UI
@@ -79,15 +80,15 @@ export function pickLevel(
   // UI-057: count what would actually be *drawn*, not what the level names.
   // An expanded scope contributes its members instead of one circle, and a
   // level chosen without knowing that would pick File, see the expansion push
-  // the count over budget, escalate to Module, and take the user's expansion
+  // the count over budget, escalate to Folder, and take the user's expansion
   // with it — auto-level and the reader fighting each other one click apart.
   const atFile = new Set<string>();
   for (const n of visible) atFile.add(expanded.has(n.file_path) ? n.id : n.file_path);
   if (atFile.size <= budget) return 'file';
 
-  // Module is the coarsest level there is, so it is returned whether or not
+  // Folder is the coarsest level there is, so it is returned whether or not
   // it fits — the draw ceiling downstream is what refuses an impossible view.
-  return 'module';
+  return 'folder';
 }
 
 export interface IndexNode {
@@ -278,7 +279,7 @@ function pruneScopeState(scoped: GraphData): void {
  *  filter — the `showGhosts` / `showBuiltinGhosts` toggles run on top, as a
  *  visualization-only layer that hides what's left. */
 function filterToSelection(full: GraphData, rules: ScopeRule[]): GraphData {
-  if (rules.length === 0) return { nodes: [], links: [], files: [], modules: [] };
+  if (rules.length === 0) return { nodes: [], links: [], files: [], folders: [] };
   // Whole-repo fast path: a bare root include with nothing excluded means
   // every node qualifies, so skip the per-node evaluation entirely.
   const matchAll = isInScope('', rules) && !hasExclusionInside('', rules);
@@ -290,8 +291,8 @@ function filterToSelection(full: GraphData, rules: ScopeRule[]): GraphData {
       return nodeIds.has(srcId) && nodeIds.has(tgtId);
     });
     const allFiles = (full.files ?? []);
-    const allModules = (full.modules ?? []);
-    return { nodes: full.nodes, links, files: allFiles, modules: allModules };
+    const allFolders = (full.folders ?? []);
+    return { nodes: full.nodes, links, files: allFiles, folders: allFolders };
   }
   // First pass: real (non-ghost) entities under the selected prefixes.
   const realNodes: D3Node[] = full.nodes.filter((n) => {
@@ -368,19 +369,19 @@ function filterToSelection(full: GraphData, rules: ScopeRule[]): GraphData {
     const tgtId = typeof l.target === 'object' ? l.target.id : l.target;
     return nodeIds.has(srcId) && nodeIds.has(tgtId);
   });
-  // Scope-filter the file/module rollups using the same predicate. Keeps
-  // the Quality "Files/Modules" tabs honest — they reflect only what's in
+  // Scope-filter the file/folder rollups using the same predicate. Keeps
+  // the Quality "Files/Folders" tabs honest — they reflect only what's in
   // the currently visualised scope.
   // Rollups are kept when the path is in scope *or* is an ancestor of
-  // something that is — a module row for `ui/src` stays meaningful when only
+  // something that is — a folder row for `ui/src` stays meaningful when only
   // `ui/src/stores` was selected. `isInScope` alone answers only the first
   // half, so the include patterns are still consulted for the second.
   const includes = rules.filter((r) => !r.negate).map((r) => r.pattern);
   const inScope = (path: string) =>
     isInScope(path, rules) || includes.some((p) => p.startsWith(path + '/'));
   const files = (full.files ?? []).filter((f) => inScope(f.path));
-  const modules = (full.modules ?? []).filter((m) => inScope(m.path));
-  return { nodes, links, files, modules };
+  const folders = (full.folders ?? []).filter((m) => inScope(m.path));
+  return { nodes, links, files, folders };
 }
 
 /** Apply the current selection: aggregate counts and publish the scoped
@@ -626,6 +627,36 @@ export async function drillIn(path: string): Promise<void> {
 }
 
 /**
+ * Drill into a scope *without* changing the grain — the region gestures on
+ * the canvas (UI-115's name click, UI-089's area double-click).
+ *
+ * `drillIn` re-enables auto-level because it answers "show me as much detail
+ * as fits". A region is different: it is drawn *at* the level the reader is
+ * reading at, and its name is a heading over nodes they are already looking
+ * at. Clicking it says "just these" — it does not say "and now show me their
+ * insides". A reader working at File level who focuses a folder and lands on
+ * a canvas of entities has had their picture swapped out, not narrowed, and
+ * has to walk the level toggle back every single time.
+ *
+ * Pinning `autoLevel` off is what makes the grain survive `applySelection`,
+ * which would otherwise re-pick and re-publish — the same pin the level
+ * toggle sets, and honest about it in the stats bar. Nothing here can
+ * overflow the render budget: the new scope is a subset of the one on
+ * screen, so a level that fit before still fits.
+ *
+ * Only File and Entity reach this. Regions are not drawn at Folder level
+ * (`hullsEnabled` in GraphView), so there is no name to click and no
+ * degenerate one-node picture to fall into.
+ */
+export async function drillInKeepingLevel(path: string): Promise<void> {
+  console.log(`[drill] drillInKeepingLevel() called path=${path} — pinning level=${get(graphLevel)}`);
+  await asNavigation(async () => {
+    autoLevel.set(false);
+    await setScopes([path]);
+  });
+}
+
+/**
  * Drill into everything marked at once — the way from a picture of files to a
  * picture of the entities inside them.
  *
@@ -770,7 +801,7 @@ export const analysisStats = derived(
 export const analysisGraphData = derived(
   [fullGraphDataStore, analysisRules],
   ([$full, $rules]): GraphData => {
-    const EMPTY: GraphData = { nodes: [], links: [], files: [], modules: [] };
+    const EMPTY: GraphData = { nodes: [], links: [], files: [], folders: [] };
     if (!$full || $rules.length === 0) return EMPTY;
     return filterToSelection($full, $rules);
   },
@@ -836,6 +867,10 @@ export async function setRootPath(newPath: string): Promise<RootPathResponse> {
       scopeRules.set([]);
       fullDataPromise = null;
       resetDetailsCache();
+      // A new root is a new checkout, and very often a different branch. No
+      // `head` event announces this one — nothing moved on disk, the server
+      // was repointed — so the chip is re-asked here (UI-114).
+      void fetchBranch();
       await loadIndex();
     } else {
       rootPathError.set(data.message || 'Unknown error');

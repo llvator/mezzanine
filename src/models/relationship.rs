@@ -47,7 +47,7 @@ pub struct Relationship {
 
     /// Resolution precision of this edge (AN-004). `Some(Exact)` when a
     /// language server (rust-analyzer) resolved the call site to this
-    /// definition; `Some(Heuristic)` when nao's name-based resolver picked
+    /// definition; `Some(Heuristic)` when mezz's name-based resolver picked
     /// it; `None` where precision doesn't apply (structural edges, imports,
     /// …). `#[serde(default)]` so pre-AN-004 JSON loads cleanly as `None`.
     #[serde(default)]
@@ -99,7 +99,7 @@ pub struct ImportSite {
 pub enum Precision {
     /// A language server resolved the call site to this exact definition.
     Exact,
-    /// nao's name-based heuristic picked this target.
+    /// mezz's name-based heuristic picked this target.
     Heuristic,
 }
 

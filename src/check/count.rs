@@ -1,10 +1,10 @@
 //! What the two rules over entities count: declarations, and elements.
 //!
-//! The other two rules a project can declare are about the edges between
+//! The other three rules a project can declare are about the edges between
 //! files and live in [`super::structure`]; these two never look outside the
 //! file they are counting.
 //!
-//! Nothing new is measured here. Both rules are counts of entities nao
+//! Nothing new is measured here. Both rules are counts of entities mezz
 //! already resolved, which is the point of putting the gate in the tool: the
 //! hand-written test this feature came from counted *import statements* and
 //! missed six re-export shims, because a count of what a file says is not a
@@ -32,7 +32,7 @@ use super::rules::{Rule, Rules};
 use super::{repo_relative, Violation};
 
 /// Every breach of the two rules counted over entities, in no particular
-/// order — the parent sorts one list over all four rules.
+/// order — the parent sorts one list over all five rules.
 pub(super) fn violations(
     graph: &DependencyGraph,
     rules: &Rules,

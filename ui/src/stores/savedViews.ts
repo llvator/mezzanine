@@ -10,9 +10,9 @@
  * having set it by hand, which is what lets the reader keep adjusting from
  * there. The cost is that the order matters, and `restoreView` documents why.
  *
- * **Where they live.** `<root>/.nao/views.json` through `/api/views`, so the
+ * **Where they live.** `<root>/.mezz/views.json` through `/api/views`, so the
  * browser UI and the VS Code webview share one list and a team can commit it
- * (ADR 0008 puts repo-shaped state in the repo). `nao serve` does not have
+ * (ADR 0008 puts repo-shaped state in the repo). `mezz serve` does not have
  * that route — the tree there came from a URL a stranger pasted — so a 404
  * means "this server has no view store" and the list falls back to this
  * browser's `localStorage`. A 5xx means something else entirely: the file
@@ -72,7 +72,7 @@ export const viewsBusy = writable(false);
 
 /** Human name for where a view is being written, for the panel's hint. */
 export const viewStoreLabel: Readable<string> = derived(viewStore, ($s) =>
-  $s === 'repo' ? '.nao/views.json' : $s === 'local' ? 'this browser' : '…',
+  $s === 'repo' ? '.mezz/views.json' : $s === 'local' ? 'this browser' : '…',
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ export const activeViewId: Readable<string | null> = derived(
  * The browser-storage key, used only in the fallback.
  *
  * Keyed by the serve-mode slug and nothing else, because those are the only
- * two shapes this branch ever sees: `nao serve`, where one origin hosts many
+ * two shapes this branch ever sees: `mezz serve`, where one origin hosts many
  * repos and the slug is what tells them apart, and an unreachable or
  * routeless server, where the origin *is* the repo. Keying by the analyzed
  * root would read better and be a bug — `rootPath` is fetched by a component
@@ -276,7 +276,7 @@ export const activeViewId: Readable<string | null> = derived(
  * written under another.
  */
 function localKey(): string {
-  return `nao-saved-views:${serveRepo() ?? ''}`;
+  return `mezz-saved-views:${serveRepo() ?? ''}`;
 }
 
 function readLocal(): SavedView[] {
@@ -305,7 +305,7 @@ export async function loadViews(): Promise<void> {
       return;
     }
     if (resp.status === 404) {
-      // No such route: `nao serve`, or a server older than UI-082. Keep the
+      // No such route: `mezz serve`, or a server older than UI-082. Keep the
       // views in the browser rather than losing the feature.
       viewStore.set('local');
       viewsError.set(null);

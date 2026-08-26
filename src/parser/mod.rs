@@ -8,6 +8,7 @@ mod go;
 mod groovy;
 mod impex;
 mod java;
+mod javascript;
 mod kotlin;
 pub mod language_parser;
 pub(crate) mod markdown;
@@ -26,6 +27,7 @@ pub use go::GoParser;
 pub use groovy::GroovyParser;
 pub use impex::ImpexParser;
 pub use java::JavaParser;
+pub use javascript::JavaScriptParser;
 pub use kotlin::KotlinParser;
 pub use language_parser::{LanguageParser, ParseResult};
 pub use markdown::MarkdownParser;
@@ -65,6 +67,7 @@ pub fn get_parser(language: Language) -> Box<dyn LanguageParser> {
         Language::Kotlin => Box::new(KotlinParser::new()),
         Language::Dart => Box::new(DartParser::new()),
         Language::TypeScript => Box::new(TypeScriptParser::new()),
+        Language::JavaScript => Box::new(JavaScriptParser::new()),
         Language::Svelte => Box::new(SvelteParser::new()),
         Language::Groovy => Box::new(GroovyParser::new()),
         Language::Impex => Box::new(ImpexParser::new()),

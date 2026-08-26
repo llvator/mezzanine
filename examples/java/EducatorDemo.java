@@ -1,12 +1,12 @@
 /**
- * Demo file for the Nao Educator hover (EDU-001..007).
+ * Demo file for the Mezzanine Educator hover (EDU-001..007).
  *
  * Each section below is annotated with the rule id that should fire when you
- * hover at the indicated token. Open this file in VS Code with the Nao
- * extension installed and `nao watch` pointed at this workspace, then hover
- * the marked tokens — the `### Nao Educator` section should appear in the
+ * hover at the indicated token. Open this file in VS Code with the Mezzanine
+ * extension installed and `mezz watch` pointed at this workspace, then hover
+ * the marked tokens — the `### Mezzanine Educator` section should appear in the
  * popup. The same content also appears in the sidebar mirror when
- * `nao.educator.sidebarEnabled` is on.
+ * `mezz.educator.sidebarEnabled` is on.
  *
  * The class deliberately does not compile cleanly — it bundles anti-patterns
  * for hover demonstration, not for execution.

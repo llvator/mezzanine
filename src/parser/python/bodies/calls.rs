@@ -1472,7 +1472,7 @@ fn extract_attribute_parts(node: &Node, source: &str) -> Option<(String, String)
 }
 
 /// A lambda is a callable like any other, so it carries the same metric set
-/// as a `def` — otherwise `nao quality` would rank a `key=lambda …` holding
+/// as a `def` — otherwise `mezz quality` would rank a `key=lambda …` holding
 /// a three-way conditional as if it had no body at all. It also still
 /// contributes to its enclosing callable's score, the way a Java lambda
 /// contributes to the method it sits in.

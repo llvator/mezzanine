@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use crate::output::{self, JsonRenderer};
 
 use super::state::AppState;
-use super::types::{CommitInfo, RootPathResponse, StagedFile, StashInfo};
+use super::types::{BranchInfo, CommitInfo, RootPathResponse, StagedFile, StashInfo};
 
 /// SSE handler: clients subscribe to reload events.
 pub(crate) async fn sse_handler(
@@ -39,6 +39,47 @@ pub(crate) async fn sse_handler(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+/// GET /api/branch — what `HEAD` points at in the analyzed checkout.
+///
+/// Its own endpoint rather than a field on `/api/root`, because it answers a
+/// different question and answers it far more often: the root moves when a
+/// reader repoints the server, the branch moves whenever they check one out,
+/// and the chip re-asks on every `head` event the watcher sends (UI-114).
+pub(crate) async fn branch_handler(State(state): State<AppState>) -> Json<BranchInfo> {
+    let repo_root = state.repo_root.read().await.clone();
+    Json(git_branch(&repo_root))
+}
+
+/// Read `HEAD` at `repo_root`. Shared by watch-mode `/api/branch` and
+/// serve-mode `/api/repos/{slug}/branch`, the way `git_commits` is.
+///
+/// `symbolic-ref` rather than `rev-parse --abbrev-ref HEAD`, which answers
+/// the literal string `HEAD` when detached — indistinguishable from a branch
+/// of that name without a second call to find out which it meant. Asking the
+/// symref directly makes "not on a branch" a failed call rather than a value
+/// to disambiguate, so the two states cannot be confused.
+///
+/// Two calls at most, and no error path: git failing to answer *is* the
+/// answer for a root that is not a checkout.
+pub(crate) fn git_branch(repo_root: &std::path::Path) -> BranchInfo {
+    let branch = crate::diff::git_lines(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .into_iter()
+        .next();
+    let head_short = crate::diff::git_lines(repo_root, &["rev-parse", "--short", "HEAD"])
+        .into_iter()
+        .next();
+    // An unborn branch has a name and no commit, so the name is what says
+    // this is a git repository. A detached HEAD has a commit and no name,
+    // and says it the other way round.
+    let git = branch.is_some() || head_short.is_some();
+    BranchInfo {
+        detached: git && branch.is_none(),
+        branch,
+        head_short,
+        git,
+    }
 }
 
 /// GET /api/commits — list recent commits.
@@ -476,6 +517,98 @@ mod tests {
         assert_eq!(rows[0].path, "src/a.rs");
         assert_eq!(rows[2].status, "D");
         assert_eq!(rows[2].path, "src/c.rs");
+    }
+
+    /// A repository with one commit, at a path unique to this test.
+    fn branch_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mezz-branch-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "--initial-branch=main", "."],
+            vec!["config", "user.email", "t@t.t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            run_git(&dir, &args);
+        }
+        dir
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+
+    fn commit(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), "x\n").unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-qm", name]);
+    }
+
+    #[test]
+    fn a_checkout_reports_the_branch_it_is_on() {
+        let dir = branch_repo("on-branch");
+        commit(&dir, "a.txt");
+        run_git(&dir, &["checkout", "-q", "-b", "feat/chip"]);
+
+        let head = git_branch(&dir);
+        assert_eq!(head.branch.as_deref(), Some("feat/chip"));
+        assert!(!head.detached);
+        assert!(head.git);
+        assert!(head.head_short.is_some(), "a branch with a commit has one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The state `rev-parse --abbrev-ref HEAD` cannot report without being
+    /// asked twice: it answers the literal string `HEAD`, which is also what
+    /// a branch of that name would answer.
+    #[test]
+    fn a_detached_head_is_a_commit_and_not_a_branch_named_head() {
+        let dir = branch_repo("detached");
+        commit(&dir, "a.txt");
+        commit(&dir, "b.txt");
+        run_git(&dir, &["checkout", "-q", "HEAD~1"]);
+
+        let head = git_branch(&dir);
+        assert_eq!(head.branch, None, "a detached HEAD is on no branch");
+        assert!(head.detached);
+        assert!(head.git);
+        assert!(head.head_short.is_some(), "it still names a commit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository with no commits still has a branch — the one the first
+    /// commit will land on — and reporting nothing there would read as "not
+    /// a git repository", which is a different thing entirely.
+    #[test]
+    fn an_unborn_branch_has_a_name_and_no_commit() {
+        let dir = branch_repo("unborn");
+        let head = git_branch(&dir);
+        assert_eq!(head.branch.as_deref(), Some("main"));
+        assert!(!head.detached);
+        assert!(head.git);
+        assert_eq!(head.head_short, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mezz watch` runs against any directory. Not being a checkout is an
+    /// answer the chip can act on, not a failure to report.
+    #[test]
+    fn a_directory_that_is_not_a_checkout_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("mezz-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let head = git_branch(&dir);
+        assert!(!head.git);
+        assert_eq!(head.branch, None);
+        assert!(!head.detached, "no repository is not a detached one");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A rename is three records, not two. Reading the source path as the next

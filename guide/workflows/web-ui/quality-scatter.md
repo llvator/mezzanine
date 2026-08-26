@@ -58,7 +58,7 @@ list. It is the reason to use the canvas here at all rather than reading
 Points marked as sitting in a dependency cycle deserve a look even at modest
 complexity. A cycle means the two entities cannot be understood, tested, or
 extracted independently — a structural cost that neither complexity number
-captures. `nao cycles <path>` prints the chains if you want them as text.
+captures. `mezz cycles <path>` prints the chains if you want them as text.
 
 ## The severity encoding
 

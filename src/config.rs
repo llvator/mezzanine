@@ -1,4 +1,4 @@
-//! Configuration for the Nao.
+//! Configuration for the Mezzanine.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -8,7 +8,7 @@ use crate::models::file_info::Language;
 use crate::models::{EntityKind, RelationshipKind};
 use crate::output::OutputFormat;
 
-/// Main configuration for the Nao.
+/// Main configuration for the Mezzanine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Root directory to analyze
@@ -93,10 +93,10 @@ pub struct AnalysisConfig {
     /// from the target repo.
     ///
     /// `true` everywhere the operator chose the path they're analyzing
-    /// (CLI, `nao watch`, `nao mcp`). `nao serve` sets it to `false`,
+    /// (CLI, `mezz watch`, `mezz mcp`). `mezz serve` sets it to `false`,
     /// because there the tree came from a URL a stranger pasted — see
     /// [`crate::server::serve`]. Gating here rather than on the env var
-    /// alone means a `NAO_LSP_EXACT=1` inherited from the environment
+    /// alone means a `MEZZ_LSP_EXACT=1` inherited from the environment
     /// cannot re-enable the pass under serve.
     #[serde(default = "default_allow_unsafe_passes")]
     pub allow_unsafe_passes: bool,
@@ -104,7 +104,7 @@ pub struct AnalysisConfig {
     /// Where the Elevator (`.elv`) spec lives, when it isn't simply
     /// "wherever it happens to be under the root".
     ///
-    /// `None` — the default and the behaviour nao has always had — means
+    /// `None` — the default and the behaviour mezz has always had — means
     /// every `.elv` file the walk finds is part of the spec. That is right
     /// for a repo whose only `.elv` files *are* its spec, and wrong for two
     /// layouts that turn up often enough to need saying:
@@ -384,9 +384,9 @@ impl Config {
     ///
     /// Deliberately lexical — no `canonicalize`, no existence check. The
     /// walk starts at `root_path` and yields paths that begin with it
-    /// verbatim, so `nao analyze .` produces `./spec/nao.elv` and this
+    /// verbatim, so `mezz analyze .` produces `./spec/mezz.elv` and this
     /// produces `./spec`. Canonicalizing one side and not the other would
-    /// compare `/abs/repo/spec` against `./spec/nao.elv`, match nothing, and
+    /// compare `/abs/repo/spec` against `./spec/mezz.elv`, match nothing, and
     /// leave the spec layer silently empty — which is the one failure mode
     /// worth engineering against here, because it looks exactly like a repo
     /// that has no spec.
@@ -487,7 +487,7 @@ mod tests {
     }
 
     /// The bug this whole flag exists to fix. A repo that pins its languages
-    /// in `.nao/settings.json` — as nao's own checkout does — must not
+    /// in `.mezz/settings.json` — as mezz's own checkout does — must not
     /// silently overrule someone typing `--include-docs`.
     #[test]
     fn a_pinned_language_list_does_not_overrule_include_docs() {

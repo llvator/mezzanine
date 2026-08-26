@@ -501,7 +501,7 @@ fn source_code_captures_the_whole_statement() {
 }"#;
     let r = parse(src);
     let e = find(&r, "elevator::f.protocol").unwrap();
-    // The full statement, so `nao diff` sees a reworded `d:` as a
+    // The full statement, so `mezz diff` sees a reworded `d:` as a
     // change and MCP `context` has something to quote.
     assert_eq!(e.source_code.as_deref(), Some(src));
 }

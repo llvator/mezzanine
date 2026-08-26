@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn a_non_git_code_root_yields_a_note_not_an_error() {
-        let dir = std::env::temp_dir().join(format!("nao-fix-nogit-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-fix-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let missing = [CrRef {
             entity: "f x".into(),

@@ -111,7 +111,7 @@ export class ScopeTreeProvider implements vscode.TreeDataProvider<ScopeItem> {
     this.changeHandler = handler;
   }
 
-  /** Fetch the index from the nao server and rebuild the tree. */
+  /** Fetch the index from the mezz server and rebuild the tree. */
   async refresh(): Promise<void> {
     try {
       this.index = await fetchIndex(this.serverPort);
@@ -119,7 +119,7 @@ export class ScopeTreeProvider implements vscode.TreeDataProvider<ScopeItem> {
       this._onDidChangeTreeData.fire();
     } catch (err) {
       vscode.window.showWarningMessage(
-        `Nao: could not load scope index — ${(err as Error).message}`
+        `Mezzanine: could not load scope index — ${(err as Error).message}`
       );
     }
   }

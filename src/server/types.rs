@@ -92,7 +92,7 @@ pub(crate) struct AnalysisScopeRequest {
     pub languages: Option<Vec<String>>,
     /// Analyze Markdown alongside the code. Widens, so it survives the
     /// `languages` filter — the CLI's `--include-docs` and the extension's
-    /// `nao.includeDocs` set the same thing.
+    /// `mezz.includeDocs` set the same thing.
     ///
     /// `None` means "leave it as the server was started"; a client that
     /// never sends the field cannot turn off a `--include-docs` the operator
@@ -216,4 +216,29 @@ pub(crate) struct TraversalRule {
     pub kind: crate::models::RelationshipKind,
     pub direction: petgraph::Direction,
     pub reason: &'static str,
+}
+
+/// What `HEAD` points at in the analyzed checkout — the answer to "which
+/// branch is this graph?" (UI-114).
+///
+/// Not an error type. A root that is not a git checkout is an ordinary state
+/// of this server — `mezz watch` runs against any directory — so it answers
+/// `git: false` and the chip that reads this simply says nothing, rather than
+/// a 500 the caller would have to translate back into "there is no branch".
+#[derive(Clone, Serialize)]
+pub(crate) struct BranchInfo {
+    /// The branch `HEAD` is on. `None` when `HEAD` is detached, and when the
+    /// root is not a checkout at all — `detached` and `git` tell those apart.
+    ///
+    /// Present on an unborn branch too: a repository with no commits still
+    /// has a branch name, and that is the branch the next commit lands on.
+    pub branch: Option<String>,
+    /// `HEAD` names a commit rather than a branch. The canvas is then a
+    /// checkout that belongs to no branch, which is worth saying outright:
+    /// nothing the reader edits here is on their way anywhere.
+    pub detached: bool,
+    /// Abbreviated `HEAD` commit. `None` on an unborn branch, which has none.
+    pub head_short: Option<String>,
+    /// Whether git could answer about this root at all.
+    pub git: bool,
 }

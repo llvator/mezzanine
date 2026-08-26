@@ -1,9 +1,10 @@
-//! What the two rules over the tree count: importers, and doors.
+//! What the three rules over the tree count: importers, doors, and the
+//! children that reach outside from the middle.
 //!
-//! These are the two rules a fractal refactor works to — *every file gets
-//! its dependencies from its parent* and *every folder has one entry file*
-//! — and both are asked of the whole repo rather than of one folder's
-//! drawing. That is the difference from the shape scores, and it is the
+//! These are the rules a fractal refactor works to — *every file gets its
+//! dependencies from its parent*, *every folder has one entry file*, and
+//! *a folder reaches outward from its leaves* — and all are asked of the
+//! whole repo rather than of one folder's drawing. That is the difference from the shape scores, and it is the
 //! reason this counts rather than reads them (ADR 0024, decision 5):
 //! `arborescence` is a ratio over a folder's *immediate children*, with
 //! each subfolder collapsed to a node, so two importers of a file inside
@@ -32,26 +33,23 @@ use crate::graph::{DependencyGraph, FileGraph};
 use super::rules::{Rule, Rules};
 use super::{repo_relative, Cited, Violation};
 
-/// Every breach of the two rules counted over the tree, in no particular
-/// order — the parent sorts one list over all four rules.
+/// Every breach of the three rules counted over the tree, in no particular
+/// order — the parent sorts one list over all five rules.
 pub(super) fn violations(
     graph: &DependencyGraph,
     rules: &Rules,
     repo_root: &Path,
 ) -> Vec<Violation> {
-    let bars = (
-        rules.bar(Rule::MaxImportersPerFile),
-        rules.bar(Rule::MaxDoorsPerFolder),
-    );
-    if bars == (None, None) {
+    let bars = Bars::of(rules);
+    if bars.none() {
         // The file-level graph is a second walk over every edge, and a repo
-        // declaring neither rule should not pay for it.
+        // declaring none of these rules should not pay for it.
         return Vec::new();
     }
     let tree = graph.file_graph();
     let pairs = graded(&tree, rules, repo_root);
     let mut found = Vec::new();
-    if let Some(bar) = bars.0 {
+    if let Some(bar) = bars.importers {
         found.extend(importers(
             &pairs,
             &Cites::of(graph, repo_root),
@@ -59,10 +57,110 @@ pub(super) fn violations(
             bar,
         ));
     }
-    if let Some(bar) = bars.1 {
-        found.extend(doors(&pairs, &tree.folders, rules, repo_root, bar));
-    }
+    found.extend(per_folder(&pairs, &tree.folders, rules, repo_root, &bars));
     found
+}
+
+/// The bars this repo declared for the rules counted here.
+///
+/// A struct rather than a tuple that grows a field per rule: the complexity
+/// gate fails on any metric increase to a function that already exists
+/// (CI-001), so a fourth rule must not be another branch in [`violations`].
+struct Bars {
+    importers: Option<u32>,
+    doors: Option<u32>,
+    entered: Option<u32>,
+    middle_exits: Option<u32>,
+}
+
+impl Bars {
+    fn of(rules: &Rules) -> Self {
+        Bars {
+            importers: rules.bar(Rule::MaxImportersPerFile),
+            doors: rules.bar(Rule::MaxDoorsPerFolder),
+            entered: rules.bar(Rule::MaxEnteredFilesPerFolder),
+            middle_exits: rules.bar(Rule::MaxMiddleExitsPerFolder),
+        }
+    }
+
+    fn none(&self) -> bool {
+        [self.importers, self.doors, self.entered, self.middle_exits]
+            .iter()
+            .all(Option::is_none)
+    }
+}
+
+/// The three rules whose subject is a folder, each counting a different set
+/// of files: the busiest, every one an outsider names at all, and every one
+/// that reaches outside from the folder's middle.
+fn per_folder(
+    pairs: &[(String, String)],
+    folders: &HashSet<String>,
+    rules: &Rules,
+    repo_root: &Path,
+    bars: &Bars,
+) -> Vec<Violation> {
+    let counted = [
+        (
+            bars.doors,
+            Rule::MaxDoorsPerFolder,
+            folder_shape::doors_by_folder as fn(&[(String, String)], &HashSet<String>) -> _,
+        ),
+        (
+            bars.entered,
+            Rule::MaxEnteredFilesPerFolder,
+            folder_shape::entered_by_folder as fn(&[(String, String)], &HashSet<String>) -> _,
+        ),
+        (
+            bars.middle_exits,
+            Rule::MaxMiddleExitsPerFolder,
+            folder_shape::middle_exits_by_folder
+                as fn(&[(String, String)], &HashSet<String>) -> _,
+        ),
+    ];
+    counted
+        .into_iter()
+        .filter_map(|(bar, rule, count)| bar.map(|bar| (bar, rule, count)))
+        .flat_map(|(bar, rule, count)| over_bar(count(pairs, folders), rule, rules, repo_root, bar))
+        .collect()
+}
+
+/// Every folder whose count is over the bar, as violations naming the files
+/// behind it. Shared by both folder rules: they differ only in which files
+/// they counted, and a second copy of "render this as a violation" would be
+/// free to render them differently.
+fn over_bar(
+    counted: HashMap<String, Vec<String>>,
+    rule: Rule,
+    rules: &Rules,
+    repo_root: &Path,
+    bar: u32,
+) -> Vec<Violation> {
+    counted
+        .into_iter()
+        .filter(|(_, files)| files.len() as u32 > bar)
+        .map(|(folder, files)| {
+            let path = repo_relative(repo_root, Path::new(&folder));
+            let names = files
+                .iter()
+                .map(|file| Cited {
+                    path: repo_relative(repo_root, Path::new(file)),
+                    line: None,
+                    via: None,
+                })
+                .collect();
+            Violation {
+                rule,
+                path,
+                line: None,
+                subject: None,
+                measured: files.len() as u32,
+                names,
+                bar,
+            }
+        })
+        .filter(|v| !rules.is_exempt(&v.path))
+        .collect()
 }
 
 /// The edges between files this repo asked to be graded on.
@@ -135,40 +233,6 @@ fn importers(
 /// reader looks. A folder nothing outside it depends on has no doors and
 /// cannot break this rule — it has never been entered, which is a different
 /// state from being entered twice.
-fn doors(
-    pairs: &[(String, String)],
-    folders: &HashSet<String>,
-    rules: &Rules,
-    repo_root: &Path,
-    bar: u32,
-) -> Vec<Violation> {
-    folder_shape::doors_by_folder(pairs, folders)
-        .into_iter()
-        .filter(|(_, doors)| doors.len() as u32 > bar)
-        .map(|(folder, doors)| {
-            let path = repo_relative(repo_root, Path::new(&folder));
-            let names = doors
-                .iter()
-                .map(|door| Cited {
-                    path: repo_relative(repo_root, Path::new(door)),
-                    line: None,
-                    via: None,
-                })
-                .collect();
-            Violation {
-                rule: Rule::MaxDoorsPerFolder,
-                path,
-                line: None,
-                subject: None,
-                measured: doors.len() as u32,
-                names,
-                bar,
-            }
-        })
-        .filter(|v| !rules.is_exempt(&v.path))
-        .collect()
-}
-
 /// Where each importer said it. Built from the import sites AN-024 records,
 /// which is the only place in the graph that knows what line an edge was
 /// written on.

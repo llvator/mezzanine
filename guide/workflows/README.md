@@ -1,6 +1,6 @@
 # Workflows
 
-Nao is one analysis engine behind several surfaces. This folder collects the
+Mezzanine is one analysis engine behind several surfaces. This folder collects the
 working patterns each surface is actually good at, so you can pick the one
 that fits the moment rather than reaching for whichever surface you opened
 last.
@@ -12,7 +12,7 @@ The split is by **how you drive it**:
 | [`cli/`](cli/) | in a terminal | You type a command, or your coding agent calls a tool. Output is text you can pipe, diff, paste, and commit. |
 | [`web-ui/`](web-ui/) | in the visualizer | You look at a canvas. Output is a pattern you notice — shape, clustering, asymmetry, absence. |
 
-`cli/` covers both binaries (`nao`, `elevator`) and the MCP tools your agent
+`cli/` covers both binaries (`mezz`, `elevator`) and the MCP tools your agent
 calls in the same session, because both are terminal-side and answer the same
 way. `web-ui/` covers the VS Code extension panel and the browser UI, which
 are the same Svelte build against the same engine.
@@ -69,6 +69,6 @@ only workflow here that does not depend on anyone remembering to run it.
 
 ## Prerequisites
 
-All of these assume `nao` and `elevator` are installed and, for the agent
+All of these assume `mezz` and `elevator` are installed and, for the agent
 tools, that the MCP server is registered. See
 [getting-started.md](../getting-started.md).

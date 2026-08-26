@@ -4,14 +4,14 @@
 
 Every other workflow here is **pull**: it works only when someone thinks to
 run it. An agent that forgets to call `assess_change` ships regressions
-silently, and so does a human. Push mode inverts that — nao's structural
+silently, and so does a human. Push mode inverts that — mezz's structural
 signal arrives without being asked.
 
 Two legs, both advisory. Neither gates anything.
 
 ## Leg 1: the Stop hook
 
-Wire `nao hook self-review` into a Claude Code Stop or PostToolUse hook. It
+Wire `mezz hook self-review` into a Claude Code Stop or PostToolUse hook. It
 reports structural regressions of the working tree against a git ref.
 
 `.claude/settings.json`:
@@ -24,9 +24,9 @@ reports structural regressions of the working tree against a git ref.
         "hooks": [
           {
             "type": "command",
-            "command": "nao hook self-review 2>/dev/null || true",
+            "command": "mezz hook self-review 2>/dev/null || true",
             "timeout": 120,
-            "statusMessage": "nao self-review"
+            "statusMessage": "mezz self-review"
           }
         ]
       }
@@ -57,9 +57,9 @@ thing you disable after a week.
 Options worth knowing:
 
 ```bash
-nao hook self-review --base-ref main       # compare against a branch point
-nao hook self-review --min-severity medium # raise the floor
-nao hook self-review --max-lines 20        # raise the cap
+mezz hook self-review --base-ref main       # compare against a branch point
+mezz hook self-review --min-severity medium # raise the floor
+mezz hook self-review --max-lines 20        # raise the cap
 ```
 
 The state file defaults to a temp-dir path keyed by repo + base SHA, so it
@@ -67,18 +67,18 @@ resets naturally when a new commit moves the base.
 
 ## Leg 2: the PR comment
 
-`nao pr-report` renders the same assessment as a PR comment body — the full
+`mezz pr-report` renders the same assessment as a PR comment body — the full
 report when the change is structural, a one-liner when it is not.
 
 ```bash
-nao pr-report --base-ref "$(git merge-base origin/main HEAD)" > report.md
+mezz pr-report --base-ref "$(git merge-base origin/main HEAD)" > report.md
 ```
 
 It **always exits 0**, so a CI job wiring it in stays non-blocking. That is
-deliberate: nao is a signal, not a gate. A reference GitHub Actions workflow
+deliberate: mezz is a signal, not a gate. A reference GitHub Actions workflow
 lives in [`.github/workflows/`](../../../.github/workflows/) — it posts one
 comment and edits it in place on every push, found by the
-`<!-- nao-pr-report -->` marker, so a long-running PR accumulates one comment
+`<!-- mezz-pr-report -->` marker, so a long-running PR accumulates one comment
 rather than thirty.
 
 ## Reading the output

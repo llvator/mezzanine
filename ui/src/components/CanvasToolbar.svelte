@@ -63,13 +63,14 @@
    *  graph with that shape says so. */
   $: entityIsFile = everyFileIsOneEntity($rawEntityGraph.nodes);
 
-  /** What each level button says on hover. Two of them state the plain
-   *  definition — a module is a folder, and nothing in nao makes it mean
-   *  anything else — so the meaning is reachable without leaving the canvas. */
+  /** What each level button says on hover, so the grain each one draws is
+   *  reachable without leaving the canvas. The coarse one no longer has to
+   *  talk its way out of its own name: it was called Module, which read as
+   *  the language construct rather than the directory it has always been. */
   const LEVEL_TITLES: Record<GraphLevel, string> = {
     entity: 'One node per entity — function, class, note.',
     file: 'One node per file.',
-    module: 'One node per folder. A module is a directory, in every language.',
+    folder: 'One node per folder — the directory holding the file.',
   };
   $: levelTitle = (lvl: GraphLevel): string =>
     lvl === 'entity' && entityIsFile
@@ -245,7 +246,7 @@
           <!-- Level toggle: aggregates the graph to one node per file or
                module. Drives both Graph and Tree views, which share data. -->
           <div class="level-toggle" role="group" aria-label="Aggregation level">
-            {#each ['entity', 'file', 'module'] as lvl}
+            {#each ['entity', 'file', 'folder'] as lvl}
               <!-- A redundant Entity button stays *enabled*: it is the
                    baseline the expansion set is expressed against, and a
                    control the reader cannot come back through is worse than
@@ -363,10 +364,10 @@
               class:active={$hoverMode === mode}
               aria-pressed={$hoverMode === mode}
               data-probe="hover-mode-{mode}"
-              disabled={mode === 'group' && $graphLevel === 'module'}
+              disabled={mode === 'group' && $graphLevel === 'folder'}
               on:click={() => hoverMode.set(mode)}
-              title={mode === 'group' && $graphLevel === 'module'
-                ? 'No folder to highlight at Module level — each node is already one'
+              title={mode === 'group' && $graphLevel === 'folder'
+                ? 'No folder to highlight at Folder level — each node is already one'
                 : HOVER_MODE_TITLES[mode]}
             >{HOVER_MODE_LABELS[mode]}</button>
           {/each}

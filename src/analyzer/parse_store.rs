@@ -45,7 +45,7 @@ const PARSE_CACHE_SALT: &str = "5";
 /// measured as no change at all. Deriving the generation removes the step
 /// that has to be remembered: the store now invalidates because the parser
 /// differs, not because someone noticed it differs.
-const PARSE_FINGERPRINT: &str = env!("NAO_PARSE_FINGERPRINT");
+const PARSE_FINGERPRINT: &str = env!("MEZZ_PARSE_FINGERPRINT");
 
 /// How long an abandoned generation must sit untouched before
 /// [`prune_stale_generations`] reclaims it. Long enough that a still-installed
@@ -91,9 +91,9 @@ pub struct ParseStore {
 impl ParseStore {
     /// Open the store, resolving the cache directory from the environment:
     ///
-    /// 1. `NAO_CACHE_DIR` — explicit override (CI, tests).
-    /// 2. `XDG_CACHE_HOME/nao`
-    /// 3. `~/.cache/nao`
+    /// 1. `MEZZ_CACHE_DIR` — explicit override (CI, tests).
+    /// 2. `XDG_CACHE_HOME/mezz`
+    /// 3. `~/.cache/mezz`
     ///
     /// If none resolve, the store is disabled (analysis stays cold but
     /// correct). The directory is created lazily on first write.
@@ -169,7 +169,7 @@ impl ParseStore {
     /// Persist a parse result. Best-effort: serialization or IO failure is
     /// swallowed (the entry simply won't exist next time). Writes to a
     /// process-unique temp file then atomically renames, so a concurrent
-    /// reader — even in a second `nao` process — never sees a torn entry.
+    /// reader — even in a second `mezz` process — never sees a torn entry.
     pub(crate) fn put(&self, abs_path: &Path, content_hash: &str, parsed: &ParsedFile) {
         let Some(dir) = self.dir.as_ref() else { return };
         let Some(final_path) = self.entry_path(abs_path) else {
@@ -253,7 +253,7 @@ struct StoredEntry {
 /// path-qualified: two files with identical content must not share an entry.
 ///
 /// Trade-off: a parse of *older* content at the same path (flipping between
-/// branches in place) is no longer a hit. `nao diff` is unaffected — it
+/// branches in place) is no longer a hit. `mezz diff` is unaffected — it
 /// analyses git worktrees, which are distinct paths.
 fn key_stem(abs_path: &Path) -> String {
     blake3::hash(abs_path.to_string_lossy().as_bytes())
@@ -297,20 +297,26 @@ fn prune_stale_generations(current: &Path) {
     }
 }
 
-/// Resolve the nao cache root from the environment. `None` when neither an
+/// Resolve the mezz cache root from the environment. `None` when neither an
 /// override nor a home/XDG directory is available.
-fn cache_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("NAO_CACHE_DIR") {
+///
+/// Public to the crate because the parse store is no longer the only thing
+/// that wants a place to survive a process. `reshape`'s baselines want the
+/// same directory and the same `MEZZ_CACHE_DIR` override — a second
+/// resolution written beside this one would be a second place for a test
+/// to leak into `~/.cache`.
+pub(crate) fn cache_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MEZZ_CACHE_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
         }
     }
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("nao"));
+            return Some(PathBuf::from(xdg).join("mezz"));
         }
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("nao"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("mezz"))
 }
 
 #[cfg(test)]
@@ -323,7 +329,7 @@ mod tests {
     /// from sibling tests. Removed if a stale one exists.
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "nao-parse-store-test-{}-{}",
+            "mezz-parse-store-test-{}-{}",
             std::process::id(),
             tag
         ));

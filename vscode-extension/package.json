@@ -1,18 +1,18 @@
 {
-  "name": "nao-code-visualizer",
-  "displayName": "Nao — Code Visualizer",
+  "name": "mezzanine",
+  "displayName": "Mezzanine — Code Visualizer",
   "description": "Visualize code relationships and dependencies for the file open in your editor",
-  "version": "1.3.0",
-  "publisher": "nao-team",
-  "license": "AGPL-3.0-only",
+  "version": "1.4.0",
+  "publisher": "llvator",
+  "license": "AGPL-3.0-only OR LicenseRef-Commercial",
   "repository": {
     "type": "git",
-    "url": "https://github.com/llvator/nao.git",
+    "url": "https://github.com/llvator/mezzanine.git",
     "directory": "vscode-extension"
   },
   "homepage": "https://llvator.com",
   "bugs": {
-    "url": "https://github.com/llvator/nao/issues"
+    "url": "https://github.com/llvator/mezzanine/issues"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -26,186 +26,186 @@
   "contributes": {
     "commands": [
       {
-        "command": "nao.openVisualizer",
-        "title": "Nao: Open Code Visualizer"
+        "command": "mezz.openVisualizer",
+        "title": "Mezzanine: Open Code Visualizer"
       },
       {
-        "command": "nao.visualizeCurrentFile",
-        "title": "Nao: Visualize Current File"
+        "command": "mezz.visualizeCurrentFile",
+        "title": "Mezzanine: Visualize Current File"
       },
       {
-        "command": "nao.stopServer",
-        "title": "Nao: Stop Server"
+        "command": "mezz.stopServer",
+        "title": "Mezzanine: Stop Server"
       },
       {
-        "command": "nao.restartServer",
-        "title": "Nao: Restart Server"
+        "command": "mezz.restartServer",
+        "title": "Mezzanine: Restart Server"
       },
       {
-        "command": "nao.selectGitRepo",
-        "title": "Nao: Select Git Repository…"
+        "command": "mezz.selectGitRepo",
+        "title": "Mezzanine: Select Git Repository…"
       },
       {
-        "command": "nao.scopes.refresh",
+        "command": "mezz.scopes.refresh",
         "title": "Refresh",
         "icon": "$(refresh)"
       },
       {
-        "command": "nao.scopes.selectAll",
+        "command": "mezz.scopes.selectAll",
         "title": "Select Root (All)",
         "icon": "$(check-all)"
       },
       {
-        "command": "nao.scopes.clear",
+        "command": "mezz.scopes.clear",
         "title": "Clear Selection",
         "icon": "$(clear-all)"
       },
       {
-        "command": "nao.analysisScopes.refresh",
+        "command": "mezz.analysisScopes.refresh",
         "title": "Refresh",
         "icon": "$(refresh)"
       },
       {
-        "command": "nao.analysisScopes.selectAll",
+        "command": "mezz.analysisScopes.selectAll",
         "title": "Select Root (All)",
         "icon": "$(check-all)"
       },
       {
-        "command": "nao.analysisScopes.clear",
+        "command": "mezz.analysisScopes.clear",
         "title": "Clear Selection",
         "icon": "$(clear-all)"
       },
       {
-        "command": "nao.scopes.extendToParent",
+        "command": "mezz.scopes.extendToParent",
         "title": "Extend Selection to Parent Folder",
         "icon": "$(arrow-up)"
       },
       {
-        "command": "nao.scopes.filter",
+        "command": "mezz.scopes.filter",
         "title": "Filter Tree…",
         "icon": "$(filter)"
       },
       {
-        "command": "nao.scopes.clearFilter",
+        "command": "mezz.scopes.clearFilter",
         "title": "Clear Tree Filter",
         "icon": "$(filter-filled)"
       },
       {
-        "command": "nao.scopes.pick",
+        "command": "mezz.scopes.pick",
         "title": "Pick Visual Scopes…",
-        "category": "Nao",
+        "category": "Mezzanine",
         "icon": "$(checklist)"
       },
       {
-        "command": "nao.analysisScopes.extendToParent",
+        "command": "mezz.analysisScopes.extendToParent",
         "title": "Extend Selection to Parent Folder",
         "icon": "$(arrow-up)"
       },
       {
-        "command": "nao.analysisScopes.filter",
+        "command": "mezz.analysisScopes.filter",
         "title": "Filter Tree…",
         "icon": "$(filter)"
       },
       {
-        "command": "nao.analysisScopes.clearFilter",
+        "command": "mezz.analysisScopes.clearFilter",
         "title": "Clear Tree Filter",
         "icon": "$(filter-filled)"
       },
       {
-        "command": "nao.analysisScopes.pick",
+        "command": "mezz.analysisScopes.pick",
         "title": "Pick Analysis Scopes…",
-        "category": "Nao",
+        "category": "Mezzanine",
         "icon": "$(checklist)"
       },
       {
-        "command": "nao.analysisScopes.followActive",
+        "command": "mezz.analysisScopes.followActive",
         "title": "Follow Active Editor",
         "icon": "$(link)"
       },
       {
-        "command": "nao.analysisScopes.unfollowActive",
+        "command": "mezz.analysisScopes.unfollowActive",
         "title": "Stop Following Active Editor",
         "icon": "$(pinned)"
       },
       {
-        "command": "nao.analysisScopes.followFile",
+        "command": "mezz.analysisScopes.followFile",
         "title": "Follow File",
         "icon": "$(file)"
       },
       {
-        "command": "nao.analysisScopes.followFolder",
+        "command": "mezz.analysisScopes.followFolder",
         "title": "Follow Folder",
         "icon": "$(folder)"
       },
       {
-        "command": "nao.educator.refreshProblems",
-        "title": "Nao: Refresh Educator Problems"
+        "command": "mezz.educator.refreshProblems",
+        "title": "Mezzanine: Refresh Educator Problems"
       },
       {
-        "command": "nao.educator.openHit",
-        "title": "Nao: Open Educator Hit"
+        "command": "mezz.educator.openHit",
+        "title": "Mezzanine: Open Educator Hit"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "nao",
-          "title": "Nao",
-          "icon": "resources/nao.svg"
+          "id": "mezz",
+          "title": "Mezzanine",
+          "icon": "resources/mezz.svg"
         }
       ]
     },
     "views": {
-      "nao": [
+      "mezz": [
         {
-          "id": "nao.scopes",
+          "id": "mezz.scopes",
           "name": "Visual Scopes",
           "size": 2
         },
         {
-          "id": "nao.analysisScopes",
+          "id": "mezz.analysisScopes",
           "name": "Analysis Scope",
           "visibility": "collapsed"
         },
         {
           "type": "webview",
-          "id": "nao.controls",
+          "id": "mezz.controls",
           "name": "Controls",
           "visibility": "collapsed",
           "size": 6
         },
         {
           "type": "webview",
-          "id": "nao.diff",
+          "id": "mezz.diff",
           "name": "Diff",
           "visibility": "collapsed"
         },
         {
           "type": "webview",
-          "id": "nao.selection",
+          "id": "mezz.selection",
           "name": "Inspector",
           "size": 3
         },
         {
           "type": "webview",
-          "id": "nao.description",
+          "id": "mezz.description",
           "name": "Description",
           "size": 3
         },
         {
           "type": "webview",
-          "id": "nao.quality",
+          "id": "mezz.quality",
           "name": "Quality",
           "size": 3
         },
         {
           "type": "webview",
-          "id": "nao.educator",
+          "id": "mezz.educator",
           "name": "Educator",
           "visibility": "collapsed"
         },
         {
-          "id": "nao.educatorProblems",
+          "id": "mezz.educatorProblems",
           "name": "Educator Problems",
           "visibility": "collapsed"
         }
@@ -214,145 +214,145 @@
     "menus": {
       "view/title": [
         {
-          "command": "nao.scopes.extendToParent",
-          "when": "view == nao.scopes",
+          "command": "mezz.scopes.extendToParent",
+          "when": "view == mezz.scopes",
           "group": "navigation@0"
         },
         {
-          "command": "nao.scopes.pick",
-          "when": "view == nao.scopes",
+          "command": "mezz.scopes.pick",
+          "when": "view == mezz.scopes",
           "group": "navigation@1"
         },
         {
-          "command": "nao.scopes.filter",
-          "when": "view == nao.scopes && !nao.scopesFiltered",
+          "command": "mezz.scopes.filter",
+          "when": "view == mezz.scopes && !mezz.scopesFiltered",
           "group": "navigation@2"
         },
         {
-          "command": "nao.scopes.clearFilter",
-          "when": "view == nao.scopes && nao.scopesFiltered",
+          "command": "mezz.scopes.clearFilter",
+          "when": "view == mezz.scopes && mezz.scopesFiltered",
           "group": "navigation@2"
         },
         {
-          "command": "nao.scopes.selectAll",
-          "when": "view == nao.scopes",
+          "command": "mezz.scopes.selectAll",
+          "when": "view == mezz.scopes",
           "group": "navigation@3"
         },
         {
-          "command": "nao.scopes.clear",
-          "when": "view == nao.scopes",
+          "command": "mezz.scopes.clear",
+          "when": "view == mezz.scopes",
           "group": "navigation@4"
         },
         {
-          "command": "nao.scopes.refresh",
-          "when": "view == nao.scopes",
+          "command": "mezz.scopes.refresh",
+          "when": "view == mezz.scopes",
           "group": "navigation@5"
         },
         {
-          "command": "nao.analysisScopes.extendToParent",
-          "when": "view == nao.analysisScopes",
+          "command": "mezz.analysisScopes.extendToParent",
+          "when": "view == mezz.analysisScopes",
           "group": "navigation@0"
         },
         {
-          "command": "nao.analysisScopes.pick",
-          "when": "view == nao.analysisScopes",
+          "command": "mezz.analysisScopes.pick",
+          "when": "view == mezz.analysisScopes",
           "group": "navigation@1"
         },
         {
-          "command": "nao.analysisScopes.filter",
-          "when": "view == nao.analysisScopes && !nao.analysisScopesFiltered",
+          "command": "mezz.analysisScopes.filter",
+          "when": "view == mezz.analysisScopes && !mezz.analysisScopesFiltered",
           "group": "navigation@2"
         },
         {
-          "command": "nao.analysisScopes.clearFilter",
-          "when": "view == nao.analysisScopes && nao.analysisScopesFiltered",
+          "command": "mezz.analysisScopes.clearFilter",
+          "when": "view == mezz.analysisScopes && mezz.analysisScopesFiltered",
           "group": "navigation@2"
         },
         {
-          "command": "nao.analysisScopes.selectAll",
-          "when": "view == nao.analysisScopes",
+          "command": "mezz.analysisScopes.selectAll",
+          "when": "view == mezz.analysisScopes",
           "group": "navigation@3"
         },
         {
-          "command": "nao.analysisScopes.clear",
-          "when": "view == nao.analysisScopes",
+          "command": "mezz.analysisScopes.clear",
+          "when": "view == mezz.analysisScopes",
           "group": "navigation@4"
         },
         {
-          "command": "nao.analysisScopes.refresh",
-          "when": "view == nao.analysisScopes",
+          "command": "mezz.analysisScopes.refresh",
+          "when": "view == mezz.analysisScopes",
           "group": "navigation@5"
         },
         {
-          "command": "nao.analysisScopes.followFolder",
-          "when": "view == nao.analysisScopes && nao.followActiveAnalysisScope && nao.analysisScopeFollowModeIsFile",
+          "command": "mezz.analysisScopes.followFolder",
+          "when": "view == mezz.analysisScopes && mezz.followActiveAnalysisScope && mezz.analysisScopeFollowModeIsFile",
           "group": "navigation@6"
         },
         {
-          "command": "nao.analysisScopes.followFile",
-          "when": "view == nao.analysisScopes && nao.followActiveAnalysisScope && !nao.analysisScopeFollowModeIsFile",
+          "command": "mezz.analysisScopes.followFile",
+          "when": "view == mezz.analysisScopes && mezz.followActiveAnalysisScope && !mezz.analysisScopeFollowModeIsFile",
           "group": "navigation@6"
         },
         {
-          "command": "nao.analysisScopes.followActive",
-          "when": "view == nao.analysisScopes && !nao.followActiveAnalysisScope",
+          "command": "mezz.analysisScopes.followActive",
+          "when": "view == mezz.analysisScopes && !mezz.followActiveAnalysisScope",
           "group": "navigation@7"
         },
         {
-          "command": "nao.analysisScopes.unfollowActive",
-          "when": "view == nao.analysisScopes && nao.followActiveAnalysisScope",
+          "command": "mezz.analysisScopes.unfollowActive",
+          "when": "view == mezz.analysisScopes && mezz.followActiveAnalysisScope",
           "group": "navigation@7"
         }
       ]
     },
     "configuration": {
-      "title": "Nao Code Visualizer",
+      "title": "Mezzanine Code Visualizer",
       "properties": {
-        "nao.binaryPath": {
+        "mezz.binaryPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the nao binary. If empty, looks for 'nao' on PATH."
+          "description": "Path to the mezz engine binary. Leave empty to use the engine bundled with this extension, falling back to 'mezz' on PATH for builds that do not carry one."
         },
-        "nao.claudeBinary": {
+        "mezz.claudeBinary": {
           "type": "string",
           "default": "",
           "description": "Path to the Claude Code executable used by the Quality view's Refactor action. If empty, looks for 'claude' on PATH."
         },
-        "nao.serverPort": {
+        "mezz.serverPort": {
           "type": "number",
           "default": 3200,
-          "description": "Port for the nao watch server (used internally by the extension)."
+          "description": "Port for the mezz watch server (used internally by the extension)."
         },
-        "nao.includeTests": {
+        "mezz.includeTests": {
           "type": "boolean",
           "default": false,
           "description": "Include test files in the analysis."
         },
-        "nao.includeDocs": {
+        "mezz.includeDocs": {
           "type": "boolean",
           "default": false,
           "description": "Analyze Markdown documents alongside the code: one node per .md file, the links between them, and the source files they point at. Off by default because a repo's READMEs, ADRs and changelogs would otherwise add hundreds of nodes to every graph."
         },
-        "nao.language": {
+        "mezz.language": {
           "type": "string",
           "default": "",
-          "description": "Restrict analysis to a single language (passed to 'nao watch --language'). Leave empty to analyze all detected languages. Useful for repos where you only care about one layer — e.g. set to 'ansible' to see just the Kubernetes deploy topology of an Ansible/Helm repo and skip its Python/vendored files. Accepts the same names as the CLI (rust, python, typescript, java, go, groovy, elevator, ansible, …)."
+          "description": "Restrict analysis to a single language (passed to 'mezz watch --language'). Leave empty to analyze all detected languages. Useful for repos where you only care about one layer — e.g. set to 'ansible' to see just the Kubernetes deploy topology of an Ansible/Helm repo and skip its Python/vendored files. Accepts the same names as the CLI (rust, python, typescript, java, go, groovy, elevator, ansible, …)."
         },
-        "nao.autoVisualize": {
+        "mezz.autoVisualize": {
           "type": "boolean",
           "default": true,
           "description": "Automatically update the visualization when switching files."
         },
-        "nao.analysisScopeFollowMode": {
+        "mezz.analysisScopeFollowMode": {
           "type": "string",
           "enum": ["file", "folder"],
           "default": "folder",
           "description": "Granularity for the Analysis Scope's 'Follow Active Editor' toggle: 'file' narrows scope to the active file, 'folder' narrows to its parent folder. Toggled from the Analysis Scope view's title bar."
         },
-        "nao.educator.hoverEnabled": {
+        "mezz.educator.hoverEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "Show Nao Educator content in the editor hover for Java source. Educator rules teach good-practice patterns at the cursor; disable to suppress them entirely. The educator contributes only when at least one rule matches at the cursor — hover popups on uninteresting tokens are unaffected."
+          "description": "Show Mezzanine Educator content in the editor hover for Java source. Educator rules teach good-practice patterns at the cursor; disable to suppress them entirely. The educator contributes only when at least one rule matches at the cursor — hover popups on uninteresting tokens are unaffected."
         }
       }
     }

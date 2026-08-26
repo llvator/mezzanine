@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "nao": {
-      "command": "nao",
+    "mezz": {
+      "command": "mezz",
       "args": ["mcp"]
     }
   }

@@ -252,7 +252,7 @@ fn a_callback_deepens_cognitive_nesting_without_branching() {
 
 #[test]
 fn bodyless_declarations_get_zero_rather_than_none() {
-    // TS-003: `None` makes `nao quality` skip the entity entirely, because
+    // TS-003: `None` makes `mezz quality` skip the entity entirely, because
     // the hotspot ranking filters on `composite_score > 0.0`.
     let res = parse("interface Store { load(id: string): Widget; }");
     assert_eq!(metrics_of(&res, "load"), (1, 0, 0));
@@ -912,4 +912,116 @@ fn a_star_re_export_forwards_values_and_is_not_erased() {
 fn an_ordinary_re_export_is_not_marked_erased() {
     let res = parse("export { D } from './d';");
     assert!(!res.imports[0].is_type_only);
+}
+
+/// A `const` initialised by a call is how a Svelte store file is written, and
+/// the call inside it was invisible: the entity existed, with a span, owning
+/// the line the call was on, and nothing walked the initialiser (TS-007).
+#[test]
+fn a_call_inside_a_const_initializer_is_attributed_to_the_const() {
+    let res = parse(
+        "import { buildIndex } from './b';\n\
+         export const index = buildIndex([1, 2]);\n",
+    );
+    let calls: Vec<(String, String)> = res
+        .relationships
+        .iter()
+        .filter(|r| r.kind == RelationshipKind::Calls)
+        .map(|r| (r.source_id.clone(), r.target_id.clone()))
+        .collect();
+    assert!(
+        calls
+            .iter()
+            .any(|(from, to)| from.contains("index") && to == "buildIndex"),
+        "the const does not call what it is built from: {calls:?}"
+    );
+}
+
+/// The shape that motivated it: the call is not at the initialiser's top
+/// level but inside a callback several arguments deep, which is what
+/// `derived([…], (…) => f(…))` does.
+#[test]
+fn a_call_inside_a_callback_in_an_initializer_is_still_found() {
+    let res = parse(
+        "import { derived } from 'svelte/store';\n\
+         import { buildChurn } from './churn';\n\
+         export const churn = derived([a, b], ([$a, $b]) => buildChurn($a, $b));\n",
+    );
+    assert!(
+        call_targets(&res).iter().any(|t| t == "buildChurn"),
+        "a call inside the callback was not found: {:?}",
+        call_targets(&res)
+    );
+}
+
+/// An arrow-function initialiser was already walked by `emit_function`; the
+/// fix must not make it walked twice.
+#[test]
+fn an_arrow_initializer_still_reports_its_calls_once() {
+    let res = parse(
+        "import { helper } from './h';\n\
+         export const run = () => helper(1);\n",
+    );
+    let hits = call_targets(&res).iter().filter(|t| *t == "helper").count();
+    assert_eq!(hits, 1, "calls: {:?}", call_targets(&res));
+}
+
+/// A call written in a bare module-level statement had no entity covering it,
+/// so it produced no edge and the file read as depending on nothing. In a
+/// store or a side-effecting entry module that is most of the file (TS-008).
+#[test]
+fn a_call_in_a_bare_module_level_statement_is_attributed_to_the_module() {
+    let res = parse(
+        "import { ensureLoaded } from './dep';\n\
+         declare const subject: { subscribe(cb: (v: number) => void): void };\n\
+         subject.subscribe((current) => { void ensureLoaded().then((d) => d + current); });\n",
+    );
+    assert!(
+        call_targets(&res).iter().any(|t| t == "ensureLoaded"),
+        "the module-level call was dropped: {:?}",
+        call_targets(&res)
+    );
+}
+
+/// The owner is named with its extension. Every entity name enters the
+/// resolver's `name_to_id`, and a bare stem is a call target a stranger can
+/// bind to — which is AN-029 exactly. `description.ts` is a name no callee
+/// expression can spell.
+#[test]
+fn the_module_owner_is_named_so_no_call_can_bind_to_it() {
+    let res = parse("declare const s: { go(): void };\ns.go();\n");
+    let modules = names_of_kind(&res, EntityKind::Module);
+    assert!(
+        modules.iter().any(|n| n.contains('.')),
+        "a bare stem would be bindable: {modules:?}"
+    );
+}
+
+/// A file of pure declarations gains nothing — the owner exists only when
+/// there is something at module scope to own.
+#[test]
+fn a_file_of_only_declarations_gets_no_module_owner() {
+    let res = parse(
+        "import { a } from './a';\n\
+         export function f(): number { return a(); }\n\
+         export const g = 1;\n",
+    );
+    assert!(
+        names_of_kind(&res, EntityKind::Module).is_empty(),
+        "{:?}",
+        names_of_kind(&res, EntityKind::Module)
+    );
+}
+
+/// Declarations own what they contain, so the module walk must skip them —
+/// otherwise a function's calls are attributed twice.
+#[test]
+fn a_declarations_calls_are_not_also_attributed_to_the_module() {
+    let res = parse(
+        "import { helper } from './h';\n\
+         export function f(): number { return helper(); }\n\
+         f();\n",
+    );
+    let hits = call_targets(&res).iter().filter(|t| *t == "helper").count();
+    assert_eq!(hits, 1, "double-counted: {:?}", call_targets(&res));
 }

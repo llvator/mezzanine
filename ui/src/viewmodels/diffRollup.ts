@@ -56,7 +56,7 @@ interface Tally {
  * reason: the graph's paths are repo-relative and the two have to meet.
  */
 export function normalizeScopePath(p: string): string {
-  const m = p.match(/nao-diff-(?:head|base)-[^/]+\/(.+)$/);
+  const m = p.match(/mezz-diff-(?:head|base)-[^/]+\/(.+)$/);
   return m ? m[1] : p;
 }
 
@@ -65,7 +65,7 @@ export function normalizeScopePath(p: string): string {
  *
  * The graph's ids are absolute — `/home/me/proj/ui/src/stores/diff.ts:12:f`
  * — while a diff computed against a ref analyzed its side in a throwaway
- * worktree, so its ids carry `/var/.../nao-diff-head-<sha>/` instead. Neither
+ * worktree, so its ids carry `/var/.../mezz-diff-head-<sha>/` instead. Neither
  * prefix means anything; what both sides share is the repo-relative tail, and
  * this recovers it.
  *
@@ -88,7 +88,7 @@ export function normalizeScopePath(p: string): string {
 const REPO_RELATIVE = /(?:^|\/)((?:src|test_data|ui|agents|docs)\/.+)$/;
 
 export function normalizeEntityId(id: string): string {
-  const worktree = id.match(/nao-diff-(?:head|base)-[^/]+\/(.+)$/);
+  const worktree = id.match(/mezz-diff-(?:head|base)-[^/]+\/(.+)$/);
   if (worktree) return worktree[1];
   // Only for something id-shaped: `:line:name` is what separates an entity id
   // from a bare path, and callers pass both.

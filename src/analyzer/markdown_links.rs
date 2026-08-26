@@ -66,7 +66,7 @@ pub(super) fn resolve_wikilinks(
 ///
 /// The parser resolves a link against the linking note's directory, so what
 /// arrives here is spelled however the analysis root was: absolute when the
-/// user ran `nao analyze /path/to/repo`, already relative when they ran it
+/// user ran `mezz analyze /path/to/repo`, already relative when they ran it
 /// from inside. Both have to end up relative, because `cr:` is compared
 /// against the `file_path`s in the rendered JSON and the renderer strips the
 /// root from those.

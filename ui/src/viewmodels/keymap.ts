@@ -89,7 +89,7 @@ export type Command =
   | 'graph.toggleView' | 'graph.toggleLabels'
   | 'graph.mark' | 'graph.markDrill'
   // view controls
-  | 'view.toggleMode' | 'view.level.entity' | 'view.level.file' | 'view.level.module'
+  | 'view.toggleMode' | 'view.level.entity' | 'view.level.file' | 'view.level.folder'
   | 'view.autoFit' | 'view.spacing' | 'view.highlightDepth' | 'view.hoverMode'
   | 'view.labels.node' | 'view.labels.kind' | 'view.labels.link'
   | 'view.structureOnly'
@@ -180,7 +180,7 @@ export const BINDINGS: readonly Binding[] = [
   { keys: 't', scope: 'view', command: 'view.toggleMode', label: 'Tree/Graph' },
   { keys: 'e', scope: 'view', command: 'view.level.entity', label: 'Entity level' },
   { keys: 'f', scope: 'view', command: 'view.level.file', label: 'File level' },
-  { keys: 'm', scope: 'view', command: 'view.level.module', label: 'Module level' },
+  { keys: 'm', scope: 'view', command: 'view.level.folder', label: 'Folder level' },
   { keys: 'a', scope: 'view', command: 'view.autoFit', label: 'Auto-fit' },
   { keys: 's', scope: 'view', command: 'view.spacing', label: 'Tree spacing' },
   { keys: 'd', scope: 'view', command: 'view.highlightDepth', label: 'Highlight depth' },

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { DiffState } from './panel';
+import type { BranchLabel, DiffState } from './panel';
 
 /**
  * Native "Diff" sidebar: mirrors the CommitPicker + diff overlay controls
@@ -11,10 +11,14 @@ import type { DiffState } from './panel';
  * native UI.
  */
 export class DiffViewProvider implements vscode.WebviewViewProvider {
-  static readonly viewType = 'nao.diff';
+  static readonly viewType = 'mezz.diff';
 
   private view?: vscode.WebviewView;
   private lastState?: DiffState;
+  /** The branch the canvas is drawing, or `null` for "say nothing" (UI-114).
+   *  Kept beside `lastState` and replayed with it, so a view that is opened
+   *  after the webview has already reported comes up labelled. */
+  private lastBranch: BranchLabel | null = null;
   private pickCommitsHandler?: () => void;
   private currentChangesHandler?: () => void;
 
@@ -28,6 +32,19 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
   update(state: DiffState): void {
     this.lastState = state;
     this.view?.webview.postMessage({ type: 'state', state });
+  }
+
+  /**
+   * Say which branch the graph is (UI-114).
+   *
+   * Its own message rather than a field on `DiffState`, because it is true
+   * whether or not a diff is loaded — and this panel's empty state, "no diff
+   * loaded", is exactly when a reader most needs to know what they are
+   * looking at.
+   */
+  updateBranch(label: BranchLabel | null): void {
+    this.lastBranch = label;
+    this.view?.webview.postMessage({ type: 'branch', label });
   }
 
   resolveWebviewView(
@@ -44,14 +61,15 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
         if (this.lastState) {
           webviewView.webview.postMessage({ type: 'state', state: this.lastState });
         }
+        webviewView.webview.postMessage({ type: 'branch', label: this.lastBranch });
       } else if (msg?.type === 'pickCommits') {
         this.pickCommitsHandler?.();
       } else if (msg?.type === 'currentChanges') {
         this.currentChangesHandler?.();
       } else if (msg?.type === 'selectRepo') {
-        void vscode.commands.executeCommand('nao.selectGitRepo');
+        void vscode.commands.executeCommand('mezz.selectGitRepo');
       } else if (msg?.type === 'command' && msg.command) {
-        vscode.commands.executeCommand('nao.internalFilterCommand', {
+        vscode.commands.executeCommand('mezz.internalFilterCommand', {
           command: msg.command,
           value: msg.value,
         });
@@ -67,6 +85,19 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
 <style>
   body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); padding: 8px 10px; margin: 0; }
   .empty { color: var(--vscode-descriptionForeground); font-style: italic; padding: 12px 0; }
+  #branch:empty { display: none; }
+  #branch {
+    display: flex; align-items: center; gap: 5px;
+    margin-bottom: 8px; padding: 3px 7px;
+    border: 1px solid var(--vscode-panel-border); border-radius: 10px;
+    font-size: 0.8em; font-family: var(--vscode-editor-font-family, monospace);
+    color: var(--vscode-descriptionForeground);
+    width: fit-content; max-width: 100%;
+  }
+  #branch .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Detached is not an error, so it is not red — but it is a state most
+     readers arrived at without meaning to. */
+  #branch.detached { border-style: dashed; }
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 10px; }
   button.action {
     padding: 5px 8px; background: transparent; color: var(--vscode-foreground);
@@ -186,6 +217,10 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
+  <!-- Which branch the graph is. Its own element, above #root and never
+       rewritten by render(), so it survives every diff state including
+       "Loading" and "no diff loaded" (UI-114). -->
+  <div id="branch"></div>
   <div id="root">
     <div class="empty">Loading\u2026</div>
   </div>
@@ -193,6 +228,7 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
 <script>
   const vscode = acquireVsCodeApi();
   const root = document.getElementById('root');
+  const branchRow = document.getElementById('branch');
   const tip = document.getElementById('diff-tip');
   const tipTitle = tip.querySelector('.tt');
   const tipBody = tip.querySelector('.tb');
@@ -449,11 +485,26 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  function renderBranch(label) {
+    branchRow.classList.toggle('detached', !!(label && label.detached));
+    if (!label) {
+      // Nothing to say: not a checkout, or an engine with no /api/branch.
+      branchRow.innerHTML = '';
+      branchRow.removeAttribute('title');
+      return;
+    }
+    branchRow.title = label.title;
+    branchRow.innerHTML = '<span aria-hidden="true">\u2387</span>'
+      + '<span class="name">' + escape(label.text) + '</span>';
+  }
+
   window.addEventListener('message', (event) => {
     const msg = event.data;
     if (msg?.type === 'state') {
       state = msg.state;
       render();
+    } else if (msg?.type === 'branch') {
+      renderBranch(msg.label ?? null);
     }
   });
 

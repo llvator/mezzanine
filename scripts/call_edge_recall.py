@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """AN-005 — call-edge recall benchmark, scored against the LSP oracle.
 
-nao resolves call edges by name heuristic. AN-004 added an exact path: with
-`NAO_LSP_EXACT=1`, rust-analyzer resolves each Rust call site and the edge is
+mezz resolves call edges by name heuristic. AN-004 added an exact path: with
+`MEZZ_LSP_EXACT=1`, rust-analyzer resolves each Rust call site and the edge is
 labelled `exact`. That gives us ground truth to score the heuristic against.
 
 This script analyses one tree twice — once heuristic (the *subject*, what every
@@ -25,14 +25,14 @@ between "the oracle confirmed the guess" and "the oracle never looked".
 Recall is the number this benchmark exists for: a missed edge is why `impact`
 reports "Used by (0)" for a function that has callers.
 
-Not a CI gate. rust-analyzer needs ~130s on nao itself before it answers a
+Not a CI gate. rust-analyzer needs ~130s on mezz itself before it answers a
 single go-to-definition, and that cost does not amortise across runs (the
 tracer's lifecycle is spawn-per-analysis). Run it by hand, commit the report.
 
-Both runs analyse with a **cold, private parse cache**. nao's parse store is
-global and generation-keyed; borrowing whatever the ambient `~/.cache/nao`
+Both runs analyse with a **cold, private parse cache**. mezz's parse store is
+global and generation-keyed; borrowing whatever the ambient `~/.cache/mezz`
 holds would measure the parser that filled it rather than the binary under
-test. `--nao` defaults to `nao` on PATH, so the report names the binary by
+test. `--mezz` defaults to `mezz` on PATH, so the report names the binary by
 content hash — the checkout you are standing in is not evidence of what ran.
 
 **The oracle is a fixture, not a re-derivation.** Even cold and correctly
@@ -52,9 +52,9 @@ To measure a change, pin the oracle and vary only the binary:
 
     # then per binary, in seconds each, on the same ground truth
     python3 scripts/call_edge_recall.py --path CORPUS --oracle oracle.json \
-        --nao ./before/nao --out before.md
+        --mezz ./before/mezz --out before.md
     python3 scripts/call_edge_recall.py --path CORPUS --oracle oracle.json \
-        --nao ./after/nao  --out after.md
+        --mezz ./after/mezz  --out after.md
 
 Usage:
     python3 scripts/call_edge_recall.py                     # analyse cwd
@@ -80,7 +80,7 @@ from pathlib import Path
 # A degraded oracle is this benchmark's one silent failure mode: every tracer
 # failure path (no rust-analyzer, no Cargo.toml, timeout, budget overrun)
 # returns an empty upgrade map, which scores as perfect recall. AN-004 measured
-# ~2.4k exact edges on nao itself, so anything in the low hundreds means the
+# ~2.4k exact edges on mezz itself, so anything in the low hundreds means the
 # oracle degraded rather than that the tree is small. Small crates legitimately
 # fall below this — pass --min-exact to lower it, deliberately.
 DEFAULT_MIN_EXACT = 200
@@ -88,35 +88,35 @@ DEFAULT_MIN_EXACT = 200
 GHOST_PREFIX = "ghost:"
 
 
-def run_nao(nao, path, out_file, exact, timeout, cache_dir):
-    """One `nao analyze` run. Returns (elapsed_seconds, stderr_text)."""
+def run_mezz(mezz, path, out_file, exact, timeout, cache_dir):
+    """One `mezz analyze` run. Returns (elapsed_seconds, stderr_text)."""
     env = dict(os.environ)
     if exact:
-        env["NAO_LSP_EXACT"] = "1"
+        env["MEZZ_LSP_EXACT"] = "1"
     else:
-        # Do not inherit an exported NAO_LSP_EXACT into the subject run — that
+        # Do not inherit an exported MEZZ_LSP_EXACT into the subject run — that
         # would score the oracle against itself and report perfect recall.
-        env.pop("NAO_LSP_EXACT", None)
+        env.pop("MEZZ_LSP_EXACT", None)
 
     # Analyse cold, in a cache nothing else writes to.
     #
-    # nao's parse store is global (`~/.cache/nao`) and keyed by a generation
+    # mezz's parse store is global (`~/.cache/mezz`) and keyed by a generation
     # tag. Any warm generation the ambient cache happens to hold is served in
     # preference to re-parsing, so a benchmark run inherits whatever parser
     # produced those entries rather than the binary under test. Measured on
     # this repo: the same binary emitted 975 different call targets warm vs
     # cold, which is 40x the effect size of a typical parser fix. A benchmark
     # that can report the previous parser's numbers is not a benchmark.
-    env["NAO_CACHE_DIR"] = str(cache_dir)
+    env["MEZZ_CACHE_DIR"] = str(cache_dir)
 
-    cmd = [nao, "analyze", str(path), "-f", "json", "-o", str(out_file),
+    cmd = [mezz, "analyze", str(path), "-f", "json", "-o", str(out_file),
            "-l", "rust", "--include-tests"]
     started = time.monotonic()
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
                           timeout=timeout)
     elapsed = time.monotonic() - started
     if proc.returncode != 0:
-        sys.exit(f"nao analyze failed ({'exact' if exact else 'heuristic'} run, "
+        sys.exit(f"mezz analyze failed ({'exact' if exact else 'heuristic'} run, "
                  f"exit {proc.returncode}):\n{proc.stderr[-2000:]}")
     return elapsed, proc.stderr
 
@@ -141,7 +141,7 @@ def load(path):
 
 
 def is_unresolved(target_id, entities):
-    """True when this target is a ghost — nao could not resolve the callee."""
+    """True when this target is a ghost — mezz could not resolve the callee."""
     if target_id.startswith(GHOST_PREFIX):
         return True
     entity = entities.get(target_id)
@@ -295,7 +295,7 @@ def oracle_coverage(stderr):
     is what lets a reader tell a real delta from a moved goalpost.
 
     Returns (answered, total) or None when the tracer said nothing (a --reuse
-    re-score, or an older nao that did not print the line).
+    re-score, or an older mezz that did not print the line).
     """
     answered = total = None
     for line in stderr.splitlines():
@@ -309,25 +309,25 @@ def oracle_coverage(stderr):
     return None if total is None else (answered, total)
 
 
-def binary_identity(nao):
+def binary_identity(mezz):
     """What actually ran, read off the binary itself.
 
     This used to be `git rev-parse HEAD` on the *script's* repo, which names
-    the checkout you are standing in and not the build you passed to `--nao`.
+    the checkout you are standing in and not the build you passed to `--mezz`.
     Two reports made from two different binaries therefore claimed the same
     provenance, so "no improvement" was indistinguishable from "measured the
-    same build twice" — and `--nao` defaults to whatever `nao` is on PATH,
+    same build twice" — and `--mezz` defaults to whatever `mezz` is on PATH,
     which is exactly the case where they differ. Hash the file instead: it
     cannot be wrong about which bytes were executed.
     """
-    exe = shutil.which(nao) or nao
+    exe = shutil.which(mezz) or mezz
     try:
         digest = hashlib.sha256(Path(exe).read_bytes()).hexdigest()[:12]
         built = datetime.datetime.fromtimestamp(
             Path(exe).stat().st_mtime).astimezone().isoformat(timespec="seconds")
-        return {"nao": str(Path(exe).resolve()), "nao_build": digest, "nao_mtime": built}
+        return {"mezz": str(Path(exe).resolve()), "mezz_build": digest, "mezz_mtime": built}
     except OSError as e:
-        return {"nao": str(exe), "nao_build": f"unreadable ({e})", "nao_mtime": "unknown"}
+        return {"mezz": str(exe), "mezz_build": f"unreadable ({e})", "mezz_mtime": "unknown"}
 
 
 def oracle_sidecar(oracle_path):
@@ -359,7 +359,7 @@ def render(args, meta, buckets, out_of_scope, unpaired, subject_entities):
     add("# AN-005 — call-edge recall vs the LSP oracle\n")
     add(f"- Date: {meta['date']}")
     add(f"- Tree analysed: `{meta['path']}` @ `{meta['tree_sha']}`")
-    add(f"- nao build: `{meta['nao_build']}` (`{meta['nao']}`, built {meta['nao_mtime']})")
+    add(f"- mezz build: `{meta['mezz_build']}` (`{meta['mezz']}`, built {meta['mezz_mtime']})")
     add(f"- rust-analyzer: `{meta['ra']}`")
     add("- Language filter: rust, tests included")
     add("- Parse cache: cold, private to this run")
@@ -411,7 +411,7 @@ def render(args, meta, buckets, out_of_scope, unpaired, subject_entities):
         add("> the tree chosen by wall-clock rather than by anything meaningful.")
         add("> Percentages are still internally valid, but **do not compare this")
         add("> report to one with different coverage** — the denominator moved.")
-        add("> Raise `NAO_LSP_TIMEOUT_SECS`, or re-run on a quieter machine.\n")
+        add("> Raise `MEZZ_LSP_TIMEOUT_SECS`, or re-run on a quieter machine.\n")
 
     if unpaired:
         add(f"> WARNING: {unpaired} oracle edges had no `(source_id, order)`")
@@ -431,10 +431,10 @@ def render(args, meta, buckets, out_of_scope, unpaired, subject_entities):
 
     for bucket, title, blurb in (
         ("missed", "Missed edges",
-         "The recall loss: the oracle resolved these, nao left them on a ghost. "
+         "The recall loss: the oracle resolved these, mezz left them on a ghost. "
          "Each one is a dependent `impact` will not report."),
         ("mistargeted", "Mistargeted edges",
-         "The precision loss: nao resolved these to a different entity than the oracle."),
+         "The precision loss: mezz resolved these to a different entity than the oracle."),
     ):
         records = buckets[bucket]
         add(f"## {title} ({len(records)})\n")
@@ -469,7 +469,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--path", default=".", help="tree to analyse (default: cwd)")
-    parser.add_argument("--nao", default="nao", help="nao binary (default: nao on PATH)")
+    parser.add_argument("--mezz", default="mezz", help="mezz binary (default: mezz on PATH)")
     parser.add_argument("--out", default=None, help="report path (default: stdout)")
     parser.add_argument("--json-out", default=None, help="also write raw scores as JSON")
     parser.add_argument("--top", type=int, default=40, help="rows per detail table (default 40)")
@@ -478,7 +478,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800, help="per-run timeout, seconds")
     parser.add_argument("--keep-json", action="store_true", help="keep the two raw analyses")
     parser.add_argument("--reuse", default=None,
-                        help="dir holding a previous run's subject.json/oracle.json; re-scores without re-running nao")
+                        help="dir holding a previous run's subject.json/oracle.json; re-scores without re-running mezz")
     parser.add_argument("--oracle", default=None,
                         help="score against this saved oracle analysis instead of running the "
                              "exact pass; the only way to compare two binaries on one ruler")
@@ -520,13 +520,13 @@ def main():
         # One cold cache per run, inside the workdir so --keep-json keeps it
         # and the normal path deletes it with everything else.
         print("[1/2] heuristic run (subject) ...", file=sys.stderr)
-        subject_secs, _ = run_nao(args.nao, path, subject_json, False, args.timeout,
+        subject_secs, _ = run_mezz(args.mezz, path, subject_json, False, args.timeout,
                                   workdir / "cache-subject")
         print(f"      {subject_secs:.1f}s", file=sys.stderr)
 
         if pinned:
             # The whole point: no exact pass, so the ground truth is byte-identical
-            # to the run that produced it and the only thing that varied is --nao.
+            # to the run that produced it and the only thing that varied is --mezz.
             oracle_json = Path(args.oracle).resolve()
             if not oracle_json.exists():
                 sys.exit(f"--oracle: no such analysis: {oracle_json}")
@@ -540,7 +540,7 @@ def main():
         else:
             print("[2/2] exact run (oracle, rust-analyzer) — the slow one ...",
                   file=sys.stderr)
-            oracle_secs, oracle_stderr = run_nao(args.nao, path, oracle_json, True,
+            oracle_secs, oracle_stderr = run_mezz(args.mezz, path, oracle_json, True,
                                                  args.timeout, workdir / "cache-oracle")
             print(f"      {oracle_secs:.1f}s", file=sys.stderr)
             oracle_origin = "derived fresh by this run"
@@ -586,7 +586,7 @@ def main():
             # Carried so a pinned run can still report how much of the tree the
             # oracle actually answered — its stderr is long gone by then.
             "oracle_coverage": oracle_coverage(oracle_stderr),
-            "produced_by": binary_identity(args.nao),
+            "produced_by": binary_identity(args.mezz),
         }, indent=2, sort_keys=True))
         print(f"oracle saved: {target} ({exact_count} exact edges)", file=sys.stderr)
 
@@ -602,7 +602,7 @@ def main():
         "date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "path": str(path),
         "tree_sha": git_sha(path),
-        **binary_identity(args.nao),
+        **binary_identity(args.mezz),
         "ra": ra_version(),
         "subject_secs": subject_secs,
         "oracle_secs": oracle_secs,
@@ -625,15 +625,15 @@ def main():
         # A meta.json written before binaries were identified by hash cannot
         # say what produced these analyses. Say that, rather than let the
         # binary named on *this* command line be read as the one that ran.
-        if "nao_build" not in recorded:
-            meta["nao_build"] = "unrecorded (pre-hash run)"
-            meta["nao_mtime"] = "unknown"
+        if "mezz_build" not in recorded:
+            meta["mezz_build"] = "unrecorded (pre-hash run)"
+            meta["mezz_mtime"] = "unknown"
     elif args.reuse:
         # Same trap, one step further out: a saved pair with no meta.json at all
         # records nothing about what produced it, and the binary named on *this*
         # command line certainly did not.
-        meta["nao_build"] = "unrecorded (no meta.json beside the analyses)"
-        meta["nao_mtime"] = "unknown"
+        meta["mezz_build"] = "unrecorded (no meta.json beside the analyses)"
+        meta["mezz_mtime"] = "unknown"
     else:
         (workdir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
     report = render(args, meta, buckets, out_of_scope, unpaired, subject_entities)

@@ -143,20 +143,20 @@ graphData.subscribe((data) => {
 function remapToContainingScope(prev: D3Node, data: GraphData): D3Node | null {
   // Build the candidate paths to look up in the new dataset, in order of
   // specificity (most specific first, so a file-level remap wins over a
-  // module-level one when both are available).
+  // folder-level one when both are available).
   const candidates: string[] = [];
 
-  if (prev.kind_raw !== 'File' && prev.kind_raw !== 'Module') {
+  if (prev.kind_raw !== 'File' && prev.kind_raw !== 'Folder') {
     // Entity → might remap to its file or its directory.
     candidates.push(prev.file_path);
     const i = prev.file_path.lastIndexOf('/');
     candidates.push(i >= 0 ? prev.file_path.slice(0, i) : '');
   } else if (prev.kind_raw === 'File') {
-    // File → might remap to its parent directory (module view).
+    // File → might remap to its parent directory (folder view).
     const i = prev.original_id.lastIndexOf('/');
     candidates.push(i >= 0 ? prev.original_id.slice(0, i) : '');
   }
-  // Module → nothing coarser to remap to; drop.
+  // Folder → nothing coarser to remap to; drop.
 
   for (const path of candidates) {
     const hit = data.nodes.find((n) => n.original_id === path);

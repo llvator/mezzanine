@@ -3,15 +3,18 @@
 mod dependency_resolver;
 mod file_walker;
 pub mod folder_shape;
+pub mod grouping;
 mod lsp_tracer;
 mod markdown_links;
 mod parse_store;
 mod receiver_index;
+pub mod relayout;
 pub mod sql_fold;
 
 pub use dependency_resolver::DependencyResolver;
 pub use file_walker::{is_test_path, FileWalker};
 pub use parse_store::ParseStore;
+pub(crate) use parse_store::cache_root;
 
 use crate::config::Config;
 use crate::models::file_info::Language;
@@ -322,7 +325,7 @@ impl Analyzer {
     /// mark the edge `Exact`. Everything left keeps its heuristic target and
     /// the `Heuristic` label applied later in `graph::from_analysis`.
     ///
-    /// Opt-in (`NAO_LSP_EXACT=1`): default off so it never re-costs the
+    /// Opt-in (`MEZZ_LSP_EXACT=1`): default off so it never re-costs the
     /// self-review hook AN-003 made cheap. Best-effort: the tracer degrades to
     /// an empty upgrade map on any failure (disabled, no server, no manifest,
     /// timeout), so this pass can only ever improve precision, never break
@@ -371,12 +374,12 @@ impl Analyzer {
     /// Resolve `sites` through rust-analyzer and rewrite the edges it can
     /// place exactly.
     ///
-    /// Gated on `config.analysis.allow_unsafe_passes`, which `nao serve`
+    /// Gated on `config.analysis.allow_unsafe_passes`, which `mezz serve`
     /// clears: resolution drives `cargo check`, which executes the analyzed
     /// repo's `build.rs` and proc-macros. That's fine for a tree the operator
     /// chose and unacceptable for one a visitor pasted a URL for. The check
     /// lives at the config layer, so it holds regardless of what
-    /// `NAO_LSP_EXACT` says in the environment.
+    /// `MEZZ_LSP_EXACT` says in the environment.
     fn apply_lsp_upgrades(&mut self, sites: &[lsp_tracer::CallSite]) {
         if !self.config.analysis.allow_unsafe_passes {
             return;
@@ -1176,7 +1179,7 @@ impl Analyzer {
 /// path, while everything the entry records — `file_path`, `FileInfo::path`,
 /// every entity's `file_path` — is the path as walked, and one physical file
 /// has as many walked paths as there are ways to reach it: a symlinked spec
-/// directory, `nao analyze .` versus an absolute root, a repo checked out
+/// directory, `mezz analyze .` versus an absolute root, a repo checked out
 /// twice. Serving the entry regardless puts the *other* spelling on every
 /// entity, so click-to-open and `cr:` anchors name a path this run never
 /// saw — and since content is what decides a hit, it stays wrong until
@@ -1259,7 +1262,7 @@ fn elevator_qualname_from_id(id: &str) -> Option<String> {
 /// Two layers do. Elevator, where a reference to an undefined Feature is
 /// drift worth seeing. And Markdown, where a link to a note that does not
 /// exist is the single most useful thing a document graph can show you —
-/// Obsidian draws it as a hollow node and so does nao, through this path.
+/// Obsidian draws it as a hollow node and so does mezz, through this path.
 fn stub_kind_from_id(id: &str) -> Option<EntityKind> {
     if id.starts_with("md::") {
         return Some(EntityKind::Note);
@@ -1310,7 +1313,7 @@ fn stub_layer_tag(id: &str) -> &'static str {
 
 /// Result of code analysis.
 ///
-/// `Serialize`/`Deserialize` exist so `nao serve` can snapshot a finished
+/// `Serialize`/`Deserialize` exist so `mezz serve` can snapshot a finished
 /// analysis to disk and rebuild the `DependencyGraph` from it on restart
 /// (SRV-004) — the *rendered* JSON the UI consumes is a lossy projection and
 /// can't reconstruct the graph that `/scope` traverses.
@@ -1384,7 +1387,7 @@ mod tests {
     /// imports a *function* from `a.ts`, which does.
     fn type_only_fixture(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "nao-an022-{}-{}-{}",
+            "mezz-an022-{}-{}-{}",
             name,
             std::process::id(),
             line!()
@@ -1463,7 +1466,7 @@ mod tests {
         let graph = crate::graph::DependencyGraph::from_analysis(&result);
 
         let src = graph
-            .module_metrics()
+            .folder_metrics()
             .iter()
             .find(|m| m.path.ends_with("src"))
             .expect("the fixture has one folder");
@@ -1499,7 +1502,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_path_to_one_file_does_not_inherit_the_first_path() {
-        let root = std::env::temp_dir().join(format!("nao-linked-parse-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mezz-linked-parse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("real")).unwrap();
         let real = root.join("real").join("thing.rs");
@@ -1606,7 +1609,7 @@ mod tests {
     /// The CFG-005 fixture: a module constant, a function local, two class
     /// fields, and a module-level name that is *called* elsewhere.
     fn assignments_fixture(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nao-cfg005-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-cfg005-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
@@ -1776,7 +1779,7 @@ mod tests {
     fn python_subscripted_return_type_reaches_the_real_class() {
         use crate::models::RelationshipKind;
 
-        let dir = std::env::temp_dir().join(format!("nao-py028-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-py028-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
@@ -1821,6 +1824,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// KT-003 / DA-001 end-to-end, on the two tickets' own fixtures: a
+    /// nullable return type must reach the class it makes nullable. Before
+    /// the Kotlin/Dart arm, `?` was not a delimiter the splitter knew, so
+    /// `User?` survived as one token and became a ghost of that literal
+    /// name — standing beside the real `User`, which was never reached.
+    ///
+    /// Table-driven across both languages because the defect, the fixture
+    /// and the assertion are the same one twice; only the syntax differs.
+    #[test]
+    fn a_nullable_return_type_reaches_the_real_class() {
+        use crate::models::RelationshipKind;
+
+        for (label, file, source, class) in [
+            (
+                "kt003",
+                "Svc.kt",
+                "data class User(val id: String)\ninterface Repo { suspend fun get(id: String): User? }\n",
+                "User",
+            ),
+            (
+                "da001",
+                "shop.dart",
+                "class Order { final String id; Order(this.id); }\nabstract class Repo { Future<Order?> find(String id); }\n",
+                "Order",
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!("mezz-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            std::fs::write(dir.join(file), source).expect("fixture");
+
+            let config = Config::for_path(&dir);
+            let mut analyzer = Analyzer::new(config);
+            let result = analyzer.analyze().expect("analysis should succeed");
+
+            let class_id = result
+                .entities
+                .iter()
+                .find(|e| e.name == class)
+                .map(|e| e.id.clone())
+                .unwrap_or_else(|| panic!("{label}: no {class} entity"));
+            let returns: Vec<&str> = result
+                .relationships
+                .iter()
+                .filter(|r| r.kind == RelationshipKind::Returns)
+                .map(|r| r.target_id.as_str())
+                .collect();
+
+            assert!(
+                returns.contains(&class_id.as_str()),
+                "{label}: no Returns edge onto the real {class} class: {returns:?}"
+            );
+            // The ghost the tickets open with is minted from an unresolved
+            // target, so no target may still carry the marker.
+            assert!(
+                !returns.iter().any(|t| t.contains('?')),
+                "{label}: nullability syntax leaked into a target name: {returns:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// AN-003: a parse-store hit must reconstruct byte-for-byte what a
     /// cold parse produced. Parse a real source file with an empty store
     /// (miss → persist), then again with the same store (hit → reload),
@@ -1831,7 +1896,7 @@ mod tests {
     fn parse_store_hit_matches_cold_parse() {
         use crate::parser;
         let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyzer/mod.rs");
-        let cache = std::env::temp_dir().join(format!("nao-an003-hit-{}", std::process::id()));
+        let cache = std::env::temp_dir().join(format!("mezz-an003-hit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
         let store = ParseStore::open_at(cache.clone());
         let lang = parser::detect_language(&file);
@@ -1870,7 +1935,7 @@ mod tests {
     /// exactly like a working fix.
     #[test]
     fn names_do_not_bind_across_a_language_boundary() {
-        let dir = std::env::temp_dir().join(format!("nao-an014-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-an014-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("frontend")).unwrap();
         std::fs::create_dir_all(dir.join("backend")).unwrap();
@@ -1966,7 +2031,7 @@ mod tests {
     /// where `CodeEntity` lives in one file and the call site in another.
     #[test]
     fn a_field_type_from_another_file_resolves_the_call() {
-        let dir = std::env::temp_dir().join(format!("nao-an012-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mezz-an012-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("fixture dir");
         std::fs::write(
@@ -2035,7 +2100,7 @@ mod tests {
     /// another file that imports the constant and reads it.
     fn constant_fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "nao-an028-{}-{}-{}",
+            "mezz-an028-{}-{}-{}",
             name,
             std::process::id(),
             line!()

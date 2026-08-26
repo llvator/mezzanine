@@ -106,7 +106,7 @@ test('a scope carries the sum of the entities inside it, file and folder', () =>
   }));
   assert.equal(idx.byScope.get('src/a.rs'), 2);
   assert.equal(idx.byScope.get('src/b.rs'), 3);
-  // The directory holding both — the Module grain the collapsed canvas draws.
+  // The directory holding both — the Folder grain the collapsed canvas draws.
   assert.equal(idx.byScope.get('src'), 5);
 });
 

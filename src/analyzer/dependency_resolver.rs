@@ -519,6 +519,7 @@ impl<'a> DependencyResolver<'a> {
             }
             Language::Python => Self::extract_python_type_names(type_str),
             Language::Go => Self::extract_go_type_names(type_str),
+            Language::Kotlin | Language::Dart => Self::extract_nullable_type_names(type_str),
             _ => Self::extract_delimited_type_names(type_str),
         }
     }
@@ -592,9 +593,6 @@ impl<'a> DependencyResolver<'a> {
         names
     }
 
-    /// The original Rust/Java-shaped splitter, unchanged, and still the
-    /// default for every language without an arm of its own.
-    /// Handles wrappers like Option<T>, Result<T, E>, Vec<T>, &T, Box<T>, etc.
     /// Go's type grammar, whose punctuation the default splitter does not
     /// know: `*` for pointers, `[]` and `[8]` for slices and arrays,
     /// `map[K]V`, `chan T`, and `...T` for a variadic.
@@ -627,6 +625,87 @@ impl<'a> DependencyResolver<'a> {
         names
     }
 
+    /// Kotlin and Dart type grammar (KT-003, DA-001).
+    ///
+    /// Both spell nullability with a trailing `?`, and `?` was not a
+    /// delimiter the Rust/Java splitter knew — so `User?` survived the split
+    /// as one token, matched no entity, and became a ghost literally named
+    /// `User?`, standing beside the real `User` it should have pointed at.
+    ///
+    /// The two languages pay different amounts for the same bug and it points
+    /// the same way in both. `User?` is the single most common return type in
+    /// idiomatic Kotlin; in Dart, null safety is on by default, so `T?` is
+    /// not an idiom there but the norm. Either way a large share of the
+    /// project's `Returns` edges was dropped, and an absent edge reads as
+    /// "no dependency" rather than as "not measured".
+    ///
+    /// Splitting on everything that is not an identifier character covers the
+    /// rest of both grammars for free: generics (`List<User>`), function
+    /// types (`(Order) -> Receipt`, `Receipt Function(Order)`), Kotlin's star
+    /// projection and its platform-type `!`, Dart's optional-positional
+    /// brackets.
+    ///
+    /// `.` survives the split and is then dropped down to the last segment,
+    /// because a qualified type (`com.shop.Order`, `http.Client`) is looked
+    /// up *by name* and the entity it should find is named `Order` /
+    /// `Client`. That is the rule Go's arm applies and the one both
+    /// languages' own `UsesType` passes already use — and the opposite of
+    /// Python's, where `datetime.datetime` is one name.
+    ///
+    /// No uppercase filter, for the reason the comments below spell out:
+    /// `Int` and `String` must keep producing edges and so must `int` and
+    /// `bool`, exactly as Python's `-> str` must.
+    fn extract_nullable_type_names(type_str: &str) -> Vec<String> {
+        // Modifiers that stand in type position without naming a type:
+        // Kotlin's `suspend`/`reified`/`vararg` and its `in`/`out` variance,
+        // Dart's `covariant`/`required`/`late`.
+        //
+        // `dynamic` is this pair's `def` (GR-015) — the *absence* of a
+        // declared type, in both languages. Left unfiltered it collects
+        // inbound edges from across a codebase onto a single ghost node that
+        // means nothing, distorting every centrality and fan-in reading of
+        // the graph. Neither parser's `UsesType` pass emits it either.
+        //
+        // `void`, `Unit`, `Null` and `null` are *not* here: they are real
+        // return types and naming one is a fact about the function.
+        const MODIFIERS: &[&str] = &[
+            "suspend",
+            "reified",
+            "vararg",
+            "out",
+            "in",
+            "covariant",
+            "required",
+            "late",
+            "dynamic",
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for part in
+            type_str.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
+        {
+            let name = part
+                .trim_matches('.')
+                .rsplit('.')
+                .next()
+                .unwrap_or_default();
+            // A fragment starting with a digit is a numeric literal or the
+            // tail of something we split — never a name.
+            if name.is_empty()
+                || MODIFIERS.contains(&name)
+                || name.starts_with(|c: char| c.is_ascii_digit())
+            {
+                continue;
+            }
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+        names
+    }
+
+    /// The original Rust/Java-shaped splitter, unchanged, and still the
+    /// default for every language without an arm of its own.
+    /// Handles wrappers like Option<T>, Result<T, E>, Vec<T>, &T, Box<T>, etc.
     fn extract_delimited_type_names(type_str: &str) -> Vec<String> {
         let mut names = Vec::new();
         // Strip references and lifetimes (Rust syntax)
@@ -1498,6 +1577,119 @@ mod tests {
             "tuple[int, ...]",
         ] {
             for name in python(type_str) {
+                assert!(
+                    is_plausible_type_name(&name),
+                    "`{name}` from `{type_str}` is not an identifier"
+                );
+            }
+        }
+    }
+
+    fn kotlin(type_str: &str) -> Vec<String> {
+        DependencyResolver::extract_type_names(type_str, Language::Kotlin)
+    }
+
+    fn dart(type_str: &str) -> Vec<String> {
+        DependencyResolver::extract_type_names(type_str, Language::Dart)
+    }
+
+    /// KT-003 / DA-001: `?` was not a delimiter the Rust/Java splitter knew,
+    /// so `User?` survived as one token and became a ghost of that literal
+    /// name instead of reaching the class declared beside it.
+    #[test]
+    fn a_nullable_type_reaches_the_type_it_makes_nullable() {
+        assert_eq!(kotlin("User?"), vec!["User"]);
+        assert_eq!(dart("Order?"), vec!["Order"]);
+    }
+
+    /// KT-003's acceptance table.
+    #[test]
+    fn kotlin_wrappers_reach_their_inner_named_types() {
+        assert_eq!(kotlin("List<User>?"), vec!["List", "User"]);
+        assert_eq!(kotlin("Map<String, User?>"), vec!["Map", "String", "User"]);
+        assert_eq!(kotlin("User?.() -> Unit"), vec!["User", "Unit"]);
+    }
+
+    /// DA-001's acceptance table. Dart's null safety is on by default, so
+    /// these three shapes are the norm rather than an idiom.
+    #[test]
+    fn dart_wrappers_reach_their_inner_named_types() {
+        assert_eq!(dart("Future<Order?>"), vec!["Future", "Order"]);
+        assert_eq!(dart("List<Order>?"), vec!["List", "Order"]);
+        assert_eq!(dart("Map<String, Order?>"), vec!["Map", "String", "Order"]);
+    }
+
+    /// A Kotlin platform type is spelled `String!`. The pinned grammar does
+    /// not surface one from source — a platform type only arises from Java
+    /// interop, and nothing in a `.kt` file writes the `!` — but the arm
+    /// handles it if a type string ever carries one, so the ticket's open
+    /// question has an answer either way.
+    #[test]
+    fn a_platform_type_marker_is_not_part_of_the_name() {
+        assert_eq!(kotlin("String!"), vec!["String"]);
+        assert_eq!(kotlin("List<User!>!"), vec!["List", "User"]);
+    }
+
+    /// Function types name a type on each side, and `suspend` names none.
+    #[test]
+    fn kotlin_function_types_yield_both_sides() {
+        assert_eq!(kotlin("(Order) -> Receipt"), vec!["Order", "Receipt"]);
+        assert_eq!(
+            kotlin("suspend (Order) -> Flow<Receipt>"),
+            vec!["Order", "Flow", "Receipt"]
+        );
+        assert_eq!(
+            dart("Receipt Function(Order)"),
+            vec!["Receipt", "Function", "Order"]
+        );
+    }
+
+    /// `dynamic` is this pair's `def` (GR-015): the absence of a declared
+    /// type, not a type. Variance and parameter modifiers are not types
+    /// either. `void` and `Unit` are — naming one is a fact about the
+    /// function.
+    #[test]
+    fn modifiers_are_not_types_but_unit_and_void_are() {
+        assert_eq!(dart("dynamic"), Vec::<String>::new());
+        assert_eq!(kotlin("dynamic"), Vec::<String>::new());
+        assert_eq!(kotlin("List<out Order>"), vec!["List", "Order"]);
+        assert_eq!(kotlin("Unit"), vec!["Unit"]);
+        assert_eq!(dart("void"), vec!["void"]);
+    }
+
+    /// A qualified type is looked up by name, so the entity it should find
+    /// is named for its last segment — the rule Go's arm applies and the one
+    /// both languages' own `UsesType` passes already use.
+    #[test]
+    fn a_qualified_kotlin_or_dart_type_is_found_by_its_last_segment() {
+        assert_eq!(kotlin("com.shop.model.Order?"), vec!["Order"]);
+        assert_eq!(dart("http.Client"), vec!["Client"]);
+    }
+
+    /// Do not reinstate an uppercase-only filter: it dropped every Python
+    /// primitive. Dart's primitives are lowercase for the same reason.
+    #[test]
+    fn kotlin_and_dart_primitives_still_produce_a_name() {
+        assert_eq!(kotlin("Int"), vec!["Int"]);
+        assert_eq!(kotlin("Boolean?"), vec!["Boolean"]);
+        for primitive in ["int", "double", "bool", "num"] {
+            assert_eq!(dart(primitive), vec![primitive]);
+        }
+    }
+
+    /// No fragment that isn't a possible identifier may become a name.
+    #[test]
+    fn kotlin_and_dart_punctuation_never_becomes_a_name() {
+        for type_str in [
+            "User?",
+            "Map<String, User?>",
+            "User?.() -> Unit",
+            "Array<*>",
+            "Future<Order?>",
+            "Map<String, dynamic>?",
+            "Receipt Function(Order, {int count})",
+        ] {
+            for name in kotlin(type_str).into_iter().chain(dart(type_str)) {
                 assert!(
                     is_plausible_type_name(&name),
                     "`{name}` from `{type_str}` is not an identifier"

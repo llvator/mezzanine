@@ -1,16 +1,16 @@
 //! The rules a project declares, and the file it declares them in.
 //!
-//! Everything here is read from `<repo>/.nao/rules.json` and nothing is
+//! Everything here is read from `<repo>/.mezz/rules.json` and nothing is
 //! defaulted: a repo with no file has no rules, and `check` has nothing to
-//! fail on ([ADR 0024](../../../docs/adr/0024-a-check-fails-on-the-projects-rules-not-naos.md),
-//! decision 1). The bar in `max_entities_per_file: 7` is the project's — nao
+//! fail on ([ADR 0024](../../../docs/adr/0024-a-check-fails-on-the-projects-rules-not-mezzs.md),
+//! decision 1). The bar in `max_entities_per_file: 7` is the project's — mezz
 //! supplies the measurement and never the number.
 //!
 //! The reading is deliberately stricter than [`crate::settings`]. A bad
 //! settings file warns and is ignored, because it must never fail a command
 //! that would otherwise have worked. A bad rules file is fatal, because the
 //! whole output of `check` is a verdict, and a verdict computed from a file
-//! nao misread is worse than no verdict (ADR 0024, decision 4).
+//! mezz misread is worse than no verdict (ADR 0024, decision 4).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,13 @@ pub enum Rule {
     MaxDoorsPerFolder,
     /// Members of a class-like entity; parameters of a callable.
     MaxElementsPerEntity,
+    /// Files in a folder that anything outside it depends on — the doors and
+    /// everything reached past them. `1` is "this folder has a single entry
+    /// point", which [`Rule::MaxDoorsPerFolder`] does not say: a folder whose
+    /// door takes 25% of the traffic arriving at it has one door and four
+    /// other ways in.
+    MaxEnteredFilesPerFolder,
+    MaxMiddleExitsPerFolder,
     /// Declarations a reader meets on opening the file — everything the MCP
     /// listings would show, minus what a class-like entity owns, since those
     /// are that entity's elements and counted by the rule above.
@@ -49,49 +56,109 @@ pub enum Rule {
     MaxImportersPerFile,
 }
 
-/// Every rule name this build understands, in report order. Named here
-/// rather than derived, so the list a diagnostic prints is the list the
-/// parser accepts.
-pub(super) const KNOWN: &[Rule] = &[
-    Rule::MaxDoorsPerFolder,
-    Rule::MaxElementsPerEntity,
-    Rule::MaxEntitiesPerFile,
-    Rule::MaxImportersPerFile,
-];
-
-impl Rule {
+/// One rule's spelling and how a breach of it reads.
+///
+/// A table rather than a `match` arm per rule inside each method. In a flat
+/// lookup, cyclomatic complexity *is* the number of arms, so every rule added
+/// pushed two existing functions higher and the complexity gate — which fails
+/// on any increase — made the next rule unlandable (CI-001). `src/mcp/mod.rs`
+/// hit the same wall with its tool dispatch and answered it the same way.
+///
+/// This is also the single list: [`known`] reads it, so the names a
+/// diagnostic offers are by construction the names the parser accepts.
+struct Spec {
+    rule: Rule,
     /// The key a project writes in the file. The one spelling of this rule
     /// anywhere: the parser, the human report and the JSON all use it.
+    name: &'static str,
+    /// How one breach reads — the count only. What the count is *of* is a
+    /// list the report prints beside it, because a rule an author can act on
+    /// has to name the places, and a phrase carrying them would be a
+    /// sentence with a list inside it.
+    phrase: fn(u32, Option<&str>) -> String,
+}
+
+/// Every rule this build understands, in report order — the order a reader
+/// would look them up in.
+const SPECS: &[Spec] = &[
+    Spec {
+        rule: Rule::MaxDoorsPerFolder,
+        name: "max_doors_per_folder",
+        phrase: |measured, _| super::tally(measured as usize, "door"),
+    },
+    Spec {
+        rule: Rule::MaxElementsPerEntity,
+        name: "max_elements_per_entity",
+        phrase: |measured, subject| match subject {
+            Some(name) => format!("{name} has {measured} elements"),
+            None => format!("{measured} elements"),
+        },
+    },
+    Spec {
+        rule: Rule::MaxEnteredFilesPerFolder,
+        name: "max_entered_files_per_folder",
+        // "entered file" rather than "way in": `tally` pluralises by
+        // appending an s, and "way ins" is not a phrase. Not "entry point"
+        // either — CONTEXT.md reserves that for a program entry.
+        phrase: |measured, _| super::tally(measured as usize, "entered file"),
+    },
+    Spec {
+        rule: Rule::MaxEntitiesPerFile,
+        name: "max_entities_per_file",
+        phrase: |measured, _| format!("{measured} declared"),
+    },
+    Spec {
+        rule: Rule::MaxMiddleExitsPerFolder,
+        name: "max_middle_exits_per_folder",
+        // "middle exit" rather than "leak": the report names a shape, and a
+        // reader who has not read the rule should still be able to guess
+        // which files it means from the phrase alone.
+        phrase: |measured, _| super::tally(measured as usize, "middle exit"),
+    },
+    Spec {
+        rule: Rule::MaxImportersPerFile,
+        name: "max_importers_per_file",
+        phrase: |measured, _| super::tally(measured as usize, "importer"),
+    },
+];
+
+/// Every rule, in report order. Derived from [`SPECS`] so a rule cannot be
+/// offered by a diagnostic without the parser accepting it.
+pub(super) fn known() -> impl Iterator<Item = Rule> {
+    SPECS.iter().map(|spec| spec.rule)
+}
+
+impl Rule {
+    /// This rule's row in [`SPECS`].
+    ///
+    /// A variant missing from the table would panic here rather than answer
+    /// wrongly — a name is what the parser matches and what the report
+    /// prints, and a plausible-looking wrong one is the failure that is not
+    /// noticed. It is unreachable by construction: nothing outside this
+    /// module can produce a `Rule` the table does not list, because `parse`
+    /// and `known` both read the table.
+    fn spec(self) -> &'static Spec {
+        SPECS
+            .iter()
+            .find(|spec| spec.rule == self)
+            .expect("every Rule variant has a row in SPECS")
+    }
+
     pub fn name(self) -> &'static str {
-        match self {
-            Rule::MaxDoorsPerFolder => "max_doors_per_folder",
-            Rule::MaxElementsPerEntity => "max_elements_per_entity",
-            Rule::MaxEntitiesPerFile => "max_entities_per_file",
-            Rule::MaxImportersPerFile => "max_importers_per_file",
-        }
+        self.spec().name
     }
 
     /// How one breach of this rule reads. `subject` is the entity that broke
     /// it, absent when the subject is the path itself.
-    ///
-    /// The count only. What the count is *of* — which importers, which doors
-    /// — is a list the report prints beside this, because a rule an author
-    /// can act on has to name the places, and a phrase that carried them
-    /// would be a sentence with a list inside it.
     pub fn phrase(self, measured: u32, subject: Option<&str>) -> String {
-        match self {
-            Rule::MaxDoorsPerFolder => super::tally(measured as usize, "door"),
-            Rule::MaxElementsPerEntity => match subject {
-                Some(name) => format!("{name} has {measured} elements"),
-                None => format!("{measured} elements"),
-            },
-            Rule::MaxEntitiesPerFile => format!("{measured} declared"),
-            Rule::MaxImportersPerFile => super::tally(measured as usize, "importer"),
-        }
+        (self.spec().phrase)(measured, subject)
     }
 
     fn parse(name: &str) -> Option<Rule> {
-        KNOWN.iter().copied().find(|rule| rule.name() == name)
+        SPECS
+            .iter()
+            .find(|spec| spec.name == name)
+            .map(|spec| spec.rule)
     }
 }
 
@@ -136,7 +203,7 @@ impl Rules {
 
 /// Where the rules file for an analyzed path lives, whether or not it
 /// exists. The same repo-scope directory the settings file uses, so
-/// `nao check src` and `nao check .` read one file (CFG-012).
+/// `mezz check src` and `mezz check .` read one file (CFG-012).
 pub fn path_for(root: &Path) -> PathBuf {
     settings::repo_dir(root).join(FILE_NAME)
 }
@@ -244,9 +311,5 @@ fn at(path: &Path, message: String) -> String {
 }
 
 fn known_names() -> String {
-    KNOWN
-        .iter()
-        .map(|rule| rule.name())
-        .collect::<Vec<_>>()
-        .join(", ")
+    known().map(Rule::name).collect::<Vec<_>>().join(", ")
 }

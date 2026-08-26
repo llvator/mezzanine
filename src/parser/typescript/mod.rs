@@ -48,18 +48,8 @@ impl TypeScriptParser {
     /// Pick the TSX or TS grammar based on file extension.
     fn new_for_path(path: &Path) -> Self {
         let mut parser = Parser::new();
-        let is_tsx = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e == "tsx")
-            .unwrap_or(false);
-        let language = if is_tsx {
-            tree_sitter_typescript::language_tsx()
-        } else {
-            tree_sitter_typescript::language_typescript()
-        };
         parser
-            .set_language(&language)
+            .set_language(&grammar_for_path(path))
             .expect("Failed to set TypeScript language");
         Self { parser }
     }
@@ -68,6 +58,26 @@ impl TypeScriptParser {
         self.parser
             .parse(content, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse TypeScript code"))
+    }
+}
+
+/// Which of the two grammars reads this file.
+///
+/// TSX is not only for `.tsx`. Every JavaScript extension takes it too
+/// (JS-001), because JSX in a plain `.js` file is ordinary React and the TS
+/// grammar cannot read it: on a component whose JSX attributes call three
+/// functions, the TS grammar recovers the declarations through error repair
+/// but loses **all three** call edges, while the TSX grammar keeps them.
+/// Nothing is given up in exchange — the one construct TSX cannot parse,
+/// the `<T>expr` cast, is TypeScript syntax that no JavaScript file holds.
+fn grammar_for_path(path: &Path) -> tree_sitter::Language {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    match ext {
+        "tsx" | "jsx" | "js" | "mjs" | "cjs" => tree_sitter_typescript::language_tsx(),
+        _ => tree_sitter_typescript::language_typescript(),
     }
 }
 
