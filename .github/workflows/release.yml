@@ -241,6 +241,24 @@ jobs:
           pattern: binary-*
           path: engines
 
+      # `build:webview` is `cd ../ui && vite build`, so ui/ needs its OWN
+      # dependencies installed — vscode-extension's npm install does not
+      # reach across the directory, and vite is not on a runner's PATH. A
+      # clean checkout has no ui/node_modules, so without this the job dies
+      # on `vite: not found` before it packages anything.
+      #
+      # This went unnoticed from the day the job was written: v1.3.0 and
+      # v1.4.0 both failed further up the graph, so `vsix` was skipped and
+      # never reached the line. The public emptying mirrors the `ui` job —
+      # vite copies ui/public verbatim into the bundle, and a developer's
+      # `mezz watch` output is what usually sits there.
+      - name: Install UI dependencies
+        run: |
+          set -euo pipefail
+          rm -f ui/public/data*.json ui/public/diff.json
+          cd ui
+          npm install
+
       # build:all rebuilds the webview itself — `build:vscode` is a different
       # vite config from the browser build, so the ui-dist artifact cannot
       # stand in for it — and copies content/ into the extension.
