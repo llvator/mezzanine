@@ -51,6 +51,7 @@
 
 use crate::models::CodeEntity;
 use tree_sitter::Node;
+use crate::parser::working_set;
 
 /// Populate the per-callable metrics every entity kind shares: LOC,
 /// parameter count, and the three body-complexity numbers.
@@ -63,6 +64,7 @@ use tree_sitter::Node;
 /// which is the whole reason KT-002 exists.
 pub(in crate::parser::kotlin) fn populate_body_metrics(
     body: Option<Node>,
+    source: &str,
     entity: &mut CodeEntity,
 ) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
@@ -80,6 +82,8 @@ pub(in crate::parser::kotlin) fn populate_body_metrics(
             entity.metrics.cognitive_complexity = Some(0);
         }
     }
+    working_set::populate(entity, body.as_ref(), source);
+    crate::parser::loops::populate(entity, body.as_ref());
 }
 
 /// Node kinds that add one to cyclomatic complexity on sight.

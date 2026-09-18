@@ -22,7 +22,7 @@ use super::super::helpers::is_predeclared_type;
 /// The type half lives in [`is_predeclared_type`] rather than here,
 /// because `UsesType` extraction needs exactly that half and neither list
 /// should be able to drift from the other.
-pub(super) fn is_builtin(name: &str) -> bool {
+pub(crate) fn is_builtin(name: &str) -> bool {
     is_predeclared_type(name)
         || matches!(
             name,

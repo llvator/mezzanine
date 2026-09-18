@@ -33,7 +33,7 @@ use tokio::sync::{broadcast, RwLock, Semaphore};
 use crate::output::{self, JsonRenderer};
 
 use super::access::{self, AccessOptions, AccessPolicy};
-use super::handlers::{git_branch, git_commits};
+use super::handlers::{self, git_branch, git_commits};
 use super::jobs::{self, JobConfig, JobLimiter, Submission};
 use super::repo::{
     analyze_repo, is_valid_slug, parse_github_url, rehydrate, unsafe_passes_allowed, RepoRegistry,
@@ -479,12 +479,20 @@ async fn repo_branch(
 
 /// GET /api/repos/{slug}/commits — recent commits of the analyzed checkout.
 /// A shallow clone has one; that's a truthful answer, not an error.
+///
+/// `HEAD` and the default window, not the query string watch mode honours: a
+/// listing of another branch is for choosing a comparison, and serve mode has
+/// no diff endpoint to make one with (SRV-003).
 async fn repo_commits(
     State(state): State<ServeState>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Json<Vec<CommitInfo>>, (StatusCode, String)> {
     let repo = lookup(&state, &slug).await?;
-    Ok(Json(git_commits(&repo.root_path)?))
+    Ok(Json(git_commits(
+        &repo.root_path,
+        None,
+        handlers::COMMIT_WINDOW,
+    )?))
 }
 
 /// POST /api/repos/{slug}/scope — smart scope traversal.

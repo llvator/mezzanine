@@ -169,6 +169,27 @@ pub enum RelationshipKind {
     /// (`{path}/{template ?? name}.yml.j2`). The load-bearing edge that
     /// ties "what is declared as deployed" to "which file defines it".
     RendersFrom,
+    /// docker: a Compose service builds from a Dockerfile stage
+    /// (`build: {context, dockerfile, target}`). The load-bearing edge of
+    /// the Docker graph, and the one the files themselves cannot state:
+    /// it ties *what runs* to *which stage builds it*, across a file
+    /// boundary, through a path that has to be resolved to be believed.
+    ///
+    /// Plays the same role here that `RendersFrom` plays for
+    /// ansible-deploy, and is kept separate for the same reason the two
+    /// deployment kinds are separate — a reader tracing a container back
+    /// to its build is asking a different question from one tracing a
+    /// manifest back to its template.
+    BuildsFrom,
+    /// docker: a build stage copies artefacts out of an earlier stage
+    /// (`COPY --from=builder`). The multi-stage lineage — the edge that
+    /// makes a builder stage load-bearing rather than dead.
+    ///
+    /// A dependency, not containment: the copying stage breaks when the
+    /// copied-from stage stops producing the path. Distinct from
+    /// `Inherits` (`FROM`), which starts a stage from an image, where this
+    /// reaches sideways into one that already finished.
+    CopiesFrom,
     /// A template interpolates a name it did not declare.
     ///
     /// ansible-deploy: a TemplateFile interpolates a `{{ variable }}`,
@@ -225,6 +246,8 @@ impl RelationshipKind {
                 | RelationshipKind::Requires
                 | RelationshipKind::RendersFrom
                 | RelationshipKind::Interpolates
+                | RelationshipKind::BuildsFrom
+                | RelationshipKind::CopiesFrom
         )
     }
 
@@ -296,7 +319,21 @@ impl RelationshipKind {
             RelationshipKind::AssociatedWith => "associated with",
             RelationshipKind::ComposedOf => "composed of",
             RelationshipKind::Aggregates => "aggregates",
-            // Only the kinds `display_label` already answered reach here.
+            other => other.build_label(),
+        }
+    }
+
+    /// The kinds that describe how an image or a container is built.
+    ///
+    /// A fourth step in the chain rather than two more arms above, for the
+    /// reason [`Self::display_label`] gives: `wider_label` sat one arm
+    /// under the complexity ceiling, so Docker's two kinds could not join
+    /// it without pushing it over.
+    fn build_label(&self) -> &'static str {
+        match self {
+            RelationshipKind::BuildsFrom => "builds from",
+            RelationshipKind::CopiesFrom => "copies from",
+            // Only the kinds an earlier step already answered reach here.
             _ => "related to",
         }
     }

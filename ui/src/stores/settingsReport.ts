@@ -16,7 +16,7 @@ import { writable, get } from 'svelte/store';
 import { apiUrl } from '../vscodeAdapter';
 
 /** Which link of the chain supplied a value. Mirrors `settings::report::Origin`. */
-export type Origin = 'flag' | 'env' | 'repo-file' | 'user-file' | 'default';
+export type Origin = 'flag' | 'env' | 'repo-override' | 'repo-file' | 'user-file' | 'default';
 
 /** What a key controls, which is what decides whether it is editable here. */
 export type Tier = 'analysis' | 'view' | 'process';
@@ -67,6 +67,7 @@ export const settingsReportError = writable<string | null>(null);
 export const ORIGIN_LABEL: Record<Origin, string> = {
   flag: 'command line',
   env: 'environment',
+  'repo-override': 'your override',
   'repo-file': 'this repo',
   'user-file': 'your settings',
   default: 'default',
@@ -75,6 +76,8 @@ export const ORIGIN_LABEL: Record<Origin, string> = {
 export const ORIGIN_TITLE: Record<Origin, string> = {
   flag: 'Passed as a flag to the command that started this server.',
   env: 'From a MEZZ_* environment variable.',
+  'repo-override':
+    'From the "repos" entry naming this checkout in your ~/.config/mezz/settings.json. It outranks the repo\'s own file.',
   'repo-file': "From this repo's .mezz/settings.json.",
   'user-file': 'From your ~/.config/mezz/settings.json.',
   default: "Nobody set this — it's mezz's built-in default.",

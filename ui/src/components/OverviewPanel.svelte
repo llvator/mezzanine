@@ -157,15 +157,13 @@
      toward the centre — and taking a column instead would shrink the very
      view this exists to help the reader hold.
 
-     The bottom inset clears `.canvas-bottom-bar`, which occupies the same
-     corner and carries the live-status and endpoint chips. At 12px this panel
-     covered them completely — a status indicator that is invisible is worse
-     than absent, because the page still looks like it is reporting one. The
-     inset is no longer a constant: the strip grows with the controls the diff
-     badge carries and wraps on a narrow window, so `App` measures it and
-     passes the clearance in. The 60px here is only the value before the first
-     measurement lands. The probe's `clears-the-bottom-bar` check asserts the
-     zero overlap, so the two cannot drift back into each other. */
+     The bottom inset used to clear the changes strip, which shared this corner
+     and carried the live-status and endpoint chips: at 12px this panel covered
+     them completely, and a status indicator that is invisible is worse than
+     absent, because the page still looks like it is reporting one. Since
+     UI-150 that strip is a row of the app shell and no longer overlaps the
+     canvas at all, so the inset is a constant again — what is left in this
+     corner is the build stamp the VS Code webview pins there. */
   .overview {
     position: absolute;
     right: 12px;

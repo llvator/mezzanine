@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   planDiffLevel, isDiffLevel, DIFF_LEVELS,
   splitEdits, isSeedFacet, SEED_FACETS,
+  linkTier,
   type LevelEdge, type EditKind, type DiffSeedFacet,
 } from '../src/viewmodels/diffLevels.ts';
 
@@ -291,4 +292,38 @@ test('the excluded half is context when a rung recruits it back', () => {
   const p = planDiffLevel('neighbourhood', SPLIT_ALL, seed, links, excluded);
   assert.deepEqual(ids(p.visible), ['arrived', 'touched']);
   assert.deepEqual(ids(p.context), ['arrived']);
+});
+
+// ── UI-144: the Rest tier's wiring ────────────────────────────────────────
+
+test('a line between two drawn nodes the rung chose is the loud tier', () => {
+  const changed = new Set(['a->b|Calls']);
+  assert.equal(linkTier('a', 'b', 'a->b|Calls', new Set(['a', 'b']), changed), 'visible');
+});
+
+test('an untouched line between two visible nodes falls to the Rest tier', () => {
+  // The rung below `neighbourhood` still refuses to draw this *loudly* — that
+  // is the whole point of the ladder. What it may no longer do is drop it: an
+  // untouched call between two edited entities is exactly the wiring a reader
+  // raising the Rest slider is asking to see.
+  const changed = new Set(['a->b|Calls']);
+  assert.equal(linkTier('a', 'c', 'a->c|Calls', new Set(['a', 'b', 'c']), changed), 'rest');
+});
+
+test('a line with one end outside the rung is the Rest tier', () => {
+  // The case the bug report was about, and the one that matters most: the
+  // line from something the reader changed down into the untouched code it
+  // calls. Neither `changedLinkKeys` nor the node rung can place it, because
+  // it is about the boundary between them.
+  assert.equal(linkTier('a', 'rest', 'a->rest|Calls', new Set(['a']), null), 'rest');
+});
+
+test('a line between two Rest nodes is the Rest tier', () => {
+  assert.equal(linkTier('x', 'y', 'x->y|Calls', new Set(['a']), null), 'rest');
+});
+
+test('at neighbourhood every line between visible nodes is loud', () => {
+  // `changedEdgesOnly` is false there, which reaches `linkTier` as a null
+  // key set — untouched wiring is the rung's own, not the Rest tier's.
+  assert.equal(linkTier('a', 'b', 'a->b|Calls', new Set(['a', 'b']), null), 'visible');
 });

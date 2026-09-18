@@ -68,6 +68,7 @@ Per entity (functions, methods, classes/structs, files):
 
 - Cyclomatic complexity
 - Cognitive complexity
+- Working set (names in view: parameters + locals + `self`/`this` fields)
 - Fan-in / fan-out
 - Weighted Methods per Class (WMC)
 - Dependency-chain depth
@@ -82,6 +83,9 @@ Per entity (functions, methods, classes/structs, files):
 - **Data Bag** (informational — flagged separately from the red smells
   since Kotlin `data class` and Python `@dataclass` are idiomatic uses
   of the same pattern).
+- **Overfull Head** (working set over 12 — the only smell that does not
+  depend on branching, so it catches the flat function that is hard to
+  read because of how much it holds, not how much it decides).
 
 ### Commands
 
@@ -102,7 +106,7 @@ Per entity (functions, methods, classes/structs, files):
 
 ## Supported languages
 
-Thirteen languages have dedicated parsers. They differ in what they give you, so
+Seventeen languages have dedicated parsers. They differ in what they give you, so
 the tiers below are by capability rather than by a first-class/fallback split.
 
 **Full: entities, call edges, and exact `UsesType` edges from signatures and
@@ -118,6 +122,7 @@ fields** — this is the tier where `impact` is type-accurate.
 | Kotlin | |
 | Dart | Full Dart 3 — class modifiers, records, patterns, extension types. Its grammar is vendored rather than pulled from crates.io; see `vendor/tree-sitter-dart/` |
 | Groovy | Includes Spring bean and embedded-script handling. Only what the code declares: `def` is the absence of a type, so dynamically-typed members carry no edge |
+| C++ / C | One parser for both — C++ is a superset of C for everything it reads, and `.h` belongs to both. Resolves a call through what the file declares, so `repo_->save()` reaches `Repository::save`; where the class body lives in a header this parse never saw, the receiver's own text is kept rather than guessed at. A `#define` is an entity, and a `SCREAMING_CASE` name read without being called is a dependency. `.h` is claimed by C, so narrow a C++ repo with `-l cpp,c` rather than `-l cpp` — an unnarrowed `mezz analyze .` reads both |
 | Svelte | Component-level; much smaller in scope than the others |
 
 **Entities and call edges, no type edges** — `impact` here approximates type
@@ -129,6 +134,8 @@ usage via "used via members".
 | Impex (SAP Hybris) | Hand-rolled parser; no tree-sitter grammar exists for the format |
 | Ansible / Kubernetes | Topology-oriented: playbooks, roles, vars and templates, not individual tasks |
 | Elevator (`.elv`) | The domain-spec language, not source code |
+| SQL | Schema-oriented: tables and columns, with a foreign key drawn as the join it is — which key joins two tables, and how many rows sit at each end |
+| Docker | Dockerfiles and Compose files read as one build-and-run topology — images, build stages and services, and what each one is built from or depends on. An entity cites the lines that define it |
 | Markdown (`.md`) | Documents and the links between them, plus the source files they point at. **Opt-in** — see below |
 
 ### Turning on the documentation layer
@@ -189,13 +196,22 @@ A `mezz` binary is installed as a prerequisite of the extension and can
 also be used directly:
 
 ```bash
-# Set a repo up: pin the languages it is written in, in .mezz/settings.json
+# Set a repo up: pin the languages it is written in, plus where the graph
+# is written and which port serves it, in .mezz/settings.json
 # (--vscode adds tasks that start, open and stop the browser UI; --mcp
-#  registers the MCP server in .mcp.json; --all does both)
+#  registers the MCP server in .mcp.json; --all does both. --editor-tools
+#  adds one task per graph tool, each scoped to the file open in VS Code)
 mezz init ./my-project --all
 
 # Serve an analysis with live reload (used by the extension)
 mezz watch ./my-project --port 3200
+
+# Watch the tree's quality as a live terminal dashboard — no browser, no port
+# (every figure is a delta against the last commit; --baseline names another)
+mezz monitor ./my-project
+
+# Or hold both ends still and read the distance between two commits
+mezz monitor ./my-project --baseline v0.4.0 --against HEAD
 
 # One-shot JSON analysis
 mezz analyze ./my-project -f json -o analysis.json
@@ -277,11 +293,11 @@ A snapshot of `src/` against the same complexity ceiling CI enforces (cyclomatic
 <!-- repo-health:start -->
 | Metric | Value |
 |---|---|
-| Source files (Rust) | 214 |
-| Functions analyzed | 2921 |
-| Functions above ceiling (grandfathered) | 107 |
-| Cyclomatic complexity (p50 / p90 / max) | 2 / 8 / 41 |
-| Cognitive complexity (p50 / p90 / max) | 1 / 10 / 129 |
+| Source files (Rust) | 274 |
+| Functions analyzed | 4520 |
+| Functions above ceiling (grandfathered) | 97 |
+| Cyclomatic complexity (p50 / p90 / max) | 2 / 7 / 33 |
+| Cognitive complexity (p50 / p90 / max) | 1 / 8 / 129 |
 | Max nesting depth (p50 / p90 / max) | 1 / 3 / 12 |
 <!-- repo-health:end -->
 

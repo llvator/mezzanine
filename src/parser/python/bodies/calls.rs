@@ -8,25 +8,158 @@
 
 use super::flow::{
     emit_branch_entity, emit_case_arm_entity, emit_loop_entity, emit_try_arm_entity,
-    emit_with_entity,
+    emit_with_entity, Arm,
 };
-use super::stdlib::is_bare_builtin;
+use super::inference::{Locals, Returns};
 use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, Visibility};
 use crate::parser::language_parser::{node_text, ParseResult};
+use crate::parser::working_set;
 use std::path::Path;
 use tree_sitter::Node;
 
-#[allow(clippy::too_many_arguments)]
+/// Who a call is attributed to, and everything fixed for the whole body that
+/// deciding a target needs. Read-only, so a helper that resolves a name
+/// cannot reach the walk's counters.
+pub(in crate::parser::python) struct Caller<'a> {
+    pub source: &'a str,
+    pub path: &'a Path,
+    pub id: &'a str,
+    pub name: &'a str,
+    /// The class this callable hangs off, when it is a method — what `self`,
+    /// `cls` and a bare sibling-method call resolve against.
+    pub parent_class: Option<&'a str>,
+    /// What this body's class and signature declare about the types its
+    /// receivers hold, so `self.store.save()` can resolve to `Store.save`
+    /// (PY-031). Empty for a body that annotates nothing, which leaves every
+    /// receiver spelled the way the source spells it.
+    pub locals: &'a Locals,
+    /// What a call to each name in this file evaluates to, so the links of a
+    /// fluent chain resolve (PY-032).
+    pub returns: &'a Returns,
+}
+
+/// What the walk accumulates as it descends: the call ordinal, and the
+/// result it is written into. Owned rather than borrowed — the ordinal
+/// starts at zero with the body and leaves only as edge metadata.
+struct Walk<'a> {
+    call_order: u32,
+    result: &'a mut ParseResult,
+}
+
+/// Context threaded through the walk, so a recursive step passes one
+/// reference rather than nine arguments. The two halves are separate structs
+/// because they change for separate reasons: a new counter is not a new
+/// thing to know about the caller.
+pub(in crate::parser::python) struct CallCtx<'a> {
+    caller: Caller<'a>,
+    walk: Walk<'a>,
+}
+
+impl<'a> CallCtx<'a> {
+    /// Start a walk over one callable's body. The call ordinal begins at
+    /// zero per body, which is what makes `order` metadata read relative to
+    /// the callable rather than to the file.
+    pub(in crate::parser::python) fn new(caller: Caller<'a>, result: &'a mut ParseResult) -> Self {
+        Self {
+            caller,
+            walk: Walk {
+                call_order: 0,
+                result,
+            },
+        }
+    }
+
+    /// Consume the next call ordinal. Taken before any filtering, so a
+    /// dropped call still burns its number and the edges that survive keep
+    /// their source order.
+    fn next_order(&mut self) -> u32 {
+        self.walk.call_order += 1;
+        self.walk.call_order
+    }
+
+    /// Address one synthetic flow entity: this caller, this enclosing arm,
+    /// this path, this file.
+    fn arm<'p>(&self, parent_branch: Option<&'p str>, path: &'p str) -> Arm<'p>
+    where
+        'a: 'p,
+    {
+        Arm {
+            caller_id: self.caller.id,
+            parent_branch,
+            path,
+            file: self.caller.path,
+        }
+    }
+}
+
+/// The three per-scope counters.
+///
+/// [`extract_calls`] starts a fresh set for every block it walks — a method
+/// body, a branch arm, a loop body — which is what makes `c1` / `l1` / `w1`
+/// read relative to their container instead of continuing the outer scope's
+/// sequence. Arms, loops and `with` blocks count on separate sequences so
+/// the first `if` and the first `for` at one scope are `c1` and `l1` rather
+/// than `c1` and `c2`.
+#[derive(Default)]
+struct Counters {
+    arm: u32,
+    loops: u32,
+    withs: u32,
+}
+
+impl Counters {
+    fn next_arm(&mut self, current_branch: Option<&str>) -> String {
+        self.arm += 1;
+        nested_path(current_branch, 'c', self.arm)
+    }
+
+    fn next_loop(&mut self, current_branch: Option<&str>) -> String {
+        self.loops += 1;
+        nested_path(current_branch, 'l', self.loops)
+    }
+
+    fn next_with(&mut self, current_branch: Option<&str>) -> String {
+        self.withs += 1;
+        nested_path(current_branch, 'w', self.withs)
+    }
+}
+
+/// An arm's path under its parent: `c1`, then `c1.l2` for a loop inside it.
+fn nested_path(current_branch: Option<&str>, prefix: char, idx: u32) -> String {
+    match current_branch {
+        Some(p) => format!("{}.{}{}", p, prefix, idx),
+        None => format!("{}{}", prefix, idx),
+    }
+}
+
+/// One edge out of the callable being walked, tagged with the arm it fired
+/// in so the analyzer can re-parent it onto that arm's node.
+fn edge(
+    caller_id: &str,
+    target: String,
+    kind: RelationshipKind,
+    current_branch: Option<&str>,
+) -> Relationship {
+    let mut rel = Relationship::new(caller_id.to_string(), target, kind);
+    if let Some(b) = current_branch {
+        rel.metadata.insert("branch".to_string(), b.to_string());
+    }
+    rel
+}
+
+/// Walk a child that may not be there. Every control-flow handler reaches
+/// for optional grammar fields, and spelling the `if let` out at each one is
+/// what pushed those handlers over the names-in-view line.
+fn walk_opt(target: Option<Node>, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    if let Some(target) = target {
+        extract_calls(&target, ctx, current_branch);
+    }
+}
+
 pub(in crate::parser::python) fn extract_calls(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    result: &mut ParseResult,
 ) {
     // Per-node dispatch: call sites, assignments, walrus writes, and
     // lambda scope creation. Pulled into a helper so this function's
@@ -34,29 +167,14 @@ pub(in crate::parser::python) fn extract_calls(
     // Returns true when the dispatch handled `node` as its own scope
     // (currently: only lambda) and the rest of this call should be
     // skipped — otherwise the walk continues normally.
-    if run_node_handlers(
-        node,
-        source,
-        path,
-        caller_id,
-        caller_name,
-        parent_class,
-        call_order,
-        current_branch,
-        result,
-    ) {
+    if run_node_handlers(node, ctx, current_branch) {
         return;
     }
-    // Per-scope counters: each recursive call (method body, branch
-    // body, loop body, module body) has its own numbering reset,
-    // so nested control-flow labels restart at 1 under their
-    // container instead of continuing the outer counter. Branch
-    // arms and loops use separate counters so the first if and the
-    // first for at the same scope are `c1` and `l1` rather than
-    // `c1` and `c2`.
-    let mut arm_counter = 0u32;
-    let mut loop_counter = 0u32;
-    let mut with_counter = 0u32;
+    // Per-scope counters: each recursive call (method body, branch body,
+    // loop body, module body) has its own numbering reset, so nested
+    // control-flow labels restart at 1 under their container instead of
+    // continuing the outer counter.
+    let mut counters = Counters::default();
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -70,134 +188,18 @@ pub(in crate::parser::python) fn extract_calls(
             "function_definition" | "class_definition" | "decorated_definition" => {
                 continue;
             }
-            "if_statement" => {
-                handle_if_statement(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    &mut arm_counter,
-                    result,
-                );
-            }
-            "for_statement" => {
-                handle_for_statement(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    &mut arm_counter,
-                    &mut loop_counter,
-                    result,
-                );
-            }
-            "conditional_expression" => {
-                handle_ternary(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    result,
-                );
-            }
+            "if_statement" => handle_if_statement(&child, ctx, current_branch, &mut counters),
+            "for_statement" => handle_for_statement(&child, ctx, current_branch, &mut counters),
+            "conditional_expression" => handle_ternary(&child, ctx, current_branch),
             "list_comprehension"
             | "set_comprehension"
             | "dictionary_comprehension"
-            | "generator_expression" => {
-                handle_comprehension(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    result,
-                );
-            }
-            "try_statement" => {
-                handle_try_statement(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    &mut arm_counter,
-                    result,
-                );
-            }
-            "match_statement" => {
-                handle_match_statement(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    &mut arm_counter,
-                    result,
-                );
-            }
-            "with_statement" => {
-                handle_with_statement(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    &mut with_counter,
-                    result,
-                );
-            }
-            "while_statement" => {
-                handle_while_statement(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    &mut arm_counter,
-                    &mut loop_counter,
-                    result,
-                );
-            }
-            _ => {
-                extract_calls(
-                    &child,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    result,
-                );
-            }
+            | "generator_expression" => handle_comprehension(&child, ctx, current_branch),
+            "try_statement" => handle_try_statement(&child, ctx, current_branch, &mut counters),
+            "match_statement" => handle_match_statement(&child, ctx, current_branch, &mut counters),
+            "with_statement" => handle_with_statement(&child, ctx, current_branch, &mut counters),
+            "while_statement" => handle_while_statement(&child, ctx, current_branch, &mut counters),
+            _ => extract_calls(&child, ctx, current_branch),
         }
     }
 }
@@ -206,7 +208,7 @@ pub(in crate::parser::python) fn extract_calls(
 /// walrus writes, and lambda scope creation. Returns `true` when the
 /// node was treated as its own scope and the caller should stop
 /// walking children — only lambdas trigger that, since they own their
-/// own caller_id and the recursion happens inside `handle_lambda`.
+/// own caller id and the recursion happens inside `handle_lambda`.
 ///
 /// Other handlers fire alongside the normal child-walk: `handle_call`
 /// on a `call` node, the assignment handlers on `assignment` /
@@ -214,47 +216,15 @@ pub(in crate::parser::python) fn extract_calls(
 /// `named_expression`. `handle_call` runs even when `extract_calls` was
 /// passed the call directly (e.g. a `for k, v in mapping.items():`
 /// where the iterator field IS the call) so the call edge isn't lost.
-#[allow(clippy::too_many_arguments)]
-fn run_node_handlers(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) -> bool {
+fn run_node_handlers(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) -> bool {
     match node.kind() {
         "lambda" => {
-            handle_lambda(node, source, path, caller_id, parent_class, result);
+            handle_lambda(node, ctx);
             return true;
         }
-        "call" => {
-            handle_call(
-                node,
-                source,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                current_branch,
-                result,
-            );
-        }
-        "raise_statement" => {
-            handle_raise(node, source, caller_id, current_branch, result);
-        }
-        _ => handle_write_forms(
-            node,
-            source,
-            path,
-            caller_id,
-            parent_class,
-            current_branch,
-            result,
-        ),
+        "call" => handle_call(node, ctx, current_branch),
+        "raise_statement" => handle_raise(node, ctx, current_branch),
+        _ => handle_write_forms(node, ctx, current_branch),
     }
     false
 }
@@ -262,31 +232,13 @@ fn run_node_handlers(
 /// The node kinds that bind a name: `x = …`, `x += …`, and the walrus
 /// `(x := …)`. Grouped into one dispatch arm so adding a node-kind handler to
 /// `run_node_handlers` doesn't widen its match every time.
-#[allow(clippy::too_many_arguments)]
-fn handle_write_forms(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    parent_class: Option<&str>,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_write_forms(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     match node.kind() {
         "assignment" | "augmented_assignment" => {
-            handle_self_write(
-                node,
-                source,
-                caller_id,
-                parent_class,
-                current_branch,
-                result,
-            );
-            handle_local_write(node, source, path, caller_id, current_branch, result);
+            handle_self_write(node, ctx, current_branch);
+            handle_local_write(node, ctx, current_branch);
         }
-        "named_expression" => {
-            handle_walrus_write(node, source, path, caller_id, current_branch, result);
-        }
+        "named_expression" => handle_walrus_write(node, ctx, current_branch),
         _ => {}
     }
 }
@@ -308,16 +260,11 @@ fn handle_write_forms(
 /// A bare `raise` (the re-raise inside an `except`) names nothing and is
 /// skipped. The branch tag is honoured — raising inside an `except` arm is
 /// the common case, and the edge belongs to that arm.
-fn handle_raise(
-    node: &Node,
-    source: &str,
-    caller_id: &str,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_raise(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     let Some(raised) = node.named_child(0) else {
         return;
     };
+    let source = ctx.caller.source;
     let named = match raised.kind() {
         "call" => raised
             .child_by_field_name("function")
@@ -327,13 +274,15 @@ fn handle_raise(
     let Some(target) = named else {
         return;
     };
-    let mut rel = Relationship::new(caller_id.to_string(), target, RelationshipKind::References);
+    let mut rel = edge(
+        ctx.caller.id,
+        target,
+        RelationshipKind::References,
+        current_branch,
+    );
     rel.metadata
         .insert("raises".to_string(), "true".to_string());
-    if let Some(b) = current_branch {
-        rel.metadata.insert("branch".to_string(), b.to_string());
-    }
-    result.add_relationship(rel);
+    ctx.walk.result.add_relationship(rel);
 }
 
 /// `a if cond else b` is a control-flow split inside an expression (PY-011):
@@ -346,49 +295,22 @@ fn handle_raise(
 /// two empty Branch nodes for each of those would bury the decision trees
 /// that matter under one-liner noise. The condition always stays in the
 /// enclosing scope; it is evaluated either way.
-#[allow(clippy::too_many_arguments)]
-fn handle_ternary(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_ternary(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     // Positional children, in source order: consequence, condition,
     // alternative — `a if cond else b`.
     let consequence = node.named_child(0);
     let condition = node.named_child(1);
     let alternative = node.named_child(2);
 
-    let mut walk = |target: Option<Node>, branch: Option<&str>, result: &mut ParseResult| {
-        if let Some(target) = target {
-            extract_calls(
-                &target,
-                source,
-                path,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                branch,
-                result,
-            );
-        }
-    };
-
-    walk(condition, current_branch, result);
+    walk_opt(condition, ctx, current_branch);
 
     let worth_branching = [consequence, alternative]
         .into_iter()
         .flatten()
         .any(|arm| contains_call(&arm));
     if !worth_branching {
-        walk(consequence, current_branch, result);
-        walk(alternative, current_branch, result);
+        walk_opt(consequence, ctx, current_branch);
+        walk_opt(alternative, ctx, current_branch);
         return;
     }
 
@@ -398,8 +320,12 @@ fn handle_ternary(
             Some(p) => format!("{}.{}_{}", p, base, index + 1),
             None => format!("{}_{}", base, index + 1),
         };
-        emit_branch_entity(caller_id, current_branch, &branch_path, &arm, path, result);
-        walk(Some(arm), Some(&branch_path), result);
+        emit_branch_entity(
+            &ctx.arm(current_branch, &branch_path),
+            &arm,
+            ctx.walk.result,
+        );
+        extract_calls(&arm, ctx, Some(&branch_path));
     }
 }
 
@@ -453,31 +379,18 @@ fn contains_call(node: &Node) -> bool {
 ///
 /// Nested `for` / `if` clauses need no special handling: they are children of
 /// the same comprehension node, so they land in the same loop scope.
-#[allow(clippy::too_many_arguments)]
-fn handle_comprehension(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_comprehension(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     let segment = flow_path_segment(node, "l");
     let loop_path = match current_branch {
         Some(p) => format!("{}.{}", p, segment),
         None => segment,
     };
+    let is_async = comprehension_is_async(node, ctx.caller.source);
     emit_loop_entity(
-        caller_id,
-        current_branch,
-        &loop_path,
+        &ctx.arm(current_branch, &loop_path),
         node,
-        path,
-        comprehension_is_async(node, source),
-        result,
+        is_async,
+        ctx.walk.result,
     );
     // A comprehension nested directly inside this one (`[[c for c in row]
     // for row in rows]`) is its own loop, but arrives as a child node rather
@@ -487,29 +400,9 @@ fn handle_comprehension(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if is_comprehension_kind(child.kind()) {
-            handle_comprehension(
-                &child,
-                source,
-                path,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                Some(&loop_path),
-                result,
-            );
+            handle_comprehension(&child, ctx, Some(&loop_path));
         } else {
-            extract_calls(
-                &child,
-                source,
-                path,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                Some(&loop_path),
-                result,
-            );
+            extract_calls(&child, ctx, Some(&loop_path));
         }
     }
 }
@@ -546,240 +439,98 @@ fn comprehension_is_async(node: &Node, source: &str) -> bool {
 /// and `handle_match_statement` were: the dispatch table has to stay at its
 /// grandfathered complexity, and it cannot if every control-flow construct
 /// spells its handling out inline.
-#[allow(clippy::too_many_arguments)]
 fn handle_if_statement(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
-    let branch_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.c{}", p, idx),
-            None => format!("c{}", idx),
-        }
-    };
-    // Condition expression stays in the enclosing scope —
-    // it's part of the outer flow, not a new arm.
-    if let Some(cond) = node.child_by_field_name("condition") {
-        extract_calls(
-            &cond,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            current_branch,
-            result,
-        );
-    }
+    // Condition expression stays in the enclosing scope — it's part of the
+    // outer flow, not a new arm.
+    walk_opt(node.child_by_field_name("condition"), ctx, current_branch);
     // The `if` arm is the first arm at this scope.
-    if let Some(body) = node.child_by_field_name("consequence") {
-        *arm_counter += 1;
-        let branch_path = branch_path_for(*arm_counter);
-        emit_branch_entity(caller_id, current_branch, &branch_path, &body, path, result);
-        extract_calls(
-            &body,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&branch_path),
-            result,
-        );
-    }
-    // Every `elif_clause` AND the final `else_clause` sit
-    // as sibling `alternative` fields on the if_statement
-    // itself (per tree-sitter-python's grammar), so we
-    // iterate them here instead of recursing into a chain.
+    walk_arm(
+        node.child_by_field_name("consequence"),
+        ctx,
+        current_branch,
+        counters,
+    );
+    // Every `elif_clause` AND the final `else_clause` sit as sibling
+    // `alternative` fields on the if_statement itself (per
+    // tree-sitter-python's grammar), so we iterate them here instead of
+    // recursing into a chain.
     let mut alt_cursor = node.walk();
     for alt in node.children_by_field_name("alternative", &mut alt_cursor) {
         match alt.kind() {
             "elif_clause" => {
-                if let Some(cond) = alt.child_by_field_name("condition") {
-                    extract_calls(
-                        &cond,
-                        source,
-                        path,
-                        caller_id,
-                        caller_name,
-                        parent_class,
-                        call_order,
-                        current_branch,
-                        result,
-                    );
-                }
-                if let Some(body) = alt.child_by_field_name("consequence") {
-                    *arm_counter += 1;
-                    let branch_path = branch_path_for(*arm_counter);
-                    emit_branch_entity(
-                        caller_id,
-                        current_branch,
-                        &branch_path,
-                        &body,
-                        path,
-                        result,
-                    );
-                    extract_calls(
-                        &body,
-                        source,
-                        path,
-                        caller_id,
-                        caller_name,
-                        parent_class,
-                        call_order,
-                        Some(&branch_path),
-                        result,
-                    );
-                }
-            }
-            "else_clause" => {
-                if let Some(body) = alt.child_by_field_name("body") {
-                    *arm_counter += 1;
-                    let branch_path = branch_path_for(*arm_counter);
-                    emit_branch_entity(
-                        caller_id,
-                        current_branch,
-                        &branch_path,
-                        &body,
-                        path,
-                        result,
-                    );
-                    extract_calls(
-                        &body,
-                        source,
-                        path,
-                        caller_id,
-                        caller_name,
-                        parent_class,
-                        call_order,
-                        Some(&branch_path),
-                        result,
-                    );
-                }
-            }
-            _ => {
-                extract_calls(
-                    &alt,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
+                walk_opt(alt.child_by_field_name("condition"), ctx, current_branch);
+                walk_arm(
+                    alt.child_by_field_name("consequence"),
+                    ctx,
                     current_branch,
-                    result,
+                    counters,
                 );
             }
+            "else_clause" => walk_arm(
+                alt.child_by_field_name("body"),
+                ctx,
+                current_branch,
+                counters,
+            ),
+            _ => extract_calls(&alt, ctx, current_branch),
         }
     }
 }
 
+/// Open one branch arm over `body` — take the next arm number at this scope,
+/// place the `Branch` entity, and walk the body inside it.
+///
+/// Every arm of an `if`, and the `else` of a loop, is this same three-step
+/// move; writing it once is what lets `handle_if_statement` read as the list
+/// of arms it dispatches rather than as the bookkeeping each one costs.
+fn walk_arm(
+    body: Option<Node>,
+    ctx: &mut CallCtx<'_>,
+    current_branch: Option<&str>,
+    counters: &mut Counters,
+) {
+    let Some(body) = body else { return };
+    let branch_path = counters.next_arm(current_branch);
+    emit_branch_entity(
+        &ctx.arm(current_branch, &branch_path),
+        &body,
+        ctx.walk.result,
+    );
+    extract_calls(&body, ctx, Some(&branch_path));
+}
+
 /// `for` / `async for`: one `Loop` entity, with the iterator expression, the
 /// body, and any `else` clause grouped under it.
-#[allow(clippy::too_many_arguments)]
 fn handle_for_statement(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    loop_counter: &mut u32,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
-    let branch_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.c{}", p, idx),
-            None => format!("c{}", idx),
-        }
-    };
-    let loop_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.l{}", p, idx),
-            None => format!("l{}", idx),
-        }
-    };
-    *loop_counter += 1;
-    let loop_path = loop_path_for(*loop_counter);
-    // Emit one Loop entity per for-loop, using the body
-    // span so the entity carries the real arm's lines.
+    let loop_path = counters.next_loop(current_branch);
+    let is_async = is_async_construct(node, ctx.caller.source);
+    // Emit one Loop entity per for-loop, using the body span so the entity
+    // carries the real arm's lines.
     if let Some(body) = node.child_by_field_name("body") {
         emit_loop_entity(
-            caller_id,
-            current_branch,
-            &loop_path,
+            &ctx.arm(current_branch, &loop_path),
             &body,
-            path,
-            is_async_construct(node, source),
-            result,
+            is_async,
+            ctx.walk.result,
         );
     }
-    // The iterator expression (`for k, v in kwargs.items()`)
-    // semantically belongs to the loop — the user sees
-    // `kwargs.items()` as part of the loop setup, so we
-    // group it under the Loop node instead of leaving it
+    // The iterator expression (`for k, v in kwargs.items()`) semantically
+    // belongs to the loop — the user sees `kwargs.items()` as part of the
+    // loop setup, so we group it under the Loop node instead of leaving it
     // at the outer scope.
-    if let Some(right) = node.child_by_field_name("right") {
-        extract_calls(
-            &right,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&loop_path),
-            result,
-        );
-    }
-    if let Some(body) = node.child_by_field_name("body") {
-        extract_calls(
-            &body,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&loop_path),
-            result,
-        );
-    }
-    // Python's `for`/`while` can carry an `else` clause
-    // that runs only when the loop completes without a
-    // break. Treat it as a branch arm inside the loop so
-    // calls there don't leak back to the outer scope.
-    if let Some(else_cl) = node.child_by_field_name("alternative") {
-        if let Some(body) = else_cl.child_by_field_name("body") {
-            *arm_counter += 1;
-            let arm_path = branch_path_for(*arm_counter);
-            emit_branch_entity(caller_id, Some(&loop_path), &arm_path, &body, path, result);
-            extract_calls(
-                &body,
-                source,
-                path,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                Some(&arm_path),
-                result,
-            );
-        }
-    }
+    walk_opt(node.child_by_field_name("right"), ctx, Some(&loop_path));
+    walk_opt(node.child_by_field_name("body"), ctx, Some(&loop_path));
+    walk_loop_else(node, ctx, current_branch, &loop_path, counters);
 }
 
 /// A `while` loop, handled as its own Loop scope. Mirrors
@@ -788,92 +539,50 @@ fn handle_for_statement(
 /// arm inside it. Split out of the `extract_calls` dispatch table so the
 /// walk stays a flat one-arm-per-node-kind match rather than carrying this
 /// construct's nesting inline.
-#[allow(clippy::too_many_arguments)]
 fn handle_while_statement(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    loop_counter: &mut u32,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
-    let branch_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.c{}", p, idx),
-            None => format!("c{}", idx),
-        }
-    };
-    let loop_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.l{}", p, idx),
-            None => format!("l{}", idx),
-        }
-    };
-    *loop_counter += 1;
-    let loop_path = loop_path_for(*loop_counter);
+    let loop_path = counters.next_loop(current_branch);
     if let Some(body) = node.child_by_field_name("body") {
         // A `while` is never async.
         emit_loop_entity(
-            caller_id,
-            current_branch,
-            &loop_path,
+            &ctx.arm(current_branch, &loop_path),
             &body,
-            path,
             false,
-            result,
+            ctx.walk.result,
         );
     }
-    // The condition runs on every iteration, so group
-    // any calls inside it with the loop too.
-    if let Some(cond) = node.child_by_field_name("condition") {
-        extract_calls(
-            &cond,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&loop_path),
-            result,
-        );
-    }
-    if let Some(body) = node.child_by_field_name("body") {
-        extract_calls(
-            &body,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&loop_path),
-            result,
-        );
-    }
-    if let Some(else_cl) = node.child_by_field_name("alternative") {
-        if let Some(body) = else_cl.child_by_field_name("body") {
-            *arm_counter += 1;
-            let arm_path = branch_path_for(*arm_counter);
-            emit_branch_entity(caller_id, Some(&loop_path), &arm_path, &body, path, result);
-            extract_calls(
-                &body,
-                source,
-                path,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                Some(&arm_path),
-                result,
-            );
-        }
-    }
+    // The condition runs on every iteration, so group any calls inside it
+    // with the loop too.
+    walk_opt(node.child_by_field_name("condition"), ctx, Some(&loop_path));
+    walk_opt(node.child_by_field_name("body"), ctx, Some(&loop_path));
+    walk_loop_else(node, ctx, current_branch, &loop_path, counters);
+}
+
+/// Python's `for`/`while` can carry an `else` clause that runs only when the
+/// loop completes without a `break`. Treat it as a branch arm *inside* the
+/// loop so calls there don't leak back to the outer scope — the arm's number
+/// still comes from the enclosing scope's sequence, which is what keeps it
+/// distinct from an arm of a sibling `if`.
+fn walk_loop_else(
+    node: &Node,
+    ctx: &mut CallCtx<'_>,
+    current_branch: Option<&str>,
+    loop_path: &str,
+    counters: &mut Counters,
+) {
+    let Some(body) = node
+        .child_by_field_name("alternative")
+        .and_then(|c| c.child_by_field_name("body"))
+    else {
+        return;
+    };
+    let arm_path = counters.next_arm(current_branch);
+    emit_branch_entity(&ctx.arm(Some(loop_path), &arm_path), &body, ctx.walk.result);
+    extract_calls(&body, ctx, Some(&arm_path));
 }
 
 /// Per-arm dispatch for `try: ... except ...: ... else: ... finally:`.
@@ -890,50 +599,22 @@ fn handle_while_statement(
 /// extracted into this helper so the call-walk dispatch table in
 /// `extract_calls` stays at its grandfathered complexity rather than
 /// growing each time we add a new control-flow node-kind handler.
-#[allow(clippy::too_many_arguments)]
 fn handle_try_statement(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
-    let branch_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.c{}", p, idx),
-            None => format!("c{}", idx),
-        }
-    };
-
     if let Some(body) = node.child_by_field_name("body") {
-        *arm_counter += 1;
-        let branch_path = branch_path_for(*arm_counter);
+        let branch_path = counters.next_arm(current_branch);
         emit_try_arm_entity(
-            caller_id,
-            current_branch,
-            &branch_path,
+            &ctx.arm(current_branch, &branch_path),
             &body,
-            path,
             "try_body",
             None,
-            result,
+            ctx.walk.result,
         );
-        extract_calls(
-            &body,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&branch_path),
-            result,
-        );
+        extract_calls(&body, ctx, Some(&branch_path));
     }
 
     // except / except* / else / finally are plain children (not in
@@ -942,34 +623,10 @@ fn handle_try_statement(
     for clause in node.children(&mut clause_cursor) {
         match clause.kind() {
             "except_clause" | "except_group_clause" => {
-                handle_except_clause(
-                    &clause,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    arm_counter,
-                    &branch_path_for,
-                    result,
-                );
+                handle_except_clause(&clause, ctx, current_branch, counters)
             }
             "else_clause" | "finally_clause" => {
-                handle_try_simple_clause(
-                    &clause,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    current_branch,
-                    arm_counter,
-                    &branch_path_for,
-                    result,
-                );
+                handle_try_simple_clause(&clause, ctx, current_branch, counters)
             }
             _ => {}
         }
@@ -982,24 +639,17 @@ fn handle_try_statement(
 /// the body is reached differs — `else_clause` exposes a `body`
 /// field, `finally_clause` doesn't and we have to find the trailing
 /// `block` named child instead.
-#[allow(clippy::too_many_arguments)]
 fn handle_try_simple_clause(
     clause: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    branch_path_for: &dyn Fn(u32) -> String,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
+    let is_else = clause.kind() == "else_clause";
     // `named` must outlive the `find` result on the finally branch
     // because the returned Node borrows from the cursor.
     let mut named = clause.walk();
-    let body = if clause.kind() == "else_clause" {
+    let body = if is_else {
         clause.child_by_field_name("body")
     } else {
         clause
@@ -1007,53 +657,27 @@ fn handle_try_simple_clause(
             .find(|nc| nc.kind() == "block")
     };
     let Some(b) = body else { return };
-    let arm_kind = if clause.kind() == "else_clause" {
-        "else"
-    } else {
-        "finally"
-    };
-    *arm_counter += 1;
-    let branch_path = branch_path_for(*arm_counter);
+    let arm_kind = if is_else { "else" } else { "finally" };
+    let branch_path = counters.next_arm(current_branch);
     emit_try_arm_entity(
-        caller_id,
-        current_branch,
-        &branch_path,
+        &ctx.arm(current_branch, &branch_path),
         &b,
-        path,
         arm_kind,
         None,
-        result,
+        ctx.walk.result,
     );
-    extract_calls(
-        &b,
-        source,
-        path,
-        caller_id,
-        caller_name,
-        parent_class,
-        call_order,
-        Some(&branch_path),
-        result,
-    );
+    extract_calls(&b, ctx, Some(&branch_path));
 }
 
 /// Body of one `except`/`except*` clause. Splits the clause into the
 /// caught type (first non-block named child, drilling through any
 /// `as_pattern` to drop the `as e` alias) and the body block, then
 /// emits the arm entity and recurses.
-#[allow(clippy::too_many_arguments)]
 fn handle_except_clause(
     clause: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    branch_path_for: &dyn Fn(u32) -> String,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
     let mut caught: Option<String> = None;
     let mut body: Option<Node> = None;
@@ -1067,45 +691,31 @@ fn handle_except_clause(
             } else {
                 nc
             };
-            caught = Some(node_text(&type_node, source).to_string());
+            caught = Some(node_text(&type_node, ctx.caller.source).to_string());
         }
     }
     let Some(b) = body else { return };
-    *arm_counter += 1;
-    let branch_path = branch_path_for(*arm_counter);
     let arm_kind = if clause.kind() == "except_group_clause" {
         "except_group"
     } else {
         "except"
     };
+    let branch_path = counters.next_arm(current_branch);
     emit_try_arm_entity(
-        caller_id,
-        current_branch,
-        &branch_path,
+        &ctx.arm(current_branch, &branch_path),
         &b,
-        path,
         arm_kind,
         caught.as_deref(),
-        result,
+        ctx.walk.result,
     );
-    extract_calls(
-        &b,
-        source,
-        path,
-        caller_id,
-        caller_name,
-        parent_class,
-        call_order,
-        Some(&branch_path),
-        result,
-    );
+    extract_calls(&b, ctx, Some(&branch_path));
 }
 
 /// Per-arm dispatch for `match SUBJECT: case PAT: ...` (PEP 634).
 ///
 /// The match `subject` expression(s) stay in the enclosing scope —
 /// they're the gate, not a per-arm action. Each `case_clause` becomes
-/// its own `Branch` arm sharing the caller's `arm_counter` so a
+/// its own `Branch` arm sharing the caller's arm counter so a
 /// sibling decision tree at the same scope (an if/elif and a match in
 /// the same function) numbers consistently.
 ///
@@ -1114,39 +724,15 @@ fn handle_except_clause(
 /// branch — not the outer scope, which is the difference from the
 /// if-condition handling. The body (`consequence` field) recurses
 /// with the new arm as `current_branch`.
-#[allow(clippy::too_many_arguments)]
 fn handle_match_statement(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    arm_counter: &mut u32,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
-    let branch_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.c{}", p, idx),
-            None => format!("c{}", idx),
-        }
-    };
-
     let mut subj_cursor = node.walk();
     for subj in node.children_by_field_name("subject", &mut subj_cursor) {
-        extract_calls(
-            &subj,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            current_branch,
-            result,
-        );
+        extract_calls(&subj, ctx, current_branch);
     }
 
     let Some(body) = node.child_by_field_name("body") else {
@@ -1157,51 +743,30 @@ fn handle_match_statement(
         if case.kind() != "case_clause" {
             continue;
         }
-        let Some(consequence) = case.child_by_field_name("consequence") else {
-            continue;
-        };
-        *arm_counter += 1;
-        let branch_path = branch_path_for(*arm_counter);
-        let pattern_text = case_pattern_text(&case, source);
-        let pattern_opt = if pattern_text.is_empty() {
-            None
-        } else {
-            Some(pattern_text.as_str())
-        };
-        emit_case_arm_entity(
-            caller_id,
-            current_branch,
-            &branch_path,
-            &consequence,
-            path,
-            pattern_opt,
-            result,
-        );
-        if let Some(guard) = case.child_by_field_name("guard") {
-            extract_calls(
-                &guard,
-                source,
-                path,
-                caller_id,
-                caller_name,
-                parent_class,
-                call_order,
-                Some(&branch_path),
-                result,
-            );
-        }
-        extract_calls(
-            &consequence,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&branch_path),
-            result,
-        );
+        handle_case_clause(&case, ctx, current_branch, counters);
     }
+}
+
+/// One `case PAT [if GUARD]:` arm of a `match`.
+fn handle_case_clause(
+    case: &Node,
+    ctx: &mut CallCtx<'_>,
+    current_branch: Option<&str>,
+    counters: &mut Counters,
+) {
+    let Some(consequence) = case.child_by_field_name("consequence") else {
+        return;
+    };
+    let branch_path = counters.next_arm(current_branch);
+    let pattern_text = case_pattern_text(case, ctx.caller.source);
+    emit_case_arm_entity(
+        &ctx.arm(current_branch, &branch_path),
+        &consequence,
+        Some(pattern_text.as_str()).filter(|t| !t.is_empty()),
+        ctx.walk.result,
+    );
+    walk_opt(case.child_by_field_name("guard"), ctx, Some(&branch_path));
+    extract_calls(&consequence, ctx, Some(&branch_path));
 }
 
 /// Build the human-readable pattern string for one `case_clause`.
@@ -1235,6 +800,13 @@ fn case_pattern_text(case: &Node, source: &str) -> String {
     text
 }
 
+/// Is this `for` / `with` its `async` form? tree-sitter-python uses one node
+/// kind for both, with `async` as a leading anonymous token, so the source
+/// slice is the only place the distinction survives.
+fn is_async_construct(node: &Node, source: &str) -> bool {
+    node_text(node, source).trim_start().starts_with("async")
+}
+
 /// Per-block dispatch for `with` / `async with` (PEP 343 context
 /// managers).
 ///
@@ -1251,61 +823,36 @@ fn case_pattern_text(case: &Node, source: &str) -> String {
 /// `async` keyword as an anonymous token rather than a named field
 /// or child — same approach `handle_function` uses for `async def`.
 ///
-/// `with_counter` is its own counter (separate from `arm_counter` and
-/// `loop_counter`) so a sibling decision tree, loop, and with-block
-/// at the same scope read as `c1`/`l1`/`w1` rather than colliding on
-/// one shared sequence.
-/// Is this `for` / `with` its `async` form? tree-sitter-python uses one node
-/// kind for both, with `async` as a leading anonymous token, so the source
-/// slice is the only place the distinction survives.
-fn is_async_construct(node: &Node, source: &str) -> bool {
-    node_text(node, source).trim_start().starts_with("async")
-}
-
-#[allow(clippy::too_many_arguments)]
+/// `with` blocks count on their own sequence (separate from arms and
+/// loops) so a sibling decision tree, loop, and with-block at the same
+/// scope read as `c1`/`l1`/`w1` rather than colliding on one shared
+/// sequence.
 fn handle_with_statement(
     node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    with_counter: &mut u32,
-    result: &mut ParseResult,
+    counters: &mut Counters,
 ) {
-    let with_path_for = |idx: u32| -> String {
-        match current_branch {
-            Some(p) => format!("{}.w{}", p, idx),
-            None => format!("w{}", idx),
-        }
-    };
-
-    let is_async = is_async_construct(node, source);
+    let is_async = is_async_construct(node, ctx.caller.source);
 
     let mut clause_cursor = node.walk();
     let with_clause = node
         .children(&mut clause_cursor)
         .find(|c| c.kind() == "with_clause");
 
-    *with_counter += 1;
-    let with_path = with_path_for(*with_counter);
+    let with_path = counters.next_with(current_branch);
 
     let manager_text = with_clause
         .as_ref()
-        .map(|c| node_text(c, source).to_string());
+        .map(|c| node_text(c, ctx.caller.source).to_string());
 
     if let Some(body) = node.child_by_field_name("body") {
         emit_with_entity(
-            caller_id,
-            current_branch,
-            &with_path,
+            &ctx.arm(current_branch, &with_path),
             &body,
-            path,
             is_async,
             manager_text.as_deref(),
-            result,
+            ctx.walk.result,
         );
     }
 
@@ -1315,152 +862,131 @@ fn handle_with_statement(
             if item.kind() != "with_item" {
                 continue;
             }
-            if let Some(value) = item.child_by_field_name("value") {
-                extract_calls(
-                    &value,
-                    source,
-                    path,
-                    caller_id,
-                    caller_name,
-                    parent_class,
-                    call_order,
-                    Some(&with_path),
-                    result,
-                );
-            }
+            walk_opt(item.child_by_field_name("value"), ctx, Some(&with_path));
         }
     }
 
-    if let Some(body) = node.child_by_field_name("body") {
-        extract_calls(
-            &body,
-            source,
-            path,
-            caller_id,
-            caller_name,
-            parent_class,
-            call_order,
-            Some(&with_path),
-            result,
-        );
-    }
+    walk_opt(node.child_by_field_name("body"), ctx, Some(&with_path));
 }
 
-fn handle_call(
-    node: &Node,
-    source: &str,
-    caller_id: &str,
-    caller_name: &str,
-    parent_class: Option<&str>,
-    call_order: &mut u32,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
-    let function_node = match node.child_by_field_name("function") {
-        Some(f) => f,
-        None => return,
+/// One call site: whatever the callee resolves to, recorded against the arm
+/// the call fires in and numbered in source order.
+fn handle_call(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let Some(function_node) = node.child_by_field_name("function") else {
+        return;
     };
-
-    *call_order += 1;
-
-    // Helper — tag the relationship with the branch id (if any) so the
-    // analyzer can synthesize a Branch entity and re-parent the edge.
-    let tag_branch = |rel: &mut Relationship| {
-        if let Some(b) = current_branch {
-            rel.metadata.insert("branch".to_string(), b.to_string());
-        }
+    // Taken before the callee is resolved, so a dropped call still burns its
+    // number and the edges that survive keep their source order.
+    let order = ctx.next_order();
+    let named = match function_node.kind() {
+        "identifier" => bare_callee(&function_node, &ctx.caller),
+        "attribute" => attribute_callee(&function_node, &ctx.caller),
+        _ => None,
     };
+    let Some((target, kind)) = named else { return };
+    let mut rel = edge(ctx.caller.id, target, kind, current_branch);
+    rel.metadata.insert("order".to_string(), order.to_string());
+    ctx.walk.result.add_relationship(rel);
+}
 
-    match function_node.kind() {
-        "identifier" => {
-            let func_name = node_text(&function_node, source).to_string();
-            // Self-recursion guard only. Bare-identifier builtin calls
-            // (`print`, `len`, `isinstance`, …) are emitted — the
-            // unresolved targets become ghost entities tagged
-            // `ghost_stdlib` by the graph builder, and the UI's
-            // stdlib-ghost toggle decides whether to show them. This
-            // keeps the data layer faithful while letting the reader
-            // collapse the builtin noise when it gets in the way.
-            if func_name == caller_name {
-                return;
-            }
-
-            // Capitalized name → likely class instantiation.
-            if func_name.chars().next().map_or(false, |c| c.is_uppercase()) {
-                let mut rel = Relationship::new(
-                    caller_id.to_string(),
-                    func_name,
-                    RelationshipKind::Instantiates,
-                );
-                rel.metadata
-                    .insert("order".to_string(), call_order.to_string());
-                tag_branch(&mut rel);
-                result.add_relationship(rel);
-            } else {
-                // Unqualified call inside a method: Python's lookup
-                // order is local → enclosing → global → builtin.
-                // For now we apply a class-prefix heuristic so
-                // `foo()` inside a method gets treated as a
-                // `<Class>.foo` reference (the common case when the
-                // user means a sibling method). Exempt builtins so
-                // `len(x)` stays bare and resolves to the
-                // `ghost_stdlib` entity rather than a fictitious
-                // method on the enclosing class.
-                let callee = match parent_class {
-                    Some(cls) if !is_bare_builtin(&func_name) => {
-                        format!("{}.{}", cls, func_name)
-                    }
-                    _ => func_name,
-                };
-                let mut rel =
-                    Relationship::new(caller_id.to_string(), callee, RelationshipKind::Calls);
-                rel.metadata
-                    .insert("order".to_string(), call_order.to_string());
-                tag_branch(&mut rel);
-                result.add_relationship(rel);
-            }
-        }
-        "attribute" => {
-            if let Some((receiver, method_name)) = extract_attribute_parts(&function_node, source) {
-                // Self-recursion guard only. We deliberately do NOT apply
-                // the builtin-name filter here: an attribute call like
-                // `obj.update(x)` can target a user-defined Observer.update
-                // method, and dropping it on the basis of the bare name
-                // collision with `dict.update` produced false negatives.
-                // Unresolved targets fall through to ghost nodes, where
-                // the UI's ghost toggle already gives the user control.
-                if method_name == caller_name {
-                    return;
-                }
-
-                let callee = match receiver.as_str() {
-                    "self" | "super()" => {
-                        if let Some(cls) = parent_class {
-                            format!("{}.{}", cls, method_name)
-                        } else {
-                            method_name
-                        }
-                    }
-                    "cls" => {
-                        if let Some(cls) = parent_class {
-                            format!("{}.{}", cls, method_name)
-                        } else {
-                            method_name
-                        }
-                    }
-                    _ => format!("{}.{}", receiver, method_name),
-                };
-
-                let mut rel =
-                    Relationship::new(caller_id.to_string(), callee, RelationshipKind::Calls);
-                rel.metadata
-                    .insert("order".to_string(), call_order.to_string());
-                tag_branch(&mut rel);
-                result.add_relationship(rel);
-            }
-        }
-        _ => {}
+/// What a bare `foo(...)` names, and which kind of edge that makes.
+///
+/// The name is emitted as written, whatever encloses the call. This looks
+/// like a missing step and is not: Python resolves a bare name by LEGB —
+/// local, enclosing, *module*, builtin — and class scope is not in that
+/// chain. `foo()` inside a method never finds a sibling method; reaching one
+/// needs `self.foo()`, which is `attribute_callee`'s business.
+///
+/// Until PY-031 this function prefixed the name with the enclosing class,
+/// on the reasoning that a bare call in a method usually means a sibling.
+/// It cannot: a module-level `normalize_string` called from a method of
+/// `StringProcessor` became `StringProcessor.normalize_string`, which exists
+/// nowhere and resolved to a ghost — while the real function sat two
+/// definitions below in the same file. The resolver already ranks a bare
+/// name by locality (AN-011), which is the same job done correctly.
+///
+/// Self-recursion is the only name dropped. Builtin calls (`print`, `len`,
+/// `isinstance`, …) are emitted — the unresolved targets become ghost
+/// entities tagged `ghost_stdlib` by the graph builder, and the UI's
+/// stdlib-ghost toggle decides whether to show them. This keeps the data
+/// layer faithful while letting the reader collapse the builtin noise when
+/// it gets in the way.
+fn bare_callee(function_node: &Node, caller: &Caller<'_>) -> Option<(String, RelationshipKind)> {
+    let func_name = node_text(function_node, caller.source).to_string();
+    if func_name == caller.name {
+        return None;
     }
+    // Capitalized name → likely class instantiation.
+    if func_name.chars().next().is_some_and(char::is_uppercase) {
+        return Some((func_name, RelationshipKind::Instantiates));
+    }
+    Some((func_name, RelationshipKind::Calls))
+}
+
+/// What a `receiver.method(...)` names.
+///
+/// Self-recursion is the only name dropped. A builtin-shaped name is not
+/// filtered out here either: an attribute call like `obj.update(x)` can target
+/// a user-defined `Observer.update` method, and dropping it on the basis of
+/// the bare name colliding with `dict.update` produced false negatives.
+/// Unresolved targets fall through to ghost nodes, where the UI's ghost toggle
+/// already gives the user control.
+fn attribute_callee(
+    function_node: &Node,
+    caller: &Caller<'_>,
+) -> Option<(String, RelationshipKind)> {
+    let (receiver, method_name) = extract_attribute_parts(function_node, caller.source)?;
+    if method_name == caller.name {
+        return None;
+    }
+    // `self` / `cls` / `super()` all name the enclosing class, when there is
+    // one; outside a class they name nothing better than the method itself.
+    let callee = match (receiver.as_str(), caller.parent_class) {
+        ("self" | "cls" | "super()", Some(cls)) => format!("{}.{}", cls, method_name),
+        ("self" | "cls" | "super()", None) => method_name,
+        _ => {
+            let typed = declared_receiver(function_node, &receiver, caller);
+            format!("{}.{}", typed.as_deref().unwrap_or(&receiver), method_name)
+        }
+    };
+    Some((callee, RelationshipKind::Calls))
+}
+
+/// The type a receiver is declared to hold, when something declared it
+/// (PY-031).
+///
+/// Two shapes carry a declaration, and `receiver_name` has already reduced
+/// both to their last segment, which is why the tree is consulted again
+/// rather than the reduced text: `self.store` and a local named `store` both
+/// arrive here as `"store"`, and only one of them is a field.
+///
+/// Answering `None` is the common case and the safe one — it leaves the
+/// receiver spelled as the source spells it, which is what every Python body
+/// without annotations got before this existed.
+fn declared_receiver(function_node: &Node, receiver: &str, caller: &Caller<'_>) -> Option<String> {
+    if caller.locals.is_empty() && caller.returns.is_empty() {
+        return None;
+    }
+    let object = function_node.child_by_field_name("object")?;
+    let declared = match object.kind() {
+        // `store.save()` — a parameter of this callable.
+        "identifier" => caller.locals.param(receiver),
+        // `self.store.save()` — a field of the enclosing class. Anything
+        // else on the left of the dot is a chain this pass cannot type.
+        "attribute" => {
+            let inner = object.child_by_field_name("object")?;
+            (node_text(&inner, caller.source) == "self")
+                .then(|| caller.locals.field(receiver))
+                .flatten()
+        }
+        // `builder.set_size(...).set_dough()` — the receiver is the *result*
+        // of `set_size`, so its type is whatever that method returns
+        // (PY-032). `receiver_name` has already reduced the call to the name
+        // of the method that produced it, which is the key `Returns` holds.
+        "call" => caller.returns.of(receiver),
+        _ => None,
+    };
+    declared.map(str::to_string)
 }
 
 fn extract_attribute_parts(node: &Node, source: &str) -> Option<(String, String)> {
@@ -1476,18 +1002,21 @@ fn extract_attribute_parts(node: &Node, source: &str) -> Option<(String, String)
 /// a three-way conditional as if it had no body at all. It also still
 /// contributes to its enclosing callable's score, the way a Java lambda
 /// contributes to the method it sits in.
-fn populate_lambda_metrics(node: &Node, entity: &mut CodeEntity) {
+fn populate_lambda_metrics(node: &Node, source: &str, entity: &mut CodeEntity) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
     entity.metrics.param_count = Some(
         node.child_by_field_name("parameters")
             .map_or(0, |p| p.named_child_count() as u32),
     );
-    if let Some(body) = node.child_by_field_name("body") {
+    let body = node.child_by_field_name("body");
+    if let Some(body) = body {
         let (cc, nesting, cog) = super::complexity::compute_complexity(&body);
         entity.metrics.cyclomatic = Some(cc);
         entity.metrics.max_nesting = Some(nesting);
         entity.metrics.cognitive_complexity = Some(cog);
     }
+    working_set::populate(entity, body.as_ref(), source);
+    crate::parser::loops::populate(entity, body.as_ref());
 }
 
 /// Reduce a receiver expression to the single identifier that names it.
@@ -1522,8 +1051,8 @@ fn receiver_name(node: &Node, source: &str) -> Option<String> {
             .map(|a| node_text(&a, source).to_string()),
         "call" => {
             let function = node.child_by_field_name("function")?;
-            // `super()` keeps its call form: `handle_call` matches on it to
-            // rewrite the callee onto the enclosing class.
+            // `super()` keeps its call form: `attribute_callee` matches on it
+            // to rewrite the callee onto the enclosing class.
             match receiver_name(&function, source) {
                 Some(name) if name == "super" => Some("super()".to_string()),
                 other => other,
@@ -1559,20 +1088,15 @@ fn literal_type_name(kind: &str) -> Option<&'static str> {
 
 /// Emit a `WritesTo` edge for `self.<ident> = …` assignments inside
 /// a method body. The target is formatted `{ClassName}.{attr}` —
-/// matching how `handle_call` resolves self-method calls — so the
+/// matching how `attribute_callee` resolves self-method calls — so the
 /// resolver can link the write to the synthetic field Variable that
 /// `create_field_entities` created from the parser's per-class
 /// `fields` list. Unresolved targets fall through to ghosts the
 /// same way call targets do.
-fn handle_self_write(
-    node: &Node,
-    source: &str,
-    caller_id: &str,
-    parent_class: Option<&str>,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
-    let Some(cls) = parent_class else { return };
+fn handle_self_write(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let Some(cls) = ctx.caller.parent_class else {
+        return;
+    };
     let Some(left) = node.child_by_field_name("left") else {
         return;
     };
@@ -1585,19 +1109,21 @@ fn handle_self_write(
     let Some(attr) = left.child_by_field_name("attribute") else {
         return;
     };
-    if node_text(&obj, source) != "self" {
+    if node_text(&obj, ctx.caller.source) != "self" {
         return;
     }
-    let field_name = node_text(&attr, source).to_string();
+    let field_name = node_text(&attr, ctx.caller.source);
     if field_name.is_empty() {
         return;
     }
     let target = format!("{}.{}", cls, field_name);
-    let mut rel = Relationship::new(caller_id.to_string(), target, RelationshipKind::WritesTo);
-    if let Some(b) = current_branch {
-        rel.metadata.insert("branch".to_string(), b.to_string());
-    }
-    result.add_relationship(rel);
+    let rel = edge(
+        ctx.caller.id,
+        target,
+        RelationshipKind::WritesTo,
+        current_branch,
+    );
+    ctx.walk.result.add_relationship(rel);
 }
 
 /// One identifier introduced by an assignment LHS. Carries the source
@@ -1653,28 +1179,16 @@ fn collect_local_targets(pattern: &Node, source: &str, out: &mut Vec<LocalTarget
 /// a `func::local::x` — a variable that does not exist, shadowing the real
 /// module-level or enclosing-function one and hiding the mutation that makes
 /// the function stateful.
-#[allow(clippy::too_many_arguments)]
 fn emit_write(
     target: &LocalTarget,
     span_node: &Node,
     rhs_text: Option<&str>,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    result: &mut ParseResult,
 ) {
-    match outer_scope_declaration(span_node, &target.name, source) {
-        Some(scope) => emit_outer_write(&target.name, scope, caller_id, current_branch, result),
-        None => emit_local_write(
-            target,
-            span_node,
-            rhs_text,
-            path,
-            caller_id,
-            current_branch,
-            result,
-        ),
+    match outer_scope_declaration(span_node, &target.name, ctx.caller.source) {
+        Some(scope) => emit_outer_write(&target.name, scope, ctx, current_branch),
+        None => emit_local_write(target, span_node, rhs_text, ctx, current_branch),
     }
 }
 
@@ -1689,20 +1203,17 @@ fn emit_write(
 fn emit_outer_write(
     name: &str,
     scope: &'static str,
-    caller_id: &str,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    result: &mut ParseResult,
 ) {
-    let mut rel = Relationship::new(
-        caller_id.to_string(),
+    let mut rel = edge(
+        ctx.caller.id,
         name.to_string(),
         RelationshipKind::WritesTo,
+        current_branch,
     );
     rel.metadata.insert("scope".to_string(), scope.to_string());
-    if let Some(b) = current_branch {
-        rel.metadata.insert("branch".to_string(), b.to_string());
-    }
-    result.add_relationship(rel);
+    ctx.walk.result.add_relationship(rel);
 }
 
 /// Did the enclosing function declare `name` as `global` or `nonlocal`?
@@ -1764,41 +1275,52 @@ fn find_scope_declaration(node: &Node, name: &str, source: &str) -> Option<&'sta
 /// `WritesTo` edge for one local target. Shared by `handle_local_write`
 /// and `handle_walrus_write` so both `x = compute()` and `(x :=
 /// compute())` produce the same shape of node.
-#[allow(clippy::too_many_arguments)]
 fn emit_local_write(
     target: &LocalTarget,
     span_node: &Node,
     rhs_text: Option<&str>,
-    path: &Path,
-    caller_id: &str,
+    ctx: &mut CallCtx<'_>,
     current_branch: Option<&str>,
-    result: &mut ParseResult,
 ) {
-    let local_id = format!("{}::local::{}", caller_id, target.name);
-    let already_exists = result.entities.iter().any(|e| e.id == local_id);
+    let local_id = format!("{}::local::{}", ctx.caller.id, target.name);
+    let already_exists = ctx.walk.result.entities.iter().any(|e| e.id == local_id);
     if !already_exists {
-        let span = crate::parser::language_parser::node_to_span(span_node);
-        let mut entity = CodeEntity::new(&target.name, EntityKind::Variable, path, span);
-        entity.id = local_id.clone();
-        entity.qualified_name = format!("{}::{}", caller_id, target.name);
-        entity.parent_id = Some(caller_id.to_string());
-        entity.tags.insert("local_var".to_string());
-        if target.splat {
-            entity.tags.insert("splat".to_string());
-        }
-        entity.visibility = Visibility::Private;
-        if let Some(rhs) = rhs_text {
-            if !rhs.is_empty() {
-                entity.documentation = Some(format!("= {}", rhs));
-            }
-        }
-        result.add_entity(entity);
+        let entity = local_entity(target, span_node, rhs_text, ctx.caller.id, ctx.caller.path);
+        ctx.walk.result.add_entity(entity);
     }
-    let mut rel = Relationship::new(caller_id.to_string(), local_id, RelationshipKind::WritesTo);
-    if let Some(b) = current_branch {
-        rel.metadata.insert("branch".to_string(), b.to_string());
+    let rel = edge(
+        ctx.caller.id,
+        local_id,
+        RelationshipKind::WritesTo,
+        current_branch,
+    );
+    ctx.walk.result.add_relationship(rel);
+}
+
+/// The synthetic node one local binding gets: private, parented on the
+/// callable that binds it, and documented with the expression it was bound
+/// from so the detail panel can show what the name holds.
+fn local_entity(
+    target: &LocalTarget,
+    span_node: &Node,
+    rhs_text: Option<&str>,
+    caller_id: &str,
+    path: &Path,
+) -> CodeEntity {
+    let span = crate::parser::language_parser::node_to_span(span_node);
+    let mut entity = CodeEntity::new(&target.name, EntityKind::Variable, path, span);
+    entity.id = format!("{}::local::{}", caller_id, target.name);
+    entity.qualified_name = format!("{}::{}", caller_id, target.name);
+    entity.parent_id = Some(caller_id.to_string());
+    entity.tags.insert("local_var".to_string());
+    if target.splat {
+        entity.tags.insert("splat".to_string());
     }
-    result.add_relationship(rel);
+    entity.visibility = Visibility::Private;
+    if let Some(rhs) = rhs_text.filter(|r| !r.is_empty()) {
+        entity.documentation = Some(format!("= {}", rhs));
+    }
+    entity
 }
 
 /// Emit a synthetic local-variable entity + `WritesTo` edge for a
@@ -1819,19 +1341,13 @@ fn emit_local_write(
 /// recursively descends into the inner assignment, we early-out when
 /// the parent node is itself an assignment — the outer call already
 /// covered every target.
-fn handle_local_write(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_local_write(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
     if let Some(parent) = node.parent() {
         if matches!(parent.kind(), "assignment" | "augmented_assignment") {
             return;
         }
     }
+    let source = ctx.caller.source;
 
     let mut targets: Vec<LocalTarget> = Vec::new();
     let mut innermost_rhs: Option<Node> = None;
@@ -1853,16 +1369,7 @@ fn handle_local_write(
 
     let rhs_text = innermost_rhs.map(|r| node_text(&r, source).to_string());
     for target in &targets {
-        emit_write(
-            target,
-            node,
-            rhs_text.as_deref(),
-            source,
-            path,
-            caller_id,
-            current_branch,
-            result,
-        );
+        emit_write(target, node, rhs_text.as_deref(), ctx, current_branch);
     }
 }
 
@@ -1870,14 +1377,8 @@ fn handle_local_write(
 /// a bare identifier — no tuple unpacking, no chaining — so this is a
 /// thin wrapper around `emit_local_write` with the named_expression's
 /// `value` field as the RHS for documentation.
-fn handle_walrus_write(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    caller_id: &str,
-    current_branch: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_walrus_write(node: &Node, ctx: &mut CallCtx<'_>, current_branch: Option<&str>) {
+    let source = ctx.caller.source;
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
@@ -1892,16 +1393,7 @@ fn handle_walrus_write(
     let rhs_text = node
         .child_by_field_name("value")
         .map(|v| node_text(&v, source).to_string());
-    emit_write(
-        &target,
-        node,
-        rhs_text.as_deref(),
-        source,
-        path,
-        caller_id,
-        current_branch,
-        result,
-    );
+    emit_write(&target, node, rhs_text.as_deref(), ctx, current_branch);
 }
 
 /// Treat a `lambda` expression as a small anonymous function. Without
@@ -1916,42 +1408,38 @@ fn handle_walrus_write(
 /// part of the outer control-flow path). `parent_class` carries
 /// through so `self.foo()` calls inside a lambda defined in a method
 /// still resolve to the surrounding class.
-fn handle_lambda(
-    node: &Node,
-    source: &str,
-    path: &Path,
-    parent_id: &str,
-    parent_class: Option<&str>,
-    result: &mut ParseResult,
-) {
+fn handle_lambda(node: &Node, ctx: &mut CallCtx<'_>) {
     let span = crate::parser::language_parser::node_to_span(node);
     let line = span.start.line + 1;
     let col = span.start.column + 1;
     let name = format!("<lambda@{}:{}>", line, col);
-    let lambda_id = format!("{}::lambda::{}:{}", parent_id, line, col);
+    let lambda_id = format!("{}::lambda::{}:{}", ctx.caller.id, line, col);
 
-    let mut entity = CodeEntity::new(&name, EntityKind::Function, path, span);
+    let mut entity = CodeEntity::new(&name, EntityKind::Function, ctx.caller.path, span);
     entity.id = lambda_id.clone();
-    entity.qualified_name = format!("{}::{}", parent_id, name);
-    entity.parent_id = Some(parent_id.to_string());
+    entity.qualified_name = format!("{}::{}", ctx.caller.id, name);
+    entity.parent_id = Some(ctx.caller.id.to_string());
     entity.tags.insert("lambda".to_string());
     entity.visibility = Visibility::Private;
-    entity.source_code = Some(node_text(node, source).to_string());
-    populate_lambda_metrics(node, &mut entity);
-    result.add_entity(entity);
+    entity.source_code = Some(node_text(node, ctx.caller.source).to_string());
+    populate_lambda_metrics(node, ctx.caller.source, &mut entity);
+    ctx.walk.result.add_entity(entity);
 
-    if let Some(body) = node.child_by_field_name("body") {
-        let mut call_order = 0u32;
-        extract_calls(
-            &body,
-            source,
-            path,
-            &lambda_id,
-            &name,
-            parent_class,
-            &mut call_order,
-            None,
-            result,
-        );
-    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    // The lambda is its own caller, with its own call ordinal sequence.
+    // A lambda reads the enclosing body's names, so the receiver tables
+    // carry through — as does the class, for the `self.foo()` reason above.
+    let inner = Caller {
+        source: ctx.caller.source,
+        path: ctx.caller.path,
+        id: &lambda_id,
+        name: &name,
+        parent_class: ctx.caller.parent_class,
+        locals: ctx.caller.locals,
+        returns: ctx.caller.returns,
+    };
+    let mut inner_ctx = CallCtx::new(inner, ctx.walk.result);
+    extract_calls(&body, &mut inner_ctx, None);
 }

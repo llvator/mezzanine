@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import * as d3 from 'd3';
-  import type { D3Node, D3Link } from '../types/graph';
+  import type { D3Node, D3Link, FkFacts } from '../types/graph';
   import { LINK_COLORS, KIND_CODES } from '../types/graph';
   import {
     graphData, selectedNode, hoveredNode, hoverLocked, hoverDepth, viewMode,
@@ -10,6 +10,8 @@
     toggleExpanded, shapePicture,
   } from '../stores/graph';
   import { focusedPane } from '../stores/keymap';
+  import { specClaimHighlightIds } from '../stores/crossFilter';
+  import { changedFileLitIds } from '../stores/changedFiles';
   import { displayPlan, displaySearchHighlightIds, linkKeyFor, type DisplayPlan } from '../viewmodels/displayPlan';
   import { drawnIdsOf } from '../viewmodels/drawCeiling';
   import { diffActive, diffStatusMap, diffSourceChangedMap, diffDimOpacity, diffContextOpacity, DIFF_COLORS, normalizeEntityId } from '../stores/diff';
@@ -32,6 +34,14 @@
     type RegionSpecClaim,
   } from '../viewmodels/regionSpec';
   import { specGraph } from '../stores/crossFilter';
+  // Aliased: `hoveredRegions` below is this component's stack of regions the
+  // pointer is *inside*, and the two would read as the singular and plural of
+  // one thing when they answer different questions (UI-141).
+  import {
+    hoveredRegion as namedRegion, selectedRegion as pinnedRegion,
+    setHoveredRegion, keepHoveredRegionAmong, pinRegion, unpinRegion,
+  } from '../stores/region';
+  import type { HoveredRegion } from '../viewmodels/regionSubject';
   import { ensureDetailsLoaded, type EntityDetails } from '../stores/details';
   import { groupMemberIds } from '../viewmodels/hoverHighlight';
   import {
@@ -44,7 +54,11 @@
   import { isMoreChildThan } from '../utils/kindPriority';
   import { nodeEncoding } from '../stores/encoding';
   import type { NodeEncoding } from '../viewmodels/nodeEncoding';
-  import { ARROW_LEN, arrowHeadPoint, linkStrokeWidth } from '../viewmodels/linkGeometry';
+  import {
+    ARROW_LEN, EDGE_MARK_GAP, LINK_LABEL_CLEAR, ORDER_BADGE_R,
+    arrowHeadPoint, edgeAnchorPoint, linkStrokeWidth,
+  } from '../viewmodels/linkGeometry';
+  import type { EdgeEnd } from '../viewmodels/linkGeometry';
   import {
     SHAPE_EDGE_COLORS,
     shapeEdgeVerdicts,
@@ -153,6 +167,10 @@
   let svg: d3.Selection<SVGSVGElement, unknown, null, undefined>;
   let g: d3.Selection<SVGGElement, unknown, null, undefined>;
   let fileHullGroup: d3.Selection<SVGGElement, unknown, null, undefined>;
+  /** Where the Flow view's column captions are drawn (UI-146). Empty in every
+   *  other mode — a layered picture with no axis is misread by default, and a
+   *  stale axis over a force layout would be a lie rather than an absence. */
+  let flowAxisGroup: d3.Selection<SVGGElement, unknown, null, undefined>;
   let linkSel: d3.Selection<SVGLineElement, D3Link, SVGGElement, unknown>;
   let linkLabelSel: d3.Selection<SVGGElement, D3Link, SVGGElement, unknown>;
   let orderBadgeSel: d3.Selection<SVGGElement, D3Link, SVGGElement, unknown>;
@@ -162,10 +180,10 @@
   let unsubscribers: (() => void)[] = [];
   let initialized = false;
   /** Track what mode we last applied so resize knows whether to restart sim. */
-  /** Which layout is on screen. `tree` and `shape` are both *pinned* — the
-   *  simulation is stopped and every node sits where a viewmodel put it —
+  /** Which layout is on screen. `tree`, `shape` and `flow` are all *pinned* —
+   *  the simulation is stopped and every node sits where a viewmodel put it —
    *  so everything below tests `!== 'force'` rather than naming them. */
-  let currentMode: 'force' | 'tree' | 'shape' = 'force';
+  let currentMode: 'force' | 'tree' | 'shape' | 'flow' = 'force';
   /** Pending auto-fit timer — cleared when a new layout starts so we don't
    *  queue multiple fits on rapid plan changes. */
   let autoFitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -249,6 +267,55 @@
     if (len < 1) return { dx: 0, dy: 0 };
     return { dx: -ey / len * 14 * dir, dy: ex / len * 14 * dir };
   }
+  /** Rendered radius of one end of a link. Still an id string until the
+   *  simulation's first tick swaps in the node object, and an unresolved end
+   *  has no radius to keep clear of yet. */
+  function endRadius(end: D3Link['source']): number {
+    return typeof end === 'object' ? getNodeSize(end as D3Node) : 0;
+  }
+
+  /** One end of a link, positioned and sized, for the anchor arithmetic. */
+  function edgeEnd(end: D3Link['source'], x: number, y: number): EdgeEnd {
+    return { x, y, radius: endRadius(end) };
+  }
+
+  /**
+   * Place the marks that ride on an edge — the kind label at its middle, the
+   * order badge a quarter of the way from the visual tail.
+   *
+   * Both go through `edgeAnchorPoint`, which keeps them out of the circles at
+   * either end. A plain fraction of the centre-to-centre line is not enough:
+   * node radius is a user-chosen channel, so raising the size scale in the
+   * legend grows a circle past a fixed fraction and hides whatever sits there
+   * — the order number most visibly, since the nodes group paints over the
+   * badges. Anchoring to the rim means the mark slides along the line as the
+   * node grows instead of disappearing under it.
+   *
+   * Shared by all three callers (force tick, tree/flow positioning, encoding
+   * restyle) so a size change can never leave one of them behind.
+   */
+  function positionEdgeMarks(
+    sx: (d: D3Link) => number, sy: (d: D3Link) => number,
+    tx: (d: D3Link) => number, ty: (d: D3Link) => number,
+  ): void {
+    linkLabelSel?.attr('transform', (d) => {
+      const src = edgeEnd(d.source, sx(d), sy(d));
+      const tgt = edgeEnd(d.target, tx(d), ty(d));
+      const p = edgeAnchorPoint(src, tgt, 0.5, LINK_LABEL_CLEAR + EDGE_MARK_GAP);
+      const off = labelPerpOffset(d, sx(d), sy(d), tx(d), ty(d));
+      return `translate(${p.x + off.dx},${p.y + off.dy})`;
+    });
+    orderBadgeSel?.attr('transform', (d) => {
+      // The badge sits on the tail side, which flips with the edge direction
+      // so it stays opposite the arrow head.
+      const src = edgeEnd(d.source, sx(d), sy(d));
+      const tgt = edgeEnd(d.target, tx(d), ty(d));
+      const [tail, head] = isReversed(d) ? [tgt, src] : [src, tgt];
+      const p = edgeAnchorPoint(tail, head, 0.25, ORDER_BADGE_R + EDGE_MARK_GAP);
+      return `translate(${p.x},${p.y})`;
+    });
+  }
+
   /** True iff `d` should render with flipped endpoints. Two rules,
    *  checked in order:
    *
@@ -298,10 +365,7 @@
       const rev = isReversed(d);
       const tailX = rev ? tx(d) : sx(d);
       const tailY = rev ? ty(d) : sy(d);
-      const headEnd = rev ? d.source : d.target;
-      // Still an id string until the simulation's first tick swaps in the
-      // node object; no radius to trim to yet, and one frame later there is.
-      const r = typeof headEnd === 'object' ? getNodeSize(headEnd as D3Node) : 0;
+      const r = endRadius(rev ? d.source : d.target);
       const p = arrowHeadPoint(tailX, tailY, rev ? sx(d) : tx(d), rev ? sy(d) : ty(d), r);
       this.setAttribute('x1', String(tailX));
       this.setAttribute('y1', String(tailY));
@@ -354,17 +418,19 @@
     // reach it, or the panel keeps describing the encoding the canvas left.
     publishOverview(true);
     simulation?.force('collision', d3.forceCollide().radius(collisionRadius()));
-    // Arrow-head setbacks are measured from the radius that just changed, so
-    // they are stale until something repositions the links. In force mode the
-    // reheat below would get there eventually; in tree mode the simulation is
-    // pinned and nothing else would, and either way "eventually" is a visible
-    // frame of arrows sunk into or floating off the resized circles.
+    // Arrow-head setbacks and edge-mark anchors are both measured from the
+    // radius that just changed, so they are stale until something repositions
+    // them. In force mode the reheat below would get there eventually; in tree
+    // mode the simulation is pinned and nothing else would, and either way
+    // "eventually" is a visible frame of arrows sunk into the resized circles
+    // and order badges swallowed by them.
     if (linkSel) {
-      positionLinks(
-        linkSel,
-        (d) => (d.source as D3Node).x ?? 0, (d) => (d.source as D3Node).y ?? 0,
-        (d) => (d.target as D3Node).x ?? 0, (d) => (d.target as D3Node).y ?? 0,
-      );
+      const sx = (d: D3Link) => (d.source as D3Node).x ?? 0;
+      const sy = (d: D3Link) => (d.source as D3Node).y ?? 0;
+      const tx = (d: D3Link) => (d.target as D3Node).x ?? 0;
+      const ty = (d: D3Link) => (d.target as D3Node).y ?? 0;
+      positionLinks(linkSel, sx, sy, tx, ty);
+      positionEdgeMarks(sx, sy, tx, ty);
     }
     simulation?.alpha(0.2).restart();
   }
@@ -564,6 +630,10 @@
    *  same answer would be the one expensive thing on this canvas that buys
    *  nothing. */
   let regionTrafficByPath = new Map<string, RegionTraffic>();
+  /** Every file path the canvas is drawing something from, so a region can be
+   *  told from its key alone whether it is a file or a folder (UI-141).
+   *  Rebuilt with the traffic counts — same pass over the same nodes. */
+  let regionFilePaths = new Set<string>();
   /** Card position in canvas pixels, and its measured box so the card can be
    *  flipped rather than clipped at the right and bottom edges. */
   let regionCardX = 0;
@@ -576,6 +646,13 @@
 
   function clearRegionHover(): void {
     if (hoveredRegions.length > 0) hoveredRegions = [];
+  }
+
+  /** The pointer left the canvas: nothing on it is being pointed at, whether
+   *  or not the label's own `mouseleave` was delivered. */
+  function onCanvasPointerLeave(): void {
+    clearRegionHover();
+    publishRegionSubject(null);
   }
 
   /**
@@ -717,14 +794,72 @@
    * The two guards make the second click of a double-click a no-op rather
    * than a second navigation frame — someone who learned the area gesture and
    * applies it to the name should not have to press back twice.
+   *
+   * The click also pins the region into the Details column (UI-148), and that
+   * half runs *before* the guards rather than after. Until it existed this
+   * handler cleared the region subject on its way out, so the one gesture
+   * aimed at a file's name emptied the pane a reader was clicking it to fill —
+   * and in the already-focused case the guard returned before doing anything
+   * at all, which is the "clicking the name does nothing" it was reported as.
+   * Pinning is the answer in both cases: a focus that cannot narrow further is
+   * still a perfectly good request to read what is under the name.
    */
   function onRegionLabelClick(event: MouseEvent, h: FolderHull): void {
     event.stopPropagation();
     event.preventDefault();
+    // From the hull rather than from the hover store: the pointer is on the
+    // name, so the two agree, and reading the hull keeps the pin correct even
+    // if a redraw cleared the hover between `mouseenter` and this click.
+    pinRegion(regionSubjectOf(h));
     if (h.path === focusInFlight || h.path === soleScopePath()) return;
     focusInFlight = h.path;
     clearRegionHover();
+    // The hover goes, the pin stays. The canvas is about to be replaced, so
+    // "the pointer is over this name" stops being true — but "this is what I
+    // am reading" is exactly what the click just said.
+    setHoveredRegion(null);
     void drillInKeepingLevel(h.path).finally(() => { focusInFlight = null; });
+  }
+
+  /**
+   * Point the side panels at a region's name (UI-141).
+   *
+   * The *name*, and not the outline the card already answers for. A hull
+   * covers most of the canvas, so retargeting a column from an area hover
+   * would replace the reader's Details view on the way to anything else —
+   * the same asymmetry UI-115 relied on to give the name a single click when
+   * the area needs a double one.
+   *
+   * Called again from `computeRegionTraffic` with the pointer standing still:
+   * the counts are recomputed per draw, and a panel showing "12 of 19 drawn"
+   * has to follow a filter that lands while the reader is reading it.
+   */
+  function publishRegionSubject(h: FolderHull | null): void {
+    setHoveredRegion(h ? regionSubjectOf(h) : null);
+  }
+
+  /**
+   * A hull, read as the subject the panels take.
+   *
+   * Split out from `publishRegionSubject` once a click could pin one
+   * (UI-148): the pin and the hover have to describe a region identically —
+   * same grain, same counts — or a reader would watch the numbers change when
+   * they clicked the name they were already reading.
+   */
+  function regionSubjectOf(h: FolderHull): HoveredRegion {
+    return {
+      path: h.path,
+      label: h.label,
+      // A file is a group key too, once entities are grouped by their file
+      // (UI-103) — and it is the innermost tier when they are, so the region
+      // under a name is as often a file as a folder. Asked of the drawn set
+      // rather than guessed from the string: a directory with a dot in its
+      // name is not a file, and a reader told otherwise would be reading a
+      // file rollup's numbers under a folder's name.
+      grain: regionFilePaths.has(h.path) ? 'file' : 'folder',
+      size: h.size,
+      traffic: regionTrafficByPath.get(h.path) ?? null,
+    };
   }
 
   /**
@@ -798,10 +933,13 @@
     if (!nodeSel || !linkSel) { regionTrafficByPath = new Map(); return; }
     const chains = new Map<string, readonly string[]>();
     const candidates: { id: string }[] = [];
+    const filePaths = new Set<string>();
     nodeSel.each((d: D3Node) => {
       candidates.push({ id: d.id });
       chains.set(d.id, chainFor(d, Infinity));
+      if (d.file_path) filePaths.add(d.file_path);
     });
+    regionFilePaths = filePaths;
     const links: { source: string; target: string }[] = [];
     linkSel.each((l: D3Link) => {
       if (!plan.visibleLinkKeys.has(linkKeyFor(l))) return;
@@ -815,6 +953,27 @@
       links,
       keysOf: (id) => chains.get(id) ?? [],
     });
+    // The panel is showing last count's numbers for a region the pointer has
+    // not left. Re-publishing here is what makes a filter applied mid-read
+    // move the column, rather than leaving it stating a membership the canvas
+    // has stopped drawing.
+    const held = get(namedRegion);
+    if (held) {
+      const hull = regionHulls.find((h) => h.path === held.path);
+      if (hull) publishRegionSubject(hull);
+    }
+    // The pin needs the same refresh and gets it separately, because it is a
+    // different subject: a click focuses the region, so the very next count is
+    // the one taken *after* the drill, and a pin left holding the pre-drill
+    // numbers would say "8 of 40 drawn" about a canvas that now holds only the
+    // 8. Unlike the hover, it is not dropped when no hull matches — a region
+    // can be pinned and then filtered off the canvas, and the last honest
+    // counts are better than clearing what the reader asked to hold.
+    const pinned = get(pinnedRegion);
+    if (pinned) {
+      const hull = regionHulls.find((h) => h.path === pinned.path);
+      if (hull) pinnedRegion.set(regionSubjectOf(hull));
+    }
   }
 
   function drawHulls(immediate = false): void {
@@ -826,6 +985,10 @@
       // grouping the canvas has stopped making.
       regionHulls = [];
       clearRegionHover();
+      // Same argument for the panels: with no outlines there is no name to be
+      // pointing at, and `mouseleave` cannot fire for an element the redraw
+      // has already removed.
+      publishRegionSubject(null);
       return;
     }
     const now = performance.now();
@@ -845,6 +1008,10 @@
       tiers: get(hullDepth),
     });
     regionHulls = hulls;
+    // A region can stop being drawn without the pointer moving — a filter, a
+    // level change, a drill. The name goes with it, so nothing would ever
+    // clear a panel still describing it.
+    keepHoveredRegionAmong(new Set(hulls.map((h) => h.path)));
 
     const sel = fileHullGroup.selectAll<SVGGElement, FolderHull>('g.folder-hull')
       .data(hulls, (h) => (h as FolderHull).path)
@@ -871,7 +1038,15 @@
             .on('dblclick', function (event: MouseEvent) {
               event.stopPropagation();
               event.preventDefault();
-            });
+            })
+            // Pointing at the name is what puts the folder in the side panels
+            // (UI-141). `mouseenter` / `mouseleave` rather than `mouseover` /
+            // `mouseout`: the label is a single text element, so there is
+            // nothing inside it to bubble a spurious leave.
+            .on('mouseenter', function () {
+              publishRegionSubject(d3.select<SVGTextElement, FolderHull>(this).datum());
+            })
+            .on('mouseleave', () => publishRegionSubject(null));
           return grp;
         },
         (update) => update,
@@ -1079,6 +1254,137 @@
     return planVisible;
   }
 
+  /**
+   * The hover text for one edge.
+   *
+   * A schema edge answers first and unconditionally, because its facts — the
+   * columns that carry the join and how many rows sit at each end — are the
+   * whole reason to look at it, and the label pill they also appear on is
+   * behind a toggle that is off by default (SQL-006).
+   */
+  function linkTitle(d: D3Link): string {
+    const fk = d.fk ? fkTitle(d.fk) : null;
+    if (!d.breakdown || d.weight == null) return fk ?? d.kind;
+    const parts = Object.entries(d.breakdown)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => `${n} × ${k}`);
+    // Singular matters here now: UI-058 puts merged edges of weight 1 on
+    // screen routinely, where before they only appeared in fully collapsed
+    // views alongside plenty of plurals.
+    const noun = d.weight === 1 ? 'relationship' : 'relationships';
+    const collapsed = `${d.kind} — ${d.weight} underlying ${noun} (${parts.join(', ')})`;
+    return fk ? `${fk}\n${collapsed}` : collapsed;
+  }
+
+  /** Long-form spellings. `N:1` is easy to read in the wrong direction at a
+   *  glance, and the tooltip is where there is room to be unambiguous. */
+  const CARDINALITY_WORDS: Record<string, string> = {
+    '1:1': 'one-to-one',
+    'n:1': 'many-to-one',
+    'n:m': 'many-to-many',
+  };
+
+  /** What a SQL foreign key joins, in the order a reader wants it: the shape
+   *  of the relation, then the key that carries it, then the constraint they
+   *  would go and read. */
+  function fkTitle(fk: FkFacts): string {
+    const shape = CARDINALITY_WORDS[fk.cardinality] ?? fk.cardinality;
+    if (fk.junctionTable) {
+      const on = [fk.junctionSourceColumns, fk.junctionTargetColumns].filter(Boolean).join(' and ');
+      const via = `${shape}, inferred from the join table ${fk.junctionTable}`;
+      return on ? `${via}\njoined on ${on}` : via;
+    }
+    const join = fk.targetColumns ? `${fk.columns} → ${fk.targetColumns}` : `${fk.columns} → ?`;
+    const notes = [fk.onDelete && `ON DELETE ${fk.onDelete}`, fk.constraint && `constraint ${fk.constraint}`]
+      .filter(Boolean)
+      .join(' · ');
+    return notes ? `${shape} · ${join}\n${notes}` : `${shape} · ${join}`;
+  }
+
+  /**
+   * Ring the code the spec pane is pointing at — hidden nothing, moved
+   * nothing (ADR 0011, `f.spec_pairing.highlight`).
+   *
+   * The counterpart to the cross-filter and deliberately the weakest thing
+   * this canvas can be told to do: a class, on nodes that are already drawn.
+   * The filter's job is to remove the context; this one's whole value is that
+   * the context is still there to point into.
+   */
+  function applySpecHighlight(ids: Set<string> = get(specClaimHighlightIds)): void {
+    nodeSel?.classed('spec-claim', (d: D3Node) => ids.has(d.id));
+  }
+
+  /**
+   * Light the circles holding the file the Changes pane is pointing at
+   * (UI-152, `f.diff_reading.point`).
+   *
+   * The same channel one pane over, and deliberately weaker still than the
+   * spec ring: a halo rather than a stroke, because here the stroke is already
+   * carrying the change status this pane exists to explain, and a mark that
+   * repainted green as violet would answer "where is this file" by hiding what
+   * the file did.
+   */
+  function applyChangeHighlight(ids: Set<string> = get(changedFileLitIds)): void {
+    nodeSel?.classed('change-lit', (d: D3Node) => ids.has(d.id));
+  }
+
+  /**
+   * The Flow view's captions (UI-146).
+   *
+   * A layered picture is misread by default here, because every arrow points
+   * the *opposite* way to the flux: an edge names a dependency, so it runs
+   * from the column that would break to the column it needs. Reversing the
+   * heads to make the picture read left-to-right would make every arrow lie
+   * about what an edge means, so the axis is stated instead.
+   *
+   * Drawn from `plan.flowAxis` rather than from the node positions, so the
+   * caption and the column come from one layering — a label derived by
+   * re-clustering x-coordinates could name a column the nodes are not in.
+   * Empty for every other mode, which is what clears it.
+   */
+  function drawFlowAxis(plan: DisplayPlan, cx: number, cy: number): void {
+    if (!flowAxisGroup) return;
+    flowAxisGroup.selectAll('*').remove();
+    if (plan.flowAxis.length === 0) return;
+
+    // Above the tallest column, so a caption never sits on a node. Measured
+    // from the positions rather than from a row height this function would
+    // have to keep in step with `flowPlacement` — the density control changes
+    // that spacing, and a stale constant here puts the labels through the
+    // first row at `spacious`.
+    let highest = 0;
+    for (const p of plan.treePositions.values()) if (p.y < highest) highest = p.y;
+    const top = cy + highest - 44;
+
+    const rungs = flowAxisGroup.selectAll('g.flow-rung')
+      .data(plan.flowAxis, (r: any) => r.layer)
+      .join('g')
+      .attr('class', 'flow-rung')
+      .attr('transform', (r) => `translate(${cx + r.x},${top})`);
+
+    rungs.append('text')
+      .attr('class', 'flow-rung-index')
+      .attr('text-anchor', 'middle')
+      .text((r) => (r.layer === 0 ? 'Layer 0 · foundation' : `Layer ${r.layer}`));
+
+    rungs.append('text')
+      .attr('class', 'flow-rung-count')
+      .attr('text-anchor', 'middle')
+      .attr('dy', 14)
+      .text((r) => `${r.count} node${r.count === 1 ? '' : 's'}`);
+
+    // The direction, once, over the whole picture. Left of column 0 rather
+    // than centred, because the sentence is about where the reading STARTS.
+    const first = plan.flowAxis[0];
+    const last = plan.flowAxis[plan.flowAxis.length - 1];
+    flowAxisGroup.append('text')
+      .attr('class', 'flow-axis-caption')
+      .attr('x', cx + (first.x + last.x) / 2)
+      .attr('y', top - 26)
+      .attr('text-anchor', 'middle')
+      .text('depended upon  →  depends on others   (arrows point at what each node needs)');
+  }
+
   function applyDisplayPlan(plan: DisplayPlan): void {
     if (!nodeSel || !linkSel) { console.log('[GraphView] applyDisplayPlan: skipped (no DOM)'); return; }
     // Kept so a grain change can recount region traffic without waiting for
@@ -1088,6 +1394,12 @@
     console.log(`[GraphView] applyDisplayPlan: mode=${plan.mode} visibleNodes=${plan.visibleNodeIds.size} visibleLinks=${plan.visibleLinkKeys.size} selectedId=${plan.selectedId}`);
     const prevSelectedId = currentSelectedId;
     currentSelectedId = plan.selectedId ?? null;
+    // The one thing a layered picture cannot show by position (UI-146): the
+    // members of a cycle share a column *because* there is no order between
+    // them, and without a mark that column reads as a layer like any other.
+    // Unconditional, because `flowCycleIds` is empty in every other mode —
+    // which is also what takes the marks off on the way out of Flow.
+    nodeSel.classed('flow-cycle', (d: D3Node) => plan.flowCycleIds.has(d.id));
     // In force mode the simulation may have cooled — nothing re-runs the
     // tick handler that reads `currentSelectedId` until the user interacts.
     // Re-apply edge endpoints once here so the arrow flip happens
@@ -1131,14 +1443,16 @@
     // at full strength no matter what the plan said.
     nodeSel.transition('fade').duration(200).attr('opacity', (d) => nodeOpacity(d.id));
 
-    // Visibility: links + labels + badges. Show links where both endpoints
-    // are visible or dimmed (when dimOpacity > 0).
+    // Visibility: links + labels + badges. Two tiers, mirroring the nodes —
+    // the wiring the view chose, and the Rest tier's, which is on screen only
+    // while the slider holds it there.
     const nodeShown = (id: string) =>
       plan.visibleNodeIds.has(id) || (plan.dimmedNodeIds.has(id) && dimOpacity > 0);
     const lkVis = (d: D3Link) => {
-      if (plan.visibleLinkKeys.has(linkKeyFor(d))) return null;
-      // Show links between dimmed nodes at reduced opacity
-      if (dimOpacity > 0 && nodeShown(sourceId(d)) && nodeShown(targetId(d))) return null;
+      const key = linkKeyFor(d);
+      if (plan.visibleLinkKeys.has(key)) return null;
+      if (dimOpacity > 0 && plan.dimmedLinkKeys.has(key)
+          && nodeShown(sourceId(d)) && nodeShown(targetId(d))) return null;
       return 'none';
     };
     // A line is never louder than the quieter of the two nodes it joins. Left
@@ -1186,6 +1500,16 @@
     // Display-search highlight is applied by a separate subscription (see
     // onMount) so it stays outside the displayPlan feedback loop.
     nodeSel.classed('selected', (d) => d.id === plan.selectedId);
+    // The spec pane's highlight is on its own store for the same reason, but
+    // unlike the display search it must also be reapplied *here*: a node that
+    // enters on a re-join arrives with a fresh class attribute, and the one
+    // moment a highlighted node is most likely to be entering is when the
+    // reader has just widened the filter to see the context it sits in.
+    applySpecHighlight();
+    // Same argument, and it bites harder here: the pane's own list is refetched
+    // on every save under a working head, so the graph re-joins underneath a
+    // light that is still pointing at the row the reader left open.
+    applyChangeHighlight();
 
     // Diff mode: color node strokes by change status when active.
     // Core changes get solid stroke, impact-only changes get dashed stroke.
@@ -1229,6 +1553,8 @@
         return p ? { x: cx + p.x, y: cy + p.y } : null;
       };
 
+      drawFlowAxis(plan, cx, cy);
+
       // Pin and animate visible nodes to their tree positions. The opacity
       // attr ensures nodes that just entered via an incremental updateGraph
       // (which starts them at opacity 0) become visible — without it, this
@@ -1257,20 +1583,7 @@
         const tx = (d: D3Link) => posOf(targetId(d))?.x ?? (d.target as D3Node).x ?? 0;
         const ty = (d: D3Link) => posOf(targetId(d))?.y ?? (d.target as D3Node).y ?? 0;
         positionLinks(linkSel, sx, sy, tx, ty);
-        linkLabelSel.attr('transform', (d) => {
-          const mx = (sx(d) + tx(d)) / 2;
-          const my = (sy(d) + ty(d)) / 2;
-          const off = labelPerpOffset(d, sx(d), sy(d), tx(d), ty(d));
-          return `translate(${mx + off.dx},${my + off.dy})`;
-        });
-        // Order badges sit 25 % from the visual tail so they stay on the
-        // opposite side of the arrow head, regardless of direction flip.
-        orderBadgeSel.attr('transform', (d) => {
-          const [hx, hy, tx2, ty2] = isReversed(d)
-            ? [tx(d), ty(d), sx(d), sy(d)]
-            : [sx(d), sy(d), tx(d), ty(d)];
-          return `translate(${hx * 0.75 + tx2 * 0.25},${hy * 0.75 + ty2 * 0.25})`;
-        });
+        positionEdgeMarks(sx, sy, tx, ty);
       };
       setTimeout(positionEdgesAndLabels, 650);
 
@@ -1285,6 +1598,7 @@
       // changes above are enough for a pure filter update.
       const wasTreeOrPinned = currentMode !== 'force';
       currentMode = 'force';
+      flowAxisGroup?.selectAll('*').remove();
       if (wasTreeOrPinned) {
         nodeSel.each((d) => { d.fx = null; d.fy = null; });
         fileHullGroup?.selectAll('*').remove();
@@ -1557,6 +1871,22 @@
   }
 
   /**
+   * In and out of the Flow view (UI-146).
+   *
+   * Its own control rather than a third stop on `toggleViewMode`, because it
+   * is not a third kind of picture: it re-lays out whatever Graph view was
+   * showing. A reader turns it on to ask which way the dependencies run and
+   * turns it back off with the same population underneath — a cycle that made
+   * them pass through Tree view would lose the selection reach on the way.
+   *
+   * Leaving Flow always lands on Graph, never on Tree, for the same reason:
+   * `graph` is the mode Flow is a re-reading of.
+   */
+  export function toggleFlowMode() {
+    viewMode.update((m) => (m === 'flow' ? 'graph' : 'flow'));
+  }
+
+  /**
    * The nodes and links the plan actually puts on screen.
    *
    * Dimmed nodes count as drawn — they render at reduced opacity rather than
@@ -1579,13 +1909,21 @@
     const keep = drawnIdsOf(plan);
     if (keep.size === 0) return empty;
     const nodes = data.nodes.filter((n) => keep.has(n.id));
-    // Both endpoint checks matter: `visibleLinkKeys` is computed against the
-    // visible set, and a dimmed endpoint can leave a key whose other end is
-    // filtered out. A link to a node that was never built renders as a line
-    // into empty space.
-    const links = data.links.filter(
-      (l) => plan.visibleLinkKeys.has(linkKeyFor(l)) && keep.has(sourceId(l)) && keep.has(targetId(l)),
-    );
+    // Both tiers of wiring, for the same reason both tiers of node are kept:
+    // the Rest tier is drawn, faintly, and a tier that is drawn has to be
+    // *built*. This filter used to admit `visibleLinkKeys` alone, which is why
+    // the Rest slider faded in a field of unconnected circles — the fallback in
+    // `applyDisplayPlan` that draws dimmed-node links at reduced opacity had no
+    // element to act on, because the join never bound one (UI-144).
+    //
+    // Both endpoint checks still matter: a key can name an end that a later
+    // filter removed, and a link to a node that was never built renders as a
+    // line into empty space.
+    const links = data.links.filter((l) => {
+      const key = linkKeyFor(l);
+      if (!plan.visibleLinkKeys.has(key) && !plan.dimmedLinkKeys.has(key)) return false;
+      return keep.has(sourceId(l)) && keep.has(targetId(l));
+    });
     return { nodes, links, files: data.files, folders: data.folders };
   }
 
@@ -1648,6 +1986,11 @@
     // region would otherwise take it. See `onContentDoubleClick`.
     g.on('dblclick', (event) => onContentDoubleClick(event));
     fileHullGroup = g.append('g').attr('class', 'file-hulls');
+    // Behind the nodes and inside the zoom group, so the captions pan and
+    // scale with the columns they name. A fixed overlay would drift off its
+    // column the first time the reader zoomed, which is worse than no label:
+    // it would name the wrong one.
+    flowAxisGroup = g.append('g').attr('class', 'flow-axis');
 
     zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.1, 4])
@@ -1658,8 +2001,13 @@
     svg.call(zoom);
     svg.call(zoom.transform, d3.zoomIdentity);
 
+    // Deselect means deselect: a pinned region is a subject the Details column
+    // is holding just as a pinned node is, and leaving it behind would make
+    // clicking empty canvas clear "some of" the selection (UI-148).
     svg.on('click', (event) => {
-      if (isCanvasBackground(event.target)) selectedNode.set(null);
+      if (!isCanvasBackground(event.target)) return;
+      selectedNode.set(null);
+      unpinRegion();
     });
 
     // `markerUnits: userSpaceOnUse` is the load-bearing attribute: without it
@@ -1720,17 +2068,7 @@
       .attr('stroke-dasharray', (d) => linkStrokeDashArray(d))
       .attr('stroke-opacity', 0.6)
       .attr('marker-end', 'url(#arrow)');
-    linkSel.append('title').text((d) => {
-      if (!d.breakdown || d.weight == null) return d.kind;
-      const parts = Object.entries(d.breakdown)
-        .sort((a, b) => b[1] - a[1])
-        .map(([k, n]) => `${n} × ${k}`);
-      // Singular matters here now: UI-058 puts merged edges of weight 1 on
-      // screen routinely, where before they only appeared in fully collapsed
-      // views alongside plenty of plurals.
-      const noun = d.weight === 1 ? 'relationship' : 'relationships';
-      return `${d.kind} — ${d.weight} underlying ${noun} (${parts.join(', ')})`;
-    });
+    linkSel.append('title').text(linkTitle);
 
     const linkLabelGroup = g.append('g').attr('class', 'link-labels');
     linkLabelSel = linkLabelGroup.selectAll('g').data(data.links).join('g').attr('class', 'link-label-container');
@@ -1756,7 +2094,7 @@
     const orderedLinks = data.links.filter((d) => d.order != null);
     const orderBadgesGroup = g.append('g').attr('class', 'order-badges');
     orderBadgeSel = orderBadgesGroup.selectAll('g').data(orderedLinks).join('g').attr('class', 'order-badge-container');
-    orderBadgeSel.append('circle').attr('r', 8).attr('fill', '#FF9800').attr('stroke', canvasColors.orderBadgeStroke).attr('stroke-width', 1.5);
+    orderBadgeSel.append('circle').attr('r', ORDER_BADGE_R).attr('fill', '#FF9800').attr('stroke', canvasColors.orderBadgeStroke).attr('stroke-width', 1.5);
     orderBadgeSel.append('text').attr('text-anchor', 'middle').attr('dominant-baseline', 'central')
       .attr('fill', canvasColors.orderBadgeText).attr('font-size', '8px').attr('font-weight', '700').attr('pointer-events', 'none')
       .text((d) => d.order!);
@@ -1867,26 +2205,10 @@
         (d) => (d.source as D3Node).x!, (d) => (d.source as D3Node).y!,
         (d) => (d.target as D3Node).x!, (d) => (d.target as D3Node).y!,
       );
-      linkLabelSel.attr('transform', (d) => {
-        const sx = (d.source as D3Node).x!;
-        const sy = (d.source as D3Node).y!;
-        const tx = (d.target as D3Node).x!;
-        const ty = (d.target as D3Node).y!;
-        const mx = (sx + tx) / 2;
-        const my = (sy + ty) / 2;
-        const off = labelPerpOffset(d, sx, sy, tx, ty);
-        return `translate(${mx + off.dx},${my + off.dy})`;
-      });
-      orderBadgeSel.attr('transform', (d) => {
-        // Keep the order badge 25 % from the visual tail, which flips with
-        // the edge direction for reversed labels.
-        const src = d.source as D3Node;
-        const tgt = d.target as D3Node;
-        const [hx, hy, tx, ty] = isReversed(d)
-          ? [tgt.x!, tgt.y!, src.x!, src.y!]
-          : [src.x!, src.y!, tgt.x!, tgt.y!];
-        return `translate(${hx * 0.75 + tx * 0.25},${hy * 0.75 + ty * 0.25})`;
-      });
+      positionEdgeMarks(
+        (d) => (d.source as D3Node).x!, (d) => (d.source as D3Node).y!,
+        (d) => (d.target as D3Node).x!, (d) => (d.target as D3Node).y!,
+      );
       nodeSel.attr('transform', (d) => `translate(${d.x},${d.y})`);
       drawHulls();
       publishOverview();
@@ -1992,7 +2314,7 @@
     g.select('.order-badges').selectAll('*').remove();
     const orderedLinks = data.links.filter((d) => d.order != null);
     orderBadgeSel = g.select('.order-badges').selectAll('g').data(orderedLinks).join('g').attr('class', 'order-badge-container');
-    orderBadgeSel.append('circle').attr('r', 8).attr('fill', '#FF9800').attr('stroke', canvasColors.orderBadgeStroke).attr('stroke-width', 1.5);
+    orderBadgeSel.append('circle').attr('r', ORDER_BADGE_R).attr('fill', '#FF9800').attr('stroke', canvasColors.orderBadgeStroke).attr('stroke-width', 1.5);
     orderBadgeSel.append('text').attr('text-anchor', 'middle').attr('dominant-baseline', 'central')
       .attr('fill', canvasColors.orderBadgeText).attr('font-size', '8px').attr('font-weight', '700').attr('pointer-events', 'none')
       .text((d) => d.order!);
@@ -2225,6 +2547,22 @@
       }
     }));
 
+    // 5. The spec pane's highlight. Same shape and the same reason — it is an
+    //    overlay, and a hover on the other pane must not be able to cost a
+    //    plan recompute of this one. `applyDisplayPlan` reapplies it after a
+    //    re-join; this is what moves it while the canvas holds still, which is
+    //    the case that matters, the pointer being on the other pane.
+    unsubscribers.push(specClaimHighlightIds.subscribe((ids) => {
+      if (initialized) applySpecHighlight(ids);
+    }));
+
+    // 6. The Changes pane's light, on the same terms. Sweeping a file list is
+    //    a pointer moving fast over dozens of rows, which is exactly the
+    //    traffic that must not reach the display plan.
+    unsubscribers.push(changedFileLitIds.subscribe((ids) => {
+      if (initialized) applyChangeHighlight(ids);
+    }));
+
     // Seed viewport width immediately so the first tree layout wraps correctly.
     viewportWidth.set(container.clientWidth);
 
@@ -2262,7 +2600,7 @@
   <svg
     bind:this={svgEl}
     on:pointermove={onCanvasPointerMove}
-    on:pointerleave={clearRegionHover}
+    on:pointerleave={onCanvasPointerLeave}
   ></svg>
   <!-- Where you are (UI-071). Widest region first, so the card reads the way
        a path does, and the tightest one last because that is what the double
@@ -2402,6 +2740,36 @@
     cursor: pointer;
   }
   :global(.hull-label:hover) { text-decoration: underline; }
+
+  /* The Flow view's axis (UI-146). Chrome, not data: it never takes the
+     pointer, and it is quiet enough that the columns it captions stay the
+     thing being read. Themed via the text tokens, like every other caption
+     on this canvas. */
+  :global(.flow-axis) { pointer-events: none; }
+  :global(.flow-rung-index) {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    fill: var(--text-muted);
+  }
+  :global(.flow-rung-count) {
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    fill: var(--text-dim);
+  }
+  /* A node with no honest place in the order. Dashed like a ghost but
+     tighter and at full opacity — a ghost is absent, a cycle member is very
+     much present and is the thing to go and look at. */
+  :global(.node.flow-cycle circle) {
+    stroke-dasharray: 2, 3;
+    stroke-width: 3px;
+  }
+  :global(.flow-axis-caption) {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    fill: var(--text-dim);
+  }
 
   /* The "where am I" card (UI-071). Cursor-anchored rather than parked in a
      corner: the question is about the point being aimed at, and a reader
@@ -2562,6 +2930,47 @@
   :global(.node.search-display-match circle) { stroke: #4DD0E1; stroke-width: 4px; filter: drop-shadow(0 0 5px rgba(77, 208, 225, 0.9)); }
   :global(.node.search-match.search-display-match circle) { stroke: #4DD0E1; filter: drop-shadow(0 0 4px rgba(255, 213, 79, 0.6)) drop-shadow(0 0 5px rgba(77, 208, 225, 0.9)); }
   :global(.node.search-display-match) { opacity: 1 !important; }
+  /* Spec claim (ADR 0011): the code an Elevator entity declares with `cr:`,
+     lit because the reader is pointing at that entity in the spec pane or has
+     pinned it. Violet, because every other stroke here is spoken for — gold
+     and cyan are the two searches, green/red/amber the diff statuses, magenta
+     the arrival ring and `var(--accent)` the selection — and because violet is
+     the spec layer's own family (Category is #5E35B1), so the ring reads as
+     that pane reaching onto this canvas.
+
+     Dashed, and that is not decoration: this is the one ring on the canvas
+     that says "belongs to", not "is". A reader who cannot separate the hues
+     can still separate a dashed ring from five solid ones, and a spec claim
+     from the trait-impl dash by its colour and its 4px weight.
+
+     Opacity forced like the display search, for the reason the whole channel
+     exists: a claim ringed at 0.2 because a search dimmed it would answer
+     "where does this Feature live" with a node the reader cannot see. */
+  :global(.node.spec-claim circle) {
+    stroke: #7C4DFF;
+    stroke-width: 4px;
+    stroke-dasharray: 6,3;
+    filter: drop-shadow(0 0 5px rgba(124, 77, 255, 0.85));
+  }
+  :global(.node.spec-claim) { opacity: 1 !important; }
+  /* Changed-file light (UI-152): the circles holding the file the Changes pane
+     is pointing at — the row under the pointer, and the row the reader opened.
+
+     The same violet as the spec claim, and on purpose: both mean "a pane over
+     there is pointing here", and a sixth hue for a sixth channel would be one
+     no reader could name. What separates them is the *form*. This one is a
+     halo and never a stroke, because the stroke of a changed node is already
+     carrying its diff status — the very thing this pane exists to explain —
+     and repainting green as violet would answer "where is this file" by
+     deleting what the file did.
+
+     Opacity forced for the reason the whole channel exists: the ladder dims
+     everything it did not recruit, and a file pointed at from the list while
+     drawn at 0.15 is an answer the reader cannot see. */
+  :global(.node.change-lit circle) {
+    filter: drop-shadow(0 0 5px rgba(124, 77, 255, 0.95)) drop-shadow(0 0 11px rgba(124, 77, 255, 0.5));
+  }
+  :global(.node.change-lit) { opacity: 1 !important; }
   /* Arrival mark (UI-066): a node that appeared on a live reload wears this
      ring for 30s. Magenta because every other stroke on the canvas is
      already spoken for — gold and cyan are the two searches, green/red/amber

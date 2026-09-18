@@ -254,9 +254,18 @@ struct JsonEntityMetrics {
     cognitive_complexity: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_nesting: Option<u32>,
+    /// Loops only, unlike `max_nesting`. Exported beside it precisely
+    /// because the two are confusable and only this one is a scaling claim
+    /// (MCP-046).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loop_nesting: Option<u32>,
     loc: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     param_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_set: Option<u32>,
     fan_in: u32,
     fan_out: u32,
     in_cycle: bool,
@@ -346,8 +355,11 @@ impl JsonEntity {
                 cyclomatic: e.metrics.cyclomatic,
                 cognitive_complexity: e.metrics.cognitive_complexity,
                 max_nesting: e.metrics.max_nesting,
+                loop_nesting: e.metrics.loop_nesting,
                 loc: e.metrics.loc,
                 param_count: e.metrics.param_count,
+                local_count: e.metrics.local_count,
+                working_set: e.metrics.working_set,
                 fan_in: e.metrics.fan_in,
                 fan_out: e.metrics.fan_out,
                 in_cycle: e.metrics.in_cycle,
@@ -376,6 +388,23 @@ impl JsonEntity {
     }
 }
 
+/// The edge's own label wins where it has one.
+///
+/// A parser that went to the trouble of saying `mounts`, `routes to`, or
+/// `user_id → id (N:1)` knows something the kind alone does not. Until
+/// SQL-006 this renderer overwrote every one of them with the generic verb —
+/// which is why `transform.ts` has always preferred the per-edge label and
+/// never once received one.
+fn edge_label(
+    r: &crate::models::Relationship,
+    source_language: crate::models::file_info::Language,
+) -> String {
+    match &r.label {
+        Some(own) => own.clone(),
+        None => r.kind.display_label_for(source_language).to_string(),
+    }
+}
+
 impl JsonRelationship {
     fn from_relationship(
         r: &crate::models::Relationship,
@@ -386,7 +415,7 @@ impl JsonRelationship {
             .ok()
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| format!("{:?}", r.kind).to_lowercase());
-        let label = r.kind.display_label_for(source_language).to_string();
+        let label = edge_label(r, source_language);
         let incoming_label = r.kind.incoming_label_for(source_language).to_string();
         Self {
             source_id: r.source_id.clone(),

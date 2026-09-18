@@ -4,10 +4,10 @@ What Mezzanine does today, how its tools are organized, why they make human
 coders and coding agents more effective, and where it could go next.
 
 Mezzanine builds a single typed graph — Entities and Relationships with
-per-entity metrics — from heterogeneous source files. Twelve languages have
-dedicated parsers (Rust, Python, TypeScript, Svelte, Java, Go, Kotlin, Dart,
-Groovy, Impex, Ansible, Elevator specs); everything else falls back to a generic
-parser with reduced fidelity. See the README for what each tier gives you.
+per-entity metrics — from heterogeneous source files. Seventeen languages have
+dedicated parsers (Rust, Python, TypeScript, JavaScript, Svelte, Java, Go, Kotlin,
+Dart, Groovy, C++/C, Impex, Ansible, SQL, Docker, Markdown, Elevator specs);
+everything else falls back to a generic parser with reduced fidelity. See the README for what each tier gives you.
 Everything below is a different way of asking that graph a question.
 
 ## The altitude Mezzanine occupies
@@ -38,7 +38,7 @@ Four roles cover the surface. Each role answers one kind of question.
 
 | Surface | What it gives |
 | --- | --- |
-| MCP `quality` | Smells (God Class, Dispatcher, Feature Envy, Shotgun Surgery, Data Bag), top offenders by composite refactor pressure, dependency cycles |
+| MCP `quality` | Smells (God Class, Dispatcher, Feature Envy, Shotgun Surgery, Data Bag, Overfull Head), top offenders by composite refactor pressure, dependency cycles |
 | MCP `hotspots` | Git churn × complexity — risk ranking that complexity alone cannot give (complex-but-stable ranks low) |
 | Metrics engine | Cyclomatic, cognitive, nesting, fan-in/out, instability, WMC, chain depth, PageRank, composite score |
 | Elevator spec health | `--check` (broken refs, orphans), `--code-map` (same code claimed twice), `--drift` (cr paths that no longer resolve, identifiers in `d:` no longer found in the claimed code), `--drift --fix` (rewrites the cr paths git recorded a rename for) |

@@ -14,4 +14,4 @@
 pub(super) mod calls;
 mod flow;
 pub(super) mod inference;
-mod stdlib;
+pub(crate) mod stdlib;

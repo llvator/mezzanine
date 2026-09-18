@@ -1,6 +1,6 @@
 //! Kotlin stdlib / common method names filtered out during call extraction.
 
-pub(super) fn is_stdlib_method(name: &str) -> bool {
+pub(crate) fn is_stdlib_method(name: &str) -> bool {
     matches!(
         name,
         "toString"

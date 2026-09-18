@@ -73,6 +73,27 @@ test('the pointer leaving a node on the far screen is a change too', () => {
   assert.equal(whatToApply(msg(), mineWithHover), 'attention');
 });
 
+// The Details pane has two contents, and a selection only names one of them:
+// a file opened from the Changes tab wins the pane over the selected entity
+// (UI-134). Mirroring the selection alone left the second window showing the
+// file's *node* beside a first window showing the file (UI-142).
+test('opening a file in the Changes tab is a change, and does not cost a refetch', () => {
+  assert.equal(whatToApply(msg({}, { file: 'src/a.rs' }), MINE), 'attention');
+});
+
+test('closing it on one screen closes it on the other', () => {
+  const open = msg({ origin: 'me' }, { file: 'src/a.rs' });
+  assert.equal(whatToApply(msg(), open), 'attention');
+});
+
+// The row pins its own file node, so the two travel together — but they are
+// two fields, and a peer that moved only one of them still moved.
+test('two windows on the same file node disagree while only one has it open', () => {
+  const pinned = msg({ origin: 'me' }, { selected: 'src/a.rs' });
+  const reading = msg({}, { selected: 'src/a.rs', file: 'src/a.rs' });
+  assert.equal(whatToApply(reading, pinned), 'attention');
+});
+
 test('freezing a preview on one screen is a change on the other', () => {
   assert.equal(whatToApply(msg({}, { hoverLocked: true }), MINE), 'attention');
 });
@@ -99,6 +120,55 @@ test('a drill path is compared as a sequence, not as a set', () => {
   const mine = msg({ origin: 'me' }, { specPath: ['a', 'b'] });
   assert.equal(whatToApply(msg({}, { specPath: ['b', 'a'] }), mine), 'attention');
   assert.equal(whatToApply(msg({}, { specPath: ['a', 'b'] }), mine), 'none');
+});
+
+// The spec pane's pointer. The arrangement this whole feature is for — canvas
+// on one screen, panes on the other — is the one where the pointer that lights
+// the code is never in the window doing the lighting, so a hover that does not
+// travel is a highlight that works everywhere except where it is needed.
+test('a pointer resting on a spec entity is a change worth sending', () => {
+  assert.equal(whatToApply(msg({}, { specHover: 'cat' }), MINE), 'attention');
+});
+
+test('the spec pointer never costs the far window a refetch', () => {
+  // It rings nodes that are already drawn; if this ever returned `all`, every
+  // sweep of the spec pane would refetch the graph on the other screen.
+  assert.equal(whatToApply(msg({}, { specHover: 'cat' }), MINE), 'attention');
+  assert.equal(whatToApply(msg({}, { specPinned: ['cat'] }), MINE), 'attention');
+});
+
+test('the spec pointer leaving is a change too', () => {
+  const pointing = msg({ origin: 'me' }, { specHover: 'cat' });
+  assert.equal(whatToApply(msg({}, { specHover: null }), pointing), 'attention');
+});
+
+test('pinning and unpinning travel', () => {
+  assert.equal(whatToApply(msg({}, { specPinned: ['cat'] }), MINE), 'attention');
+  const pinned = msg({ origin: 'me' }, { specPinned: ['cat'] });
+  assert.equal(whatToApply(msg({}, { specPinned: [] }), pinned), 'attention');
+});
+
+// The opposite of the drill path directly above, and deliberately so: a pin is
+// a membership, and calling two orderings of one set a difference would have
+// the windows publish-and-apply at each other over a picture they agree on.
+test('pins are compared as a set, not as a sequence', () => {
+  const mine = msg({ origin: 'me' }, { specPinned: ['a', 'b'] });
+  assert.equal(whatToApply(msg({}, { specPinned: ['b', 'a'] }), mine), 'none');
+  assert.equal(whatToApply(msg({}, { specPinned: ['a'] }), mine), 'attention');
+  assert.equal(whatToApply(msg({}, { specPinned: ['a', 'c'] }), mine), 'attention');
+});
+
+// Same rule as the canvas pointer, and it has to be: two windows both showing
+// the spec pane would otherwise overwrite each other every few pixels.
+test('the local spec pointer wins while it is on something', () => {
+  assert.equal(hoverToShow('mine', 'theirs', null), 'mine');
+});
+
+test('a borrowed spec hover is given back when the local pointer leaves', () => {
+  // `mine` is only set because it was adopted, so it is not a local gesture
+  // and must not outrank the peer's newer one.
+  assert.equal(hoverToShow('theirs', 'newer', 'theirs'), 'newer');
+  assert.equal(hoverToShow(null, 'theirs', null), 'theirs');
 });
 
 test('a different reading is applied in full', () => {
@@ -243,6 +313,45 @@ test('a drill path that is not a list of ids reads as nothing opened', () => {
   assert.deepEqual(at(['cat', 7, null, 'feat']), ['cat', 'feat']);
 });
 
+// A path is not an id, but it reaches this the same way one does, and a
+// non-string here would be handed to `changedFiles.find` as a path.
+test('an open file that is not a path reads as nothing open', () => {
+  const at = (file: unknown) => normalizeMessage(
+    { origin: 'a', seq: 1, state: {}, attention: { file } },
+  )?.attention.file;
+  assert.equal(at(17), null);
+  assert.equal(at(['src/a.rs']), null);
+  assert.equal(at('src/a.rs'), 'src/a.rs');
+});
+
+test('a spec pointer that is not an id reads as pointing at nothing', () => {
+  const at = (specHover: unknown) => normalizeMessage(
+    { origin: 'a', seq: 1, state: {}, attention: { specHover } },
+  )?.attention.specHover;
+  assert.equal(at(3), null);
+  assert.equal(at(['cat']), null);
+  assert.equal(at('cat'), 'cat');
+});
+
+test('a pin list that is not a list of ids reads as nothing pinned', () => {
+  const at = (specPinned: unknown) => normalizeMessage(
+    { origin: 'a', seq: 1, state: {}, attention: { specPinned } },
+  )?.attention.specPinned;
+  assert.deepEqual(at('cat'), []);
+  assert.deepEqual(at(['cat', 7, null, 'feat']), ['cat', 'feat']);
+});
+
+// The realistic case for both fields above: a window left open from before
+// this shipped. It says nothing about the spec pointer, which has to read as
+// "not pointing at anything" rather than dragging its peer's rings off.
+test('a window that predates the spec pointer leaves it alone', () => {
+  const old = { origin: 'a', seq: 1, state: {}, attention: { selected: 'x', specPath: ['cat'] } };
+  const got = normalizeMessage(old)?.attention;
+  assert.equal(got?.specHover, null);
+  assert.deepEqual(got?.specPinned, []);
+  assert.deepEqual(got?.specPath, ['cat']);
+});
+
 test('a view mode this version does not know falls back to the graph', () => {
   const at = { mode: 'hyperbolic' };
   assert.equal(normalizeMessage({ origin: 'a', seq: 1, state: {}, attention: at })?.attention.mode, 'graph');
@@ -254,9 +363,12 @@ test('a well-formed message survives the round trip', () => {
     {
       selected: 'src/a.rs:1:f',
       hovered: 'src/b.rs:2:g',
+      file: 'src/c.rs',
       hoverLocked: true,
       mode: 'tree',
       specPath: ['spec/app.elv:1:Parsing', 'spec/app.elv:9:Rust'],
+      specHover: 'spec/app.elv:14:Inference',
+      specPinned: ['spec/app.elv:9:Rust'],
     },
   );
   const got = normalizeMessage(JSON.parse(JSON.stringify(sent)));

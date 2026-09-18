@@ -5,8 +5,9 @@
 //! definitions inside a function body so closures and inner classes
 //! are still registered as their own entities.
 
-use super::super::bodies::calls::extract_calls;
+use super::super::bodies::calls::{extract_calls, CallCtx, Caller};
 use super::super::bodies::complexity::{compute_complexity, count_return_tuple_elements};
+use super::super::bodies::inference::Locals;
 use super::super::ctx::ExtractCtx;
 use super::super::decorators::{emit_decorator_edges, extract_decorators};
 use super::super::docstrings::extract_docstring;
@@ -14,6 +15,7 @@ use super::super::generics::collect_type_parameters;
 use crate::models::entity::Parameter;
 use crate::models::{CodeEntity, EntityKind, Visibility};
 use crate::parser::language_parser::{node_text, node_to_span};
+use crate::parser::working_set;
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -77,21 +79,26 @@ pub(super) fn handle_function(
                 }
             }
         }
+        let entity_parameters = entity.parameters.clone();
         ctx.result.add_entity(entity);
         emit_decorator_edges(node, ctx.source, &caller_id, ctx.result);
         if let Some(body) = node.child_by_field_name("body") {
-            let mut call_order = 0u32;
-            extract_calls(
-                &body,
-                ctx.source,
-                ctx.path,
-                &caller_id,
-                &caller_name,
-                parent_class_name.as_deref(),
-                &mut call_order,
-                None,
-                ctx.result,
-            );
+            // What this body's receivers are declared to be: the enclosing
+            // class's fields, and this callable's own parameters (PY-031).
+            // Both are read off entities already placed, so nothing here
+            // re-walks the tree.
+            let locals = Locals::new(&class_fields(parent_id, ctx), &entity_parameters);
+            let caller = Caller {
+                source: ctx.source,
+                path: ctx.path,
+                id: &caller_id,
+                name: &caller_name,
+                parent_class: parent_class_name.as_deref(),
+                locals: &locals,
+                returns: ctx.returns,
+            };
+            let mut call_ctx = CallCtx::new(caller, ctx.result);
+            extract_calls(&body, &mut call_ctx, None);
         }
         // Nested `def`/`class` declarations inside the body are the
         // dispatcher's to register, once it has this id to parent them
@@ -170,7 +177,7 @@ fn parse_function(
         entity.metrics.return_complexity = count_return_tuple_elements(&ret, source);
     }
 
-    populate_body_metrics(node, &mut entity);
+    populate_body_metrics(node, source, &mut entity);
 
     // Docstring.
     entity.documentation = extract_docstring(node, source);
@@ -231,11 +238,12 @@ fn apply_decorator_tags(entity: &mut CodeEntity) {
 /// signature, anything in a `.pyi`) scores `1 / 0 / 0` — one
 /// straight-through path — rather than `None`, so the hotspot ranking sees
 /// "measured and trivial" instead of "not measured".
-fn populate_body_metrics(node: &Node, entity: &mut CodeEntity) {
+fn populate_body_metrics(node: &Node, source: &str, entity: &mut CodeEntity) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
     // `parse_parameters` already drops `self` / `cls`.
     entity.metrics.param_count = Some(entity.parameters.len() as u32);
-    if let Some(body) = node.child_by_field_name("body") {
+    let body = node.child_by_field_name("body");
+    if let Some(body) = body {
         let (cc, nesting, cog) = compute_complexity(&body);
         entity.metrics.cyclomatic = Some(cc);
         entity.metrics.max_nesting = Some(nesting);
@@ -245,6 +253,8 @@ fn populate_body_metrics(node: &Node, entity: &mut CodeEntity) {
         entity.metrics.max_nesting = Some(0);
         entity.metrics.cognitive_complexity = Some(0);
     }
+    working_set::populate(entity, body.as_ref(), source);
+    crate::parser::loops::populate(entity, body.as_ref());
 }
 
 /// Tag `entity` as a generator (and `async_generator` when also async)
@@ -460,4 +470,23 @@ fn parse_typed_default_param(node: &Node, source: &str) -> Option<Parameter> {
         default_value,
         visibility: None,
     })
+}
+
+/// The fields of the class a method hangs off, or nothing when the callable
+/// is not a method.
+///
+/// Read from the entity the dispatcher already placed rather than from the
+/// tree: `parse_class_fields` has done this work, including the `__init__`
+/// parameter types it reads through, and doing it twice would let the two
+/// answers drift.
+fn class_fields(parent_id: Option<&str>, ctx: &ExtractCtx<'_>) -> Vec<Parameter> {
+    let Some(pid) = parent_id else {
+        return Vec::new();
+    };
+    ctx.result
+        .entities
+        .iter()
+        .find(|e| e.id == pid && e.kind.is_container())
+        .map(|e| e.fields.clone())
+        .unwrap_or_default()
 }

@@ -37,9 +37,10 @@
 <div class="setting-section">
   <h2>Settings file</h2>
   <p class="section-desc">
-    What mezz resolved before drawing anything, and which of the four sources
-    decided each value. Precedence runs command line → environment → this repo
-    → your settings → default; the first one that says something wins.
+    What mezz resolved before drawing anything, and which source decided each
+    value. Precedence runs command line → environment → your override for this
+    repo → this repo → your settings → default; the first one that says
+    something wins.
   </p>
 
   {#if $settingsReportError}
@@ -260,6 +261,8 @@
     color: var(--text-disabled);
   }
 
+  /* The links a reader chose, as against the ones that were chosen for them. */
+  .badge.repo-override,
   .badge.repo-file,
   .badge.flag {
     color: var(--accent);

@@ -27,6 +27,7 @@ use super::super::types::{self, TypeUse};
 use crate::models::{CodeEntity, EntityKind};
 use crate::parser::language_parser::{node_text, node_to_span};
 use tree_sitter::Node;
+use crate::parser::working_set;
 
 /// Parse a `func Name(…)`, add it, and walk its body.
 pub(super) fn handle_function(node: &Node, ctx: &mut ExtractCtx<'_>) {
@@ -108,6 +109,8 @@ fn place(
             entity.metrics.cognitive_complexity = Some(0);
         }
     }
+    working_set::populate(&mut entity, body.as_ref(), ctx.source);
+    crate::parser::loops::populate(&mut entity, body.as_ref());
 
     let caller_id = entity.id.clone();
     let caller_name = entity.name.clone();

@@ -40,6 +40,10 @@ pub enum Origin {
     Flag,
     /// One of the `MEZZ_*` environment variables.
     Env,
+    /// The `repos` entry of `~/.config/mezz/settings.json` that names this
+    /// checkout — the reader's own repo-scope settings, which outrank the
+    /// repo's own file.
+    RepoOverride,
     /// `<analyzed-root>/.mezz/settings.json`.
     RepoFile,
     /// `~/.config/mezz/settings.json`.
@@ -172,6 +176,14 @@ impl Inputs<'_> {
         &self.loaded.repo
     }
 
+    /// The user file's `repos` entry for this checkout. Its own link of the
+    /// chain rather than part of `user()`, because it wins where the rest of
+    /// the user scope loses — reporting it as "your settings" would tell a
+    /// reader the repo file had been beaten by something that never beats it.
+    fn repo_override(&self) -> &Settings {
+        &self.loaded.repo_override
+    }
+
     fn user(&self) -> &Settings {
         &self.loaded.user
     }
@@ -181,19 +193,38 @@ impl Inputs<'_> {
     /// `env` is passed in rather than looked up per key because only two keys
     /// have an environment variable at all; asking the environment about
     /// `max_depth` would invent a link that does not exist.
-    fn origin(&self, key: &str, env: bool, repo: bool, user: bool) -> Origin {
-        if self.flags.contains(key) {
-            Origin::Flag
-        } else if env {
-            Origin::Env
-        } else if repo {
-            Origin::RepoFile
-        } else if user {
-            Origin::UserFile
-        } else {
-            Origin::Default
+    /// The chain in one list, highest first, so adding a link stays a change
+    /// to data rather than another `else if` on the end of it.
+    fn origin(&self, key: &str, env: bool, scopes: Scopes) -> Origin {
+        [
+            (self.flags.contains(key), Origin::Flag),
+            (env, Origin::Env),
+            (scopes.repo_override, Origin::RepoOverride),
+            (scopes.repo, Origin::RepoFile),
+            (scopes.user, Origin::UserFile),
+        ]
+        .into_iter()
+        .find_map(|(said_something, origin)| said_something.then_some(origin))
+        .unwrap_or(Origin::Default)
+    }
+
+    /// Which of the three file scopes set a key, in precedence order.
+    fn scopes(&self, present: impl Fn(&Settings) -> bool) -> Scopes {
+        Scopes {
+            repo_override: present(self.repo_override()),
+            repo: present(self.repo()),
+            user: present(self.user()),
         }
     }
+}
+
+/// The three file answers to "did this scope set the key", kept together so
+/// [`Inputs::origin`] takes one argument rather than a row of anonymous bools.
+#[derive(Copy, Clone)]
+struct Scopes {
+    repo_override: bool,
+    repo: bool,
+    user: bool,
 }
 
 /// A key whose value the last writer wins outright.
@@ -204,7 +235,7 @@ fn scalar(
     value: Value,
     present: impl Fn(&Settings) -> bool,
 ) -> Row {
-    let origin = inputs.origin(key, false, present(inputs.repo()), present(inputs.user()));
+    let origin = inputs.origin(key, false, inputs.scopes(present));
     Row {
         key,
         tier,
@@ -224,7 +255,7 @@ fn from_env(
     present: impl Fn(&Settings) -> bool,
 ) -> Row {
     let env = std::env::var_os(var).is_some_and(|v| !v.is_empty());
-    let origin = inputs.origin(key, env, present(inputs.repo()), present(inputs.user()));
+    let origin = inputs.origin(key, env, inputs.scopes(present));
     Row {
         key,
         tier: Tier::Process,
@@ -248,16 +279,15 @@ fn widened(
     on: bool,
     saying_yes: impl Fn(&Settings) -> bool,
 ) -> Row {
-    let mut sources = Vec::new();
-    if inputs.flags.contains(key) {
-        sources.push(Origin::Flag);
-    }
-    if saying_yes(inputs.repo()) {
-        sources.push(Origin::RepoFile);
-    }
-    if saying_yes(inputs.user()) {
-        sources.push(Origin::UserFile);
-    }
+    let mut sources: Vec<Origin> = [
+        (inputs.flags.contains(key), Origin::Flag),
+        (saying_yes(inputs.repo_override()), Origin::RepoOverride),
+        (saying_yes(inputs.repo()), Origin::RepoFile),
+        (saying_yes(inputs.user()), Origin::UserFile),
+    ]
+    .into_iter()
+    .filter_map(|(turned_it_on, origin)| turned_it_on.then_some(origin))
+    .collect();
     let note = (sources.len() > 1)
         .then_some("Widened, not overridden — this switch is on if any source turns it on.");
     if sources.is_empty() {
@@ -285,17 +315,14 @@ fn patterns(
     of: impl Fn(&Settings) -> &Vec<String>,
 ) -> Row {
     // The order `apply_to_config` produces: the built-ins, then whatever the
-    // two files added, user before repo.
-    let entries: Vec<Entry> = defaults
-        .iter()
-        .map(|p| (p, Origin::Default))
-        .chain(of(inputs.user()).iter().map(|p| (p, Origin::UserFile)))
-        .chain(of(inputs.repo()).iter().map(|p| (p, Origin::RepoFile)))
-        .map(|(value, source)| Entry {
-            value: value.clone(),
-            source,
-        })
-        .collect();
+    // scopes added, lowest-precedence first.
+    let mut entries = contributed(defaults, Origin::Default);
+    entries.extend(contributed(of(inputs.user()), Origin::UserFile));
+    entries.extend(contributed(of(inputs.repo()), Origin::RepoFile));
+    entries.extend(contributed(
+        of(inputs.repo_override()),
+        Origin::RepoOverride,
+    ));
     let mut sources: Vec<Origin> = Vec::new();
     for e in &entries {
         if !sources.contains(&e.source) {
@@ -313,6 +340,17 @@ fn patterns(
         note,
         entries,
     }
+}
+
+/// One scope's patterns, each stamped with where it came from.
+fn contributed(patterns: &[String], source: Origin) -> Vec<Entry> {
+    patterns
+        .iter()
+        .map(|value| Entry {
+            value: value.clone(),
+            source,
+        })
+        .collect()
 }
 
 fn analysis_rows(inputs: &Inputs) -> Vec<Row> {
@@ -521,10 +559,45 @@ mod tests {
                 max_depth: Some(9),
                 ..Default::default()
             },
-            warnings: Vec::new(),
+            ..Default::default()
         };
         let r = report(loaded, &[], Config::default());
         assert_eq!(row(&r.rows, "max_depth").sources, vec![Origin::RepoFile]);
+    }
+
+    /// The one place the "repo beats user" story does not hold, so it is worth
+    /// a test of its own: an entry keyed by this checkout's path is the reader
+    /// speaking about this repo, not a machine-wide default.
+    #[test]
+    fn a_repos_entry_outranks_the_repo_file() {
+        let loaded = Loaded {
+            repo_override: Settings {
+                max_depth: Some(2),
+                ..Default::default()
+            },
+            repo: Settings {
+                max_depth: Some(5),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = report(loaded, &[], Config::default());
+        assert_eq!(row(&r.rows, "max_depth").sources, vec![Origin::RepoOverride]);
+    }
+
+    /// And a flag still beats it — the override is one link of the chain, not
+    /// a way out of the chain.
+    #[test]
+    fn a_flag_outranks_a_repos_entry() {
+        let loaded = Loaded {
+            repo_override: Settings {
+                spec_dir: Some(PathBuf::from("/elsewhere/specs")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = report(loaded, &["spec_dir"], Config::default());
+        assert_eq!(row(&r.rows, "spec_dir").sources, vec![Origin::Flag]);
     }
 
     #[test]
@@ -553,7 +626,7 @@ mod tests {
                 include_docs: Some(true),
                 ..Default::default()
             },
-            warnings: Vec::new(),
+            ..Default::default()
         };
         let mut config = Config::default();
         config.analysis.include_docs = true;

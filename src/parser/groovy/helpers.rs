@@ -176,3 +176,38 @@ pub(super) fn annotation_name(node: &Node, source: &str) -> Option<String> {
 pub(super) fn is_field_annotation(name: &str) -> bool {
     name == "Field" || name == "groovy.transform.Field"
 }
+
+/// True when a `local_variable_declaration` carries a `@Field` (or
+/// fully-qualified `@groovy.transform.Field`) annotation. Used by the
+/// dispatcher to decide whether a script-scope `local_variable_declaration`
+/// should be promoted to a module-state entity.
+pub(super) fn has_field_annotation(node: &Node, source: &str) -> bool {
+    let modifiers = match node.child_by_field_name("modifiers") {
+        Some(m) => Some(m),
+        None => {
+            let mut cursor = node.walk();
+            let mut found = None;
+            for c in node.children(&mut cursor) {
+                if c.kind() == "modifiers" {
+                    found = Some(c);
+                    break;
+                }
+            }
+            found
+        }
+    };
+    let Some(modifiers) = modifiers else {
+        return false;
+    };
+    let mut cursor = modifiers.walk();
+    for child in modifiers.children(&mut cursor) {
+        if child.kind() == "marker_annotation" || child.kind() == "annotation" {
+            if let Some(name) = annotation_name(&child, source) {
+                if is_field_annotation(&name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}

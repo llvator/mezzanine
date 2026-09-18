@@ -23,6 +23,7 @@ function plan(over: Partial<DisplayPlan> = {}): DisplayPlan {
     mode: 'force',
     visibleNodeIds: new Set(),
     visibleLinkKeys: new Set(),
+    dimmedLinkKeys: new Set(),
     selectedId: null,
     treePositions: new Map(),
     nodeDistances: null,

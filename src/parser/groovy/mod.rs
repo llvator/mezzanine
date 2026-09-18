@@ -2,6 +2,7 @@
 //!
 //! Submodules group the parsing logic by concern:
 //! - [`containers`] — class, interface, enum
+//! - [`ctx`] — the context threaded through the extraction walk
 //! - [`callables`] — methods, constructors, `def`-style functions
 //! - [`fields`] — class fields and `@Field` script-scope state
 //! - [`imports`] — `import` declarations
@@ -17,18 +18,20 @@ mod callables;
 mod calls;
 mod complexity;
 mod containers;
+mod ctx;
 mod fields;
 mod flow;
 mod helpers;
 mod imports;
 mod javadoc;
-mod stdlib;
+pub(crate) mod stdlib;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
 use super::language_parser::{node_text, node_to_span, LanguageParser, ParseResult};
+use ctx::ExtractCtx;
 use crate::models::file_info::Language;
 use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind};
 use anyhow::Result;
@@ -37,14 +40,6 @@ use tree_sitter::{Node, Parser, Tree};
 
 pub struct GroovyParser {
     parser: Parser,
-}
-
-/// Shared context threaded through the entity-extraction walk.
-pub(super) struct ExtractCtx<'a> {
-    pub source: &'a str,
-    pub path: &'a Path,
-    pub package: &'a str,
-    pub result: &'a mut ParseResult,
 }
 
 /// Bridge `tree-sitter-groovy`'s `LanguageFn` (built against the
@@ -220,7 +215,7 @@ fn extract_entities(node: Node, parent_id: Option<&str>, ctx: &mut ExtractCtx<'_
                     ctx.result.add_entity(entity);
                 }
             }
-            "local_variable_declaration" if fields::has_field_annotation(&child, ctx.source) => {
+            "local_variable_declaration" if helpers::has_field_annotation(&child, ctx.source) => {
                 handle_field_decl(&child, parent_id, ctx);
             }
             "import_declaration" => {

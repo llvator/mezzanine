@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -408,6 +408,82 @@ pub(super) fn is_webview_origin(origin: &str) -> bool {
         && origin[..WEBVIEW_SCHEME.len()].eq_ignore_ascii_case(WEBVIEW_SCHEME)
 }
 
+/// Is this request from a page *this server itself* served?
+///
+/// The distinction the token was reaching for is not "local" — it is "mine".
+/// A browser sets `Origin` on every cross-origin POST and a page cannot forge
+/// it, so an exact match against the `Host` this request arrived on separates
+/// the bundled UI from any other page the user happens to have open. A page on
+/// `https://evil.example` gets its own origin and is refused; a different local
+/// server on another port is a different origin too, and also refused.
+///
+/// This is the check that lets the same-origin UI work at all: it is served by
+/// the engine and has no way to learn the pairing token, which is printed once
+/// in the startup banner.
+fn is_same_origin(headers: &HeaderMap) -> bool {
+    let get = |k: header::HeaderName| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let (Some(origin), Some(host)) = (get(header::ORIGIN), get(header::HOST)) else {
+        // No Origin means a non-browser client. Those must bring the token —
+        // this allowance exists for the served page, not for curl.
+        return false;
+    };
+    // Compare authorities: strip the scheme from Origin, leaving `host:port`.
+    let authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&origin);
+    authority.eq_ignore_ascii_case(&host)
+}
+
+/// The bar a route must clear before it **changes something on the host** —
+/// spawning an agent (SRV-017) or writing a `.elv` into the repo (SRV-022).
+///
+/// Every read route here inherits the policy above, and neither half of that
+/// policy is right for a mutation:
+///
+/// * [`AccessPolicy::needs_token`] exempts loopback origins, because loopback
+///   is not a boundary against a browser and the trade was made for reading a
+///   graph. A page the user happens to have open would inherit that exemption.
+/// * The token middleware also skips requests carrying **no `Origin` header at
+///   all**, which is every non-browser client.
+///
+/// So the bar here is "a page this engine served, or someone holding the
+/// token" — not "anything local". Stated once, because a second copy of this
+/// reasoning is a second place for the two routes to drift apart.
+pub(super) fn require_trusted_ui(
+    headers: &HeaderMap,
+    body_token: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if is_same_origin(headers) || is_webview_origin(origin) {
+        return Ok(());
+    }
+    // No token minted (`--no-token`) is the user having opened the door
+    // themselves, the same reading the CORS allowlist gives it.
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if tokens_match(body_token.unwrap_or_default(), expected) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        format!(
+            "This route needs either a page served by this engine or the pairing token from \
+             its startup banner. Send it as `token` in the body or `?{TOKEN_QUERY_PARAM}=`."
+        ),
+    ))
+}
+
 /// Normalize an origin to the form an `Origin` header carries:
 /// `scheme://host[:port]`, lowercase, no path and no trailing slash.
 ///
@@ -450,6 +526,97 @@ mod tests {
             no_token: true,
         })
         .expect("test origins should be valid")
+    }
+
+    fn hdrs(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(k.clone(), v.parse().unwrap());
+        }
+        h
+    }
+
+    /// The regression that broke every click on the agent route: the engine's
+    /// own page is served same-origin and cannot know the token.
+    #[test]
+    fn the_engines_own_page_is_recognised() {
+        assert!(is_same_origin(&hdrs(&[
+            (header::ORIGIN, "http://localhost:3000"),
+            (header::HOST, "localhost:3000"),
+        ])));
+    }
+
+    /// The hole the token was there to close. A page on another origin gets
+    /// its own `Origin`, which it cannot rewrite.
+    #[test]
+    fn other_pages_are_not_same_origin() {
+        // A drive-by page.
+        assert!(!is_same_origin(&hdrs(&[
+            (header::ORIGIN, "https://evil.example"),
+            (header::HOST, "localhost:3000"),
+        ])));
+        // Another local server — a different port is a different origin.
+        assert!(!is_same_origin(&hdrs(&[
+            (header::ORIGIN, "http://localhost:5199"),
+            (header::HOST, "localhost:3000"),
+        ])));
+        // Same name, different host.
+        assert!(!is_same_origin(&hdrs(&[
+            (header::ORIGIN, "http://127.0.0.1:3000"),
+            (header::HOST, "localhost:3000"),
+        ])));
+    }
+
+    /// Non-browser clients send no `Origin`. They must bring the token; this
+    /// allowance exists for the served page, not for curl.
+    #[test]
+    fn a_missing_origin_is_never_same_origin() {
+        assert!(!is_same_origin(&hdrs(&[(header::HOST, "localhost:3000")])));
+        assert!(!is_same_origin(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn tokens_match_is_exact() {
+        assert!(tokens_match("abc123", "abc123"));
+        assert!(!tokens_match("abc123", "abc124"));
+        assert!(!tokens_match("abc", "abc123"));
+        assert!(!tokens_match("", "abc123"));
+    }
+
+    /// The guard both mutating routes share: this engine's own page, the
+    /// webview, or the token — and nothing else, however local it is.
+    #[test]
+    fn a_mutation_admits_the_served_page_the_webview_and_the_token() {
+        let same_origin = hdrs(&[
+            (header::ORIGIN, "http://localhost:3000"),
+            (header::HOST, "localhost:3000"),
+        ]);
+        assert!(require_trusted_ui(&same_origin, None, Some("secret")).is_ok());
+
+        let webview = hdrs(&[
+            (header::ORIGIN, "vscode-webview://abc-123"),
+            (header::HOST, "localhost:3000"),
+        ]);
+        assert!(require_trusted_ui(&webview, None, Some("secret")).is_ok());
+
+        let stranger = hdrs(&[
+            (header::ORIGIN, "https://evil.example"),
+            (header::HOST, "localhost:3000"),
+        ]);
+        assert!(require_trusted_ui(&stranger, Some("secret"), Some("secret")).is_ok());
+        assert!(require_trusted_ui(&stranger, Some("wrong"), Some("secret")).is_err());
+        assert!(require_trusted_ui(&stranger, None, Some("secret")).is_err());
+    }
+
+    /// A non-browser client sends no `Origin` at all, which the read API's
+    /// token middleware waves through. Here it must bring the token.
+    #[test]
+    fn a_mutation_does_not_wave_through_a_headerless_client() {
+        let bare = HeaderMap::new();
+        assert!(require_trusted_ui(&bare, None, Some("secret")).is_err());
+        assert!(require_trusted_ui(&bare, Some("secret"), Some("secret")).is_ok());
+        // `--no-token`: the user opened the door themselves.
+        assert!(require_trusted_ui(&bare, None, None).is_ok());
     }
 
     /// Same, but with the pairing token in force.

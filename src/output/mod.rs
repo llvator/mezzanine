@@ -12,6 +12,7 @@ pub mod elevator_list;
 pub(crate) mod elevator_text_renderer;
 mod json_renderer;
 mod mermaid_renderer;
+pub mod tty_prose;
 
 pub use ascii_renderer::AsciiRenderer;
 pub use dot_renderer::DotRenderer;

@@ -27,7 +27,7 @@
  * change; the fallback then stops being load-bearing.
  *
  *   app-root · left-panel · details-panel · right-panel · canvas · toolbar
- *   stats-bar · canvas-bottom-bar · canvas-stats · mode-bar
+ *   stats-bar · changes-bar · canvas-stats · mode-bar
  *   sidebar-top · scope-tree · quality-table
  *   pin-toggle · search-input · search-results · legend
  *   scope-query · file-filter · file-tree
@@ -1516,6 +1516,73 @@ function installProbeLib() {
         }
       }
       return null;
+    },
+
+    /** Point at a region's *name* and report what the two columns say
+     *  (UI-141).
+     *
+     *  Dispatched on the element `regionLabelPoint` proved a reader can hit,
+     *  not on the label by selector: the whole claim is that the name is a
+     *  reachable target, and a probe that reached past `elementFromPoint`
+     *  would pass on a label buried under a node.
+     *
+     *  Polled to stability for the reason `hoverPoint` documents — the panels
+     *  are Svelte state, so they render on the tick after the event, and a
+     *  synchronous read returns the previous subject. */
+    async hoverRegionName() {
+      const p = this.regionLabelPoint();
+      if (!p) return null;
+      const el = document.elementFromPoint(p.x, p.y);
+      if (!el) return null;
+      el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false, clientX: p.x, clientY: p.y }));
+      let prev = null;
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 40));
+        const now = this.regionPanels();
+        const key = JSON.stringify(now);
+        if (prev === key) return { ...now, asked: p.path, on: el.getAttribute('class') };
+        prev = key;
+      }
+      return { ...this.regionPanels(), asked: p.path, on: el.getAttribute('class') };
+    },
+
+    /** Stop pointing at it. The name's own `mouseleave`, which is what a
+     *  reader moving the pointer off it delivers. */
+    async leaveRegionName() {
+      const p = this.regionLabelPoint();
+      const el = p && document.elementFromPoint(p.x, p.y);
+      if (el) el.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }));
+      for (let i = 0; i < 15; i++) {
+        if (document.querySelector('[data-probe="folder-info"]') === null) return true;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return false;
+    },
+
+    /** What the Details and Description columns are showing about a region. */
+    regionPanels() {
+      const f = document.querySelector('[data-probe="folder-info"]');
+      const rungs = [...document.querySelectorAll('[data-probe="description-panel"] .rung')];
+      return {
+        details: f === null ? null : {
+          path: f.getAttribute('data-region-path'),
+          name: f.querySelector('.name')?.textContent.trim() ?? null,
+          membership: f.querySelector('[data-probe="folder-membership"]')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+          traffic: f.querySelector('[data-probe="folder-traffic"]')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+          metrics: [...f.querySelectorAll('.metric')].map((m) => m.textContent.replace(/\s+/g, ' ').trim()),
+          spec: f.querySelector('[data-probe="folder-spec"]')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+          unmeasured: f.querySelector('[data-probe="folder-unmeasured"]') !== null,
+        },
+        // The prose column, read as rungs: a region chain is the folder plus
+        // whichever folders above it a spec entity actually describes.
+        description: rungs.map((r) => ({
+          kind: r.querySelector('.kind')?.textContent.trim() ?? null,
+          name: r.querySelector('.name')?.textContent.trim() ?? null,
+          attribution: r.querySelector('[data-probe="description-attribution"]')?.textContent.trim() ?? null,
+          doc: r.querySelector('.doc')?.textContent.replace(/\s+/g, ' ').trim().slice(0, 80) ?? null,
+          selectable: r.querySelector('button.name') !== null,
+        })),
+      };
     },
 
     /** The folder of every drawn node that has one — what a focused view is
@@ -4588,6 +4655,90 @@ const SUITES = {
           const pass = on?.on?.includes('hull-label') && after.length > 0 && outside.length === 0 && widerBefore;
           return ok(pass, { on, focused: p.path, before: before.length, after: after.length, outside: [...new Set(outside)].slice(0, 8) },
             pass ? '' : (widerBefore ? 'a click on the name did not narrow the view to it' : 'the view was already only that region — nothing was narrowed'));
+        },
+      },
+    ],
+  },
+
+  'ui-141': {
+    ticket: 'UI-141', title: "A folder's name fills the side panels",
+    async setup(page) {
+      await page.viewport(1600, 1000);
+      await page.goto(APP); await ready(page);
+      const scope = await widestScope(page);
+      for (let i = 0; i < 6; i++) {
+        const state = await page.eval((p) => window.__probe.scopeRowState(p), scope);
+        if (!state?.checked) await page.eval((p) => window.__probe.toggleScopePath(p), scope);
+        await sleep(1500);
+        if (await page.eval(() => window.__probe.renderedNodes()) > 0) break;
+      }
+      await clearDiff(page);
+      // Same settings ui-071 needs and for the same reason: a region has to
+      // exist before anything can be said about pointing at its name, and at
+      // the default cohesion zero separable regions is a legitimate outcome.
+      await page.eval(() => window.__probe.setCohesion('high'));
+      await page.eval(() => window.__probe.setHulls(true));
+      await page.eval(() => window.__probe.setHullDepth(2));
+      await waitSettled(page);
+    },
+    checks: [
+      {
+        id: 'the-name-fills-the-details-column',
+        criterion: "Pointing at a region's name shows that folder in Details",
+        async run(page) {
+          const seen = await page.eval(() => window.__probe.hoverRegionName());
+          if (!seen) return ok(false, null, 'no region name a reader could hit');
+          const d = seen.details;
+          const pass = !!d && d.path === seen.asked;
+          return ok(pass, { asked: seen.asked, on: seen.on, details: d },
+            pass ? '' : (d ? 'the column is describing a different region than the name under the pointer'
+                           : 'the column stayed empty — the name is not a subject'));
+        },
+      },
+      {
+        id: 'the-folder-carries-its-own-numbers',
+        criterion: 'A hovered folder reports membership and its rollup',
+        async run(page) {
+          const seen = await page.eval(() => window.__probe.hoverRegionName());
+          const d = seen?.details;
+          if (!d) return ok(false, { seen }, 'nothing in the column to measure');
+          // Membership is about the picture, the metrics are about the repo,
+          // and the panel is worth nothing without both. `unmeasured` is a
+          // legitimate third state — a region outside the Quality population —
+          // so it counts as an answer, just not as metrics.
+          const hasMembership = /drawn/.test(d.membership ?? '');
+          const answered = d.metrics.length >= 4 || d.unmeasured;
+          return ok(hasMembership && answered, d,
+            hasMembership ? (answered ? '' : 'no rollup and no statement that there is none')
+                          : 'the column never says how much of the folder is on screen');
+        },
+      },
+      {
+        id: 'the-prose-column-narrates-the-folder',
+        criterion: "The Description pane reads the folder, not the last node",
+        async run(page) {
+          const seen = await page.eval(() => window.__probe.hoverRegionName());
+          const rungs = seen?.description ?? [];
+          const head = rungs[0];
+          const pass = !!head && (head.kind === 'Folder' || head.kind === 'File')
+            && head.selectable === false;
+          return ok(pass, { asked: seen?.asked, rungs },
+            head ? (pass ? '' : 'the first rung is still an entity — the pane did not follow the name')
+                 : 'the prose column stayed empty');
+        },
+      },
+      {
+        id: 'leaving-the-name-hands-the-column-back',
+        criterion: 'Moving off the name clears the folder from Details',
+        async run(page) {
+          // The "before" is load-bearing: a column that never filled would
+          // pass a bare "is it empty now?" for the worst possible reason.
+          const before = await page.eval(() => window.__probe.hoverRegionName());
+          if (!before?.details) return ok(false, { before }, 'nothing to clear — the hover never landed');
+          const cleared = await page.eval(() => window.__probe.leaveRegionName());
+          const after = await page.eval(() => window.__probe.regionPanels());
+          return ok(cleared === true && after.details === null, { was: before.details.path, after },
+            cleared === true ? '' : 'the folder stayed in the column after the pointer left its name');
         },
       },
     ],

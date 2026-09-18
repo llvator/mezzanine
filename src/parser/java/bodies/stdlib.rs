@@ -3,7 +3,7 @@
 //! Used by the call-extraction pass to filter out calls that aren't
 //! interesting for the visualizer.
 
-pub(super) fn is_stdlib_method(name: &str) -> bool {
+pub(crate) fn is_stdlib_method(name: &str) -> bool {
     matches!(
         name,
         "toString"

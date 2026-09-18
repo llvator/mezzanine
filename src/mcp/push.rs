@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
+use crate::analyzer::TestPaths;
 use crate::check;
+use crate::config::Config;
 use crate::diff;
 use crate::graph::DependencyGraph;
 use crate::mcp::tools;
@@ -37,6 +39,29 @@ const COMPLEXITY_FLOOR: f64 = 3.0;
 
 /// Default hard cap on hook output lines (LSP-diagnostics contract).
 pub const DEFAULT_LINE_CAP: usize = 10;
+
+/// How a new finding and a resolved one are marked in hook output.
+///
+/// Named rather than inlined because the blocking channel has to tell them
+/// apart, and two spellings of the same marker would be free to drift. Both
+/// legs render through `diff_against_state`, so one pair covers `self-review`
+/// and `check` alike.
+pub const NEW_PREFIX: &str = "\u{26a0} ";
+pub const RESOLVED_PREFIX: &str = "\u{2713} resolved: ";
+
+/// Whether rendered hook output holds anything the working tree *introduced*,
+/// as opposed to news that something got fixed.
+///
+/// Only this earns a blocked stop. Halting an agent to tell it the tree
+/// improved costs a turn and teaches it the channel is noise; the `resolved`
+/// line exists to close the loop on a finding, not to open one.
+///
+/// The infinite-loop guard is not here — it is the session state file. A
+/// finding enters the state the moment it is emitted, so the next run no
+/// longer counts it as new and the same finding can block at most once.
+pub fn has_new_findings(output: &str) -> bool {
+    output.lines().any(|l| l.starts_with(NEW_PREFIX))
+}
 
 /// Severity ranks, ordered so `min` acts as a floor: `Low < Medium < High`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,6 +115,34 @@ pub struct DiffArtifacts {
     pub head_root: PathBuf,
 }
 
+/// The base side: check `base_ref` out, analyse the subtree that corresponds
+/// to `root`, and remove the checkout whether or not the analysis succeeded.
+///
+/// Hands back the root it analysed at, not only the graph. The caller needs
+/// that path as `compute_diff`'s prefix, and a base whose *config* root and
+/// whose *stripping* root disagree is the same defect one level along: the
+/// two sides then key their entities differently and every row reads as
+/// added-and-removed. Returning them together is what stops them drifting
+/// (SRV-021).
+fn analyse_base(
+    root: &Path,
+    base_ref: &str,
+    from_sha: &str,
+    scope: &Config,
+) -> Result<(DependencyGraph, PathBuf)> {
+    let base_dir = std::env::temp_dir().join(format!("mezz-push-base-{}", from_sha));
+    diff::create_worktree(root, &base_dir, base_ref)?;
+    // The subtree corresponding to `root`, not the checkout's top: `git
+    // worktree add` always materialises the whole repository.
+    let base_root = diff::checkout_root(root, &base_dir);
+    let analysed = diff::analyze_with(
+        diff::rooted_at(scope, &base_root),
+        &format!("base ({})", from_sha),
+    );
+    diff::remove_worktree(root, &base_dir);
+    Ok((analysed?.0, base_root))
+}
+
 /// Analyze `base_ref` (via a throwaway worktree) and the working tree,
 /// diff them, and collect the git-changed path list. Uncached — a hook
 /// or CI job is a fresh process, so the MCP warm cache buys nothing.
@@ -111,20 +164,13 @@ pub fn build_artifacts(
     // structural change.
     let scope = diff::build_analysis_config(root, include_tests, languages);
 
-    let base_dir = std::env::temp_dir().join(format!("mezz-push-base-{}", from_sha));
-    diff::create_worktree(root, &base_dir, base_ref)?;
-    let base = diff::analyze_with(
-        diff::rooted_at(&scope, &base_dir),
-        &format!("base ({})", from_sha),
-    );
-    diff::remove_worktree(root, &base_dir);
-    let (base_graph, _) = base?;
+    let (base_graph, base_root) = analyse_base(root, base_ref, &from_sha, &scope)?;
 
     let (head_graph, _) = diff::analyze_with(scope, "working tree")?;
     let result = diff::compute_diff(
         &base_graph,
         &head_graph,
-        &base_dir,
+        &base_root,
         root,
         &from_sha,
         "working",
@@ -136,7 +182,7 @@ pub fn build_artifacts(
         head_graph,
         result,
         changed,
-        base_root: base_dir,
+        base_root,
         head_root: root.to_path_buf(),
     })
 }
@@ -156,6 +202,33 @@ fn fingerprint(tag: &str, d: &diff::EntityDiff, detail: &str) -> String {
 /// The first three are per-entity and read off the diff rows; the fourth
 /// is per-folder and is joined by path instead, because a folder can lose
 /// its shape to an edge added in a file it does not contain.
+/// How loudly a new smell should reach a pull request.
+///
+/// Informational smells sit below the default floor, so a bot posting at
+/// `medium` no longer opens a comment asking for a create-spec struct to be
+/// broken up. See `SmellKind::is_informational`.
+fn smell_severity(s: SmellKind) -> Severity {
+    if s.is_informational() {
+        Severity::Low
+    } else {
+        Severity::Medium
+    }
+}
+
+/// Whether an entity belongs in a hook finding: listed in agent-facing
+/// output, and not test code.
+///
+/// `is_listed` alone was the filter here, and it does not know about tests.
+/// A run on this repo reported seven smells, all seven on `#[cfg(test)]`
+/// functions inside `src/graph.rs` — inline test modules the path heuristic
+/// cannot see and `is_test_entity` exists to catch. `quality` filtered them
+/// and the hook did not, so the one channel that speaks unprompted was the
+/// one with the worst signal. A hook whose first words are false positives
+/// is a hook that gets switched off.
+fn listed_source(graph: &DependencyGraph, e: &CodeEntity, tests: &TestPaths) -> bool {
+    tools::is_listed(e) && !tools::is_test_entity(graph, e, tests)
+}
+
 pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
     let head_by_id: HashMap<&str, &CodeEntity> = a
         .head_graph
@@ -168,6 +241,7 @@ pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
         .map(|e| (e.id.as_str(), e))
         .collect();
 
+    let tests = TestPaths::rooted_at(&a.head_root);
     let mut out: Vec<Finding> = Vec::new();
     for d in &a.result.entities {
         if d.status == diff::ChangeStatus::Removed {
@@ -176,7 +250,7 @@ pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
         let Some(head) = head_by_id.get(d.entity_id.as_str()).copied() else {
             continue;
         };
-        if !tools::is_listed(head) {
+        if !listed_source(&a.head_graph, head, &tests) {
             continue;
         }
         let base = d
@@ -192,7 +266,7 @@ pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
             if !base_smells.contains(s) {
                 out.push(Finding {
                     fingerprint: fingerprint("smell", d, s.label()),
-                    severity: Severity::Medium,
+                    severity: smell_severity(*s),
                     line: format!(
                         "new smell: {} on {} {} — {}",
                         s.label(),
@@ -233,8 +307,12 @@ pub fn findings(a: &DiffArtifacts, min: Severity) -> Vec<Finding> {
                 fingerprint: fingerprint("cx", d, ""),
                 severity,
                 line: format!(
-                    "complexity +{}: {} {} — {}",
-                    cx as i64, d.kind, d.name, d.file_path
+                    "complexity +{}: {} {} — {}{}",
+                    cx as i64,
+                    d.kind,
+                    d.name,
+                    d.file_path,
+                    tools::moved_note(d)
                 ),
             });
         }
@@ -456,12 +534,12 @@ fn diff_against_state(
     let mut candidates: Vec<(String, String, bool)> = Vec::new(); // (fp, line, is_new)
     for f in current {
         if !seen.contains_key(&f.0) {
-            candidates.push((f.0.clone(), format!("⚠ {}", f.1), true));
+            candidates.push((f.0.clone(), format!("{NEW_PREFIX}{}", f.1), true));
         }
     }
     for (fp, line) in seen {
         if !current_fps.contains(fp.as_str()) {
-            candidates.push((fp.clone(), format!("✓ resolved: {}", line), false));
+            candidates.push((fp.clone(), format!("{RESOLVED_PREFIX}{}", line), false));
         }
     }
 
@@ -627,7 +705,8 @@ pub fn check_new(
     let scope = check::scope_for(root);
     let base_dir = std::env::temp_dir().join(format!("mezz-check-base-{}", from_sha));
     diff::create_worktree(root, &base_dir, base_ref)?;
-    let base = check::graded(&base_dir, diff::rooted_at(&scope, &base_dir), &rules);
+    let base_root = diff::checkout_root(root, &base_dir);
+    let base = check::graded(&base_root, diff::rooted_at(&scope, &base_root), &rules);
     diff::remove_worktree(root, &base_dir);
 
     let head = check::graded(root, scope, &rules);
@@ -895,6 +974,66 @@ mod tests {
             names: Vec::new(),
             bar: v.bar,
         }
+    }
+
+    /// A file whose only change is a new inline module holding a two-function
+    /// loop. `mod_name` decides whether that module reads as test code.
+    fn inline_module_loop(mod_name: &str) -> (TmpDir, TmpDir) {
+        let base = TmpDir::new("base");
+        let head = TmpDir::new("head");
+        for dir in [&base, &head] {
+            dir.write("src/pkg/mod.rs", "pub mod util;\n");
+        }
+        base.write("src/pkg/util.rs", "pub fn real() -> i32 { 1 }\n");
+        head.write(
+            "src/pkg/util.rs",
+            &format!(
+                "pub fn real() -> i32 {{ 1 }}\n\
+                 mod {mod_name} {{\n\
+                 pub fn ping() -> i32 {{ pong() }}\n\
+                 pub fn pong() -> i32 {{ ping() }}\n\
+                 }}\n"
+            ),
+        );
+        (base, head)
+    }
+
+    /// The control for the test below: the same loop in a module nobody would
+    /// call tests *is* reported, so a green result there means the filter did
+    /// the suppressing rather than the analyzer failing to see the cycle.
+    #[test]
+    fn a_cycle_inside_an_ordinary_inline_module_is_still_reported() {
+        let (base, head) = inline_module_loop("helpers");
+        let found = findings(&artifacts_of(&base, &head), Severity::Low);
+        assert!(
+            found.iter().any(|f| f.line.contains("new cycle")),
+            "expected the loop to surface, got {found:#?}"
+        );
+    }
+
+    /// Rust puts its tests inside the file they cover, so the path heuristic
+    /// cannot see them. Before `listed_source`, a live run of the hook on this
+    /// repo reported seven smells and all seven were on `#[cfg(test)]`
+    /// functions — the unprompted channel had the worst signal of any tool.
+    #[test]
+    fn a_cycle_confined_to_an_inline_test_module_is_not_a_finding() {
+        let (base, head) = inline_module_loop("tests");
+        let found = findings(&artifacts_of(&base, &head), Severity::Low);
+        assert!(
+            found.is_empty(),
+            "test-only code must not reach the hook, got {found:#?}"
+        );
+    }
+
+    /// Only something the edit introduced may block a stop.
+    #[test]
+    fn resolved_lines_alone_never_block() {
+        let resolved = format!("{RESOLVED_PREFIX}new cycle: function from_a");
+        assert!(!has_new_findings(&resolved));
+        assert!(!has_new_findings(""));
+        assert!(has_new_findings(&format!(
+            "{resolved}\n{NEW_PREFIX}new smell: God Class on struct Foo"
+        )));
     }
 
     fn artifacts_of(base: &TmpDir, head: &TmpDir) -> DiffArtifacts {

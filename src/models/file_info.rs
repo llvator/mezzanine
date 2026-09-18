@@ -92,6 +92,21 @@ pub enum Language {
     /// Markdown unless it is named explicitly (`-l markdown`) — see
     /// `Language::is_opt_in`.
     Markdown,
+    /// Docker — `Dockerfile`s and Compose files. Like ansible-deploy, a
+    /// topology language rather than a code-quality one: it recovers what
+    /// builds from what (stage → base image, stage → stage) and what runs
+    /// against what (service → stage, service → volume/network), so
+    /// complexity metrics stay empty per ADR 0003. Lint-shaped findings
+    /// (`latest` tags, root users, layer counts) are hadolint's job and
+    /// deliberately not this parser's — see ADR 0034.
+    ///
+    /// Deliberately NOT wired into `from_extension`: the canonical
+    /// `Dockerfile` has no extension at all, and `compose.yaml` shares
+    /// `.yml`/`.yaml` with every other YAML in a repo. Selection is
+    /// filename-structural (see the parser's `classify`), and Compose
+    /// files additionally have to *look* like Compose before being
+    /// claimed.
+    Docker,
     /// SQL schema files (`.sql`). Parsed for *topology* — tables, columns and
     /// the foreign keys between them — not for control flow, so complexity
     /// metrics stay empty. In migration-based repos a `.sql` file is a
@@ -189,6 +204,11 @@ impl Language {
             // Intentionally empty: ansible-deploy is path-classified,
             // not extension-owned (`.yml`/`.j2` belong to no one).
             Language::AnsibleDeploy => &[],
+            // Likewise empty, and for a sharper version of the same
+            // reason: `Dockerfile` carries no extension for this to
+            // return, and the one it *could* claim (`.yaml`) belongs to
+            // no one. Filename-classified — see `parser::docker::classify`.
+            Language::Docker => &[],
             Language::Unknown => &[],
         }
     }
@@ -221,6 +241,7 @@ impl Language {
             "svelte" => Some(Language::Svelte),
             "elevator" | "elv" => Some(Language::Elevator),
             "ansible" | "ansible-deploy" | "ansibledeploy" => Some(Language::AnsibleDeploy),
+            "docker" | "dockerfile" | "compose" | "docker-compose" => Some(Language::Docker),
             "sql" | "postgres" | "postgresql" => Some(Language::Sql),
             "markdown" | "md" => Some(Language::Markdown),
             _ => None,
@@ -259,6 +280,7 @@ impl Language {
             Language::Svelte => "svelte",
             Language::Elevator => "elevator",
             Language::AnsibleDeploy => "ansible",
+            Language::Docker => "docker",
             Language::Sql => "sql",
             Language::Markdown => "markdown",
             Language::Unknown => "unknown",
@@ -340,6 +362,7 @@ impl Language {
             Language::Svelte => "Svelte",
             Language::Elevator => "Elevator",
             Language::AnsibleDeploy => "Ansible Deploy",
+            Language::Docker => "Docker",
             Language::Sql => "SQL",
             Language::Markdown => "Markdown",
             Language::Unknown => "Unknown",
@@ -443,6 +466,7 @@ mod tests {
         Language::Svelte,
         Language::Elevator,
         Language::AnsibleDeploy,
+        Language::Docker,
         Language::Sql,
         Language::Markdown,
     ];

@@ -12,15 +12,18 @@
 //! - Configurable depth for dependency traversal
 //! - Filter by entity type (classes, functions, interfaces)
 
+pub mod activity;
 pub mod analyzer;
 pub mod check;
 pub mod config;
 pub mod diff;
 pub mod educator;
+pub mod explain;
 pub mod graph;
 pub mod init;
 pub mod mcp;
 pub mod models;
+pub mod monitor;
 pub mod output;
 pub mod parser;
 pub mod server;

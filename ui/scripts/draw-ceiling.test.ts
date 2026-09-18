@@ -19,7 +19,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { gateByDrawCeiling, drawnIdsOf, DRAW_CEILING } from '../src/viewmodels/drawCeiling.ts';
+import { gateByDrawCeiling, drawnIdsOf, drawnNodeSet, DRAW_CEILING } from '../src/viewmodels/drawCeiling.ts';
 import type { DisplayPlan } from '../src/viewmodels/displayPlan.ts';
 
 /** A plan carrying `n` visible nodes and enough live state that we can tell
@@ -30,6 +30,7 @@ function planWith(n: number, extra: Partial<DisplayPlan> = {}): DisplayPlan {
     mode: 'force',
     visibleNodeIds: ids,
     visibleLinkKeys: new Set(['n0->n1|Calls']),
+    dimmedLinkKeys: new Set(['n1->n2|Calls']),
     selectedId: 'n0',
     treePositions: new Map(),
     nodeDistances: new Map([['n0', 0]]),
@@ -152,4 +153,32 @@ test('the shipped ceiling leaves headroom over the auto-level budget', () => {
   // land above the target — a hand-pinned level, ghosts switched on, or the
   // param and class-field nodes injected after collapse.
   assert.ok(DRAW_CEILING >= 400 * 2, `expected headroom over RENDER_BUDGET, got ${DRAW_CEILING}`);
+});
+
+// ── UI-144: the set the edge tiers are decided against ────────────────────
+
+test('drawnNodeSet is the rule drawnIdsOf applies, before there is a plan', () => {
+  // `compute` needs the answer partway through, to decide which lines have
+  // both ends on screen. Sharing the function is what stops the ceiling from
+  // charging for one set while the View builds another.
+  const plan = planWith(10, { dimmedNodeIds: new Set(['d0', 'd1']), dimOpacity: 0.15 });
+  assert.deepEqual(
+    [...drawnNodeSet(plan.visibleNodeIds, plan.dimmedNodeIds, plan.dimOpacity)].sort(),
+    [...drawnIdsOf(plan)].sort(),
+  );
+});
+
+test('a hidden Rest tier contributes no nodes for edges to hang from', () => {
+  // At 0 the View sets `display: none` on the whole tier, so a line into it
+  // would be an arrow into empty space. This is the diff filters' default.
+  assert.equal(drawnNodeSet(new Set(['a']), new Set(['x', 'y']), 0).size, 1);
+  assert.equal(drawnNodeSet(new Set(['a']), new Set(['x', 'y']), 0.15).size, 3);
+});
+
+test('the gate empties the Rest tier wiring along with everything else', () => {
+  // Over the ceiling nothing is built, and a leftover key set would have the
+  // View filtering a link list against names it will never draw.
+  const gated = gateByDrawCeiling(planWith(5000), 100);
+  assert.equal(gated.dimmedLinkKeys.size, 0);
+  assert.equal(gated.visibleLinkKeys.size, 0);
 });

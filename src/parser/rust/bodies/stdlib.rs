@@ -4,7 +4,7 @@
 //! etc. collide with real project methods and are filtered by match context
 //! (qualified names) rather than here.
 
-pub(super) fn is_stdlib_function(name: &str) -> bool {
+pub(crate) fn is_stdlib_function(name: &str) -> bool {
     matches!(
         name,
         "clone"

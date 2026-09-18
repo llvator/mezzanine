@@ -2,9 +2,32 @@
   import {
     commits, commitsLoading, diffComputing, diffApiError,
     fetchCommits, triggerDiff, diffActive,
+    diffStopping, cancelDiff,
     stashes, stashesLoading, fetchStashes, type Stash,
     stagedFiles, stagedLoading, fetchStaged,
+    branches, fetchBranches,
   } from '../stores/diff';
+  import { knownCommits } from '../stores/diff';
+  import BranchCompare from './BranchCompare.svelte';
+  import { orderBranches } from '../viewmodels/branchCompare';
+  import {
+    railRows, baseRefFor, includedCount, rangeWarning, findCommit, isRoot,
+    type BaseRef,
+  } from '../viewmodels/commitRange';
+
+  /**
+   * What the Stop button says it will do (UI-141).
+   *
+   * Both halves matter. A comparison of two commits checks out and analyses
+   * two whole trees, so a reader who picked the wrong pair is otherwise
+   * watching a minute of work they no longer want with nothing to press. And
+   * stopping is *not* leaving diff mode: whatever overlay they were already
+   * looking at is still there afterwards, which is the reason to stop rather
+   * than to clear.
+   */
+  const STOP_TITLE =
+    'Stop this comparison. The engine ends at its next checkpoint; '
+    + 'the diff you were already looking at stays on screen.';
 
   let showPicker = false;
   let fromRef = '';
@@ -21,19 +44,61 @@
    * needs somewhere to say two things — that the canvas will not become the
    * index, and that nothing is staged, which is the ordinary state of a
    * repository rather than a failed comparison (UI-111).
+   *
+   * Branches get one because their base is *computed* rather than picked: two
+   * branches are compared from where they diverged, which is a question only
+   * the server can answer and a sentence the reader has to be shown (UI-143).
    */
-  let mode: 'commits' | 'stashes' | 'staged' = 'commits';
+  type Mode = 'commits' | 'branches' | 'stashes' | 'staged';
+  let mode: Mode = 'commits';
+
+  /** One heading per mode. A table rather than a nested ternary that grows a
+   *  branch every time the modal learns to show something new. */
+  const HEADINGS: Record<Mode, string> = {
+    commits: 'Compare Commits',
+    branches: 'Compare Branches',
+    stashes: 'Stashes',
+    staged: 'Staged Changes',
+  };
+
+  /**
+   * Whose history the commit list is showing. Empty means the checkout's own
+   * `HEAD`, which is the only listing there used to be.
+   *
+   * The list is one branch at a time and `From`/`To` are not, which is what
+   * makes a cross-branch pair possible: pick the base from one branch, switch
+   * the list, pick the target from another. The two selections are held as
+   * hashes, so switching the list underneath them changes nothing (UI-143).
+   */
+  let listRef = '';
 
   async function openPicker() {
     mode = 'commits';
     showPicker = true;
     if ($commits.length === 0) {
-      await fetchCommits();
+      await fetchCommits(listRef || undefined);
+    }
+    // The branch list is what the commit list is switched with. Cheap, and
+    // fetched here rather than on first use so the dropdown is never empty
+    // for the moment after it appears.
+    if ($branches.length === 0) {
+      void fetchBranches();
     }
     // Default "to" to HEAD/first commit if not set
     if (!toRef && $commits.length > 0) {
       toRef = 'HEAD';
     }
+  }
+
+  /** Show another branch's history in the list below. */
+  async function listBranch(name: string) {
+    listRef = name;
+    await fetchCommits(name || undefined);
+  }
+
+  async function openBranches() {
+    mode = 'branches';
+    showPicker = true;
   }
 
   async function openStashes() {
@@ -91,9 +156,36 @@
     diffApiError.set(null);
   }
 
+  /**
+   * The range the two picks describe, drawn onto the listing (UI-151).
+   *
+   * `From` names the oldest commit *included*, so the tree the engine starts
+   * from is the one below it — and the rail is what makes that visible
+   * instead of a rule the reader has to hold in their head. See
+   * `viewmodels/commitRange.ts`.
+   */
+  $: hashes = $commits.map((c) => c.hash);
+  /** What `HEAD` means in the list on screen. Nothing, when the list is
+   *  another branch's: the checkout's HEAD is genuinely not in it. */
+  $: headHash = listRef === '' ? ($commits[0]?.hash ?? null) : null;
+  $: rail = railRows(hashes, fromRef, toRef, headHash);
+  $: railByHash = new Map(rail.map((r) => [r.hash, r]));
+  $: included = includedCount(rail);
+  $: warning = rangeWarning(hashes, fromRef, toRef, headHash);
+  /** Looked up in everything known rather than the list on screen, so a base
+   *  picked on one branch survives switching the list under it (UI-143). */
+  $: base = (fromRef ? baseRefFor(fromRef, $knownCommits) : { ref: null }) as BaseRef;
+  $: baseCommit = base.ref ? findCommit(base.ref, $knownCommits) : undefined;
+
   async function computeDiff() {
-    if (!fromRef || !toRef) return;
-    await triggerDiff(fromRef, toRef);
+    // `base.ref`, not `fromRef`: the engine is given the tree to start from,
+    // and the reader named the first commit they wanted to see. The button is
+    // already disabled when there is no such tree, so this guard is the
+    // second of two.
+    if (!fromRef || !toRef || !base.ref) return;
+    await triggerDiff(base.ref, toRef, {
+      inclusiveFrom: findCommit(fromRef, $knownCommits),
+    });
     if (!$diffApiError) {
       closePicker();
     }
@@ -126,8 +218,11 @@
   <button type="button" class="picker-btn" on:click={showCurrentChanges} disabled={$diffComputing} title="Compare HEAD with current working directory">
     {$diffComputing ? '⏳' : '📝'} Current Changes
   </button>
-  <button type="button" class="picker-btn" on:click={openPicker} title="Select commits to compare">
+  <button type="button" class="picker-btn" on:click={openPicker} title="Select commits to compare — from this branch or any other">
     🔄 Compare Commits
+  </button>
+  <button type="button" class="picker-btn" on:click={openBranches} title="Review one branch against another, from where they diverged">
+    🌿 Branches
   </button>
   <button type="button" class="picker-btn" on:click={openStaged} title="Compare what you have staged against HEAD">
     🗂 Staged
@@ -135,6 +230,21 @@
   <button type="button" class="picker-btn" on:click={openStashes} title="Look at work set aside with git stash">
     📦 Stashes
   </button>
+  <!-- Only while something is running, and outside the modal as well as in
+       it: `Current Changes` starts a comparison with no modal at all, and
+       every other button in this row is disabled for as long as it lasts. -->
+  {#if $diffComputing}
+    <button
+      type="button"
+      class="picker-btn stop-btn"
+      data-probe="diff-cancel"
+      on:click={() => void cancelDiff()}
+      disabled={$diffStopping}
+      title={STOP_TITLE}
+    >
+      {$diffStopping ? '⏳ Stopping…' : '⏹ Stop'}
+    </button>
+  {/if}
 </div>
 
 {#if showPicker}
@@ -143,7 +253,7 @@
   <div class="picker-overlay" on:click|self={closePicker}>
     <div class="picker-modal">
       <header class="picker-header">
-        <h3>{mode === 'stashes' ? 'Stashes' : mode === 'staged' ? 'Staged Changes' : 'Compare Commits'}</h3>
+        <h3>{HEADINGS[mode]}</h3>
         <button type="button" class="close-btn" on:click={closePicker}>×</button>
       </header>
 
@@ -152,7 +262,9 @@
           <div class="error-banner">{$diffApiError}</div>
         {/if}
 
-      {#if mode === 'staged'}
+      {#if mode === 'branches'}
+        <BranchCompare onDone={closePicker} />
+      {:else if mode === 'staged'}
         <!-- Same trap as the stash note, arrived at from the other side. The
              index reads as *more* live than a stash, so the pull to expect the
              canvas to become it is stronger — and it is a commit all the same,
@@ -245,9 +357,14 @@
           {/if}
         </div>
       {:else}
+        <!-- Both ends are *included*, and the labels say so. `From (base)`
+             was accurate about the engine and wrong about the reader: the
+             commit they clicked was the one commit the comparison could not
+             see, so reviewing four commits meant hunting for the fifth
+             (UI-151). -->
         <div class="ref-inputs">
           <div class="ref-input-group">
-            <label for="from-ref">From (base)</label>
+            <label for="from-ref">From — oldest commit included</label>
             <input
               id="from-ref"
               type="text"
@@ -257,7 +374,7 @@
           </div>
           <span class="arrow">→</span>
           <div class="ref-input-group">
-            <label for="to-ref">To (compare)</label>
+            <label for="to-ref">To — newest commit included</label>
             <input
               id="to-ref"
               type="text"
@@ -267,10 +384,53 @@
           </div>
         </div>
 
+        <!-- What the pair actually resolves to, in one line, before a minute
+             of analysis rather than after it. Naming the base tree here is
+             the whole of the ambiguity: the reader can see that it sits
+             outside what they asked for, and the rail below shows where. -->
+        <p class="range-note" data-probe="commit-range-note">
+          {#if base.problem === 'root'}
+            <span class="range-blocked">
+              That is the first commit in this history — there is no earlier tree to
+              compare it against, so it cannot be the oldest one included.
+            </span>
+          {:else if included}
+            Comparing <strong>{included}</strong> commit{included === 1 ? '' : 's'}, both ends
+            included.{#if baseCommit}{' '}Starting from the tree at
+              <code class="commit-hash">{baseCommit.short_hash}</code>, which is not part of it.{/if}
+          {:else if fromRef && toRef}
+            Both ends included. The comparison starts from the tree just before
+            <code class="commit-hash">{fromRef.slice(0, 12)}</code>.
+          {:else}
+            Pick the oldest and newest commits you want to see.
+          {/if}
+        </p>
+        {#if warning}
+          <p class="range-warning" data-probe="commit-range-warning">{warning}</p>
+        {/if}
+
         <div class="commit-list-section">
           <div class="commit-list-header">
-            <span>Recent Commits</span>
-            <button type="button" class="refresh-commits-btn" on:click={() => fetchCommits()} disabled={$commitsLoading}>
+            <!-- Which history is listed, as a control rather than a caption.
+                 `From` and `To` hold hashes, so switching the list under them
+                 loses nothing: that is what makes a base on one branch and a
+                 target on another two clicks apart (UI-143). -->
+            <span class="list-source">
+              <label for="list-branch">Commits on</label>
+              <select
+                id="list-branch"
+                data-probe="commit-list-branch"
+                value={listRef}
+                on:change={(e) => void listBranch(e.currentTarget.value)}
+                disabled={$commitsLoading}
+              >
+                <option value="">this checkout (HEAD)</option>
+                {#each orderBranches($branches) as b (b.name)}
+                  <option value={b.name}>{b.name}</option>
+                {/each}
+              </select>
+            </span>
+            <button type="button" class="refresh-commits-btn" on:click={() => fetchCommits(listRef || undefined)} disabled={$commitsLoading}>
               {$commitsLoading ? '↻' : '↻ Refresh'}
             </button>
           </div>
@@ -280,28 +440,65 @@
           {:else if $commits.length === 0}
             <div class="empty">No commits found. Is the server running?</div>
           {:else}
-            <div class="commit-list">
+            <!-- The rail down the left is the boundary, drawn (UI-151). Row
+                 tints said *which two rows were clicked*; a reader still had
+                 to work out what lay between them and which side of `From`
+                 the comparison began on. A line with a node per commit says
+                 both at a glance, and the divider below `From` puts the one
+                 excluded commit visibly outside it. -->
+            <div class="commit-list" data-probe="commit-list">
               {#each $commits as commit (commit.hash)}
-                <div class="commit-row" class:selected-from={fromRef === commit.hash} class:selected-to={toRef === commit.hash}>
+                {@const row = railByHash.get(commit.hash)}
+                {#if row?.boundaryAbove}
+                  <div class="range-boundary" data-probe="range-boundary">
+                    <span>base — everything below is where the comparison starts from</span>
+                  </div>
+                {/if}
+                <div
+                  class="commit-row"
+                  class:in-range={row?.included}
+                  class:selected-from={row?.isFrom}
+                  class:selected-to={row?.isTo}
+                >
+                  <!-- Decoration: every state it shows is also written in the
+                       row beside it or in the sentence above the list. -->
+                  <div class="rail" aria-hidden="true">
+                    <span class="rail-line up" class:lit={row?.litAbove}></span>
+                    <span
+                      class="rail-node"
+                      class:from={row?.isFrom}
+                      class:to={row?.isTo}
+                      class:inside={row?.included}
+                      class:base={row?.isBase}
+                    ></span>
+                    <span class="rail-line down" class:lit={row?.litBelow}></span>
+                  </div>
                   <div class="commit-info">
                     <code class="commit-hash">{commit.short_hash}</code>
                     <span class="commit-msg" title={commit.message}>{truncateMessage(commit.message)}</span>
                     <span class="commit-meta">{commit.author} · {formatDate(commit.date)}</span>
                   </div>
                   <div class="commit-actions">
+                    <!-- Declined on the root commit rather than sent and
+                         failed: there is no tree before the first commit, and
+                         finding that out from a red banner after a minute of
+                         analysis is the worse way to learn it. -->
                     <button
                       type="button"
                       class="select-btn from"
                       class:active={fromRef === commit.hash}
+                      disabled={isRoot(commit, $commits)}
                       on:click={() => selectCommit(commit.hash, 'from')}
-                      title="Set as base (from)"
+                      title={isRoot(commit, $commits)
+                        ? 'The first commit in this history — nothing earlier to compare it against'
+                        : 'Include this commit and everything after it'}
                     >From</button>
                     <button
                       type="button"
                       class="select-btn to"
                       class:active={toRef === commit.hash}
                       on:click={() => selectCommit(commit.hash, 'to')}
-                      title="Set as target (to)"
+                      title="Stop at this commit, including it"
                     >To</button>
                   </div>
                 </div>
@@ -314,12 +511,31 @@
 
       <footer class="picker-footer">
         <button type="button" class="cancel-btn" on:click={closePicker}>Cancel</button>
+        <!-- In every mode, including stashes: a stash row's `Show` starts the
+             same two-worktree comparison the footer button does, and the
+             modal stays open for all of it. `Cancel` beside it closes this
+             dialog and leaves the engine working — the two words are close
+             enough that the tooltip has to say which is which. -->
+        {#if $diffComputing}
+        <button
+          type="button"
+          class="stop-btn"
+          data-probe="diff-cancel-footer"
+          on:click={() => void cancelDiff()}
+          disabled={$diffStopping}
+          title={STOP_TITLE}
+        >
+          {$diffStopping ? 'Stopping…' : '⏹ Stop'}
+        </button>
+        {/if}
         <!-- Stash mode has no Compare: each row carries its own base, so the
              comparison is decided by which row was clicked and there is
-             nothing left for a footer button to confirm. Staged mode is the
-             opposite — one comparison, no rows to choose between — so the
-             button is the whole of the choice, and the list above it is what
-             the reader is agreeing to. -->
+             nothing left for a footer button to confirm. Branch mode has none
+             for the mirror reason — its button sits under the sentence saying
+             what will be compared, which is the thing being agreed to. Staged
+             mode is the opposite of both — one comparison, no rows to choose
+             between — so the button is the whole of the choice, and the list
+             above it is what the reader is agreeing to. -->
         {#if mode === 'staged'}
         <button
           type="button"
@@ -331,12 +547,15 @@
         >
           {$diffComputing ? 'Computing…' : 'Compare staged'}
         </button>
-        {:else if mode !== 'stashes'}
+        {:else if mode === 'commits'}
         <button
           type="button"
           class="compute-btn"
           on:click={computeDiff}
-          disabled={!fromRef || !toRef || $diffComputing}
+          disabled={!fromRef || !toRef || !base.ref || $diffComputing}
+          title={base.problem === 'root'
+            ? 'There is no tree before the first commit to compare against'
+            : 'Compare the range, both ends included'}
         >
           {#if $diffComputing}
             Computing…
@@ -490,6 +709,26 @@
     font-size: 0.85rem;
     color: var(--text-secondary, #888);
   }
+  .list-source {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
+  }
+  .list-source select {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: monospace;
+    font-size: 0.8rem;
+    padding: 0.15rem 0.25rem;
+    max-width: 16rem;
+  }
+  .list-source select:disabled {
+    opacity: 0.6;
+  }
+
   .refresh-commits-btn {
     background: none;
     border: none;
@@ -518,7 +757,7 @@
   .commit-row {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: stretch;
     padding: 0.5rem 0.75rem;
     border-bottom: 1px solid var(--border);
     transition: background 0.15s;
@@ -528,6 +767,12 @@
   }
   .commit-row:hover {
     background: var(--bg-hover, #2a2a2a);
+  }
+  /* The span, not the two clicks. Faint, because the rail beside it is what
+     states the range and a tint strong enough to compete would say the rows
+     between the ends were selected too. */
+  .commit-row.in-range {
+    background: rgba(33, 150, 243, 0.06);
   }
   .commit-row.selected-from {
     background: rgba(76, 175, 80, 0.15);
@@ -539,9 +784,107 @@
     background: linear-gradient(90deg, rgba(76, 175, 80, 0.15) 50%, rgba(33, 150, 243, 0.15) 50%);
   }
 
+  /* --- The rail (UI-151) ---------------------------------------------- */
+
+  /* A column of its own rather than a border on the row, so the line can stop
+     at a node instead of running the full height of every row: where the
+     accent *ends* is the boundary, and a border cannot express that. */
+  .rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 14px;
+    flex-shrink: 0;
+    margin-right: 0.6rem;
+    align-self: stretch;
+  }
+  .rail-line {
+    flex: 1;
+    width: 2px;
+    min-height: 6px;
+    background: var(--border);
+  }
+  .rail-line.lit {
+    background: #2196F3;
+  }
+  .rail-node {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--bg-surface-alt);
+    border: 2px solid var(--border);
+    box-sizing: border-box;
+  }
+  .rail-node.inside {
+    border-color: #2196F3;
+    background: #2196F3;
+  }
+  /* Hollow ends. Both are *in* the comparison, and a filled node next to a
+     filled span would leave nothing saying which two the reader chose. */
+  .rail-node.from {
+    width: 12px;
+    height: 12px;
+    border-color: #4CAF50;
+    background: var(--bg-body);
+  }
+  .rail-node.to {
+    width: 12px;
+    height: 12px;
+    border-color: #2196F3;
+    background: var(--bg-body);
+  }
+  /* Outside the range and named as such — the one commit that used to be
+     picked by accident. */
+  .rail-node.base {
+    border-style: dashed;
+    border-color: var(--text-dim);
+    background: transparent;
+  }
+
+  /* The answer to "where does it start". A divider rather than a caption on a
+     row, because the thing being drawn is the seam between two commits and
+     not a property of either. */
+  .range-boundary {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.75rem;
+    background: var(--bg-surface-alt);
+    border-bottom: 1px solid var(--border);
+    border-top: 1px dashed var(--text-dim);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    text-transform: lowercase;
+    letter-spacing: 0.02em;
+  }
+
+  .range-note {
+    margin: 0 0 0.75rem;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    color: var(--text-secondary, #888);
+  }
+  .range-note strong {
+    color: var(--text);
+  }
+  .range-blocked {
+    color: #ef9a9a;
+  }
+  .range-warning {
+    margin: -0.35rem 0 0.75rem;
+    padding: 0.4rem 0.6rem;
+    border-left: 2px solid #FFB74D;
+    background: rgba(255, 183, 77, 0.08);
+    font-size: 0.8rem;
+    line-height: 1.45;
+    color: var(--text-secondary, #888);
+  }
+
   .commit-info {
     display: flex;
     flex-direction: column;
+    justify-content: center;
     gap: 0.15rem;
     overflow: hidden;
     flex: 1;
@@ -565,9 +908,14 @@
 
   .commit-actions {
     display: flex;
+    align-items: center;
     gap: 0.25rem;
     margin-left: 0.5rem;
     flex-shrink: 0;
+  }
+  .select-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
   }
   .select-btn {
     padding: 0.2rem 0.5rem;
@@ -626,5 +974,30 @@
   .compute-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* Deliberately not red. Stopping a comparison destroys nothing — the
+     overlay already on screen survives it — and a warning colour would say
+     otherwise. It reads as the plain button it is, in the toolbar row and in
+     the footer alike. */
+  .stop-btn {
+    background: var(--bg-surface-alt);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .picker-footer .stop-btn {
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .stop-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  /* `wait`, not `not-allowed`: the button is disabled because the thing it
+     asked for is happening, which is the opposite of a refusal. */
+  .stop-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
   }
 </style>

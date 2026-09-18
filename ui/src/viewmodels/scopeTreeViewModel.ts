@@ -8,6 +8,10 @@
  *   - Component-local UI state: folder expansion, search text
  *   - Derived `flatList` (depth-first traversal respecting filters)
  *   - Action helpers for language filter and folder toggling
+ *   - The search box's timing: the match set trails the input, and the
+ *     projection trails the match set, so a keystroke costs a render rather
+ *     than a walk of the repo. `commitQuery` flushes, so Enter is never
+ *     served a stale query.
  *
  * What this VM re-exports (pass-through from the Model layer):
  *   - `indexData`, `selectedScopes`, `selectionStats`, `refreshing`
@@ -22,8 +26,12 @@ import {
   indexData, treeLanguageFilter, fullGraphDataStore,
   setScopes, addScopes, scopeCounts,
 } from '../stores/scope';
+import type { IndexData, IndexNode } from '../stores/scope';
+import type { D3Node } from '../types/graph';
 import { compactRules, includeAll } from '../utils/scopeRules';
 import { parseQuery, scoreQuery, violatesNegation } from '../utils/fuzzyPath';
+import { trailing } from '../utils/trailingStore';
+import { bestMatches } from '../utils/topMatches';
 
 // --- Pass-through re-exports for the view ---
 export {
@@ -47,6 +55,29 @@ export {
 // --- View-owned UI state ---
 export const filterText = writable<string>('');
 export const openFolders = writable<Set<string>>(new Set(['']));
+
+/**
+ * How long the match set waits behind the input.
+ *
+ * Long enough that a typed word costs one search instead of five, short
+ * enough to read as instant. The prefixes skipped are the expensive ones:
+ * `g` matches the whole repo, `graph` matches a corner of it.
+ */
+const FILTER_DEBOUNCE_MS = 120;
+
+/**
+ * Extra lag on the projection, on top of the above.
+ *
+ * The `⏎ N entities` hint is the most expensive thing the box computes and
+ * the least urgent — it answers "what would Enter cost", which only matters
+ * once the reader has stopped to look. Rows land first; the number follows.
+ */
+const PROJECTION_DEBOUNCE_MS = 200;
+
+/** The query the match set is actually computed from. Clearing the box skips
+ *  the wait: an empty query costs nothing to apply and Escape should feel
+ *  immediate. */
+const debouncedFilter = trailing(filterText, FILTER_DEBOUNCE_MS, (v) => v.trim() === '');
 
 // --- Actions ---
 export function setFilterText(text: string): void {
@@ -116,9 +147,13 @@ export interface ScopeMatch {
 /** True while the user has typed something into the filter box. Views use
  *  it to switch between the tree and the flat result list, and to show the
  *  whole path per row instead of the basename — two `mod.rs` hits from
- *  different folders are otherwise indistinguishable. */
+ *  different folders are otherwise indistinguishable.
+ *
+ *  Derived from the debounced query, not the raw input, so the view never
+ *  flips to result mode before the results exist — reading it off `filterText`
+ *  flashed "No matches" on the first character of every word. */
 export const queryActive: Readable<boolean> = derived(
-  filterText,
+  debouncedFilter,
   ($f) => $f.trim().length > 0,
 );
 
@@ -153,7 +188,77 @@ const MAX_ENTITY_NAME = 80;
 export const MATCH_ROWS_SHOWN = 200;
 
 /**
- * Everything matching the current query, best first, over two corpora.
+ * The two corpora, folded and flattened once per analysis run.
+ *
+ * A repo's paths and entity names are fixed between keystrokes, but the
+ * scan re-derived them every time: `Object.entries` rebuilt a 65k-pair array,
+ * and `toLowerCase` allocated a throwaway string per candidate *per term*.
+ * None of that depends on the query, so it is hoisted here and keyed on the
+ * identity of the data it came from — a re-analysis swaps the object and the
+ * cache misses exactly once, which is the behaviour we want.
+ *
+ * `WeakMap` rather than a "last seen" pair so an old graph is collectable
+ * with its folded copy, and so two corpora can be live at once.
+ */
+interface PathCorpus {
+  paths: string[];
+  nodes: IndexNode[];
+  /** `paths` lowercased, positionally aligned. */
+  lowered: string[];
+}
+
+const pathCorpora = new WeakMap<object, PathCorpus>();
+
+function pathCorpus(idx: IndexData): PathCorpus {
+  const hit = pathCorpora.get(idx.nodes);
+  if (hit) return hit;
+
+  const paths: string[] = [];
+  const nodes: IndexNode[] = [];
+  const lowered: string[] = [];
+  for (const path of Object.keys(idx.nodes)) {
+    if (path === '') continue;
+    paths.push(path);
+    nodes.push(idx.nodes[path]);
+    lowered.push(path.toLowerCase());
+  }
+
+  const corpus: PathCorpus = { paths, nodes, lowered };
+  pathCorpora.set(idx.nodes, corpus);
+  return corpus;
+}
+
+interface EntityCorpus {
+  nodes: D3Node[];
+  /** Each node's `name`, lowercased, positionally aligned. */
+  lowered: string[];
+}
+
+const entityCorpora = new WeakMap<object, EntityCorpus>();
+
+/** Pre-filtered to the entities a query could ever return: the eligibility
+ *  rules below don't depend on what was typed, so they belong here rather
+ *  than in the scan. The language filter does, and stays there. */
+function entityCorpus(nodes: D3Node[]): EntityCorpus {
+  const hit = entityCorpora.get(nodes);
+  if (hit) return hit;
+
+  const kept: D3Node[] = [];
+  const lowered: string[] = [];
+  for (const n of nodes) {
+    if (!n.file_path || n.tags?.includes('ghost')) continue;
+    if (n.name.length > MAX_ENTITY_NAME) continue;
+    kept.push(n);
+    lowered.push(n.name.toLowerCase());
+  }
+
+  const corpus: EntityCorpus = { nodes: kept, lowered };
+  entityCorpora.set(nodes, corpus);
+  return corpus;
+}
+
+/**
+ * Everything matching the current query, over two corpora.
  *
  * **Paths** come from the whole `IndexData.nodes` keyset. Expansion state is
  * a display concern and deliberately plays no part: gating the search on
@@ -168,21 +273,26 @@ export const MATCH_ROWS_SHOWN = 200;
  * fetch. Degrading is correct here: the index is always present and is the
  * corpus this box is primarily about.
  *
- * Uncapped, because this is also the set that gets committed to the scope.
+ * Uncapped, because this is also the set that gets committed to the scope —
+ * and **unordered**, because nothing downstream needs the order: the rows
+ * take theirs from `rankedMatches`, and `queryScopePaths` collapses this into
+ * a set. Sorting tens of thousands of matches to render two hundred of them
+ * was work nobody read.
  */
 export const queryMatches: Readable<ScopeMatch[]> = derived(
-  [indexData, filterText, treeLanguageFilter, fullGraphDataStore],
+  [indexData, debouncedFilter, treeLanguageFilter, fullGraphDataStore],
   ([$idx, $filter, $langFilter, $full]) => {
     const terms = parseQuery($filter);
     if (!$idx || terms.length === 0) return [] as ScopeMatch[];
 
     const out: ScopeMatch[] = [];
-    for (const [path, node] of Object.entries($idx.nodes)) {
-      if (path === '') continue;
+    const { paths, nodes, lowered } = pathCorpus($idx);
+    for (let i = 0; i < paths.length; i++) {
+      const node = nodes[i];
       if (!nodeMatchesLanguage(node.languages, $langFilter)) continue;
-      const score = scoreQuery(terms, path);
+      const score = scoreQuery(terms, paths[i], lowered[i]);
       if (score === null) continue;
-      out.push({ path, kind: node.type === 'folder' ? 'folder' : 'file', score });
+      out.push({ path: paths[i], kind: node.type === 'folder' ? 'folder' : 'file', score });
     }
 
     // Entity hits are scored on the name alone, not the path: the path was
@@ -190,20 +300,21 @@ export const queryMatches: Readable<ScopeMatch[]> = derived(
     // contribute would rank a badly-named entity in a well-named folder
     // above the thing the user actually typed.
     const pathHits = new Set(out.map((m) => m.path));
-    for (const n of $full?.nodes ?? []) {
-      if (!n.file_path || n.tags?.includes('ghost')) continue;
-      if (n.name.length > MAX_ENTITY_NAME) continue;
+    const entities = $full ? entityCorpus($full.nodes) : null;
+    for (let i = 0; entities && i < entities.nodes.length; i++) {
+      const n = entities.nodes[i];
       if (!nodeMatchesLanguage([n.language], $langFilter)) continue;
-      const score = scoreQuery(terms, n.name);
+      // One row per file: a query matching thirty methods of one class says
+      // the same thing thirty times, and the commit target is the file
+      // either way. Checked before scoring — it is the cheaper test and it
+      // rejects far more.
+      if (pathHits.has(n.file_path)) continue;
+      const score = scoreQuery(terms, n.name, entities.lowered[i]);
       if (score === null) continue;
       // Negation applies to the path this row would scope to, not just to
       // the name that matched. `^src !parser` otherwise returned
       // `src/parser/…` on the strength of an entity called `src`.
       if (violatesNegation(terms, n.file_path)) continue;
-      // One row per file: a query matching thirty methods of one class says
-      // the same thing thirty times, and the commit target is the file
-      // either way.
-      if (pathHits.has(n.file_path)) continue;
       pathHits.add(n.file_path);
       out.push({
         path: n.file_path,
@@ -213,15 +324,23 @@ export const queryMatches: Readable<ScopeMatch[]> = derived(
       });
     }
 
-    return out.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+    return out;
   },
+);
+
+/** The slice the tree actually draws: best first, capped at the row limit.
+ *  Not exported — `flatList` is the shape the view wants, and `matchOverflow`
+ *  is the only other thing that needs to know how many rows survived. */
+const rankedMatches: Readable<ScopeMatch[]> = derived(
+  queryMatches,
+  ($m) => bestMatches($m, MATCH_ROWS_SHOWN),
 );
 
 /** How many matches exist beyond the rendered cap, so the view can say so
  *  rather than silently truncating. */
 export const matchOverflow: Readable<number> = derived(
-  queryMatches,
-  ($m) => Math.max(0, $m.length - MATCH_ROWS_SHOWN),
+  [queryMatches, rankedMatches],
+  ([$all, $shown]) => Math.max(0, $all.length - $shown.length),
 );
 
 /** What a commit would put in the scope — the whole match set, not the
@@ -232,15 +351,27 @@ export const queryScopePaths: Readable<string[]> = derived(
   ($m) => [...new Set($m.map((m) => m.path))],
 );
 
+/** The projection's own input, trailing the match set. Emptying is immediate
+ *  so the hint disappears with the query rather than outliving it. */
+const projectionPaths = trailing(
+  queryScopePaths,
+  PROJECTION_DEBOUNCE_MS,
+  (paths) => paths.length === 0,
+);
+
 /**
  * Entity and relationship totals the current query would bring into scope.
  *
  * Shown before Enter is pressed, so a query that would cross
  * `ENTITY_THRESHOLD` is visible as a number rather than as a warning that
  * appears once the graph has already refused to draw.
+ *
+ * Reads the trailing paths, not the live ones. This is a whole-tree walk over
+ * a rule per match, so it is the one derivation worth keeping off the typing
+ * path entirely — the rows are the answer, this is the footnote.
  */
 export const queryProjection: Readable<{ entities: number; relationships: number } | null> = derived(
-  [indexData, queryScopePaths],
+  [indexData, projectionPaths],
   ([$idx, $paths]) => {
     if (!$idx || $paths.length === 0) return null;
     return scopeCounts(compactRules(includeAll($paths)), $idx);
@@ -261,6 +392,12 @@ export const queryProjection: Readable<{ entities: number; relationships: number
  * must not silently clear what you had.
  */
 export async function commitQuery(add = false): Promise<void> {
+  // Enter can beat the debounce — type a word and hit it in the same breath
+  // and the match set is still the one for a prefix of what is on screen.
+  // Committing that would scope to something the reader never saw, so the
+  // pending query is forced through first. Synchronous, so the `get` below
+  // sees it.
+  debouncedFilter.flush();
   const paths = get(queryScopePaths);
   if (paths.length === 0) return;
   // Both paths land in rule compaction, which drops the enumeration a query
@@ -276,12 +413,12 @@ export async function commitQuery(add = false): Promise<void> {
 // `openFolders`, so clearing the box restores the tree exactly as the user
 // left it.
 export const flatList: Readable<FlatListItem[]> = derived(
-  [indexData, queryActive, queryMatches, openFolders, treeLanguageFilter],
+  [indexData, queryActive, rankedMatches, openFolders, treeLanguageFilter],
   ([$idx, $querying, $matches, $open, $langFilter]) => {
     if (!$idx) return [] as FlatListItem[];
 
     if ($querying) {
-      return $matches.slice(0, MATCH_ROWS_SHOWN).map((m) => ({
+      return $matches.map((m) => ({
         path: m.path,
         depth: 0,
         isFolder: m.kind === 'folder',

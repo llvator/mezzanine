@@ -29,7 +29,7 @@
 //!   when it is not, which is the shape `graph.rs` already accepts from the
 //!   Rust parser's impl blocks.
 
-mod bodies;
+pub(crate) mod bodies;
 mod complexity;
 mod ctx;
 mod declarations;

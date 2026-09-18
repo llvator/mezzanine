@@ -13,6 +13,8 @@ import type { D3Node } from '../types/graph';
 import { detailsMap, ensureDetailsLoaded } from './details';
 import type { DiffLevel, DiffSeedFacet } from '../viewmodels/diffLevels';
 import { headIsWorkingTree } from '../viewmodels/diffVerdict';
+import { changedFileScope } from '../viewmodels/diffScope';
+import { RENDER_BUDGET, indexData, scopeCounts, scopeRules, setScopes } from './scope';
 
 export type { DiffLevel, DiffSeedFacet };
 
@@ -131,6 +133,23 @@ export const diffFiltersEnabled = writable(true);
 
 /** Opacity for unchanged/filtered-out nodes when diff filters are active (0 = hidden, 1 = fully visible). */
 export const diffDimOpacity = writable(0);
+
+/**
+ * How far the `Rest` slider can raise the tier the ladder left out.
+ *
+ * The old ceiling was 0.15, which was enough to say "there is more graph
+ * here" and not enough to read it: at that strength a name label is a grey
+ * smudge, so a reader who wanted to know *what* their changes sit next to had
+ * to leave diff mode to find out. This lets the rejected tier come up far
+ * enough to be identified — nodes, labels and the wiring between them.
+ *
+ * Short of 1 on purpose. Rest is the bottom of three tiers, under the edits
+ * (drawn at full strength) and the context a rung recruited
+ * (`CONTEXT_OPACITY_FLOOR` .. 1). A rejected node drawn as loudly as a
+ * changed one would make the diff colours the only thing separating them,
+ * and the picture would stop answering "what did I change" at a glance.
+ */
+export const REST_OPACITY_CEILING = 0.6;
 
 /**
  * How strongly the canvas draws what a rung recruited, against the edits it
@@ -604,13 +623,55 @@ export const DIFF_COLORS: Record<ChangeStatus, string> = {
 export interface Commit {
   hash: string;
   short_hash: string;
+  /** First parent, absent on a root commit. What `From` translates into
+   *  (UI-151) — see `viewmodels/commitRange.ts`. Absent from a listing
+   *  served by a server built before it. */
+  parent_hash?: string;
   message: string;
   author: string;
   date: string;
 }
 
-/** Store for available commits. */
+/** Store for available commits — the one listing the picker is showing. */
 export const commits = writable<Commit[]>([]);
+
+/**
+ * Every commit this session has been told about, keyed by full hash (UI-143).
+ *
+ * Separate from `commits` because the two answer different questions. That one
+ * is *the list on screen*, which holds one ref's history at a time and is
+ * replaced whenever the reader switches branch. This one is *what the app can
+ * name*, and it only grows: branch tips, merge bases, and every listing
+ * fetched along the way.
+ *
+ * It exists because a comparison records shas. `diff.json` echoes back
+ * `from_ref`/`to_ref` as resolved short hashes, so a diff of `main…feature`
+ * reaches `refLabel` as two hashes — and with only the current branch's list
+ * loaded, the branch's own commits are not in it and both sides render as bare
+ * hashes. Accumulating is what keeps UI-139's answer working once the refs
+ * being compared stop coming from one branch.
+ */
+export const knownCommits = writable<Commit[]>([]);
+
+/**
+ * Fold a listing into `knownCommits`, newest listing winning on a tie.
+ *
+ * Merged field by field rather than replaced, because the listings that feed
+ * this do not all carry the same ones. `/api/branches` describes a tip with
+ * what a branch row needs — subject, author, date — and says nothing about
+ * its parent; a wholesale replace therefore *erased* the parent of every
+ * branch tip the commit listing had already reported, and the picker read the
+ * tip of the checked-out branch as a root commit with nothing before it
+ * (UI-151). Winning on a tie should mean newer values, not fewer facts.
+ */
+function remember(fetched: Commit[]): void {
+  if (fetched.length === 0) return;
+  knownCommits.update((held) => {
+    const byHash = new Map(held.map((c) => [c.hash, c]));
+    for (const c of fetched) byHash.set(c.hash, { ...byHash.get(c.hash), ...c });
+    return [...byHash.values()];
+  });
+}
 
 /** Whether we're currently fetching commits. */
 export const commitsLoading = writable<boolean>(false);
@@ -618,26 +679,139 @@ export const commitsLoading = writable<boolean>(false);
 /** Whether we're currently computing a diff. */
 export const diffComputing = writable<boolean>(false);
 
+/**
+ * Set between "stop this comparison" and the run actually ending (UI-141).
+ *
+ * Two jobs, and they are the same fact read from either end. It is what the
+ * Stop button reads to say `Stopping…` rather than pretend the work is
+ * already over — the engine stops at its next checkpoint, which on a large
+ * repository is a second or two away. And it is how `triggerDiff` knows that
+ * the declined response about to arrive is the answer to a button the reader
+ * pressed, not a failure to report: the server's decline is a sentence, and
+ * matching on its text would be the mistake `NoDiff` exists to avoid.
+ */
+export const diffStopping = writable<boolean>(false);
+
 /** Error message from commit/diff operations. */
 export const diffApiError = writable<string | null>(null);
 
-/** Fetch recent commits from the server. */
-export async function fetchCommits(limit = 50): Promise<void> {
+/**
+ * Fetch recent commits from the server — of `HEAD`, or of any ref.
+ *
+ * `gitRef` is what lets a reviewer on `main` pick a commit from the branch
+ * they are reviewing (UI-143). Absent, the answer is what it always was: the
+ * history behind the checkout's own HEAD.
+ */
+export async function fetchCommits(gitRef?: string, limit = 50): Promise<void> {
   commitsLoading.set(true);
   diffApiError.set(null);
   try {
-    const resp = await fetch(apiUrl(`/api/commits?limit=${limit}`));
+    const at = gitRef ? `&ref=${encodeURIComponent(gitRef)}` : '';
+    const resp = await fetch(apiUrl(`/api/commits?limit=${limit}${at}`));
     if (!resp.ok) {
       const text = await resp.text();
       throw new Error(text || `HTTP ${resp.status}`);
     }
     const data: Commit[] = await resp.json();
     commits.set(data);
+    remember(data);
   } catch (err) {
     diffApiError.set(`Failed to fetch commits: ${err}`);
     commits.set([]);
   } finally {
     commitsLoading.set(false);
+  }
+}
+
+/**
+ * One branch, as `GET /api/branches` reports it. Mirrors `BranchRef` in
+ * src/server/types.rs.
+ *
+ * `name` is a usable ref and is what crosses back on a comparison — unlike a
+ * stash's `stash@{N}`, which is a position that renumbers (UI-107). A branch
+ * name means "wherever that branch is", which is what a reviewer asking about
+ * `main` is asking.
+ */
+export interface BranchRef {
+  name: string;
+  /** Remote-tracking (`origin/main`). Decided by the ref's namespace on the
+   *  server, because a slash in the name tells the two apart in neither
+   *  direction — a local branch may be `feat/chip`. */
+  remote: boolean;
+  /** The branch this checkout is on. The canvas is drawing its working tree. */
+  is_head: boolean;
+  tip: string;
+  tip_short: string;
+  subject: string;
+  author: string;
+  date: string;
+}
+
+/** Store for the repository's branches, most recently committed to first. */
+export const branches = writable<BranchRef[]>([]);
+
+/** Whether we're currently fetching branches. */
+export const branchesLoading = writable<boolean>(false);
+
+/**
+ * Fetch the repository's branches.
+ *
+ * A repository with one branch is the ordinary state of a fresh checkout, so
+ * an empty-ish answer is left to the panel to say rather than surfaced as an
+ * error — the rule the stash and index listings already follow.
+ *
+ * The tips are folded into `knownCommits`: a comparison of two branches is
+ * recorded as two shas, and these are the commits those shas most often name.
+ */
+export async function fetchBranches(): Promise<void> {
+  branchesLoading.set(true);
+  diffApiError.set(null);
+  try {
+    const resp = await fetch(apiUrl('/api/branches'));
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(text || `HTTP ${resp.status}`);
+    }
+    const data: BranchRef[] = await resp.json();
+    branches.set(data);
+    remember(data.map((b) => ({
+      hash: b.tip,
+      short_hash: b.tip_short,
+      message: b.subject,
+      author: b.author,
+      date: b.date,
+    })));
+  } catch (err) {
+    diffApiError.set(`Failed to fetch branches: ${err}`);
+    branches.set([]);
+  } finally {
+    branchesLoading.set(false);
+  }
+}
+
+/**
+ * Where two refs diverged, or `null` when they share no history.
+ *
+ * The one call standing between "compare two branches" and a comparison that
+ * reports everything landed on the base branch since the fork as work the
+ * other branch deleted. See the endpoint's own note (UI-143) — it is the
+ * stash's first-parent rule, arrived at from the other side.
+ *
+ * `null` on a failed request too, and the caller treats the two alike: both
+ * mean "no divergence point to compare from", and the panel says so and offers
+ * the tip instead rather than blocking on a lookup that is an optimisation of
+ * the base, not a precondition for one.
+ */
+export async function fetchMergeBase(from: string, to: string): Promise<Commit | null> {
+  try {
+    const q = `from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+    const resp = await fetch(apiUrl(`/api/merge-base?${q}`));
+    if (!resp.ok) return null;
+    const data: Commit | null = await resp.json();
+    if (data) remember([data]);
+    return data;
+  } catch {
+    return null;
   }
 }
 
@@ -741,8 +915,53 @@ export async function fetchStaged(): Promise<void> {
 }
 
 /**
+ * The commit the reader named as the oldest one included (UI-151).
+ *
+ * Set only by the commit picker, whose `From` means "include this one" and
+ * which therefore sends that commit's *parent* as `from_ref`. Everything
+ * downstream reads `from_ref` back out of `diff.json` and names it, so
+ * without this the Changes header would head a comparison with a hash and a
+ * subject the reader never chose and would not recognise — the same
+ * off-by-one that made `From` confusing, resurfacing one pane over.
+ *
+ * Null for every other kind of comparison. A stash, the index, the working
+ * tree and a branch divergence all carry bases that are genuinely the thing
+ * to name, and substituting anything for them would be the lie this prevents.
+ */
+export const inclusiveFrom = writable<Commit | null>(null);
+
+/**
+ * Which ref the panes should *say* the comparison starts from.
+ *
+ * `from_ref` is what the engine was given and stays that in `diff.json`; this
+ * is what the reader asked for. They differ by exactly one commit, and only
+ * for a pick made in the commit picker.
+ *
+ * The short hash, because that is the spelling `diff.json` echoes back and
+ * this stands in for it: the panes that print a ref raw would otherwise show
+ * forty characters on one side of the arrow and seven on the other.
+ */
+export const shownFromRef: Readable<string | undefined> = derived(
+  [diffData, inclusiveFrom],
+  ([$diff, $from]) => $from?.short_hash ?? $diff?.from_ref,
+);
+
+/** What a caller can tell [`triggerDiff`] beyond the two refs. */
+export interface TriggerOpts {
+  /** The commit the reader picked as the oldest included one, when
+   *  `fromRef` is its parent rather than itself. */
+  inclusiveFrom?: Commit;
+}
+
+/**
  * Trigger a diff computation between two refs (commits/branches), or the
  * `WORKING` / `STAGED` sentinels.
+ *
+ * `fromRef` is the *baseline tree* — the state the comparison starts from,
+ * which is not itself part of it. A caller whose reader picked the oldest
+ * commit they wanted *included* translates before calling (see
+ * `viewmodels/commitRange.ts`) and passes what they picked as
+ * `opts.inclusiveFrom`, so the panes can name it.
  *
  * A 200 is not the same as a diff. The server answers `success: false` for the
  * comparisons it declines rather than fails — another diff already running,
@@ -751,7 +970,16 @@ export async function fetchStaged(): Promise<void> {
  * them and then called `loadDiff`, which re-served the *previous* comparison:
  * the picker closed, the overlay stayed, and nothing said why.
  */
-export async function triggerDiff(fromRef: string, toRef: string): Promise<void> {
+export async function triggerDiff(
+  fromRef: string,
+  toRef: string,
+  opts: TriggerOpts = {},
+): Promise<void> {
+  // Before the request, and unconditionally, so every caller that does not
+  // pass one clears the last caller's. The alternative — each mode
+  // remembering to reset it — is a stale label on the next comparison, which
+  // is the exact failure this store exists to prevent.
+  inclusiveFrom.set(opts.inclusiveFrom ?? null);
   diffComputing.set(true);
   diffApiError.set(null);
   try {
@@ -766,6 +994,14 @@ export async function triggerDiff(fromRef: string, toRef: string): Promise<void>
     }
     const body = await resp.json();
     if (body?.success === false) {
+      // A stop the reader asked for comes back as a decline like any other,
+      // and is the one decline that must not be shown: they know why there is
+      // no diff, and a red banner saying so reads as their button having
+      // broken something (UI-141).
+      if (get(diffStopping)) {
+        console.log(`[diff] ${body.message || 'stopped'}`);
+        return;
+      }
       // The server's own words, unwrapped: "Nothing is staged" is not a
       // failure to compute anything and must not read as one.
       diffApiError.set(body.message || 'The diff was declined.');
@@ -773,11 +1009,111 @@ export async function triggerDiff(fromRef: string, toRef: string): Promise<void>
     }
     // After successful diff, reload the diff.json
     await loadDiff();
+    // …and land on what it changed, if the picture it landed in cannot show
+    // it. Here rather than in `loadDiff` deliberately: that runs on every live
+    // refresh too (UI-067), and re-scoping on each file save would move the
+    // canvas out from under a reader who is typing.
+    console.log(`[diff] auto-scope: ${await autoScopeToChanges()}`);
   } catch (err) {
-    diffApiError.set(`Failed to compute diff: ${err}`);
+    if (!get(diffStopping)) diffApiError.set(`Failed to compute diff: ${err}`);
   } finally {
     diffComputing.set(false);
+    diffStopping.set(false);
   }
+}
+
+/**
+ * Stop the comparison that is running (UI-141).
+ *
+ * Not `stopDiff`, and the difference is what the reader is left looking at.
+ * That one leaves diff mode and drops the overlay; this one only ends the
+ * *computation* — the case it exists for is a reader who asked for two
+ * commits, watched a full analysis of each begin, and wants the view they had
+ * back rather than none at all.
+ *
+ * The request is not aborted, deliberately. Dropping it would free this page
+ * immediately and leave the engine holding its in-progress lock with nobody
+ * to release it, so the next comparison would be refused as "already in
+ * progress" for the rest of the session. Asking the server to stop and
+ * waiting for it to say it has is a second of `Stopping…` in exchange for a
+ * server that is still usable afterwards.
+ */
+export async function cancelDiff(): Promise<void> {
+  if (!get(diffComputing)) return;
+  // Serve mode has no diff endpoint (SRV-003), so nothing there is computing.
+  if (isServeMode()) return;
+  diffStopping.set(true);
+  try {
+    await fetch(apiUrl('/api/diff/cancel'), { method: 'POST' });
+  } catch {
+    // An engine we cannot reach is not one we can stop, and the run this was
+    // meant for will report itself either way. Put the button back rather
+    // than leave it saying `Stopping…` about a request that never landed.
+    diffStopping.set(false);
+  }
+}
+
+/**
+ * Narrow the canvas to a set of changed files and set the diff controls that
+ * make them legible.
+ *
+ * The rung goes to `edits` and the facet to `all` because the scope has
+ * already done the narrowing: a wider rung on a scope this size draws the
+ * neighbourhood of the change, which is a reading the reader can now ask for
+ * rather than one they have to undo.
+ *
+ * `setScopes` records a navigation frame, so the wayback (UI-092) returns to
+ * the pre-comparison scope in one step. Nothing here is taken away for good.
+ */
+export async function scopeToChanges(paths: string[]): Promise<void> {
+  diffLevel.set('edits');
+  diffSeedFacet.set('all');
+  diffFiltersEnabled.set(true);
+  await setScopes(paths);
+}
+
+/** Why the automatic scope did or did not fire. Returned rather than logged
+ *  inside, so the one line in `triggerDiff` says which condition decided. */
+export type AutoScopeVerdict =
+  | 'scoped'
+  | 'no diff loaded'
+  | 'no core-changed file to scope to'
+  | 'the current scope already fits';
+
+/**
+ * Scope an explicitly-requested comparison to what it changed (UI-135).
+ *
+ * One rule, three guards, and the guards are what keep it from fighting the
+ * reader:
+ *
+ * - **Only when the current scope does not fit.** A view that was already
+ *   working is not improved by taking most of it away. `pickLevel` collapses
+ *   toward `RENDER_BUDGET`, so that is the same number deciding both — above
+ *   it the canvas would have escalated to folder aggregation and drawn the
+ *   change as circles.
+ * - **Only when there is something to scope to.** An impact-only or entirely
+ *   unanalysed change yields no path, and an empty scope is a blank canvas —
+ *   the failure this exists to prevent, not a narrower version of it.
+ * - **Only from `triggerDiff`.** See the call site.
+ *
+ * An empty rule list counts as not fitting: that canvas is already blank, so
+ * there is nothing to take away.
+ */
+export async function autoScopeToChanges(): Promise<AutoScopeVerdict> {
+  const data = get(diffData);
+  if (!data) return 'no diff loaded';
+
+  const idx = get(indexData);
+  const { paths } = changedFileScope(data.entities, idx);
+  if (paths.length === 0) return 'no core-changed file to scope to';
+
+  const rules = get(scopeRules);
+  if (idx && rules.length > 0 && scopeCounts(rules, idx).entities <= RENDER_BUDGET) {
+    return 'the current scope already fits';
+  }
+
+  await scopeToChanges(paths);
+  return 'scoped';
 }
 
 /** Drop the overlay in this page. Says nothing to the server — see `stopDiff`. */

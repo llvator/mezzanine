@@ -14,7 +14,7 @@
 //! - [`modifiers`] — visibility + Kotlin's many modifier buckets
 //! - [`types`] — `UsesType` edges from signature/property types (post-pass)
 
-mod bodies;
+pub(crate) mod bodies;
 mod ctx;
 mod declarations;
 mod helpers;

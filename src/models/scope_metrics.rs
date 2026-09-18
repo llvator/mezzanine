@@ -347,6 +347,24 @@ pub struct FolderShape {
     /// rather than about one level in isolation. `None` for a folder with
     /// no subfolders.
     pub child_compliance: Option<f32>,
+    /// This folder's breadth against its widest subfolder's, smaller over
+    /// larger. `None` for a folder with no subfolder to compare against —
+    /// one level is not a comparison.
+    ///
+    /// The only term here that compares two zoom levels rather than reading
+    /// one. Every other score, `child_compliance` included, grades a folder
+    /// against a fixed bar and then asks whether its children clear that
+    /// same fixed bar; a tree of levels that each pass separately can still
+    /// change scale abruptly from one to the next, and nothing asked until
+    /// this (ADR 0033). A folder of 11 children holding a subfolder of 57
+    /// scores 0.19 while every other number on it reads clean.
+    ///
+    /// Reported beside the score and gating nothing, per ADR 0032: it is
+    /// measured and thresholded in the change that introduces it, and earns
+    /// a gate later on evidence about how it distributes across a corpus
+    /// rather than across the one repo it was written in.
+    #[serde(default)]
+    pub uniformity: Option<f32>,
     /// Immediate children, files and subfolders together.
     ///
     /// Gates `Fractal` against `Thresholds::shape_max_children` and stays
@@ -414,6 +432,11 @@ pub struct ShapeTerms {
     /// outgoing edge inside the folder and is not its door. `egress` is
     /// `1 − middle_exits ÷ exits`.
     pub middle_exits: u32,
+    /// Children held by the widest subfolder inside this folder.
+    /// `uniformity` is that against `child_count`, smaller over larger.
+    /// Zero for a folder with no subfolder to compare against.
+    #[serde(default)]
+    pub widest_child: u32,
 }
 
 /// File names that are wiring / entry-point by nature — the folder

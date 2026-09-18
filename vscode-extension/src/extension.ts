@@ -12,6 +12,7 @@ import { DiffViewProvider } from './diffViewProvider';
 import { EducatorHoverProvider } from './educatorHoverProvider';
 import { EducatorViewProvider } from './educatorViewProvider';
 import { EducatorProblemsView } from './educatorProblemsViewProvider';
+import { registerChangesView } from './changesTreeProvider';
 import * as http from 'http';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -712,6 +713,13 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Changes — git's list of the files the loaded comparison touched, beside
+  // the canvas's reading of the same change (UI-137). Everything it needs
+  // registered is behind the one call, and both getters are module-level
+  // functions rather than lambdas: this function is already an Overfull Head,
+  // and the gate fails a change that pushes an existing one higher still.
+  registerChangesView(context, runningServerPort, getProjectRoot);
+
   // Educator Problems — dedicated TreeView under the Mezzanine sidebar that lists
   // scan hits per file. Replaces the earlier DiagnosticCollection integration
   // so Educator findings stay out of the shared Problems view (which would
@@ -779,6 +787,14 @@ export function deactivate() {
     server = undefined;
   }
   VisualizerPanel.dispose();
+}
+
+/** The port the analysis server is answering on, or `undefined` while it is
+ *  not running. Module-level so callers can pass it by name — a lambda spelled
+ *  out at a call site inside `activate` would add its branch to a function
+ *  that is already an Overfull Head. */
+function runningServerPort(): number | undefined {
+  return server?.running ? server.port : undefined;
 }
 
 /** Effective project root: the git repository the user selected via

@@ -99,8 +99,8 @@ export const sidebarPaneOpen = persisted('mezz-sidebar-pane-open', true, (v) => 
 
 /** Which of the sidebar's three tabs is showing. Same move, same reason: `f`,
  *  `q` and `s` switch tabs from outside `Sidebar.svelte`. */
-export type SidebarTab = 'filters' | 'quality' | 'settings';
-const SIDEBAR_TABS: SidebarTab[] = ['filters', 'quality', 'settings'];
+export type SidebarTab = 'filters' | 'quality' | 'changes' | 'settings';
+const SIDEBAR_TABS: SidebarTab[] = ['filters', 'quality', 'changes', 'settings'];
 export const sidebarTab = persisted<SidebarTab>('mezz-sidebar-tab', 'filters', (v) =>
   SIDEBAR_TABS.includes(v as SidebarTab) ? (v as SidebarTab) : 'filters');
 
@@ -112,6 +112,18 @@ export const toolbarCollapsed = persisted('mezz-toolbar-collapsed', false, (v) =
 /** Whether the Description column is expanded. Same key as when this lived in
  *  `description.ts`, so an existing preference survives the move. */
 export const describePaneOpen = persisted('mezz-describe-pane-open', true, (v) => v === 'true');
+
+/**
+ * Whether the changes row under the columns is expanded (UI-150).
+ *
+ * Default open, because it is what it replaced: the branch chip and the
+ * comparison buttons were always on screen when they floated over the canvas,
+ * and a reader who never finds the chevron should lose nothing. Unlike the
+ * columns it costs height rather than width, so folding it is a trade against
+ * the canvas rather than against another pane — which is why it gets its own
+ * flag instead of a slot in the width budget.
+ */
+export const changesBarOpen = persisted('mezz-changes-bar-open', true, (v) => v === 'true');
 
 /** Whether the Elevator spec renders as its own pane beside the code canvas
  *  (ADR 0011). Off by default: a project with no `.elv` layer gains nothing
@@ -134,6 +146,55 @@ export const splitViewOpen = persisted('mezz-split-view-open', false, (v) => v =
  * and there is no second consumer of either.
  */
 export const followAnalysisScope = persisted('mezz-spec-follow-scope', false, (v) => v === 'true');
+
+/**
+ * Whether a click in the spec pane also filters the code canvas.
+ *
+ * On by default, because that is what the click has always done and because
+ * narrowing to what an entity owns is the reason the pane is beside the graph
+ * at all. The switch exists because the click carries a second job it cannot
+ * decline: it is also the only way to read an entity's description, so a
+ * reader who wanted the Details pane paid for it by having the canvas emptied
+ * to that entity's files. Off, the click opens, drills and moves Details, and
+ * the canvas is left where it was — the highlight channel (hover, and pins)
+ * being what answers "where does this live" without deleting the context the
+ * question is about.
+ *
+ * Beside `followAnalysisScope` for the same reason it is: a spec-pane
+ * behaviour switch with exactly one reader, remembered between sessions.
+ */
+export const filterOnSpecClick = persisted('mezz-spec-filter-on-click', true, (v) => v !== 'false');
+
+/**
+ * Whether clicking a row in the Changes pane also seeds the code canvas.
+ *
+ * The same switch as `filterOnSpecClick`, one pane over, for the same reason:
+ * the click carries two jobs and only one of them was ever asked for every
+ * time. Opening a file's diff is why a reader clicks the row; making its node
+ * the graph's selection re-roots the tree on it, and the rest of the change —
+ * which is the list the reader is working down — leaves the picture.
+ *
+ * On by default, that being what the click has always done. Off, the click
+ * still opens the diff, still marks the row and still lights the file's
+ * circles on the canvas (`changeHighlight`), and the seed, the ladder and the
+ * scope stay exactly where the reader left them.
+ */
+export const filterOnChangeClick = persisted('mezz-changes-filter-on-click', true, (v) => v !== 'false');
+
+/**
+ * Whether the Changes list is drawn as a folder tree rather than flat (UI-154).
+ *
+ * Two readings of one comparison, and which one is wanted depends on the
+ * question: a flat list is the shorter walk when the reader is working down
+ * every file, and a tree is the only one of the two that says *where* the
+ * change happened — three edits in one folder and three spread across the repo
+ * are the same list and very different changes.
+ *
+ * Off by default, that being what the pane has always drawn, and remembered
+ * per browser because it is a reading habit rather than a property of any one
+ * comparison.
+ */
+export const changesAsTree = persisted('mezz-changes-as-tree', false, (v) => v === 'true');
 
 /**
  * What each column remembers being dragged to.

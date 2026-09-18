@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -9,28 +9,48 @@ use axum::{
 use std::process::Command;
 use tokio::sync::broadcast;
 
+use crate::activity;
 use crate::output::{self, JsonRenderer};
 
 use super::state::AppState;
-use super::types::{BranchInfo, CommitInfo, RootPathResponse, StagedFile, StashInfo};
+use super::types::{
+    ActivityQuery, BranchInfo, BranchRef, CommitInfo, CommitsQuery, MergeBaseQuery,
+    RootPathResponse, StagedFile, StashInfo,
+};
 
-/// SSE handler: clients subscribe to reload events.
+/// What one turn of the SSE loop decided to do.
+///
+/// The loop reads two channels — completion pings and activity notices —
+/// and each has the same three outcomes. Naming them keeps the `select!`
+/// arms down to one expression apiece; inlining the matches instead put the
+/// whole thing over the complexity gate.
+enum Tick {
+    Send(Box<Event>),
+    /// A lagged receiver. Skipped rather than reported: the client resyncs
+    /// through `/api/activity?since=`, and a status feed's correct response
+    /// to falling behind is to lose the middle, not the connection.
+    Skip,
+    Stop,
+}
+
+/// SSE handler: clients subscribe to reload events and activity notices.
 pub(crate) async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let mut rx = state.tx.subscribe();
+    let mut notices = state.activity.subscribe();
     let stream = async_stream::stream! {
         // Send an initial "connected" event so the client knows the stream is live.
         yield Ok(Event::default().event("connected").data("ok"));
         loop {
-            match rx.recv().await {
-                Ok(kind) => {
-                    // Two event names, so a client can re-fetch only the
-                    // overlay when only the overlay moved (UI-067).
-                    yield Ok(Event::default().event(kind.event_name()).data("changed"));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            let tick = tokio::select! {
+                reload = rx.recv() => reload_tick(reload),
+                notice = notices.recv() => notice_tick(notice),
+            };
+            match tick {
+                Tick::Send(event) => yield Ok(*event),
+                Tick::Skip => continue,
+                Tick::Stop => break,
             }
         }
     };
@@ -39,6 +59,50 @@ pub(crate) async fn sse_handler(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+/// A completion ping. Three event names, so a client can re-fetch only the
+/// overlay when only the overlay moved (UI-067).
+fn reload_tick(reload: Result<super::state::ReloadKind, broadcast::error::RecvError>) -> Tick {
+    match reload {
+        Ok(kind) => Tick::Send(Box::new(
+            Event::default().event(kind.event_name()).data("changed"),
+        )),
+        Err(broadcast::error::RecvError::Lagged(_)) => Tick::Skip,
+        Err(broadcast::error::RecvError::Closed) => Tick::Stop,
+    }
+}
+
+/// An activity notice. Unlike the three above this carries its payload
+/// inline rather than telling the client to come and get it: the whole point
+/// is to say something *during* work the client is otherwise blind to, and a
+/// round trip per status line would be a request every few hundred
+/// milliseconds for the length of an analysis (UI-138).
+fn notice_tick(notice: Result<activity::Update, broadcast::error::RecvError>) -> Tick {
+    match notice {
+        Ok(update) => match serde_json::to_string(&update) {
+            Ok(json) => Tick::Send(Box::new(Event::default().event("activity").data(json))),
+            // Unreachable for this shape, and not worth dropping the stream
+            // over if it ever stops being.
+            Err(_) => Tick::Skip,
+        },
+        Err(broadcast::error::RecvError::Lagged(_)) => Tick::Skip,
+        Err(broadcast::error::RecvError::Closed) => Tick::Stop,
+    }
+}
+
+/// GET /api/activity — what the engine is doing, and what it recently said.
+///
+/// Exists alongside the stream rather than instead of it, for the two moments
+/// the stream cannot cover: a page opened while a run is already in flight,
+/// which has missed the notices that would have told it, and one that
+/// reconnects after a drop. `since` is the last `seq` the client saw, so the
+/// answer is exactly the gap — `0`, the default, means "everything you have".
+pub(crate) async fn activity_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ActivityQuery>,
+) -> Json<activity::Snapshot> {
+    Json(state.activity.snapshot(query.since.unwrap_or(0)))
 }
 
 /// GET /api/branch — what `HEAD` points at in the analyzed checkout.
@@ -82,28 +146,22 @@ pub(crate) fn git_branch(repo_root: &std::path::Path) -> BranchInfo {
     }
 }
 
-/// GET /api/commits — list recent commits.
-pub(crate) async fn commits_handler(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<CommitInfo>>, (StatusCode, String)> {
-    let repo_root = state.repo_root.read().await.clone();
-    Ok(Json(git_commits(&repo_root)?))
-}
-
-/// Read the 50 most recent commits of the repository at `repo_root`.
-/// Shared by watch-mode `/api/commits` and serve-mode
-/// `/api/repos/{slug}/commits`.
-pub(crate) fn git_commits(
+/// Run git at `repo_root` and hand back its stdout.
+///
+/// The two failures it folds together are the two a caller answers the same
+/// way: git absent from the machine, and git refusing the command. Neither is
+/// something the reader chose, and both leave the endpoint with nothing to
+/// report but that it could not answer.
+///
+/// Shared by every git-reading endpoint in this module rather than copied
+/// per handler, which is what let `/api/commits` quietly grow a second
+/// spelling of the same twenty lines.
+fn git_stdout(
     repo_root: &std::path::Path,
-) -> Result<Vec<CommitInfo>, (StatusCode, String)> {
+    args: &[&str],
+) -> Result<String, (StatusCode, String)> {
     let output = Command::new("git")
-        .args([
-            "log",
-            "--oneline",
-            "--format=%H|%h|%s|%an|%ad",
-            "--date=short",
-            "-50",
-        ])
+        .args(args)
         .current_dir(repo_root)
         .output()
         .map_err(|e| {
@@ -120,25 +178,269 @@ pub(crate) fn git_commits(
         ));
     }
 
-    let commits: Vec<CommitInfo> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.len() >= 5 {
-                Some(CommitInfo {
-                    hash: parts[0].to_string(),
-                    short_hash: parts[1].to_string(),
-                    message: parts[2].to_string(),
-                    author: parts[3].to_string(),
-                    date: parts[4].to_string(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    Ok(commits)
+/// A ref this server will hand to git, or a 400 saying why not.
+///
+/// One rule, and it is about the command line rather than about git history:
+/// everything after a git subcommand is positional until something looks like
+/// a flag, so a "ref" spelled `--output=/tmp/x` would be read as one. These
+/// endpoints are the only place a ref arrives from a query string, so this is
+/// where it is checked.
+///
+/// A ref that simply does not exist is *not* rejected here. git answers that
+/// question better than a pre-check could, and does it for `HEAD~3`,
+/// `origin/main@{yesterday}` and every other spelling this function would
+/// otherwise have to learn.
+fn usable_ref(git_ref: &str) -> Result<&str, (StatusCode, String)> {
+    let trimmed = git_ref.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Not a ref this server will resolve: {:?}", git_ref),
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// The commit fields the picker shows, subject last.
+///
+/// Last because it is the one field that can contain the separator: a subject
+/// is free text, and taking `%s` from the middle hands its tail to the author
+/// and shifts the date off the end. Five fixed fields from the left and the
+/// remainder left whole is the rule [`parse_stash_lines`] already follows,
+/// arrived at from the same trap.
+///
+/// `%P` is here for the picker's `From`, which names the oldest commit the
+/// reader wants *included* (UI-151). The tree that comparison starts from is
+/// therefore that commit's parent, and the picker can only translate the one
+/// into the other if the listing says what the parent is. Asked here rather
+/// than resolved per click, because `%P` costs nothing on a walk git is
+/// already doing and a round trip per click would make the range flicker.
+const COMMIT_FORMAT: &str = "--format=%H|%h|%P|%an|%ad|%s";
+
+/// How many commits a listing carries when the caller does not say.
+pub(crate) const COMMIT_WINDOW: usize = 50;
+
+/// The most a caller may ask for. A picker list is scrolled, not read, and a
+/// repository's whole history rendered into one modal is a long wait for rows
+/// nobody reaches.
+const MAX_COMMIT_WINDOW: usize = 500;
+
+/// GET /api/commits — list recent commits, of `HEAD` or of any ref.
+pub(crate) async fn commits_handler(
+    State(state): State<AppState>,
+    Query(query): Query<CommitsQuery>,
+) -> Result<Json<Vec<CommitInfo>>, (StatusCode, String)> {
+    let repo_root = state.repo_root.read().await.clone();
+    Ok(Json(git_commits(
+        &repo_root,
+        query.git_ref.as_deref(),
+        query.limit.unwrap_or(COMMIT_WINDOW),
+    )?))
+}
+
+/// Read the most recent commits reachable from `git_ref` — `HEAD` when it is
+/// `None`. Shared by watch-mode `/api/commits` and serve-mode
+/// `/api/repos/{slug}/commits`.
+///
+/// The `--` is not decoration. `git log <ref>` reads its argument as a ref
+/// *or* as a path, and a branch and a directory can share a name; the
+/// separator says which one was meant, so a repository with a `docs/` branch
+/// and a `docs/` folder still lists commits.
+pub(crate) fn git_commits(
+    repo_root: &std::path::Path,
+    git_ref: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, (StatusCode, String)> {
+    let git_ref = usable_ref(git_ref.unwrap_or("HEAD"))?;
+    let count = format!("-{}", limit.clamp(1, MAX_COMMIT_WINDOW));
+    let stdout = git_stdout(
+        repo_root,
+        &[
+            "log",
+            COMMIT_FORMAT,
+            "--date=short",
+            &count,
+            git_ref,
+            "--",
+        ],
+    )?;
+    Ok(parse_commit_lines(&stdout))
+}
+
+/// One commit, named by any ref. `None` when the ref resolves to nothing —
+/// which is how [`git_merge_base`] reports unrelated histories.
+fn commit_at(
+    repo_root: &std::path::Path,
+    git_ref: &str,
+) -> Result<Option<CommitInfo>, (StatusCode, String)> {
+    let stdout = git_stdout(
+        repo_root,
+        &["log", "-1", COMMIT_FORMAT, "--date=short", git_ref, "--"],
+    )?;
+    Ok(parse_commit_lines(&stdout).into_iter().next())
+}
+
+/// Parse `git log COMMIT_FORMAT` output. A row missing a field is dropped:
+/// nothing downstream can do anything with a half-named commit, and a blank
+/// row in the picker would offer a comparison that cannot be computed.
+fn parse_commit_lines(stdout: &str) -> Vec<CommitInfo> {
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(6, '|').collect();
+            let [hash, short_hash, parents, author, date, message] = parts[..] else {
+                return None;
+            };
+            Some(CommitInfo {
+                hash: hash.to_string(),
+                short_hash: short_hash.to_string(),
+                // First parent only, and `None` on the root commit. A merge's
+                // second parent is the side that was merged in, so a range
+                // starting at a merge starts at the branch it landed on —
+                // which is the history the picker is listing. The root has no
+                // earlier tree at all, and saying so is what lets the picker
+                // decline that one click instead of sending git a `~1` that
+                // cannot resolve.
+                parent_hash: parents.split_whitespace().next().map(str::to_string),
+                message: message.to_string(),
+                author: author.to_string(),
+                date: date.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// GET /api/merge-base — the commit two refs last had in common (UI-143).
+///
+/// The endpoint exists because comparing two branches by their tips answers a
+/// question almost nobody asks. A branch that was cut a week ago differs from
+/// `main` by its own work *and* by everything that landed on main since, and a
+/// tip-to-tip comparison reports the second half as the branch having removed
+/// it. This is the same mistake the stash picker already refuses to make by
+/// pairing a stash with its own first parent instead of with HEAD (UI-107) —
+/// here the right base is where the two branches diverged.
+///
+/// `null`, not a 404, when the two share no history. That is a fact about the
+/// pair rather than a failed lookup, and the picker says so and falls back to
+/// the tip.
+pub(crate) async fn merge_base_handler(
+    State(state): State<AppState>,
+    Query(query): Query<MergeBaseQuery>,
+) -> Result<Json<Option<CommitInfo>>, (StatusCode, String)> {
+    let repo_root = state.repo_root.read().await.clone();
+    Ok(Json(git_merge_base(&repo_root, &query.from, &query.to)?))
+}
+
+/// Where two refs diverged, as a commit. `None` for unrelated histories.
+pub(crate) fn git_merge_base(
+    repo_root: &std::path::Path,
+    from: &str,
+    to: &str,
+) -> Result<Option<CommitInfo>, (StatusCode, String)> {
+    let from = usable_ref(from)?;
+    let to = usable_ref(to)?;
+    // `git_lines` rather than `git_stdout`: two refs with no common ancestor
+    // make `merge-base` exit non-zero, and that is an answer — "they never
+    // met" — not a server that failed to look.
+    let Some(sha) = crate::diff::git_lines(repo_root, &["merge-base", from, to])
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    commit_at(repo_root, &sha)
+}
+
+/// GET /api/branches — the branches a comparison can be made from (UI-143).
+pub(crate) async fn branches_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BranchRef>>, (StatusCode, String)> {
+    let repo_root = state.repo_root.read().await.clone();
+    Ok(Json(git_branches(&repo_root)?))
+}
+
+/// The refname first, so the namespace decides `remote` rather than the name
+/// guessing at it, and the subject last, for [`COMMIT_FORMAT`]'s reason.
+///
+/// `%(HEAD)` is `*` on the branch the checkout is on and a space on every
+/// other. It sits in the middle deliberately: `git_lines` trims each row, and
+/// a single-space field at either end would be trimmed away along with the
+/// row's own whitespace.
+const BRANCH_FORMAT: &str = "--format=%(refname)|%(objectname)|%(objectname:short)|%(HEAD)|%(authorname)|%(committerdate:short)|%(contents:subject)";
+
+/// How many branches the picker is handed. Sorted by most recently committed
+/// to, so the cut falls on branches nobody has touched in months — and a
+/// reviewer who wants one of those can still type its name into `From`.
+const BRANCH_WINDOW: usize = 200;
+
+/// Every local branch and remote-tracking branch, most recently worked on
+/// first.
+pub(crate) fn git_branches(
+    repo_root: &std::path::Path,
+) -> Result<Vec<BranchRef>, (StatusCode, String)> {
+    let count = format!("--count={}", BRANCH_WINDOW);
+    let stdout = git_stdout(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            BRANCH_FORMAT,
+            &count,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(parse_branch_lines(&stdout))
+}
+
+/// Parse `git for-each-ref BRANCH_FORMAT` output.
+///
+/// Two rows are deliberately dropped. Anything outside `refs/heads` and
+/// `refs/remotes` is not a branch, whatever it was asked for. And
+/// `refs/remotes/<remote>/HEAD` is a symbolic ref at whatever the remote calls
+/// its default branch — a second name for a row already in this list, which
+/// would read as two branches whose tips can never differ.
+fn parse_branch_lines(stdout: &str) -> Vec<BranchRef> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(7, '|').collect();
+            let [refname, tip, tip_short, head, author, date, subject] = parts[..] else {
+                return None;
+            };
+            let (name, remote) = branch_name(refname)?;
+            if name.ends_with("/HEAD") {
+                return None;
+            }
+            Some(BranchRef {
+                name,
+                remote,
+                is_head: head.trim() == "*",
+                tip: tip.to_string(),
+                tip_short: tip_short.to_string(),
+                subject: subject.to_string(),
+                author: author.to_string(),
+                date: date.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A full refname as the short name a reviewer types, and whether it is
+/// remote-tracking. `None` for a ref in neither namespace.
+fn branch_name(refname: &str) -> Option<(String, bool)> {
+    if let Some(name) = refname.strip_prefix("refs/heads/") {
+        return Some((name.to_string(), false));
+    }
+    refname
+        .strip_prefix("refs/remotes/")
+        .map(|name| (name.to_string(), true))
 }
 
 /// GET /api/stashes — list the repository's stash entries.
@@ -167,30 +469,9 @@ const STASH_FORMAT: &str = "%H|%h|%P|%p|%s|%an|%ad";
 pub(crate) fn git_stashes(
     repo_root: &std::path::Path,
 ) -> Result<Vec<StashInfo>, (StatusCode, String)> {
-    let output = Command::new("git")
-        .args([
-            "stash",
-            "list",
-            &format!("--format={}", STASH_FORMAT),
-            "--date=short",
-        ])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git: {}", e),
-            )
-        })?;
-
-    if !output.status.success() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Not a git repository or git command failed".to_string(),
-        ));
-    }
-
-    Ok(parse_stash_lines(&String::from_utf8_lossy(&output.stdout)))
+    let format = format!("--format={}", STASH_FORMAT);
+    let stdout = git_stdout(repo_root, &["stash", "list", &format, "--date=short"])?;
+    Ok(parse_stash_lines(&stdout))
 }
 
 /// GET /api/staged — the repo-relative paths currently in the index, with the
@@ -219,62 +500,30 @@ pub(crate) async fn staged_handler(
 pub(crate) fn git_staged(
     repo_root: &std::path::Path,
 ) -> Result<Vec<StagedFile>, (StatusCode, String)> {
-    let output = Command::new("git")
-        .args(["diff", "--cached", "--name-status", "-z"])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to run git: {}", e),
-            )
-        })?;
-
-    if !output.status.success() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Not a git repository or git command failed".to_string(),
-        ));
-    }
-
-    Ok(parse_staged_records(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    let stdout = git_stdout(repo_root, &["diff", "--cached", "--name-status", "-z"])?;
+    Ok(parse_staged_records(&stdout))
 }
 
-/// Parse `git diff --cached --name-status -z` output.
+/// The index's rows, as the picker needs them.
 ///
-/// `-z` rather than lines, because a path may contain anything a filesystem
-/// allows — including a newline, which line splitting would turn into two
-/// half-paths. It also stops git from quoting and escaping non-ASCII names, so
-/// what arrives is the path as it is on disk.
+/// The parse itself is `diff::parse_name_status`'s, where the rest of this
+/// codebase's git plumbing lives: `git diff --name-status -z` has one shape
+/// whoever asks for it, and its trap — a rename is *three* records, so
+/// reading the source path as the next row's status desynchronises every row
+/// after it — is not a thing to get right twice. This is the projection onto
+/// what the index list shows: git's status letter and the path it lands on.
 ///
-/// Records alternate status then path, except for a rename or copy, whose
-/// status carries a similarity score and is followed by *two* paths — old then
-/// new. The new one is what the diff will report, so the old is read and
-/// dropped; taking it as the next status instead is what would desynchronise
-/// every row after the first rename.
+/// The source path of a rename is dropped rather than carried. The picker
+/// lists what is staged; the file's history before it got there is a question
+/// only the diff asks (UI-134).
 fn parse_staged_records(stdout: &str) -> Vec<StagedFile> {
-    let mut records = stdout.split('\0').filter(|r| !r.is_empty());
-    let mut files = Vec::new();
-    while let Some(status) = records.next() {
-        let Some(path) = records.next() else { break };
-        let renamed = status.starts_with('R') || status.starts_with('C');
-        let path = if renamed {
-            // The second path is the destination, and the first was the source.
-            match records.next() {
-                Some(dest) => dest,
-                None => break,
-            }
-        } else {
-            path
-        };
-        files.push(StagedFile {
-            status: status.chars().next().unwrap_or('?').to_string(),
-            path: path.to_string(),
-        });
-    }
-    files
+    crate::diff::parse_name_status(stdout)
+        .into_iter()
+        .map(|r| StagedFile {
+            status: r.status,
+            path: r.path,
+        })
+        .collect()
 }
 
 /// Parse `git stash list --format=STASH_FORMAT` output.
@@ -648,5 +897,154 @@ mod tests {
     fn a_dangling_status_is_dropped() {
         assert!(parse_staged_records("M\0").is_empty());
         assert_eq!(parse_staged_records("M\0a.rs\0R100\0old.rs\0").len(), 1);
+    }
+
+    // --------------------------------------------------------------
+    //  Comparing across branches (UI-143)
+    // --------------------------------------------------------------
+
+    /// The trap `COMMIT_FORMAT` moves the subject to the end for: a subject
+    /// is free text, and splitting the row across every separator hands its
+    /// tail to the author and pushes the date off the end.
+    #[test]
+    fn a_commit_subject_may_contain_the_separator() {
+        let rows = parse_commit_lines("aaa|aaa|bbb|Ada|2026-08-31|fix a|b parsing");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message, "fix a|b parsing");
+        assert_eq!(rows[0].author, "Ada");
+        assert_eq!(rows[0].date, "2026-08-31");
+        assert_eq!(rows[0].parent_hash.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn a_commit_row_missing_fields_is_dropped() {
+        assert!(parse_commit_lines("aaa|aaa|Ada").is_empty());
+        assert!(parse_commit_lines("").is_empty());
+    }
+
+    /// The reason the ref goes through `usable_ref` at all: everything after
+    /// a git subcommand is positional until it looks like a flag.
+    #[test]
+    fn a_ref_that_would_read_as_a_flag_is_refused() {
+        assert!(usable_ref("--output=/tmp/x").is_err());
+        assert!(usable_ref("  ").is_err());
+        assert_eq!(usable_ref(" main ").unwrap(), "main");
+        assert!(usable_ref("origin/main").is_ok());
+        assert!(usable_ref("HEAD~3").is_ok());
+    }
+
+    /// A refname's namespace says whether it is remote-tracking. Its *name*
+    /// does not, in either direction: a local branch may be `feat/chip` and a
+    /// remote-tracking one `origin/main`.
+    #[test]
+    fn a_slash_in_a_name_does_not_make_a_branch_remote() {
+        let rows = parse_branch_lines(
+            "refs/heads/feat/chip|aaa111|aaa|*|Ada|2026-08-31|the chip\n\
+             refs/remotes/origin/main|bbb222|bbb| |Bo|2026-08-30|land it\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "feat/chip");
+        assert!(!rows[0].remote);
+        assert!(rows[0].is_head, "`*` marks the branch HEAD is on");
+        assert_eq!(rows[1].name, "origin/main");
+        assert!(rows[1].remote);
+        assert!(!rows[1].is_head);
+    }
+
+    /// `origin/HEAD` is a symref at the remote's default branch — a second
+    /// name for a row already in the list, and a pair of branches whose tips
+    /// can never differ.
+    #[test]
+    fn the_remotes_head_symref_is_not_offered_as_a_branch() {
+        let rows = parse_branch_lines(
+            "refs/remotes/origin/HEAD|bbb222|bbb| |Bo|2026-08-30|land it\n\
+             refs/tags/v1|ccc333|ccc| |Cy|2026-08-29|release\n",
+        );
+        assert!(rows.is_empty(), "neither a symref nor a tag is a branch");
+    }
+
+    /// The whole point of the `ref` parameter: a reviewer on `main` can list
+    /// the commits of a branch they are not on.
+    #[test]
+    fn commits_can_be_listed_for_a_branch_the_checkout_is_not_on() {
+        let dir = branch_repo("cross-branch");
+        commit(&dir, "base.txt");
+        run_git(&dir, &["checkout", "-q", "-b", "feature"]);
+        commit(&dir, "only-on-feature.txt");
+        run_git(&dir, &["checkout", "-q", "main"]);
+
+        let on_head = git_commits(&dir, None, 50).unwrap();
+        assert_eq!(on_head.len(), 1, "main has only the base commit");
+
+        let on_feature = git_commits(&dir, Some("feature"), 50).unwrap();
+        assert_eq!(on_feature.len(), 2);
+        assert_eq!(on_feature[0].message, "only-on-feature.txt");
+
+        let listed = git_branches(&dir).unwrap();
+        let names: Vec<&str> = listed.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"main") && names.contains(&"feature"));
+        let head = listed.iter().find(|b| b.is_head).unwrap();
+        assert_eq!(head.name, "main", "the checkout is back on main");
+        let feature = listed.iter().find(|b| b.name == "feature").unwrap();
+        assert_eq!(feature.subject, "only-on-feature.txt");
+        assert!(!feature.tip.is_empty() && !feature.tip_short.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listing_is_capped_at_what_was_asked_for() {
+        let dir = branch_repo("window");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            commit(&dir, name);
+        }
+        assert_eq!(git_commits(&dir, None, 2).unwrap().len(), 2);
+        // Zero would be a listing nobody can pick from; the clamp makes the
+        // smallest answer one commit rather than none.
+        assert_eq!(git_commits(&dir, None, 0).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What separates a review of a branch from a diff of two tips: the base
+    /// is where they parted, not where the other one has got to since.
+    #[test]
+    fn two_branches_diverge_at_their_last_common_commit() {
+        let dir = branch_repo("merge-base");
+        commit(&dir, "base.txt");
+        let fork = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        run_git(&dir, &["checkout", "-q", "-b", "feature"]);
+        commit(&dir, "on-feature.txt");
+        run_git(&dir, &["checkout", "-q", "main"]);
+        // Main moves on. A tip-to-tip comparison would report this commit as
+        // something the feature branch deleted.
+        commit(&dir, "landed-on-main.txt");
+
+        let base = git_merge_base(&dir, "main", "feature").unwrap().unwrap();
+        assert_eq!(base.hash, fork);
+        assert_eq!(base.message, "base.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two roots share no commit. That is a fact about the pair, not a lookup
+    /// that failed, so the picker is told `null` and falls back to the tip.
+    #[test]
+    fn unrelated_histories_have_no_common_commit() {
+        let dir = branch_repo("unrelated");
+        commit(&dir, "base.txt");
+        run_git(&dir, &["checkout", "-q", "--orphan", "other"]);
+        commit(&dir, "elsewhere.txt");
+
+        assert!(git_merge_base(&dir, "main", "other").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

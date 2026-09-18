@@ -108,6 +108,12 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
   button.action.accent { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
   button.action.accent:hover { background: var(--vscode-button-hoverBackground); }
   button.action:disabled { opacity: 0.5; cursor: wait; }
+  /* Full width under the two it is the alternative to, so it reads as the
+     one thing left to press rather than as a third comparison to start. */
+  .stop-row { margin-bottom: 10px; }
+  .stop-row button.action { width: 100%; }
+  /* Not an error colour: stopping keeps the overlay that is already there. */
+  button.action.stop:disabled { opacity: 0.6; }
 
   .summary {
     background: var(--vscode-textCodeBlock-background);
@@ -285,13 +291,27 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  function renderActions(computing) {
+  // What Stop promises, in the two sentences that keep it apart from the \u00D7
+  // above the summary: the run ends, the overlay does not (UI-141).
+  var STOP_TITLE = 'Stop this comparison. The engine ends at its next checkpoint; '
+    + 'the diff you were already looking at stays on screen.';
+
+  function renderActions(computing, stopping) {
+    // A row of its own, under the grid. Both buttons above it are disabled
+    // for the whole comparison \u2014 a minute of it, on a repository large enough
+    // to want out of \u2014 and this is the one control that does anything.
+    var stop = computing
+      ? '<div class="stop-row"><button class="action stop" id="btn-stop"'
+        + (stopping ? ' disabled' : '') + ' title="' + STOP_TITLE + '">'
+        + (stopping ? '\u23F3 Stopping\u2026' : '\u23F9 Stop') + '</button></div>'
+      : '';
     return '<div class="actions">'
       + '<button class="action" id="btn-current"' + (computing ? ' disabled' : '') + ' title="Compare HEAD with the current working directory">'
       + (computing ? '\u23F3 ' : '') + 'Working changes</button>'
       + '<button class="action accent" id="btn-pick"' + (computing ? ' disabled' : '') + ' title="Pick two commits to compare">'
       + (computing ? '\u23F3 ' : '') + 'Compare commits</button>'
-      + '</div>';
+      + '</div>'
+      + stop;
   }
 
   function renderScopeHint() {
@@ -440,7 +460,7 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     hideTip();
     root.innerHTML =
       errorHtml
-      + renderActions(state.computing)
+      + renderActions(state.computing, state.stopping)
       + (state.active
           ? (renderScopeHint() + renderSummary() + renderFilters())
           : '<div class="empty">No diff loaded. Compare two commits, or show working-directory changes.</div>');
@@ -449,6 +469,10 @@ export class DiffViewProvider implements vscode.WebviewViewProvider {
     document.getElementById('btn-select-repo')?.addEventListener('click', () => vscode.postMessage({ type: 'selectRepo' }));
     document.getElementById('btn-current')?.addEventListener('click', () => vscode.postMessage({ type: 'currentChanges' }));
     document.getElementById('btn-pick')?.addEventListener('click', () => vscode.postMessage({ type: 'pickCommits' }));
+    // Through the webview, like every other diff control here: the store that
+    // knows a comparison is in flight lives there, and the engine is the same
+    // one either surface is talking to (UI-141).
+    document.getElementById('btn-stop')?.addEventListener('click', () => vscode.postMessage({ type: 'command', command: 'cancelDiff' }));
     document.getElementById('btn-clear')?.addEventListener('click', () => vscode.postMessage({ type: 'command', command: 'clearDiff' }));
     document.getElementById('btn-scope-changes')?.addEventListener('click', () => vscode.postMessage({ type: 'command', command: 'scopeToChangedFiles' }));
     document.getElementById('btn-scope-all')?.addEventListener('click', () => vscode.postMessage({ type: 'command', command: 'scopeToChangedFiles' }));

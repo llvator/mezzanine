@@ -166,10 +166,16 @@ fn merge_analysis_keys(
     Ok(existing)
 }
 
-/// A `--spec-dir` outside the tree is a legitimate thing for an operator to
-/// pass and an illegitimate thing to write down: the loader refuses it on the
-/// next start (a cloned file does not get to pick which directories mezz
-/// reads), so saving it would produce a file that silently stops working.
+/// A spec directory outside the tree is a legitimate thing for an operator to
+/// name and an illegitimate thing to write into *this* file: the loader
+/// refuses it on the next start (a cloned file does not get to pick which
+/// directories mezz reads), so saving it would produce a file that silently
+/// stops working.
+///
+/// This button writes the repo's file, which is the one file that may not say
+/// it, so the refusal stands — but there is now somewhere durable to put it,
+/// and an error that only says "keep passing the flag" would send a reader
+/// back to the one workflow `mezz watch` cannot use.
 fn reject_escaping_spec_dir(scope: &Settings) -> Result<(), (StatusCode, String)> {
     let escapes = scope.spec_dir.as_ref().is_some_and(|dir| {
         dir.is_absolute()
@@ -180,9 +186,12 @@ fn reject_escaping_spec_dir(scope: &Settings) -> Result<(), (StatusCode, String)
     if escapes {
         return Err((
             StatusCode::BAD_REQUEST,
-            "This spec directory points outside the repo, and a settings file \
-             may only name one inside it — the loader would refuse it on the \
-             next start. Keep passing it with --spec-dir."
+            "This spec directory points outside the repo, and the repo's own \
+             settings file may only name one inside it — the loader would \
+             refuse it on the next start. To keep it, put it in your \
+             ~/.config/mezz/settings.json instead:\n\n\
+             { \"repos\": { \"<this repo's path>\": { \"spec_dir\": \"…\" } } }\n\n\
+             Or keep passing it with --spec-dir."
                 .to_string(),
         ));
     }

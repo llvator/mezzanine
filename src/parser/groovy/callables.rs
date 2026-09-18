@@ -10,10 +10,11 @@ use super::helpers::{
     declared_type, parse_modifier_attributes, parse_parameters, parse_visibility,
 };
 use super::javadoc::extract_javadoc;
-use super::ExtractCtx;
+use super::ctx::ExtractCtx;
 use crate::models::{CodeEntity, EntityKind};
 use std::path::Path;
 use tree_sitter::Node;
+use crate::parser::working_set;
 
 /// Parse a callable, register it, and walk its body extracting call
 /// relationships. The body of a `function_definition` is a `closure`
@@ -153,7 +154,8 @@ pub(super) fn parse_constructor(
 fn populate_body_metrics(node: &Node, source: &str, entity: &mut CodeEntity) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
     entity.metrics.param_count = Some(entity.parameters.len() as u32);
-    if let Some(body) = node.child_by_field_name("body") {
+    let body = node.child_by_field_name("body");
+    if let Some(body) = body {
         let (cc, nesting, cog) = compute_complexity(&body, source);
         entity.metrics.cyclomatic = Some(cc);
         entity.metrics.max_nesting = Some(nesting);
@@ -163,4 +165,6 @@ fn populate_body_metrics(node: &Node, source: &str, entity: &mut CodeEntity) {
         entity.metrics.max_nesting = Some(0);
         entity.metrics.cognitive_complexity = Some(0);
     }
+    working_set::populate(entity, body.as_ref(), source);
+    crate::parser::loops::populate(entity, body.as_ref());
 }

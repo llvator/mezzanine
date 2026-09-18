@@ -3,7 +3,8 @@
 //! Two scopes, resolved in this order, each losing to the one after it:
 //!
 //! ```text
-//! CLI flag  >  env var  >  <repo>/.mezz/settings.json  >  ~/.config/mezz/settings.json  >  defaults
+//! CLI flag  >  env var  >  ~/.config/mezz/settings.json `repos["<this repo>"]`
+//!           >  <repo>/.mezz/settings.json  >  ~/.config/mezz/settings.json  >  defaults
 //! ```
 //!
 //! The split is not cosmetic. `ui_dir` is a property of the *installation* —
@@ -12,6 +13,16 @@
 //! in version control beside the code it describes. Each key is therefore
 //! valid in one scope, the other, or both, and saying so is most of what this
 //! module does.
+//!
+//! # The repo scope, written by the reader
+//!
+//! [`Settings::repos`] is the one place those two orderings cross. It holds
+//! repo-scope settings keyed by a checkout's path, in the *user*-scope file,
+//! and it outranks that checkout's own `.mezz/settings.json`. Two facts make
+//! that coherent: naming a repo by its path is a deliberate statement about
+//! that repo rather than a machine-wide default, and the file it is written in
+//! was never cloned from anyone — which is the whole of what
+//! [`Settings::clear_escaping_spec_dir`] is guarding against.
 //!
 //! # The keys that are not here
 //!
@@ -67,6 +78,15 @@ const FILE_NAME: &str = "settings.json";
 /// two drift apart.
 pub const DEFAULT_PORT: u16 = 3000;
 
+/// Why `repos` is refused in a repo-scope file. See [`Settings::clear_repos`].
+const REPOS_IN_A_CLONE: &str = "is never settable from a repo's settings file — it would let a \
+     cloned file pick which directories mezz reads, for every checkout on this \
+     machine. Write it in your own ~/.config/mezz/settings.json instead.";
+
+/// Why `repos` is dropped inside a `repos` entry.
+const REPOS_NESTED: &str = "does not nest — an entry configures one checkout, and a `repos` \
+     block inside one names nothing.";
+
 /// Keys a settings file may never set, at either scope, with the reason to
 /// print when one turns up. Each grants something a file should not be able
 /// to grant: code execution, or read access to the reader's source.
@@ -83,13 +103,22 @@ const REJECTED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Which file a value came from. Determines which keys are honoured.
+/// Which file — and which part of it — a value came from. Determines which
+/// keys are honoured.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
     /// `~/.config/mezz/settings.json` — properties of this installation.
     User,
     /// `<repo-root>/.mezz/settings.json` — properties of the repo.
     Repo,
+    /// One entry of the user-scope file's [`Settings::repos`]: the repo keys,
+    /// for a checkout named by path, written by the reader rather than cloned.
+    ///
+    /// The same key set as [`Self::Repo`] with one rule dropped —
+    /// [`Settings::clear_escaping_spec_dir`], which exists to stop a *stranger*
+    /// choosing what mezz reads and has nothing to say about a file the reader
+    /// wrote themselves.
+    RepoOverride,
 }
 
 /// How much a reader should care about a diagnostic.
@@ -154,15 +183,30 @@ pub struct Loaded {
     /// `<root>/.mezz/settings.json`, already stripped of keys its scope may
     /// not set. Always default under `serve`, which never reads it.
     pub repo: Settings,
+    /// The user-scope file's [`Settings::repos`] entry naming this checkout,
+    /// if it has one. Kept apart from `user` because it wins where the rest of
+    /// the user scope loses — see [`Self::merged`].
+    pub repo_override: Settings,
     /// `~/.config/mezz/settings.json`, same treatment.
     pub user: Settings,
     pub warnings: Vec<Warning>,
 }
 
 impl Loaded {
-    /// The merged view the rest of mezz consumes: repo over user.
+    /// The merged view the rest of mezz consumes: the reader's override for
+    /// this repo, then the repo's own file, then the user's machine-wide
+    /// defaults.
+    ///
+    /// The override sits *above* the repo file rather than below it with the
+    /// rest of the user scope. An entry keyed by a checkout's path is not a
+    /// machine-wide default that a more specific file should beat; it is the
+    /// reader saying something about that one checkout, which is the same
+    /// claim a flag already outranks the repo file with, one link up.
     pub fn merged(&self) -> Settings {
-        self.repo.clone().over(self.user.clone())
+        self.repo_override
+            .clone()
+            .over(self.repo.clone())
+            .over(self.user.clone())
     }
 }
 
@@ -214,6 +258,30 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_fallback: Option<PathBuf>,
 
+    /// Repo-scope settings the *reader* writes for one named checkout, keyed
+    /// by that checkout's path. User scope, top level, and nowhere else.
+    ///
+    /// This is the escape hatch for the one thing a repo-scope file may not
+    /// say. A spec that lives outside the tree — a sibling docs repo, the top
+    /// of a monorepo whose services are watched one at a time — is a real
+    /// layout, and until this key the only way to name it was `--spec-dir`:
+    /// a flag, and therefore unavailable to `mezz watch`, `mezz mcp` and the
+    /// VS Code extension, every one of which is launched with none.
+    ///
+    /// ```json
+    /// { "repos": { "~/src/app": { "spec_dir": "/abs/path/sibling-docs" } } }
+    /// ```
+    ///
+    /// Safe for the reason [`Self::spec_dir`] is not: this file arrived from
+    /// nobody. The key is refused outright in a repo-scope file — one that
+    /// could set it would be choosing what mezz reads for *every* checkout on
+    /// the machine, not merely its own.
+    ///
+    /// Keys are matched by resolved directory, so `~`, a relative spelling and
+    /// a symlinked path all find the same entry. See [`Self::repo_override`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub repos: BTreeMap<String, Settings>,
+
     // ---- repo scope only ----
     /// Where `watch` writes the JSON it serves. Repo-relative by default
     /// (`ui/public`), so a machine-wide value would point every analyzed repo
@@ -230,8 +298,9 @@ pub struct Settings {
     /// a stranger, and this key is a path mezz will read from: an absolute
     /// `/home/you/.ssh` or a `../../..` would let the clone choose where.
     /// Naming a directory outside the tree is a real layout — a spec in a
-    /// sibling docs repo — but it takes an operator saying so, with
-    /// `--spec-dir` or from the browser UI.
+    /// sibling docs repo — but it takes an operator saying so: `--spec-dir`,
+    /// the browser UI, or a [`Self::repos`] entry for the checkout, which is
+    /// the one of the three that outlives the session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_dir: Option<PathBuf>,
 
@@ -412,6 +481,34 @@ fn absolutize(root: &Path) -> Option<PathBuf> {
     std::env::current_dir().ok().map(|cwd| cwd.join(root))
 }
 
+/// One comparable spelling of a directory, for matching a [`Settings::repos`]
+/// key against the checkout the loader resolved.
+///
+/// `canonicalize` where the directory exists — a repo root being analyzed
+/// always does — because without it a macOS `/tmp/app` never matches the
+/// `/private/tmp/app` it is, and no reader would guess why their entry was
+/// ignored. Where it does not resolve, the absolute path with its interior `.`
+/// dropped, so a stale entry compares as itself rather than as nothing.
+fn dir_key(dir: &Path) -> Option<PathBuf> {
+    let absolute = absolutize(&expand_home(dir))?;
+    Some(std::fs::canonicalize(&absolute).unwrap_or_else(|_| absolute.components().collect()))
+}
+
+/// A leading `~` replaced by `$HOME`. Only that whole first component, so a
+/// directory genuinely named `~backup` is left alone.
+///
+/// The shell does this for a flag and nothing does it for a JSON string, which
+/// is exactly the asymmetry that makes a hand-written `"~/src/app"` look like
+/// it should work.
+fn expand_home(dir: &Path) -> PathBuf {
+    let Ok(rest) = dir.strip_prefix("~") else {
+        return dir.to_path_buf();
+    };
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map_or_else(|| dir.to_path_buf(), |home| PathBuf::from(home).join(rest))
+}
+
 /// The repo-scope file as raw JSON, for a writer that has to preserve keys it
 /// does not understand.
 ///
@@ -502,6 +599,9 @@ pub fn user_scoped() -> Loaded {
     let (user, warnings) = read(&path, Scope::User);
     Loaded {
         repo: Settings::default(),
+        // `serve` analyzes trees it cloned into slugs of its own choosing;
+        // no path a reader wrote down could name one.
+        repo_override: Settings::default(),
         user,
         warnings,
     }
@@ -520,17 +620,34 @@ pub fn load(root: &Path) -> Settings {
 pub fn load_scoped(root: &Path) -> Loaded {
     let repo_root = repo_root(root);
     let (mut repo, mut warnings) = read(&repo_root.join(REPO_DIR).join(FILE_NAME), Scope::Repo);
+    let (user, mut repo_override, user_warnings) = user_scope(&repo_root);
     repo.rebase_spec_dir(&repo_root, root);
-    let (user, user_warnings) = user_path()
-        .map(|p| read(&p, Scope::User))
-        .unwrap_or_default();
+    repo_override.rebase_spec_dir(&repo_root, root);
     warnings.extend(user_warnings);
     warnings.iter().for_each(Warning::print);
     Loaded {
         repo,
+        repo_override,
         user,
         warnings,
     }
+}
+
+/// The user-scope file, plus whichever of its `repos` entries names this
+/// checkout, plus everything either of them got wrong.
+///
+/// Split from [`load_scoped`] because the entry has to be validated against
+/// the file it was written in — the reader fixes it in `~/.config`, not in the
+/// repo — and threading that path back out of the caller is how the two
+/// diagnostics end up naming different files.
+fn user_scope(repo_root: &Path) -> (Settings, Settings, Vec<Warning>) {
+    let Some(path) = user_path() else {
+        return Default::default();
+    };
+    let (user, mut warnings) = read(&path, Scope::User);
+    let (repo_override, entry_warnings) = user.repo_override(repo_root, &path);
+    warnings.extend(entry_warnings);
+    (user, repo_override, warnings)
 }
 
 impl Settings {
@@ -538,13 +655,83 @@ impl Settings {
     fn validate(&mut self, scope: Scope, from: &Path) -> Vec<Warning> {
         let mut warnings = self.report_rejected(from);
         warnings.extend(self.clear_malformed_globs(from));
-        if scope == Scope::Repo {
-            warnings.extend(self.clear_user_only(from));
+        warnings.extend(self.clear_misscoped(scope, from));
+        warnings
+    }
+
+    /// Clear whatever this scope may not set.
+    ///
+    /// Split from [`Self::validate`] rather than matched inline: the branches
+    /// are a nesting level each, and the complexity gate fails a PR that makes
+    /// an existing function busier however slightly.
+    fn clear_misscoped(&mut self, scope: Scope, from: &Path) -> Vec<Warning> {
+        if scope == Scope::User {
+            return self.clear_repo_only(from);
+        }
+        // Both repo-shaped scopes from here. They differ only in the rules that
+        // are about the *author* of the file rather than about the key — an
+        // entry in the user file was written by the reader, not cloned.
+        let cloned = scope == Scope::Repo;
+        let mut warnings = self.clear_user_only(from);
+        if cloned {
             warnings.extend(self.clear_escaping_spec_dir(from));
-        } else {
-            warnings.extend(self.clear_repo_only(from));
+        }
+        // `repos` belongs at the top of the user file and nowhere else. In a
+        // cloned repo file that is this module's threat model at its sharpest:
+        // the key names absolute directories and hands each one a settings
+        // block, so a file that could set it would be choosing what mezz reads
+        // for *every* checkout on the machine — a strictly wider grant than the
+        // `spec_dir` escape above, which is why it is refused more firmly.
+        // Inside another entry it is not dangerous, only meaningless: one level
+        // is all the nesting there is.
+        if !self.repos.is_empty() {
+            self.repos = BTreeMap::new();
+            let (severity, why) = match cloned {
+                true => (Severity::Rejected, REPOS_IN_A_CLONE),
+                false => (Severity::Ignored, REPOS_NESTED),
+            };
+            warnings.push(Warning::new(
+                from,
+                Some("repos"),
+                severity,
+                format!("`repos` {why}"),
+            ));
         }
         warnings
+    }
+
+    /// The [`Self::repos`] entry naming this checkout, validated as the
+    /// repo-scope file the reader wishes the clone had shipped.
+    ///
+    /// Entries are matched by *resolved directory*, not by string: an entry
+    /// written `~/src/app` has to find the `$HOME/src/app` the loader
+    /// derived, and on macOS a `/tmp/…` checkout really lives at `/private/tmp/…`.
+    /// A first-match win rather than an error on two entries that resolve to
+    /// the same place — `repos` is a JSON object, so the keys were already
+    /// distinct strings, and refusing to load over it would punish a duplicate
+    /// nobody can see with a session nobody can start.
+    fn repo_override(&self, repo_root: &Path, from: &Path) -> (Settings, Vec<Warning>) {
+        let Some(wanted) = dir_key(repo_root) else {
+            return Default::default();
+        };
+        let Some((name, entry)) = self
+            .repos
+            .iter()
+            .find(|(name, _)| dir_key(Path::new(name)).is_some_and(|k| k == wanted))
+        else {
+            return Default::default();
+        };
+        let mut entry = entry.clone();
+        let mut warnings = entry.validate(Scope::RepoOverride, from);
+        // Say which entry, so a reader with several knows which block to open.
+        // Only the prose: the `key` stays the bare setting name, because that
+        // is what the browser panel matches on to sit a warning beside the row
+        // it concerns — a qualified one would belong to no row and be shown
+        // nowhere at all.
+        for w in &mut warnings {
+            w.message = format!("in `repos` entry `{name}`: {}", w.message);
+        }
+        (entry, warnings)
     }
 
     /// Re-express a repo-scope `spec_dir` against the directory the file was
@@ -559,10 +746,16 @@ impl Settings {
     /// [`Config::spec_root`](crate::config::Config::spec_root) is written to
     /// avoid: a spec layer that is empty for a reason nobody can see.
     ///
-    /// Runs after [`Self::clear_escaping_spec_dir`], so what is joined here is
-    /// already known to be relative and free of `..` — the result cannot name
-    /// anywhere but inside the repo. A no-op in the ordinary case, where the
-    /// two roots are the same directory.
+    /// A no-op in the ordinary case, where the two roots are the same
+    /// directory.
+    ///
+    /// For the repo scope this runs after [`Self::clear_escaping_spec_dir`],
+    /// so what is joined is already known to be relative and free of `..` and
+    /// the result cannot name anywhere but inside the repo. A [`Self::repos`]
+    /// entry is under no such rule, and needs none: `Path::join` discards the
+    /// base when handed an absolute path, so an out-of-tree spec passes
+    /// through unchanged and only a relative one is resolved against the
+    /// checkout — which is what "relative to the repo" has to mean there too.
     ///
     /// Which *spelling* comes out is not cosmetic, because
     /// [`Config::spec_root`](crate::config::Config::spec_root) joins anything
@@ -617,8 +810,10 @@ impl Settings {
             Some("spec_dir"),
             Severity::Ignored,
             "`spec_dir` must stay inside the repo — a cloned file does not get \
-             to pick which directories mezz reads. Pass `--spec-dir` to name one \
-             elsewhere."
+             to pick which directories mezz reads. To name one elsewhere, put \
+             it in your own ~/.config/mezz/settings.json as \
+             `{\"repos\": {\"<this repo>\": {\"spec_dir\": \"…\"}}}`, or pass \
+             `--spec-dir`."
                 .to_string(),
         )]
     }
@@ -687,8 +882,11 @@ impl Settings {
                 ("ui_dir", self.ui_dir.is_some()),
                 ("content_fallback", self.content_fallback.is_some()),
             ],
-            "describes this installation, not this repo — move it to the user \
-             settings file.",
+            // Phrased for both callers: from a repo file the destination is
+            // the user settings file, and from a `repos` entry — which is
+            // already in it — the destination is its top level.
+            "describes this installation, not one repo — set it at the top \
+             level of the user settings file.",
         );
         self.ui_dir = None;
         self.content_fallback = None;
@@ -787,6 +985,10 @@ impl Settings {
             debounce_ms: self.debounce_ms.or(lower.debounce_ms),
             exclude_patterns: concat(lower.exclude_patterns, self.exclude_patterns),
             include_patterns: concat(lower.include_patterns, self.include_patterns),
+            // Both are answered before the merge and mean nothing after it:
+            // `repo_override` has already picked the one entry that applies,
+            // and `report_rejected` has already named the unknown keys.
+            repos: BTreeMap::new(),
             unrecognized: BTreeMap::new(),
         }
     }
@@ -1175,6 +1377,170 @@ mod tests {
         assert!(repo_root(&tree.0.join("src")).is_absolute());
         assert!(repo_root(&cwd.join("src")).is_absolute());
         assert!(!repo_root(Path::new("src")).is_absolute());
+    }
+
+    /// The whole point of the key: a spec that lives outside the tree, said
+    /// once in a file, so `mezz watch`, `mezz mcp` and the VS Code extension —
+    /// none of which is launched with a flag — can all see it.
+    #[test]
+    fn a_repos_entry_may_name_a_spec_dir_outside_the_repo() {
+        let tree = TempTree::new("override-spec");
+        tree.git(None);
+        let user = user_file(&tree.0, r#"{"spec_dir":"/elsewhere/sibling-docs"}"#);
+        let (entry, warnings) = user.repo_override(&tree.0, Path::new("/config/settings.json"));
+
+        assert_eq!(entry.spec_dir, Some(PathBuf::from("/elsewhere/sibling-docs")));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A relative one still means "inside the repo", the same as in the repo's
+    /// own file — the entry changes who may name a directory, not what a
+    /// relative path is relative to.
+    #[test]
+    fn a_relative_spec_dir_in_a_repos_entry_resolves_against_the_checkout() {
+        let tree = TempTree::new("override-relative");
+        tree.git(None);
+        let sub = tree.dir("src");
+        let user = user_file(&tree.0, r#"{"spec_dir":"docs/domain"}"#);
+        let (mut entry, _) = user.repo_override(&tree.0, Path::new("/config/settings.json"));
+        entry.rebase_spec_dir(&tree.0, &sub);
+
+        assert_eq!(entry.spec_dir, Some(tree.0.join("docs/domain")));
+    }
+
+    /// Entries are matched by resolved directory, or a `~` nobody expands and
+    /// a macOS `/tmp` that is really `/private/tmp` would both silently miss.
+    #[test]
+    fn a_repos_entry_matches_however_the_path_was_spelled() {
+        let tree = TempTree::new("override-spelling");
+        tree.git(None);
+        // The `..` spelling below walks through it, and `canonicalize` will
+        // only resolve a component that is really there.
+        tree.dir("src");
+        for spelling in [
+            tree.0.display().to_string(),
+            format!("{}/", tree.0.display()),
+            format!("{}/./src/..", tree.0.display()),
+        ] {
+            let user = Settings {
+                repos: BTreeMap::from([(
+                    spelling.clone(),
+                    Settings {
+                        max_depth: Some(7),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            let (entry, _) = user.repo_override(&tree.0, Path::new("/config/settings.json"));
+            assert_eq!(entry.max_depth, Some(7), "`{spelling}` did not match");
+        }
+    }
+
+    #[test]
+    fn a_repos_entry_for_another_checkout_is_left_alone() {
+        let tree = TempTree::new("override-other");
+        tree.git(None);
+        let user = Settings {
+            repos: BTreeMap::from([(
+                "/some/other/repo".to_string(),
+                Settings {
+                    max_depth: Some(7),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let (entry, warnings) = user.repo_override(&tree.0, Path::new("/config/settings.json"));
+        assert_eq!(entry.max_depth, None);
+        assert!(warnings.is_empty(), "a dormant entry is not a diagnostic");
+    }
+
+    /// The regression this key could introduce, and the reason it is refused
+    /// in a repo file: a `repos` block a stranger shipped would pick what mezz
+    /// reads for every checkout on the machine, not merely its own.
+    #[test]
+    fn a_repo_scope_file_may_not_set_repos() {
+        let dir = TempConfig::new("repos-in-a-clone");
+        let path = dir.write(r#"{"repos":{"/etc":{"spec_dir":"/etc"}}}"#);
+        let (settings, warnings) = read(&path, Scope::Repo);
+        assert!(settings.repos.is_empty(), "a cloned `repos` block survived");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Rejected);
+        assert_eq!(warnings[0].key.as_deref(), Some("repos"));
+    }
+
+    /// One level is all the nesting there is, and an entry that quietly did
+    /// nothing would read as mezz ignoring a setting.
+    #[test]
+    fn repos_does_not_nest() {
+        let tree = TempTree::new("override-nested");
+        tree.git(None);
+        let user = user_file(&tree.0, r#"{"repos":{"/x":{"max_depth":9}}}"#);
+        let (entry, warnings) = user.repo_override(&tree.0, Path::new("/config/settings.json"));
+        assert!(entry.repos.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].severity, Severity::Ignored);
+    }
+
+    /// An entry may set what a repo file may set — no more. `ui_dir` is a
+    /// property of the installation wherever it is written down.
+    #[test]
+    fn an_installation_key_in_a_repos_entry_is_dropped_and_located() {
+        let tree = TempTree::new("override-uidir");
+        tree.git(None);
+        let user = user_file(&tree.0, r#"{"ui_dir":"/tmp/x"}"#);
+        let (entry, warnings) = user.repo_override(&tree.0, Path::new("/config/settings.json"));
+        assert_eq!(entry.ui_dir, None);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].message.contains("`repos` entry"),
+            "a reader with several entries has to be told which: {}",
+            warnings[0].message
+        );
+        assert_eq!(
+            warnings[0].key.as_deref(),
+            Some("ui_dir"),
+            "the key stays bare, or the panel shows the warning beside no row"
+        );
+    }
+
+    /// The precedence claim the feature rests on, at the level that decides
+    /// it. `report.rs` asserts the badge; this asserts the value.
+    #[test]
+    fn a_repos_entry_wins_the_merge_against_the_repo_file() {
+        let loaded = Loaded {
+            repo_override: Settings {
+                spec_dir: Some(PathBuf::from("/elsewhere/specs")),
+                exclude_patterns: vec!["**/mine/**".into()],
+                ..Default::default()
+            },
+            repo: Settings {
+                spec_dir: Some(PathBuf::from("docs/domain")),
+                exclude_patterns: vec!["**/theirs/**".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = loaded.merged();
+        assert_eq!(merged.spec_dir, Some(PathBuf::from("/elsewhere/specs")));
+        assert_eq!(
+            merged.exclude_patterns,
+            vec!["**/theirs/**".to_string(), "**/mine/**".to_string()],
+            "the pattern lists extend across scopes rather than overriding"
+        );
+    }
+
+    /// A user-scope file carrying one `repos` entry for `root`, parsed the way
+    /// the loader parses it — so a test that is about the entry cannot pass on
+    /// a file the real reader would have been unable to write.
+    fn user_file(root: &Path, entry: &str) -> Settings {
+        let dir = TempConfig::new("override-user");
+        let path = dir.write(&format!(
+            r#"{{"repos":{{{}:{entry}}}}}"#,
+            serde_json::to_string(&root.display().to_string()).unwrap()
+        ));
+        values(&path, Scope::User)
     }
 
     /// `--spec-dir` beat the file before this ran; it must still win after.

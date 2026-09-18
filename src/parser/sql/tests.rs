@@ -92,8 +92,8 @@ fn inline_references_emits_a_foreign_key_edge() {
     assert_eq!(fk.kind, RelationshipKind::References);
     assert_eq!(fk.source_id, table_id("public", "paths"));
     assert_eq!(fk.target_id, table_id("public", "users"));
-    assert_eq!(fk.metadata.get("fk_column").unwrap(), "user_id");
-    assert_eq!(fk.metadata.get("fk_target_column").unwrap(), "user_id");
+    assert_eq!(fk.metadata.get("fk_columns").unwrap(), "user_id");
+    assert_eq!(fk.metadata.get("fk_target_columns").unwrap(), "user_id");
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn table_level_foreign_key_emits_the_same_edge() {
 
     let fk = &s.relationships[0];
     assert_eq!(fk.target_id, table_id("public", "orgs"));
-    assert_eq!(fk.metadata.get("fk_column").unwrap(), "org_id");
+    assert_eq!(fk.metadata.get("fk_columns").unwrap(), "org_id");
     assert!(fk.metadata.get("on_delete").unwrap().contains("CASCADE"));
 }
 
@@ -468,7 +468,7 @@ fn a_renamed_column_keeps_its_position_and_its_foreign_key() {
     let posts = table(&s, "posts");
     assert_eq!(posts.fields[1].name, "author_id", "position preserved");
     assert_eq!(
-        s.relationships[0].metadata.get("fk_column").unwrap(),
+        s.relationships[0].metadata.get("fk_columns").unwrap(),
         "author_id"
     );
 }
@@ -566,4 +566,311 @@ fn tables_are_attributed_to_the_migration_that_created_them() {
         PathBuf::from("001_init.sql"),
         "not the file that last touched it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cardinality and the key that carries it (SQL-006)
+// ---------------------------------------------------------------------------
+
+/// The label is the whole feature: an edge that says only "these two tables
+/// are joined" is what SQL-006 was filed against.
+fn label(s: &FoldedSchema, target: &str) -> String {
+    s.relationships
+        .iter()
+        .find(|r| r.target_id == table_id("public", target))
+        .unwrap_or_else(|| panic!("no edge to {target}"))
+        .label
+        .clone()
+        .expect("every SQL edge is labelled")
+}
+
+fn card(s: &FoldedSchema, target: &str) -> String {
+    s.relationships
+        .iter()
+        .find(|r| r.target_id == table_id("public", target))
+        .unwrap_or_else(|| panic!("no edge to {target}"))
+        .metadata
+        .get("cardinality")
+        .expect("every SQL edge states its cardinality")
+        .clone()
+}
+
+/// The ordinary case, and the default: nothing stops two orders from naming
+/// one user.
+#[test]
+fn an_unconstrained_foreign_key_is_many_to_one() {
+    let s = schema_of(
+        "CREATE TABLE users (id UUID PRIMARY KEY);
+         CREATE TABLE orders (id UUID PRIMARY KEY, user_id UUID REFERENCES users(id));",
+    );
+    assert_eq!(card(&s, "users"), "n:1");
+    assert_eq!(label(&s, "users"), "user_id → id (N:1)");
+}
+
+/// Uniqueness on the *referencing* side is the only thing that makes a
+/// foreign key one-to-one, and it is exactly what the parser used to drop.
+#[test]
+fn a_unique_foreign_key_column_is_one_to_one() {
+    let s = schema_of(
+        "CREATE TABLE users (id UUID PRIMARY KEY);
+         CREATE TABLE profiles (user_id UUID UNIQUE REFERENCES users(id));",
+    );
+    assert_eq!(card(&s, "users"), "1:1");
+    assert_eq!(label(&s, "users"), "user_id → id (1:1)");
+}
+
+/// The same claim written as the table-level constraint, and as a primary
+/// key — a foreign key that is also the whole primary key is one-to-one.
+#[test]
+fn a_primary_key_foreign_key_is_one_to_one() {
+    let s = schema_of(
+        "CREATE TABLE users (id UUID PRIMARY KEY);
+         CREATE TABLE profiles (
+             user_id UUID REFERENCES users(id),
+             PRIMARY KEY (user_id)
+         );",
+    );
+    assert_eq!(card(&s, "users"), "1:1");
+}
+
+/// `CREATE UNIQUE INDEX` is how a migration adds uniqueness to a table that
+/// already exists, and it is a statement the parser previously skipped
+/// wholesale along with every other index.
+#[test]
+fn a_unique_index_in_a_later_migration_makes_the_edge_one_to_one() {
+    let s = fold_files(&[
+        (
+            "001.sql",
+            "CREATE TABLE users (id UUID PRIMARY KEY);
+             CREATE TABLE profiles (user_id UUID REFERENCES users(id));",
+        ),
+        (
+            "002.sql",
+            "CREATE UNIQUE INDEX one_profile_per_user ON profiles (user_id);",
+        ),
+    ]);
+    assert_eq!(card(&s, "users"), "1:1");
+}
+
+/// A non-unique index still says nothing about cardinality, and must not be
+/// mistaken for one that does.
+#[test]
+fn a_plain_index_does_not_make_an_edge_one_to_one() {
+    let s = fold_files(&[
+        (
+            "001.sql",
+            "CREATE TABLE users (id UUID PRIMARY KEY);
+             CREATE TABLE orders (user_id UUID REFERENCES users(id));",
+        ),
+        ("002.sql", "CREATE INDEX orders_by_user ON orders (user_id);"),
+    ]);
+    assert_eq!(card(&s, "users"), "n:1");
+}
+
+/// `UNIQUE (user_id, slug)` permits many rows per `user_id`, so it does not
+/// make a key on `user_id` alone one-to-one. Uniqueness has to cover the
+/// foreign key's columns *exactly*.
+#[test]
+fn a_wider_unique_constraint_does_not_make_the_edge_one_to_one() {
+    let s = schema_of(
+        "CREATE TABLE users (id UUID PRIMARY KEY);
+         CREATE TABLE pages (
+             user_id UUID REFERENCES users(id),
+             slug TEXT,
+             UNIQUE (user_id, slug)
+         );",
+    );
+    assert_eq!(card(&s, "users"), "n:1");
+}
+
+/// A composite key is one key. Naming only its first column tells the reader
+/// something false about how the two tables join.
+#[test]
+fn a_composite_foreign_key_names_every_column() {
+    let s = schema_of(
+        "CREATE TABLE users (tenant_id UUID, id UUID, PRIMARY KEY (tenant_id, id));
+         CREATE TABLE orders (
+             tenant_id UUID,
+             user_id UUID,
+             FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id)
+         );",
+    );
+    let edge = &s.relationships[0];
+    assert_eq!(edge.metadata.get("fk_columns").unwrap(), "tenant_id, user_id");
+    assert_eq!(
+        edge.metadata.get("fk_target_columns").unwrap(),
+        "tenant_id, id"
+    );
+    assert_eq!(
+        label(&s, "users"),
+        "(tenant_id, user_id) → (tenant_id, id) (N:1)"
+    );
+}
+
+/// The bare form means "the target's primary key" — a fact only the fold
+/// knows, because the target is usually declared in another file.
+#[test]
+fn a_bare_references_resolves_against_the_targets_primary_key() {
+    let s = fold_files(&[
+        ("001.sql", "CREATE TABLE users (id UUID PRIMARY KEY);"),
+        (
+            "002.sql",
+            "CREATE TABLE orders (user_id UUID REFERENCES users);",
+        ),
+    ]);
+    assert_eq!(label(&s, "users"), "user_id → id (N:1)");
+}
+
+/// A target outside the migration set has no primary key to resolve against.
+/// The label says what it knows and stops, rather than guessing `id`.
+#[test]
+fn an_unresolvable_target_leaves_the_right_hand_side_off() {
+    let s = schema_of("CREATE TABLE orders (user_id UUID REFERENCES auth.users);");
+    let edge = &s.relationships[0];
+    assert_eq!(edge.label.as_deref().unwrap(), "user_id → (N:1)");
+    assert!(!edge.metadata.contains_key("fk_target_columns"));
+}
+
+/// The junction case: the join table keeps its node and its two edges, and
+/// the many-to-many is drawn beside them.
+#[test]
+fn a_join_table_yields_a_many_to_many_edge_beside_its_own() {
+    let s = schema_of(
+        "CREATE TABLE orders (id UUID PRIMARY KEY);
+         CREATE TABLE products (id UUID PRIMARY KEY);
+         CREATE TABLE order_items (
+             order_id UUID REFERENCES orders(id),
+             product_id UUID REFERENCES products(id),
+             PRIMARY KEY (order_id, product_id)
+         );",
+    );
+
+    // The join table is still a table, with its two ordinary edges.
+    assert!(names(&s).contains(&"order_items"));
+    assert_eq!(s.relationships.len(), 3, "two foreign keys, one inferred");
+
+    let nm = s
+        .relationships
+        .iter()
+        .find(|r| r.metadata.get("cardinality").map(String::as_str) == Some("n:m"))
+        .expect("the many-to-many edge");
+    assert_eq!(nm.source_id, table_id("public", "orders"));
+    assert_eq!(nm.target_id, table_id("public", "products"));
+    assert_eq!(nm.label.as_deref().unwrap(), "N:M via order_items");
+    assert_eq!(nm.metadata.get("junction").unwrap(), &table_id("public", "order_items"));
+    assert_eq!(nm.metadata.get("inferred").unwrap(), "true");
+}
+
+/// The surrogate-key form: `id` plus two foreign keys is a log of events,
+/// not a relation, unless the pair is also declared unique. Getting this
+/// wrong puts an edge on the canvas that the schema does not license.
+#[test]
+fn two_foreign_keys_without_a_unique_pair_are_not_a_join_table() {
+    let s = schema_of(
+        "CREATE TABLE orders (id UUID PRIMARY KEY);
+         CREATE TABLE products (id UUID PRIMARY KEY);
+         CREATE TABLE order_events (
+             id UUID PRIMARY KEY,
+             order_id UUID REFERENCES orders(id),
+             product_id UUID REFERENCES products(id)
+         );",
+    );
+    assert_eq!(s.relationships.len(), 2, "no inferred edge");
+}
+
+/// The same table with the pair declared unique *is* a join table — the
+/// surrogate primary key does not disqualify it.
+#[test]
+fn a_surrogate_key_join_table_is_still_a_join_table() {
+    let s = schema_of(
+        "CREATE TABLE orders (id UUID PRIMARY KEY);
+         CREATE TABLE products (id UUID PRIMARY KEY);
+         CREATE TABLE order_items (
+             id UUID PRIMARY KEY,
+             order_id UUID REFERENCES orders(id),
+             product_id UUID REFERENCES products(id),
+             UNIQUE (order_id, product_id)
+         );",
+    );
+    assert_eq!(s.relationships.len(), 3);
+}
+
+/// A table joining one table to itself would draw a self-loop that says
+/// nothing its two ordinary edges do not.
+#[test]
+fn a_self_join_table_infers_no_edge() {
+    let s = schema_of(
+        "CREATE TABLE users (id UUID PRIMARY KEY);
+         CREATE TABLE follows (
+             follower_id UUID REFERENCES users(id),
+             followee_id UUID REFERENCES users(id),
+             PRIMARY KEY (follower_id, followee_id)
+         );",
+    );
+    assert_eq!(s.relationships.len(), 2, "no inferred edge");
+}
+
+/// Dropping a column takes the uniqueness that covered it, so an edge that
+/// was one-to-one stops claiming to be.
+#[test]
+fn dropping_a_unique_column_takes_the_one_to_one_with_it() {
+    let s = fold_files(&[
+        (
+            "001.sql",
+            "CREATE TABLE users (id UUID PRIMARY KEY);
+             CREATE TABLE profiles (id UUID PRIMARY KEY, user_id UUID UNIQUE REFERENCES users(id));",
+        ),
+        ("002.sql", "ALTER TABLE profiles DROP COLUMN user_id;"),
+    ]);
+    assert!(s.relationships.is_empty(), "the key went with the column");
+}
+
+/// `ADD CONSTRAINT … UNIQUE` is the other way a later migration tightens an
+/// edge, and it shares a namespace with foreign keys for `DROP CONSTRAINT`.
+#[test]
+fn a_unique_constraint_can_be_added_and_dropped_later() {
+    let tightened = fold_files(&[
+        (
+            "001.sql",
+            "CREATE TABLE users (id UUID PRIMARY KEY);
+             CREATE TABLE profiles (user_id UUID REFERENCES users(id));",
+        ),
+        (
+            "002.sql",
+            "ALTER TABLE profiles ADD CONSTRAINT one_each UNIQUE (user_id);",
+        ),
+    ]);
+    assert_eq!(card(&tightened, "users"), "1:1");
+
+    let loosened = fold_files(&[
+        (
+            "001.sql",
+            "CREATE TABLE users (id UUID PRIMARY KEY);
+             CREATE TABLE profiles (user_id UUID REFERENCES users(id));",
+        ),
+        (
+            "002.sql",
+            "ALTER TABLE profiles ADD CONSTRAINT one_each UNIQUE (user_id);",
+        ),
+        ("003.sql", "ALTER TABLE profiles DROP CONSTRAINT one_each;"),
+    ]);
+    assert_eq!(card(&loosened, "users"), "n:1");
+}
+
+/// A partial unique index constrains only the rows matching its predicate,
+/// so it cannot make the edge one-to-one for the rest of them.
+#[test]
+fn a_partial_unique_index_does_not_make_an_edge_one_to_one() {
+    let s = fold_files(&[
+        (
+            "001.sql",
+            "CREATE TABLE users (id UUID PRIMARY KEY);
+             CREATE TABLE memberships (user_id UUID REFERENCES users(id), revoked_at TIMESTAMP);",
+        ),
+        (
+            "002.sql",
+            "CREATE UNIQUE INDEX one_active ON memberships (user_id) WHERE revoked_at IS NULL;",
+        ),
+    ]);
+    assert_eq!(card(&s, "users"), "n:1");
 }

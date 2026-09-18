@@ -9,6 +9,9 @@
  *    outside the `cr:` paths its subtree declares. Asking "show me only what
  *    belongs to this" and getting the surrounding code back anyway is not an
  *    answer.
+ *  - **spec → code is *also* a highlight**, on a separate channel, because
+ *    "show me only this" and "show me where this is" are two questions and
+ *    the click could only answer one of them. See `viewmodels/specHighlight.ts`.
  *  - **code → spec is a highlight.** The spec pane is small and its whole
  *    value is the shape of the hierarchy; filtering it to the two entities
  *    that claim the selected file would delete the map to show a pin on it.
@@ -36,9 +39,14 @@ import { derived, get, writable } from 'svelte/store';
 import type { Readable } from 'svelte/store';
 import type { D3Node } from '../types/graph';
 import { fullGraphDataStore } from './scope';
-import { focusNode, rawEntityGraph, selectedNode } from './graph';
-import { followAnalysisScope, splitViewOpen } from './panes';
+import { focusNode, graphData, rawEntityGraph, selectedNode } from './graph';
+import { filterOnSpecClick, followAnalysisScope, splitViewOpen } from './panes';
 import { buildPathUniverse } from '../utils/refPaths';
+import {
+  claimedNodeIds,
+  highlightSources,
+  togglePin,
+} from '../viewmodels/specHighlight';
 import {
   buildSpecGraph,
   claimedPaths,
@@ -180,6 +188,91 @@ export const specHighlightIds: Readable<Set<string>> = derived(
   },
 );
 
+// ---------------------------------------------------------------------------
+// The highlight channel
+// ---------------------------------------------------------------------------
+
+/**
+ * The spec entity under the pointer in the spec pane, or `null`.
+ *
+ * Pointer state in a store rather than in the component because the thing it
+ * moves is on the *other* canvas — the same reason `hoveredNode` lives in
+ * `graph.ts`. It is not persisted and not mirrored: a hover is a question
+ * being asked right now by the hand that is moving.
+ */
+export const specHoverId = writable<string | null>(null);
+
+/**
+ * Spec entities whose claimed code stays lit after the pointer leaves.
+ *
+ * The hover answers "where is this" for as long as you hold still, which is
+ * exactly as long as you cannot also be clicking, scrolling or reading the
+ * Details pane. Pinning is what makes the answer survive the next gesture,
+ * and it is what lets the two channels be used together: filter to a Category
+ * with a click, then pin a Functionality to see which of the remaining code
+ * is its.
+ */
+export const specPinnedHighlight = writable<Set<string>>(new Set());
+
+/** Pinned plus hovered — see `highlightSources` for why it is a union. */
+export const specHighlightSourceIds: Readable<string[]> = derived(
+  [specPinnedHighlight, specHoverId],
+  ([$pinned, $hover]) => highlightSources($pinned, $hover),
+);
+
+/**
+ * Code paths the highlight stands for.
+ *
+ * Reads `visibleSpecGraph` for the same reason `crossFilterPaths` does: it
+ * carries the *unfiltered* claims map, so a Category still stands for its
+ * whole subtree even when the pane has revealed only one level of it. Pointing
+ * at something must not mean less than selecting it would.
+ */
+export const specHighlightPaths: Readable<string[] | null> = derived(
+  [visibleSpecGraph, specHighlightSourceIds],
+  ([$graph, $sources]) => {
+    if ($graph.empty || $sources.length === 0) return null;
+    const live = $sources.filter((id) => $graph.claims.has(id));
+    if (live.length === 0) return null;
+    return claimedPathsForAll($graph, live);
+  },
+);
+
+/**
+ * What the code canvas rings: ids, resolved against `graphData`.
+ *
+ * `graphData` and not `rawEntityGraph`, because this is the only store here
+ * whose answer has to be in the *drawn* vocabulary — the canvas puts a class
+ * on a node it has, and at File or Module level the node it has is a rollup
+ * whose id was minted by `collapseGraph`. Matching by `file_path` inside
+ * `claimedNodeIds` is what makes the rollup answer for the entities under it.
+ *
+ * Resolving to ids here rather than handing the canvas the paths keeps the
+ * per-node path arithmetic out of the render loop, where it would rerun on
+ * every plan apply for an answer that only changes when the pointer does.
+ */
+export const specClaimHighlightIds: Readable<Set<string>> = derived(
+  [specHighlightPaths, graphData],
+  ([$paths, $data]) => claimedNodeIds($paths, $data.nodes),
+);
+
+/** The pane's hover. Takes the node so the caller cannot pass an id from a
+ *  graph this store does not hold. */
+export function hoverSpecEntity(node: D3Node | null): void {
+  specHoverId.set(node?.id ?? null);
+}
+
+/** Pin or unpin what the pointer is on — the pane's shift-click. */
+export function togglePinnedHighlight(id: string): void {
+  specPinnedHighlight.update((current) => togglePin(current, id));
+}
+
+/** Drop every pin. The hover is left alone: it is about to be answered by
+ *  wherever the pointer is now. */
+export function clearPinnedHighlight(): void {
+  specPinnedHighlight.set(new Set());
+}
+
 /**
  * The graph the pane actually draws: roots, the open path, each step's
  * children, and whatever the code selection forced open.
@@ -191,13 +284,19 @@ export const specHighlightIds: Readable<Set<string>> = derived(
  * the pane never holds more than one branch's worth of choices.
  */
 export const drawnSpecGraph: Readable<SpecGraph> = derived(
-  [visibleSpecGraph, specPath, specSelection, specHighlightIds],
-  ([$graph, $path, $selection, $highlight]) => {
+  [visibleSpecGraph, specPath, specSelection, specHighlightIds, specPinnedHighlight],
+  ([$graph, $path, $selection, $highlight, $pinned]) => {
     if ($graph.empty) return $graph;
     // Anything selected is forced visible along with its trail, whether it was
     // picked here or ticked in the Filters pane. A filter running from a row
-    // the pane refuses to draw is the state this whole rework exists to avoid.
-    const forced = new Set([...$selection, ...$highlight]);
+    // the pane refuses to draw is the state this whole rework exists to avoid,
+    // and a *pin* is the same state one channel over: rings on the canvas whose
+    // source the pane has since navigated away from and will not redraw.
+    //
+    // The hover is deliberately not in here. It is forced open by nothing
+    // because it cannot need to be — you can only hover what is already drawn —
+    // and putting it in would relay the pane out on every pointer move.
+    const forced = new Set([...$selection, ...$highlight, ...$pinned]);
     return filterSpecGraph($graph, revealedIds($graph, $path, forced));
   },
 );
@@ -271,6 +370,16 @@ export const specSelectedNodes: Readable<D3Node[]> = derived(
  * Re-picking the open entity closes one level rather than clearing outright:
  * the gesture that opened a level should close it, and dropping the whole path
  * on a mis-click is the expensive mistake in a drill-down.
+ *
+ * **Whether it also filters is `filterOnSpecClick`.** The two halves were one
+ * gesture because they arrived as one, not because they are one question: a
+ * reader who clicks to read a Feature's description in the Details pane has
+ * asked nothing about what the canvas should draw, and got the canvas emptied
+ * down to that Feature's files anyway. Off, the click still opens, still
+ * drills and still moves Details — everything the reader wanted — and leaves
+ * whatever filter the Filters pane's checkboxes are running untouched, which
+ * is the separation `specSelection` and `specPath` already had and only this
+ * function was collapsing.
  */
 export function focusSpecEntity(node: D3Node): void {
   const graph = get(visibleSpecGraph);
@@ -283,7 +392,7 @@ export function focusSpecEntity(node: D3Node): void {
   });
   // Closing a level clears the filter with it; the entity you just closed is
   // no longer the thing you are asking about.
-  specSelection.set(wasOpen ? new Set() : new Set([node.id]));
+  if (get(filterOnSpecClick)) specSelection.set(wasOpen ? new Set() : new Set([node.id]));
   // `focusNode`, not `selectedNode.set`: this is a click on a *panel*, and the
   // pane the reader clicked is not the canvas, so whatever the graph still
   // thinks is hovered is a leftover. Details prefers the selection and the
@@ -307,11 +416,15 @@ export function setSpecSelection(ids: Iterable<string>): void {
   specSelection.set(new Set(ids));
 }
 
-/** Drop the filter and close the pane's path. The one control that undoes
- *  everything this feature did, reachable from both surfaces. */
+/** Drop the filter, the pins and the pane's path. The one control that undoes
+ *  everything this feature did, reachable from both surfaces — and it has to
+ *  reach the pins too, or closing the pane strands rings on the canvas with
+ *  nothing left on screen that explains them. */
 export function clearSpecFocus(): void {
   specSelection.set(new Set());
   specPath.set([]);
+  specPinnedHighlight.set(new Set());
+  specHoverId.set(null);
 }
 
 /** Truncate the drill path at `id` — the breadcrumb's click. Leaves the

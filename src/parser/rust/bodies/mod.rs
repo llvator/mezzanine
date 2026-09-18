@@ -12,4 +12,4 @@
 
 pub(super) mod calls;
 mod inference;
-mod stdlib;
+pub(crate) mod stdlib;

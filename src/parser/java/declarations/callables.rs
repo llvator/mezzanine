@@ -12,6 +12,7 @@ use crate::models::{CodeEntity, EntityKind};
 use crate::parser::language_parser::{node_text, node_to_span};
 use std::path::Path;
 use tree_sitter::Node;
+use crate::parser::working_set;
 
 /// Parse a method or constructor, add it, and extract call relationships
 /// from its body.
@@ -85,7 +86,7 @@ pub(super) fn parse_method(
         entity.parameters = parse_parameters(&params, source);
     }
 
-    populate_body_metrics(node, &mut entity);
+    populate_body_metrics(node, source, &mut entity);
 
     entity.documentation = extract_javadoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());
@@ -112,7 +113,7 @@ pub(super) fn parse_constructor(
         entity.parameters = parse_parameters(&params, source);
     }
 
-    populate_body_metrics(node, &mut entity);
+    populate_body_metrics(node, source, &mut entity);
 
     entity.documentation = extract_javadoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());
@@ -123,10 +124,11 @@ pub(super) fn parse_constructor(
 /// body-complexity numbers. Bodyless methods (abstract / interface)
 /// default to `cyclomatic = 1` and zero nesting/cognitive — they have one
 /// straight-through path by virtue of existing as a signature.
-fn populate_body_metrics(node: &Node, entity: &mut CodeEntity) {
+fn populate_body_metrics(node: &Node, source: &str, entity: &mut CodeEntity) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
     entity.metrics.param_count = Some(entity.parameters.len() as u32);
-    if let Some(body) = node.child_by_field_name("body") {
+    let body = node.child_by_field_name("body");
+    if let Some(body) = body {
         let (cc, nesting, cog) = compute_complexity(&body);
         entity.metrics.cyclomatic = Some(cc);
         entity.metrics.max_nesting = Some(nesting);
@@ -136,4 +138,6 @@ fn populate_body_metrics(node: &Node, entity: &mut CodeEntity) {
         entity.metrics.max_nesting = Some(0);
         entity.metrics.cognitive_complexity = Some(0);
     }
+    working_set::populate(entity, body.as_ref(), source);
+    crate::parser::loops::populate(entity, body.as_ref());
 }

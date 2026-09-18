@@ -41,6 +41,19 @@
 //! bury the 13% that is real under three times its own weight in noise,
 //! and an agent who is told to fix 192 things fixes none of them. Fifty-two
 //! imports across twenty-three folder pairs is a list somebody finishes.
+//!
+//! ## A file is a subject here, a folder is not the only one
+//!
+//! `reshape` and `layout` refuse a file because shape is a property of a
+//! folder's children and a file has none. That rationale is theirs and
+//! does not carry (MCP-040): every import in a file either lands on
+//! another folder's door or reaches past it, and the file is where the
+//! offending import is actually written — which is why this tool already
+//! reports its line number. So [`Subject`] is a folder *or* a file, and
+//! the two differ in one thing only: which of the folder's files the
+//! imports counted were written in. The boundary itself is the holding
+//! folder's either way, because a file has no door of its own and an
+//! import that stays inside its folder crosses nothing.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -52,7 +65,7 @@ use crate::analyzer::folder_shape;
 use crate::graph::FileGraph;
 
 use super::format::listed;
-use super::reshape::{rel, target_folder};
+use super::reshape::rel;
 use super::tools::cap_lines;
 use super::McpServer;
 
@@ -68,57 +81,140 @@ use super::McpServer;
 /// on `reshape`'s forbidden list.
 const CONTRACT_REACHERS: usize = 3;
 
-/// `boundaries` — what this folder's own imports do to everyone else's
-/// structure.
+/// `boundaries` — what this folder's (or this file's) own imports do to
+/// everyone else's structure.
 pub fn boundaries(server: &McpServer, args: &Value) -> Result<String> {
-    let folder = target_folder(server, args)?;
-    let absolute = folder.display().to_string();
     let graph = super::tools::analyze(server, &server.root)?;
     let fg = graph.file_graph();
-    if !fg.folders.contains(&absolute) {
-        bail!(
-            "No analysed folder at {}. Folders come from the files in scope, so a \
-             directory holding nothing mezz parsed has no boundary to cross.",
-            rel(&folder, &server.root),
-        );
-    }
+    let subject = Subject::of(server, args, &fg)?;
 
-    let used = names_used(&graph, &absolute);
-    let map = Boundary::of(&fg, &absolute);
-    let sites: HashMap<(&str, &str), usize> = graph
-        .import_sites()
-        .iter()
-        .map(|s| {
-            (
-                (path_of(&s.from), path_of(&s.to)),
-                s.line + 1,
-            )
-        })
-        .collect();
-
+    let map = Boundary::of(&fg, &subject);
     let root = &server.root;
-    let named = rel(&folder, root);
+    let ctx = Context {
+        used: names_used(&graph, &subject),
+        sites: graph
+            .import_sites()
+            .iter()
+            .map(|s| ((path_of(&s.from), path_of(&s.to)), s.line + 1))
+            .collect(),
+        subject: &subject,
+        root,
+    };
+
     let mut body = vec![
-        format!(
-            "# Boundaries of {}",
-            // `rel` of the root against the root is the empty string, and a
-            // heading that trails off is worse than one that names the case.
-            if named.is_empty() {
-                "the analysis root"
-            } else {
-                named.as_str()
-            }
-        ),
+        format!("# Boundaries of {}", subject.heading(root)),
         String::new(),
     ];
-    body.extend(tally(&map, absolute == server.root.display().to_string()));
-    body.extend(reaching_section(&map, &sites, &used, root));
+    body.extend(tally(&map, &subject, root));
+    body.extend(reaching_section(&map, &ctx));
     body.extend(contracts_section(&map, root));
     body.extend(fixes_section(&map));
-    Ok(cap_lines(
-        body,
-        "Call `boundaries` on a subfolder for a shorter list.",
-    ))
+    Ok(cap_lines(body, subject.shorten_hint()))
+}
+
+/// What the tool was asked about: a folder, or one file in it.
+///
+/// Both are graded against the same boundary — the doors of the folders
+/// they reach into, and what counts as being outside their own — and
+/// differ only in which imports are the subject's to answer for.
+enum Subject {
+    /// Every import written anywhere under this folder.
+    Folder(String),
+    /// Only the imports written in this file, against the boundary of the
+    /// folder holding it.
+    File { path: String, folder: String },
+}
+
+impl Subject {
+    /// Resolve `path` to a folder or a file the graph actually holds.
+    fn of(server: &McpServer, args: &Value, fg: &FileGraph) -> Result<Subject> {
+        let resolved = super::reshape::target_path(server, args);
+        let absolute = resolved.display().to_string();
+        let named = rel(&resolved, &server.root);
+        if !resolved.is_file() {
+            if !fg.folders.contains(&absolute) {
+                bail!(
+                    "No analysed folder at {named}. Folders come from the files in \
+                     scope, so a directory holding nothing mezz parsed has no boundary \
+                     to cross."
+                );
+            }
+            return Ok(Subject::Folder(absolute));
+        }
+        if !fg.files.contains(&absolute) {
+            bail!(
+                "{named} is not in the analysed graph — nothing mezz parsed, or nothing \
+                 in scope. A file it cannot read writes no imports it can grade."
+            );
+        }
+        let folder = parent_dir(&absolute).unwrap_or_default().to_string();
+        Ok(Subject::File {
+            path: absolute,
+            folder,
+        })
+    }
+
+    /// The folder whose doors and interior define the boundary. For a file
+    /// that is the folder holding it: a file has no door of its own, and
+    /// an import that stays inside its folder crosses nothing.
+    fn folder(&self) -> &str {
+        match self {
+            Subject::Folder(f) => f,
+            Subject::File { folder, .. } => folder,
+        }
+    }
+
+    /// Whether an import written in `file` is this subject's to answer for.
+    fn wrote(&self, file: &str) -> bool {
+        match self {
+            Subject::Folder(f) => is_inside(f, file),
+            Subject::File { path, .. } => path == file,
+        }
+    }
+
+    /// The whole project, which has nothing outside it to cross into.
+    fn is_analysis_root(&self, root: &Path) -> bool {
+        matches!(self, Subject::Folder(f) if Path::new(f) == root)
+    }
+
+    fn heading(&self, root: &Path) -> String {
+        let named = rel(Path::new(self.path()), root);
+        // `rel` of the root against the root is the empty string, and a
+        // heading that trails off is worse than one that names the case.
+        if named.is_empty() {
+            return "the analysis root".to_string();
+        }
+        named
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Subject::Folder(f) => f,
+            Subject::File { path, .. } => path,
+        }
+    }
+
+    /// The files on this side of one boundary, named so the sentence
+    /// agrees: the phrase, and whether it is plural. A file subject has
+    /// exactly one file and *is* that file, so "one of your files" would
+    /// read as if the report covered something wider than it does.
+    fn ours(&self, count: usize) -> (String, bool) {
+        match self {
+            Subject::File { .. } => ("This file".to_string(), false),
+            Subject::Folder(_) if count == 1 => ("One of your files".to_string(), false),
+            Subject::Folder(_) => (format!("{count} of your files"), true),
+        }
+    }
+
+    /// What to narrow to when the report runs past the line cap. A file
+    /// is already the narrowest subject there is, so it is sent to the
+    /// work instead.
+    fn shorten_hint(&self) -> &'static str {
+        match self {
+            Subject::Folder(_) => "Call `boundaries` on a subfolder, or on one file, for a shorter list.",
+            Subject::File { .. } => "Fix the first boundary above and re-run — this is already one file's list.",
+        }
+    }
 }
 
 /// `&Path` as the string spelling the graph keys everything by.
@@ -136,7 +232,7 @@ fn path_of(p: &Path) -> &str {
 /// would be asking for a facade in name only.
 fn names_used<'a>(
     graph: &'a crate::graph::DependencyGraph,
-    folder: &str,
+    subject: &Subject,
 ) -> HashMap<&'a str, BTreeSet<&'a str>> {
     let file_of: HashMap<&str, &str> = graph
         .entities()
@@ -153,7 +249,7 @@ fn names_used<'a>(
         ) else {
             continue;
         };
-        if !is_inside(folder, from) || is_inside(folder, to) || to.is_empty() {
+        if !subject.wrote(from) || is_inside(subject.folder(), to) || to.is_empty() {
             continue;
         }
         if let Some(name) = graph.get_entity(&rel.target_id).map(|e| e.name.as_str()) {
@@ -209,13 +305,14 @@ struct Boundary {
 }
 
 impl Boundary {
-    fn of(fg: &FileGraph, folder: &str) -> Boundary {
+    fn of(fg: &FileGraph, subject: &Subject) -> Boundary {
         let doors = folder_shape::doors_by_folder(&fg.pairs, &fg.folders);
         let reachers = reachers_of(fg);
+        let folder = subject.folder();
         let mut seen: HashSet<(&str, &str)> = HashSet::new();
         let mut crossings = Vec::new();
         for (from, to) in &fg.pairs {
-            let leaving = is_inside(folder, from) && !is_inside(folder, to) && to != folder;
+            let leaving = subject.wrote(from) && !is_inside(folder, to) && to != folder;
             if !leaving || !seen.insert((from, to)) {
                 continue;
             }
@@ -332,37 +429,13 @@ fn is_inside(folder: &str, path: &str) -> bool {
 //  Rendering
 // ------------------------------------------------------------------
 
-fn tally(map: &Boundary, is_root: bool) -> Vec<String> {
+fn tally(map: &Boundary, subject: &Subject, root: &Path) -> Vec<String> {
     let total = map.crossings.len();
-    if total == 0 && is_root {
-        return vec![
-            "The analysis root has nothing outside it, so every dependency it makes \
-             is internal by construction and there is no boundary here to cross. \
-             Call `boundaries` on a subfolder — the tangle this finds lives between \
-             siblings, not above them."
-                .to_string(),
-            String::new(),
-        ];
-    }
     if total == 0 {
-        return vec![
-            "This folder's files depend on nothing outside it. There is no boundary \
-             behaviour to report, which is the most self-contained a folder gets."
-                .to_string(),
-            String::new(),
-        ];
+        return vec![nothing_crosses(subject, root), String::new()];
     }
     vec![
-        format!(
-            "Its files make {total} {} on code outside it. Where those land is the \
-             target folder's business; whether they knocked on its front door is \
-             this folder's.",
-            if total == 1 {
-                "dependency"
-            } else {
-                "dependencies"
-            }
-        ),
+        opening(subject, total, root),
         String::new(),
         format!(
             "- **{}** land on the door of every folder they cross.",
@@ -381,14 +454,68 @@ fn tally(map: &Boundary, is_root: bool) -> Vec<String> {
     ]
 }
 
+/// The opening sentence, in the subject's own grammar: a folder answers
+/// for what its files do, a file answers for itself.
+fn opening(subject: &Subject, total: usize, root: &Path) -> String {
+    let plural = if total == 1 {
+        "dependency"
+    } else {
+        "dependencies"
+    };
+    match subject {
+        Subject::Folder(_) => format!(
+            "Its files make {total} {plural} on code outside it. Where those land is \
+             the target folder's business; whether they knocked on its front door is \
+             this folder's."
+        ),
+        Subject::File { folder, .. } => format!(
+            "It makes {total} {plural} on code outside `{}`, the folder holding it — \
+             the boundary is that folder's, since a file has no door of its own. Where \
+             those land is the target folder's business; whether they knocked on its \
+             front door is this file's, and each one is an import line in it.",
+            rel(Path::new(folder), root),
+        ),
+    }
+}
+
+/// Nothing left the boundary at all, which means three different things
+/// depending on what was asked.
+fn nothing_crosses(subject: &Subject, root: &Path) -> String {
+    if subject.is_analysis_root(root) {
+        return "The analysis root has nothing outside it, so every dependency it makes \
+                is internal by construction and there is no boundary here to cross. \
+                Call `boundaries` on a subfolder — the tangle this finds lives between \
+                siblings, not above them."
+            .to_string();
+    }
+    match subject {
+        Subject::Folder(_) => "This folder's files depend on nothing outside it. There \
+                               is no boundary behaviour to report, which is the most \
+                               self-contained a folder gets."
+            .to_string(),
+        Subject::File { folder, .. } => format!(
+            "This file depends on nothing outside `{}`, the folder holding it. Every \
+             import it writes stays inside, so it crosses no boundary and there is \
+             nothing here to grade.",
+            rel(Path::new(folder), root),
+        ),
+    }
+}
+
+/// Everything the work list needs besides the boundary map: what was
+/// asked about, where each import is written, and what it reaches for.
+struct Context<'a> {
+    subject: &'a Subject,
+    /// `(source file, target file)` → the 1-based line the import is on.
+    sites: HashMap<(&'a str, &'a str), usize>,
+    /// Target file → the named things this side actually uses from it.
+    used: HashMap<&'a str, BTreeSet<&'a str>>,
+    root: &'a Path,
+}
+
 /// The work list: one heading per folder reached into, so the fix is
 /// read per boundary rather than per import.
-fn reaching_section(
-    map: &Boundary,
-    sites: &HashMap<(&str, &str), usize>,
-    used: &HashMap<&str, BTreeSet<&str>>,
-    root: &Path,
-) -> Vec<String> {
+fn reaching_section(map: &Boundary, ctx: &Context) -> Vec<String> {
     let reaching = map.with(Verdict::Reaches);
     // Nothing crossed the boundary at all: the tally above has already said
     // so, and a second sentence congratulating the folder on discipline it
@@ -398,10 +525,15 @@ fn reaching_section(
     }
     if reaching.is_empty() {
         return vec![
-            "**Nothing here reaches past a door.** Every dependency this folder \
-             makes either lands on a door or lands on shared vocabulary, which is \
-             the boundary discipline holding."
-                .to_string(),
+            format!(
+                "**Nothing here reaches past a door.** Every dependency {} makes \
+                 either lands on a door or lands on shared vocabulary, which is \
+                 the boundary discipline holding.",
+                match ctx.subject {
+                    Subject::Folder(_) => "this folder",
+                    Subject::File { .. } => "this file",
+                }
+            ),
             String::new(),
         ];
     }
@@ -427,7 +559,7 @@ fn reaching_section(
         String::new(),
     ];
     for (folder, crossings) in by_folder {
-        body.extend(one_boundary(folder, &crossings, map, sites, used, root));
+        body.extend(one_boundary(folder, &crossings, map, ctx));
     }
     body
 }
@@ -436,10 +568,9 @@ fn one_boundary(
     folder: &str,
     crossings: &[&Crossing],
     map: &Boundary,
-    sites: &HashMap<(&str, &str), usize>,
-    used: &HashMap<&str, BTreeSet<&str>>,
-    root: &Path,
+    ctx: &Context,
 ) -> Vec<String> {
+    let root = ctx.root;
     let doors: Vec<String> = map
         .doors
         .get(folder)
@@ -465,7 +596,8 @@ fn one_boundary(
         String::new(),
     ];
     body.extend(listed(crossings.iter().map(|c| {
-        let at = sites
+        let at = ctx
+            .sites
             .get(&(c.from.as_str(), c.to.as_str()))
             .map(|line| format!(":{line}"))
             .unwrap_or_default();
@@ -477,7 +609,10 @@ fn one_boundary(
         )
     })));
     body.push(String::new());
-    body.push(prescribe(&Evidence::of(crossings, map.doors.get(folder), used), root));
+    body.push(prescribe(
+        &Evidence::of(crossings, map.doors.get(folder), &ctx.used),
+        ctx.subject,
+    ));
     body.push(String::new());
     body
 }
@@ -542,8 +677,8 @@ const FACADE_NAMES: usize = 4;
 /// facades; and a boundary crossed at three files is not one door being
 /// gone round, so it is separated from the case a door can actually
 /// absorb. The last two differ only in how much of the fix is yours.
-fn prescribe(e: &Evidence, root: &Path) -> String {
-    let _ = root;
+fn prescribe(e: &Evidence, subject: &Subject) -> String {
+    let (ours, many) = subject.ours(e.mine);
     if e.doors != 1 {
         return format!(
             "→ **Blocked on the other side.** That folder has {}, so there is no \
@@ -566,13 +701,12 @@ fn prescribe(e: &Evidence, root: &Path) -> String {
     }
     if e.theirs >= DISSOLVED {
         return format!(
-            "→ **Reshape the other folder first.** Your {} {} reach {} different files \
+            "→ **Reshape the other folder first.** {ours} {} {} different files \
              inside it for {} named things. That is not one door being gone round, it \
              is a folder with no surface — and pushing {} things through one file \
              would be a facade in name only. `reshape` and `layout` on that folder are \
              the work; come back here after.",
-            e.mine,
-            if e.mine == 1 { "file" } else { "files" },
+            if many { "reach" } else { "reaches" },
             e.theirs,
             e.names.len(),
             e.names.len(),
@@ -580,23 +714,19 @@ fn prescribe(e: &Evidence, root: &Path) -> String {
     }
     if e.names.len() <= FACADE_NAMES {
         return format!(
-            "→ **The door should own {}.** {} — a facade that genuinely owns the \
-             concept, not a re-export of the file behind it. If you are its only \
-             caller anywhere, moving it into this folder is the other honest answer, \
-             and often the better one.",
+            "→ **The door should own {}.** {ours} {} the same small set — a facade that \
+             genuinely owns the concept, not a re-export of the file behind it. If you \
+             are its only caller anywhere, moving it into this folder is the other \
+             honest answer, and often the better one.",
             names_phrase(&e.names),
-            if e.mine > 1 {
-                format!("{} of your files want the same small set", e.mine)
-            } else {
-                "One of your files wants them".to_string()
-            },
+            if many { "want" } else { "wants" },
         );
     }
     format!(
         "→ **Too wide for one facade, too narrow to reshape.** {} named things across \
-         {} {}. Split it: the two or three your folder depends on most belong at that \
-         door, and the rest are probably a dependency that belongs further down your \
-         own tree, next to the caller that actually needs it.",
+         {} {}. Split it: the two or three you depend on most belong at that door, \
+         and the rest are probably a dependency that belongs further down your own \
+         tree, next to the caller that actually needs it.",
         e.names.len(),
         e.theirs,
         if e.theirs == 1 { "file" } else { "files" },
@@ -698,6 +828,18 @@ mod tests {
         s.replace('/', std::path::MAIN_SEPARATOR_STR)
     }
 
+    fn folder(s: &str) -> Subject {
+        Subject::Folder(p(s))
+    }
+
+    /// The file subject `Subject::of` builds for a path that is a file:
+    /// the boundary is the holding folder's.
+    fn file(s: &str) -> Subject {
+        let path = p(s);
+        let folder = parent_dir(&path).unwrap_or_default().to_string();
+        Subject::File { path, folder }
+    }
+
     fn graph(pairs: &[(&str, &str)]) -> FileGraph {
         let pairs: Vec<(String, String)> =
             pairs.iter().map(|(a, b)| (p(a), p(b))).collect();
@@ -734,7 +876,7 @@ mod tests {
             ("src/c/uses.rs", "src/x/door.rs"),
             ("src/a/one.rs", "src/x/inner.rs"),
         ]);
-        let map = Boundary::of(&fg, &p("src/a"));
+        let map = Boundary::of(&fg, &folder("src/a"));
         assert_eq!(map.crossings.len(), 1);
         assert_eq!(map.crossings[0].verdict(), Verdict::Reaches);
         assert_eq!(map.crossings[0].bypassed.as_deref(), Some(p("src/x").as_str()));
@@ -748,7 +890,7 @@ mod tests {
             ("src/a/one.rs", "src/x/door.rs"),
             ("src/b/two.rs", "src/x/door.rs"),
         ]);
-        let map = Boundary::of(&fg, &p("src/a"));
+        let map = Boundary::of(&fg, &folder("src/a"));
         assert_eq!(map.crossings[0].verdict(), Verdict::Door);
     }
 
@@ -767,7 +909,7 @@ mod tests {
             ("src/f/six.rs", "src/models/door.rs"),
             ("src/g/g.rs", "src/models/door.rs"),
         ]);
-        let map = Boundary::of(&fg, &p("src/a"));
+        let map = Boundary::of(&fg, &folder("src/a"));
         assert_eq!(map.crossings[0].verdict(), Verdict::Contract);
     }
 
@@ -784,7 +926,7 @@ mod tests {
             ("src/a/one.rs", "src/x/inner.rs"),
             ("src/b/two.rs", "src/x/inner.rs"),
         ]);
-        let map = Boundary::of(&fg, &p("src/a"));
+        let map = Boundary::of(&fg, &folder("src/a"));
         assert_eq!(map.crossings[0].verdict(), Verdict::Reaches);
     }
 
@@ -792,7 +934,7 @@ mod tests {
     #[test]
     fn a_sibling_with_a_shared_prefix_is_outside_the_folder() {
         let fg = graph(&[("src/uid/a.rs", "src/uidx/b.rs")]);
-        let map = Boundary::of(&fg, &p("src/uid"));
+        let map = Boundary::of(&fg, &folder("src/uid"));
         assert_eq!(map.crossings.len(), 1);
     }
 
@@ -805,7 +947,84 @@ mod tests {
             ("src/c/uses.rs", "src/x/door.rs"),
             ("src/a/one.rs", "src/x/deep/inner.rs"),
         ]);
-        let map = Boundary::of(&fg, &p("src/a"));
+        let map = Boundary::of(&fg, &folder("src/a"));
         assert_eq!(map.crossings[0].bypassed.as_deref(), Some(p("src/x").as_str()));
+    }
+
+    // ---------------------------------------------------------------
+    //  Asked about one file (MCP-040)
+    // ---------------------------------------------------------------
+
+    /// The narrowing, and the whole of it: the same boundary, graded over
+    /// the imports written in one file rather than all of the folder's.
+    #[test]
+    fn a_file_is_graded_on_its_own_imports_and_not_its_neighbours() {
+        // `door.rs` has to out-poll `inner.rs` to be the door at all —
+        // three dependencies against the two written in `src/a`.
+        let fg = graph(&[
+            ("src/b/uses.rs", "src/x/door.rs"),
+            ("src/c/uses.rs", "src/x/door.rs"),
+            ("src/d/uses.rs", "src/x/door.rs"),
+            ("src/a/one.rs", "src/x/inner.rs"),
+            ("src/a/two.rs", "src/x/inner.rs"),
+        ]);
+        let whole = Boundary::of(&fg, &folder("src/a"));
+        assert_eq!(whole.crossings.len(), 2);
+
+        let just_one = Boundary::of(&fg, &file("src/a/one.rs"));
+        assert_eq!(just_one.crossings.len(), 1);
+        assert_eq!(just_one.crossings[0].from, p("src/a/one.rs"));
+        // Same verdict, same bypassed door: only the set considered narrowed.
+        assert_eq!(just_one.crossings[0].verdict(), Verdict::Reaches);
+        assert_eq!(
+            just_one.crossings[0].bypassed.as_deref(),
+            Some(p("src/x").as_str())
+        );
+    }
+
+    /// The doors are the enclosing folder's, not the file's. A file has
+    /// no door of its own, and an import that stays inside the folder
+    /// holding it crosses nothing to be graded on.
+    #[test]
+    fn an_import_inside_the_holding_folder_is_not_a_crossing() {
+        let fg = graph(&[
+            ("src/a/one.rs", "src/a/two.rs"),
+            ("src/a/one.rs", "src/a/deep/three.rs"),
+        ]);
+        let map = Boundary::of(&fg, &file("src/a/one.rs"));
+        assert!(map.crossings.is_empty());
+    }
+
+    /// A file that lands on the door is the discipline holding, exactly as
+    /// it is for the folder — the three-way split is unchanged.
+    #[test]
+    fn a_files_import_onto_a_door_is_not_a_finding() {
+        let fg = graph(&[
+            ("src/a/one.rs", "src/x/door.rs"),
+            ("src/b/two.rs", "src/x/door.rs"),
+        ]);
+        let map = Boundary::of(&fg, &file("src/a/one.rs"));
+        assert_eq!(map.crossings.len(), 1);
+        assert_eq!(map.crossings[0].verdict(), Verdict::Door);
+    }
+
+    /// The report speaks about the file it was asked about, not about
+    /// "one of your files" — which would read as a folder's report.
+    #[test]
+    fn a_file_subject_speaks_in_the_singular() {
+        let e = Evidence {
+            mine: 1,
+            theirs: 1,
+            names: ["Door".to_string()].into_iter().collect(),
+            doors: 1,
+            fewest_reachers: 1,
+        };
+        let said = prescribe(&e, &file("src/a/one.rs"));
+        assert!(said.contains("This file wants"), "unexpected: {said}");
+        let folder_said = prescribe(&e, &folder("src/a"));
+        assert!(
+            folder_said.contains("One of your files wants"),
+            "unexpected: {folder_said}"
+        );
     }
 }

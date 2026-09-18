@@ -145,3 +145,118 @@ test('hasExclusionInside guards the count fast-path', () => {
   // globs are opaque, so assume they might bite
   assert.ok(hasExclusionInside('src', [inc(''), exc('**/*.test.ts')]));
 });
+
+// --- Differential tests against the pre-compilation implementations ---------
+//
+// `isInScope`, `isDirectRule`, `hasExclusionInside` and `compactRules` were
+// rewritten from linear scans of the rule list into lookups over a compiled
+// form, because a committed query produces one rule per match and the old
+// shapes were O(R) and O(R²) in that count (UI-136). The rewrite is only
+// worth anything if it is invisible, so the reference implementations below
+// are the originals, kept verbatim, and the tests assert the two agree.
+//
+// Not deleted once green: these are the definition of what the compiled form
+// owes the rest of the app, and they are what a future change to the
+// compilation has to answer to.
+
+function refIsInScope(path: string, rules: ScopeRule[]): boolean {
+  let verdict = false;
+  for (const rule of rules) {
+    if (patternMatches(rule.pattern, path)) verdict = !rule.negate;
+  }
+  return verdict;
+}
+
+function refIsDirectRule(path: string, rules: ScopeRule[]): boolean {
+  return rules.some((r) => !r.negate && r.pattern === path);
+}
+
+function refHasExclusionInside(folder: string, rules: ScopeRule[]): boolean {
+  return rules.some((r) => {
+    if (!r.negate) return false;
+    if (r.pattern.includes('*')) return true;
+    return r.pattern === folder || r.pattern.startsWith(folder === '' ? '' : folder + '/');
+  });
+}
+
+/** Deterministic PRNG — a failing seed has to be reproducible to be worth
+ *  reporting, and `Math.random` would make every run a different test. */
+function mulberry32(seed: number): () => number {
+  let a = seed;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Deliberately a small, colliding vocabulary: the interesting cases are
+// ancestor/descendant pairs, repeated patterns and dead negates, none of
+// which show up if every generated pattern is unique.
+const PATTERNS = [
+  '', 'ui', 'ui/src', 'ui/src/stores', 'ui/src/stores/scope.ts', 'ui/src/legacy',
+  'ui/src/legacy/old.ts', 'ui/scripts', 'src', 'src/parser', 'src/parser/mod.rs',
+  'README.md', '**/*.ts', 'ui/**/*.svelte', 'src/*/mod.rs', 'ui/s',
+];
+
+const PROBE_PATHS = [
+  '', 'ui', 'ui/src', 'ui/src/stores', 'ui/src/stores/scope.ts', 'ui/src/legacy',
+  'ui/src/legacy/old.ts', 'ui/src/legacy/keep.ts', 'ui/scripts/probe.mjs',
+  'src', 'src/parser', 'src/parser/mod.rs', 'src/graph/mod.rs', 'README.md',
+  'ui/src/components/FileTree.svelte', 'ui/sibling.ts',
+];
+
+function randomRules(rand: () => number): ScopeRule[] {
+  const n = 1 + Math.floor(rand() * 8);
+  return Array.from({ length: n }, () => ({
+    pattern: PATTERNS[Math.floor(rand() * PATTERNS.length)],
+    // Negates deliberately rarer than includes, matching how scopes are
+    // actually built — but common enough to land inside a covered subtree.
+    negate: rand() < 0.35,
+  }));
+}
+
+test('compiled rule evaluation matches the linear scan it replaced', () => {
+  const rand = mulberry32(0x5EED);
+  for (let iter = 0; iter < 3000; iter++) {
+    const rules = randomRules(rand);
+    const where = () => `seed-iter ${iter}: ${JSON.stringify(rules)}`;
+    for (const p of PROBE_PATHS) {
+      assert.equal(isInScope(p, rules), refIsInScope(p, rules),
+        `isInScope(${JSON.stringify(p)}) ${where()}`);
+      assert.equal(isDirectRule(p, rules), refIsDirectRule(p, rules),
+        `isDirectRule(${JSON.stringify(p)}) ${where()}`);
+      assert.equal(hasExclusionInside(p, rules), refHasExclusionInside(p, rules),
+        `hasExclusionInside(${JSON.stringify(p)}) ${where()}`);
+    }
+  }
+});
+
+test('compaction preserves every verdict over random rule lists', () => {
+  const rand = mulberry32(0xC0FFEE);
+  for (let iter = 0; iter < 3000; iter++) {
+    const rules = randomRules(rand);
+    const compacted = compactRules(rules);
+    assert.ok(compacted.length <= rules.length, 'compaction must not grow the list');
+    for (const p of PROBE_PATHS) {
+      assert.equal(isInScope(p, compacted), refIsInScope(p, rules),
+        `${JSON.stringify(p)} changed at iter ${iter}: `
+        + `${JSON.stringify(rules)} -> ${JSON.stringify(compacted)}`);
+    }
+  }
+});
+
+test('a committed query compacts and counts without quadratic blowup', () => {
+  // The shape that motivated the rewrite: one include per matched file, which
+  // is what `commitQuery` hands to `setScopes`. At 5k rules the old nested
+  // scan was already seconds; this asserts the budget rather than the exact
+  // timing, so it fails loudly on a regression to O(R²) without being flaky.
+  const paths = Array.from({ length: 5000 }, (_, i) =>
+    `pkg${i % 40}/mod${i % 200}/file${i}.ts`);
+  const started = performance.now();
+  const compacted = compactRules(includeAll(paths));
+  const elapsed = performance.now() - started;
+  assert.equal(compacted.length, paths.length, 'no path shares a prefix, so none is redundant');
+  assert.ok(elapsed < 500, `compactRules(5000) took ${elapsed.toFixed(0)}ms`);
+});

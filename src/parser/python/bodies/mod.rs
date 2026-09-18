@@ -3,7 +3,7 @@
 //! - [`calls`] — call-site relationships, plus self/local write tracking
 //! - [`complexity`] — cyclomatic / cognitive metrics
 //! - [`flow`] — synthetic Branch / Loop / try-arm entity emission
-//! - [`stdlib`] — built-in name table for call filtering
+//! - [`inference`] — the declared types a body's receivers resolve through
 //!
 //! Nothing here reaches back up to a declaration: a body is handed the node
 //! it lives in and reports what it found.
@@ -11,4 +11,4 @@
 pub(super) mod calls;
 pub(super) mod complexity;
 mod flow;
-mod stdlib;
+pub(super) mod inference;

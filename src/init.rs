@@ -12,13 +12,35 @@
 //! - Only keys it inferred from the tree. A scaffold that spelled out every
 //!   default would freeze today's defaults into every repo that ran it, and
 //!   the next change to a default would silently skip them all.
-//! - Never a key it cannot justify from the repo — no `output_dir`, no
-//!   `port`. Both have working defaults, and an absolute `output_dir` copied
-//!   between checkouts is the wart this repo's own file carries.
+//! - Never a key it cannot justify from the repo. `debounce_ms` is the plain
+//!   case: nothing here reads it, and `300` in the file is only today's
+//!   default frozen.
 //!
-//! Two more files are written on request: `.vscode/tasks.json` (`--vscode`)
-//! and `.mcp.json` (`--mcp`). Both already exist in most repos and belong to
-//! their owner, so both merge into what is there rather than replace it.
+//! `output_dir` and `port` used to sit under that second limit and no longer
+//! do, because this command does not write one file. `write_tasks` bakes the
+//! port into three places in `.vscode/tasks.json` and those tasks write to
+//! `output_dir` — a value a scaffold depends on is justified by the scaffold,
+//! whatever the tree says. Both are pinned relative to `.mezz/`, so what this
+//! writes stays inside the directory it just made; the absolute `output_dir`
+//! copied between checkouts is the wart this repo's own file carries, and is
+//! what "relative" is guarding against. See CFG-016.
+//!
+//! Three more files are written on request: `.vscode/tasks.json` (`--vscode`),
+//! `.mcp.json` (`--mcp`) and `.claude/settings.json` (`--hooks`). All three
+//! already exist in most repos and belong to their owner, so all three merge
+//! into what is there rather than replace it.
+//!
+//! `--hooks` is the one that changes what happens rather than what is
+//! available: it wires the push-mode `Stop` hooks, so a turn that introduced a
+//! structural regression is blocked once and handed the finding. `--mcp` gives
+//! an agent tools it must remember to call; this is the half that arrives
+//! whether or not it remembered.
+//!
+//! Two flags add tasks to the file `--vscode` writes rather than a file of
+//! their own, and both sit outside `--all`. `--allow-agent-spawn` is held
+//! back because of what its task does; `--editor-tools` because of how many
+//! there are — eleven graph tools bound to the editor's open file, in a list
+//! the reader shares with their own builds. See [`EDITOR_TOOLS`].
 //!
 //! `.vscode/settings.json` is deliberately *not* among them. The extension's
 //! `mezz.language` and `mezz.includeTests` reach the engine as CLI flags, and a
@@ -57,22 +79,30 @@ const MIN_SHARE: f64 = 0.05;
 pub struct Targets {
     pub vscode: bool,
     pub mcp: bool,
+    pub hooks: bool,
     /// Write the extra VS Code task that starts the engine with
     /// `--allow-agent-spawn`. Not a file of its own — a fourth task in the
     /// file `vscode` already writes — and deliberately not part of `--all`;
     /// see [`Targets::with_agent_spawn`].
     pub agent_spawn: bool,
+    /// Write the [`EDITOR_TOOLS`] tasks — one graph tool each, scoped to the
+    /// editor's open file. Like `agent_spawn`, more tasks in the file
+    /// `vscode` writes rather than a file of its own, and outside `--all`;
+    /// see [`Targets::with_editor_tools`].
+    pub editor_tools: bool,
 }
 
 impl Targets {
     /// `--all` is not a third scaffold. It is every scaffold below turned on
     /// at once, which is why it lives here: a new one added to this struct
     /// joins `--all` by being read here, not by anyone remembering to.
-    pub fn new(vscode: bool, mcp: bool, all: bool) -> Self {
+    pub fn new(vscode: bool, mcp: bool, hooks: bool, all: bool) -> Self {
         Self {
-            vscode: vscode || all,
-            mcp: mcp || all,
+            vscode: or_all(vscode, all),
+            mcp: or_all(mcp, all),
+            hooks: or_all(hooks, all),
             agent_spawn: false,
+            editor_tools: false,
         }
     }
 
@@ -92,6 +122,32 @@ impl Targets {
             ..self
         }
     }
+
+    /// Ask for the editor-scoped tool tasks as well.
+    ///
+    /// Outside `--all` for a different reason than [`Targets::with_agent_spawn`]:
+    /// nothing here runs anything the plain tasks don't, so the objection is
+    /// not safety but volume. Eleven entries land in a list a reader shares
+    /// with their own builds and tests, and a scaffold that triples the
+    /// length of that list because it was asked for "everything" is one
+    /// people stop running. Implies `--vscode` for the same reason the
+    /// spawn task does: there is nowhere else for a task to live.
+    pub fn with_editor_tools(self, on: bool) -> Self {
+        Self {
+            vscode: self.vscode || on,
+            editor_tools: on,
+            ..self
+        }
+    }
+}
+
+/// One scaffold's own flag, with `--all` folded in.
+///
+/// A function rather than a `||` per field: the complexity gate counts each
+/// one against [`Targets::new`] and fails on any increase, so a fourth
+/// scaffold has to cost a row rather than a branch (CI-001).
+const fn or_all(asked: bool, all: bool) -> bool {
+    asked || all
 }
 
 /// Scaffold `.mezz/settings.json`, plus whichever optional files were asked for.
@@ -100,18 +156,35 @@ pub fn run(root: &Path, targets: Targets, force: bool) -> Result<()> {
     write_scaffolds(root, targets, force)
 }
 
+/// Every optional scaffold: whether this run asked for it, and what it writes.
+///
+/// A table rather than an `if` per target. In a flat run of branches the
+/// cyclomatic count *is* the number of scaffolds, so each one added pushed
+/// this function higher and the gate — which fails on any increase to an
+/// existing function — would have made the next one unlandable. `check/rules.rs`
+/// and `mcp/mod.rs` hit the same wall and answered it the same way (CI-001).
+///
+/// This is also the single list: [`Targets::new`] decides the flags, and a
+/// scaffold joins `mezz init` by gaining a row here rather than by anyone
+/// remembering to call it.
+const OPTIONAL: &[(fn(&Targets) -> bool, fn(&Path, Targets, bool) -> Result<()>)] = &[
+    (|t| t.vscode, write_tasks),
+    (|t| t.mcp, |root, _, force| write_mcp(root, force)),
+    (|t| t.hooks, |root, _, force| write_hooks(root, force)),
+];
+
 /// The files that are written only on request.
 ///
-/// Split from [`run`] so that a fourth scaffold costs a branch here rather
-/// than in the function every caller of this module goes through.
+/// Split from [`run`] so that a fourth scaffold costs a row in [`OPTIONAL`]
+/// rather than a branch in the function every caller of this module goes
+/// through.
 fn write_scaffolds(root: &Path, targets: Targets, force: bool) -> Result<()> {
-    if targets.vscode {
-        write_tasks(root, targets.agent_spawn, force)?;
-    }
-    if targets.mcp {
-        write_mcp(root, force)?;
-    }
-    Ok(())
+    // Filtered rather than a `for` with an `if` inside it: that nests one
+    // deeper than the loop this replaced, and the gate scores nesting too.
+    OPTIONAL
+        .iter()
+        .filter(|(wanted, _)| wanted(&targets))
+        .try_for_each(|(_, write)| write(root, targets, force))
 }
 
 /// Every file a default analysis of this root would parse.
@@ -155,10 +228,14 @@ fn write_settings(root: &Path, force: bool) -> Result<()> {
         );
     }
 
-    // Against the directory the file lands in, not the one that was walked:
-    // `spec_dir` is read back relative to the repo root (CFG-012), so
-    // `mezz init src` must write `src/spec` rather than `spec`.
-    let body = settings_body(&languages, detect_spec_dir(&settings::repo_root(root), &files));
+    // Read before the write that replaces it, so `--force` can put back the
+    // keys the reader chose rather than the tree implied.
+    let previous = settings::read_raw(&path).unwrap_or_default();
+    // `spec_dir` is detected against the directory the file lands in, not the
+    // one that was walked: it is read back relative to the repo root
+    // (CFG-012), so `mezz init src` must write `src/spec` rather than `spec`.
+    let inferred = settings_body(&languages, detect_spec_dir(&settings::repo_root(root), &files));
+    let body = carry_over(inferred, &previous);
     std::fs::create_dir_all(settings::repo_dir(root))
         .with_context(|| format!("creating {}", settings::repo_dir(root).display()))?;
     std::fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
@@ -236,9 +313,63 @@ fn detect_spec_dir(root: &Path, files: &[PathBuf]) -> Option<PathBuf> {
     (all_agree && first.components().next().is_some()).then_some(first)
 }
 
+/// The keys `--force` leaves alone.
+///
+/// Everything else this command writes is *inferred* — re-run it after a repo
+/// changes shape and a fresh language list is the whole point. These two are
+/// not inferred from anything; they are a choice, and `port` in particular is
+/// one a reader has to make the moment they open a second repo beside this
+/// one. Resetting it would also undo it in `.vscode/tasks.json`, which is
+/// rewritten from this file in the same run — so a reader who moved the port
+/// and re-scaffolded the tasks would silently get the old number back in both
+/// places (CFG-016).
+const CARRIED_ACROSS_FORCE: [&str; 2] = ["output_dir", "port"];
+
+/// Put back whatever [`CARRIED_ACROSS_FORCE`] key the file being replaced
+/// already had.
+///
+/// `previous` is the raw map of that file, and the caller reads it with
+/// `unwrap_or_default` on purpose: a file that is absent, unreadable or not
+/// JSON carries nothing over, which is the same answer as an empty one. This
+/// runs on the way to *replacing* that file, so refusing to proceed over a
+/// parse failure would strand the reader with the broken file `--force` was
+/// reached for.
+fn carry_over(body: String, previous: &Map<String, Value>) -> String {
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&body) else {
+        return body;
+    };
+    for key in CARRIED_ACROSS_FORCE {
+        if let Some(value) = previous.get(key) {
+            map.insert(key.to_string(), value.clone());
+        }
+    }
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&Value::Object(map)).unwrap_or(body)
+    )
+}
+
+/// Where a scaffolded repo writes its graph JSON.
+///
+/// Under `.mezz/`, the directory this command has just created, rather than
+/// the built-in `ui/public` default: that one is a guess about the reader's
+/// tree, and a repo whose root already holds a file called `ui` fails on the
+/// first `mezz watch` with nothing but `ENOTDIR` to go on (CFG-016).
+const SCAFFOLD_OUTPUT_DIR: &str = ".mezz/data";
+
 fn settings_body(languages: &[Language], spec_dir: Option<PathBuf>) -> String {
     let names: Vec<&str> = languages.iter().map(|l| l.filter_name()).collect();
-    let mut body = json!({ "language": names });
+    // Two keys that are defaults everywhere else and pinned here, against the
+    // module doc's general rule, because this command writes a *second* file
+    // that reads them. `write_tasks` bakes the port into three places in
+    // `tasks.json`; leaving it out of the settings file puts the number
+    // somewhere the reader cannot change it. `output_dir` is where those
+    // tasks write, and its default can collide with the repo (CFG-016).
+    let mut body = json!({
+        "language": names,
+        "output_dir": SCAFFOLD_OUTPUT_DIR,
+        "port": settings::DEFAULT_PORT,
+    });
     if let Some(dir) = spec_dir {
         body["spec_dir"] = json!(dir.to_string_lossy());
     }
@@ -262,12 +393,17 @@ fn indent(body: &str) -> String {
 
 const TASKS_PATH: [&str; 2] = [".vscode", "tasks.json"];
 
-fn write_tasks(root: &Path, agent_spawn: bool, force: bool) -> Result<()> {
+fn write_tasks(root: &Path, targets: Targets, force: bool) -> Result<()> {
     let path = TASKS_PATH
         .iter()
         .fold(root.to_path_buf(), |p, part| p.join(part));
     let port = settings::load(root).port.unwrap_or(settings::DEFAULT_PORT);
-    let tasks = [mezz_tasks(port), spawn_tasks(agent_spawn)].concat();
+    let tasks = [
+        mezz_tasks(port),
+        spawn_tasks(targets.agent_spawn),
+        editor_tool_tasks(targets.editor_tools),
+    ]
+    .concat();
 
     let merged = match std::fs::read_to_string(&path) {
         Ok(text) => match merge_tasks(&text, tasks.clone(), &path, force) {
@@ -469,6 +605,187 @@ fn opener() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Editor-scoped tool tasks
+// ---------------------------------------------------------------------------
+
+/// One graph tool, bound to whatever the editor has open.
+///
+/// The `mezz` argv is stored whole rather than assembled from a tool name
+/// and a scope kind. The sixteen tools do not take their target the same
+/// way — `quality` takes a positional path, `impact` takes `--path`, and
+/// `--line` turns `impact` from a file report into an entity one — so a
+/// scope enum would have had a variant per spelling and bought nothing over
+/// writing the arguments down.
+struct EditorTool {
+    /// What the reader picks from the task list, after the `Mezzanine: `
+    /// prefix every task in this file carries.
+    label: &'static str,
+    detail: &'static str,
+    /// Passed to `mezz` as-is. VS Code substitutes the `${...}` variables
+    /// before the process starts, so mezz never sees one.
+    args: &'static [&'static str],
+}
+
+/// The file the editor has open, relative to its workspace folder — which is
+/// exactly how the tools read a path, since `Scope` resolves `path`
+/// arguments against the root.
+const THIS_FILE: &str = "${relativeFile}";
+
+/// Its folder, for the tools that grade an area rather than a file.
+const THIS_FOLDER: &str = "${relativeFileDirname}";
+
+/// The cursor's line, 1-based — which is the base `--line` counts from.
+const THIS_LINE: &str = "${lineNumber}";
+
+/// The graph tools worth a keystroke, in the three families they fall into:
+/// what the open file *is*, what the entity under the cursor is, and what
+/// the folder around it looks like.
+///
+/// Four of the sixteen are missing because the editor has no answer to give
+/// them. `overview`, `similar` and `trace` take a name, a query or a pair of
+/// entities — a task would have to prompt for it, which is slower than
+/// typing the command. `assess_change` takes a git ref and is about the
+/// working tree, not about any one file. `spec_slice` writes a file and
+/// needs a repo with an Elevator spec, so it is a command to run
+/// deliberately rather than one to bind to the cursor.
+const EDITOR_TOOLS: &[EditorTool] = &[
+    EditorTool {
+        label: "Map this file",
+        detail: "Entities in the open file with their metrics and coupling",
+        args: &["map", THIS_FILE],
+    },
+    EditorTool {
+        label: "Quality of this file",
+        detail: "Smells and refactor pressure in the open file",
+        args: &["quality", THIS_FILE],
+    },
+    EditorTool {
+        label: "Dead code in this file",
+        detail: "Entities in the open file that nothing references",
+        args: &["dead-code", THIS_FILE],
+    },
+    EditorTool {
+        label: "What depends on this file",
+        detail: "Who breaks if the open file changes, and what it owes the rest of the tree",
+        args: &["impact", "--path", THIS_FILE],
+    },
+    EditorTool {
+        label: "Impact of the entity at the cursor",
+        detail: "Blast radius of the entity the cursor is inside",
+        args: &["impact", "--path", THIS_FILE, "--line", THIS_LINE],
+    },
+    EditorTool {
+        label: "Cost of the entity at the cursor",
+        detail: "How the entity the cursor is inside scales, and what it calls — worst-case time complexity along the call chain",
+        args: &["cost", "--path", THIS_FILE, "--line", THIS_LINE],
+    },
+    EditorTool {
+        label: "Context for the entity at the cursor",
+        detail: "The minimal pack needed to edit the entity the cursor is inside",
+        args: &["context", "--path", THIS_FILE, "--line", THIS_LINE],
+    },
+    EditorTool {
+        label: "Tests covering the entity at the cursor",
+        detail: "Which tests reach the entity the cursor is inside, directly or transitively",
+        args: &["tests-for", "--path", THIS_FILE, "--line", THIS_LINE],
+    },
+    EditorTool {
+        label: "Reshape this file's folder",
+        detail: "The one change that would improve the structure of the folder around the open file",
+        args: &["reshape", THIS_FOLDER],
+    },
+    EditorTool {
+        label: "Layout of this file's folder",
+        detail: "Where this folder's files would sit if its dependency drawing decided",
+        args: &["layout", THIS_FOLDER],
+    },
+    EditorTool {
+        label: "Boundaries of this file's folder",
+        detail: "Which of this folder's imports reach past another folder's door",
+        args: &["boundaries", THIS_FOLDER],
+    },
+    EditorTool {
+        label: "Hotspots in this file's folder",
+        detail: "This folder ranked by git churn × complexity",
+        args: &["hotspots", THIS_FOLDER],
+    },
+];
+
+/// The [`EDITOR_TOOLS`] tasks, or nothing.
+fn editor_tool_tasks(editor_tools: bool) -> Vec<Value> {
+    if !editor_tools {
+        return Vec::new();
+    }
+    EDITOR_TOOLS.iter().map(editor_tool_task).collect()
+}
+
+fn editor_tool_task(tool: &EditorTool) -> Value {
+    json!({
+        "label": format!("Mezzanine: {}", tool.label),
+        "detail": tool.detail,
+        "type": "shell",
+        "command": "mezz",
+        "args": tool.args,
+        // `${fileWorkspaceFolder}` rather than the `${workspaceFolder}` the
+        // web-UI tasks use, because these three variables disagree in a
+        // multi-root workspace: `${relativeFile}` is relative to the folder
+        // holding the open file, and `${workspaceFolder}` is the first one
+        // in the workspace. Pairing them would analyze one repo and hand it
+        // a path into another. It also fails loudly rather than quietly when
+        // the open file belongs to no workspace folder at all.
+        "options": { "cwd": "${fileWorkspaceFolder}" },
+        // `clear` because every run of these replaces the last one's answer
+        // rather than continuing it, and a panel holding a report about the
+        // file you just navigated away from is the way to misread one.
+        "presentation": {
+            "reveal": "always", "panel": "dedicated", "focus": false, "clear": true
+        },
+        "problemMatcher": tool_matcher(tool.args[0])
+    })
+}
+
+/// The Problems-panel matcher for a tool whose output carries `file:line`,
+/// or the empty list every other task here uses.
+///
+/// Only `quality` gets one, and only over its `## Smells` section. Two
+/// conditions have to hold for a matcher to be honest, and this is the one
+/// place both do:
+///
+/// - **Every row it matches is in a file VS Code can find.** `quality`
+///   prints paths relative to the scope it was asked about
+///   ([tools.rs](../mcp/tools.rs) `entity_row`), and this task's scope is
+///   the open file — so a bare `init.rs:370` resolves against
+///   `${fileDirname}` and nowhere else. The entity-level tools print
+///   root-relative paths instead, which would need a different base.
+/// - **A row is a finding.** Smells are. `map`'s entity list and `quality`'s
+///   own refactor-pressure ranking are not: that ranking opens by saying it
+///   is "a ranking, not a verdict", and piping it into the Problems panel
+///   would contradict the sentence above it. The regex requires the row to
+///   end at the `⚠` marker, which the pressure rows never do — they carry a
+///   `N of it identified` tail.
+///
+/// A drift in that row format costs an empty Problems panel and no wrong
+/// answer, which is the failure direction to pick when tying one file's
+/// regex to another file's `format!`.
+fn tool_matcher(tool: &str) -> Value {
+    if tool != "quality" {
+        return json!([]);
+    }
+    json!({
+        "owner": "mezz",
+        "source": "mezz",
+        "severity": "warning",
+        "fileLocation": ["relative", "${fileDirname}"],
+        "pattern": {
+            "regexp": "^- \\w+ `[^`]+` — ([^ :]+):(\\d+) \\(.*⚠ ([^,)]+)\\)$",
+            "file": 1,
+            "line": 2,
+            "message": 3
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // MCP registration
 // ---------------------------------------------------------------------------
 
@@ -606,6 +923,197 @@ fn servers_of<'a>(file: &'a mut Value, path: &Path) -> Result<&'a mut Map<String
     }
 }
 
+// ------------------------------------------------------------------
+//  Claude Code Stop hooks (--hooks)
+// ------------------------------------------------------------------
+
+const CLAUDE_SETTINGS_PATH: [&str; 2] = [".claude", "settings.json"];
+
+/// What marks a hook entry as one of ours, on a re-run and on `--force`.
+///
+/// The subcommand rather than the whole command line: the wrapper around it
+/// is the part most likely to be edited by hand, and a reader who tuned their
+/// redirection should not end up with a second copy of the same leg.
+const HOOK_MARKER: &str = "mezz hook ";
+
+/// Long enough for two full analyses of a large repo, short enough that a
+/// wedged hook does not hold a session. Mezzanine's own checkout — ~16.7k
+/// entities analyzed twice — takes about two seconds.
+const HOOK_TIMEOUT_SECS: u64 = 120;
+
+/// Wire the two push-mode legs into `.claude/settings.json` as `Stop` hooks.
+///
+/// The other scaffolds hand an agent things it must remember to use: `--mcp`
+/// registers tools it can call, `--vscode` adds tasks a human can run. This
+/// one is the only scaffold that arrives on its own — an agent that never
+/// calls `assess_change` still cannot end a turn on a cycle it just closed.
+///
+/// Anchored on the repo root, like `.mcp.json`: Claude Code reads this file
+/// from the checkout it was started in, so `mezz init --hooks src` must still
+/// write where that agent will look.
+fn write_hooks(root: &Path, force: bool) -> Result<()> {
+    let path = CLAUDE_SETTINGS_PATH
+        .iter()
+        .fold(settings::repo_root(root), |p, part| p.join(part));
+    let group = hook_group();
+
+    let merged = match std::fs::read_to_string(&path) {
+        Ok(text) => match merge_hooks(&text, group.clone(), &path, force) {
+            Ok(merged) => merged,
+            // Same bargain as the other two: we refuse to rewrite the file,
+            // so we owe the reader the block we would have written.
+            Err(e) => return Err(offer_hooks_by_hand(e, &group)),
+        },
+        Err(_) => Some(json!({ "hooks": { "Stop": [group] } })),
+    };
+
+    let Some(file) = merged else {
+        println!("✓ {} already runs the mezz hooks", path.display());
+        return Ok(());
+    };
+
+    std::fs::create_dir_all(path.parent().unwrap_or(root))
+        .with_context(|| format!("creating {}", path.display()))?;
+    let body = format!("{}\n", serde_json::to_string_pretty(&file)?);
+    std::fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+    println!("✓ wrote {}", path.display());
+    println!(
+        "   A stop that introduced a new smell, cycle, complexity jump, folder-shape \
+         fall or rule breach now blocks once, with the finding, so the agent can fix \
+         it before the turn ends. Silent otherwise."
+    );
+    warn_unless_hooks_can_run();
+    Ok(())
+}
+
+/// Print the block the merge refused to write, and hand back the error that
+/// stopped it — the command still fails, because nothing was written.
+fn offer_hooks_by_hand(error: anyhow::Error, group: &Value) -> anyhow::Error {
+    let body =
+        serde_json::to_string_pretty(&json!({ "hooks": { "Stop": [group] } })).unwrap_or_default();
+    eprintln!("   Add this by hand:\n{}", indent(&body));
+    error
+}
+
+/// The two legs, as one `Stop` group.
+fn hook_group() -> Value {
+    json!({
+        "hooks": [
+            hook_leg("self-review", "mezz self-review"),
+            hook_leg("check", "mezz rule check"),
+        ]
+    })
+}
+
+fn hook_leg(sub: &str, status: &str) -> Value {
+    json!({
+        "type": "command",
+        "command": hook_command(sub),
+        "timeout": HOOK_TIMEOUT_SECS,
+        "statusMessage": status,
+    })
+}
+
+/// The shell around the hook, and why it is not just the bare command.
+///
+/// Three things have to happen that the binary cannot do for itself:
+///
+/// - **Drop the progress chatter.** `mezz` writes `Analyzing base ...` to
+///   stderr and its findings to stdout, precisely so a caller can discard one
+///   without the other. `2>/dev/null` is that discard.
+/// - **Put the findings where a blocked stop reads them.** A `Stop` hook that
+///   exits 0 sends stdout to a debug log — not the transcript, and never the
+///   agent. Exit 2 blocks the stop and feeds back *stderr*, so the findings
+///   are re-emitted there.
+/// - **Let only exit 2 through.** A mezz that is missing, half-built or
+///   erroring exits something else, and that must end the hook quietly rather
+///   than wedge every stop in the repo.
+fn hook_command(sub: &str) -> String {
+    format!(
+        "o=$(mezz hook {sub} --block 2>/dev/null); r=$?; \
+         [ -n \"$o\" ] && echo \"$o\" >&2; [ $r -eq 2 ] && exit 2; exit 0"
+    )
+}
+
+/// Both ways the wrapper can be written correctly and still never run.
+fn warn_unless_hooks_can_run() {
+    if !on_path("mezz") {
+        eprintln!(
+            "   ⚠ `mezz` is not on PATH. The hooks name it anyway, because \
+             .claude/settings.json is committed and an absolute path out of one \
+             developer's home directory is a hook only that machine can run — \
+             install it with `cargo install --path .`."
+        );
+    }
+    if std::env::consts::OS == "windows" {
+        eprintln!(
+            "   ⚠ The wrapper is POSIX shell. On Windows, run it under Git Bash or \
+             WSL, or rewrite the command for your shell — the parts that matter are \
+             `--block`, stderr for the findings, and exit 2."
+        );
+    }
+}
+
+/// Add the group to a `.claude/settings.json` that already exists, or `None`
+/// when the hooks are already wired.
+///
+/// The refusals are the point, as in [`merge_mcp`]. That file holds a
+/// reader's permission allowlist and whatever other hooks they run, and it is
+/// the only record of both — so anything we cannot parse is left alone rather
+/// than rewritten from a guess.
+///
+/// `--force` replaces our own group and nobody else's: the retain drops only
+/// entries carrying [`HOOK_MARKER`], so a repo with its own `Stop` hook keeps
+/// it either way.
+fn merge_hooks(text: &str, group: Value, path: &Path, force: bool) -> Result<Option<Value>> {
+    let mut file: Value = serde_json::from_str(text).map_err(|e| {
+        anyhow::anyhow!(
+            "{}: {e}. Left untouched — the permissions and hooks already there \
+             are worth more than the ones we came to add.",
+            path.display()
+        )
+    })?;
+
+    let groups = stop_groups_of(&mut file, path)?;
+    if groups.iter().any(is_mezz_group) && !force {
+        return Ok(None);
+    }
+    groups.retain(|g| !is_mezz_group(g));
+    groups.push(group);
+    Ok(Some(file))
+}
+
+/// The `hooks.Stop` array, created when absent.
+///
+/// Written out rather than indexed into, for [`servers_of`]'s reason: a file
+/// whose `hooks` is a string should be refused, not panicked on.
+fn stop_groups_of<'a>(file: &'a mut Value, path: &Path) -> Result<&'a mut Vec<Value>> {
+    let Value::Object(map) = file else {
+        bail!(
+            "{}: the top level is not a JSON object. Left untouched.",
+            path.display()
+        );
+    };
+    let hooks = match map.entry("hooks").or_insert_with(|| json!({})) {
+        Value::Object(hooks) => hooks,
+        _ => bail!("{}: `hooks` is not an object. Left untouched.", path.display()),
+    };
+    match hooks.entry("Stop").or_insert_with(|| json!([])) {
+        Value::Array(groups) => Ok(groups),
+        _ => bail!(
+            "{}: `hooks.Stop` is not an array. Left untouched.",
+            path.display()
+        ),
+    }
+}
+
+fn is_mezz_group(group: &Value) -> bool {
+    group["hooks"].as_array().is_some_and(|legs| {
+        legs.iter()
+            .any(|leg| leg["command"].as_str().is_some_and(|c| c.contains(HOOK_MARKER)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,10 +1178,81 @@ mod tests {
         assert_eq!(detect_spec_dir(root, &paths(&["/repo/mezz.elv"])), None);
     }
 
+    /// Nothing beyond the inferred language and the two keys the scaffold's
+    /// own second file depends on. `debounce_ms`, `max_depth` and the rest
+    /// stay absent: written out they would only freeze today's defaults.
     #[test]
-    fn the_body_carries_only_what_was_inferred() {
+    fn the_body_carries_what_was_inferred_and_what_the_scaffold_needs() {
         let body = settings_body(&[Language::Rust], None);
-        assert_eq!(body, "{\n  \"language\": [\n    \"rust\"\n  ]\n}\n");
+        assert_eq!(
+            body,
+            "{\n  \"language\": [\n    \"rust\"\n  ],\n  \
+             \"output_dir\": \".mezz/data\",\n  \"port\": 3000\n}\n"
+        );
+    }
+
+    /// The reported failure (CFG-016): the scaffolded `output_dir` must stay
+    /// under `.mezz/`, the directory init just made. `ui/public` is a guess
+    /// about the reader's tree, and a repo with a file called `ui` at its
+    /// root fails the first `mezz watch` on it.
+    #[test]
+    fn the_scaffolded_output_dir_stays_inside_the_mezz_directory() {
+        let body: Value = serde_json::from_str(&settings_body(&[Language::Rust], None)).unwrap();
+        let dir = body["output_dir"].as_str().unwrap();
+        assert!(Path::new(dir).is_relative(), "{dir} escapes the checkout");
+        assert!(dir.starts_with(".mezz/"), "{dir} is outside .mezz/");
+    }
+
+    /// `write_tasks` bakes the port into `tasks.json` by reading it back from
+    /// the file `write_settings` has just written. If the two disagree, the
+    /// Open task points at one engine and the Stop task kills another.
+    #[test]
+    fn the_scaffolded_port_is_the_one_the_tasks_are_built_from() {
+        let body: Value = serde_json::from_str(&settings_body(&[Language::Rust], None)).unwrap();
+        assert_eq!(body["port"].as_u64(), Some(u64::from(settings::DEFAULT_PORT)));
+    }
+
+    fn previous(json: &str) -> Map<String, Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// `--force` is for re-inferring a language list after the repo changed
+    /// shape. A port the reader picked is not an inference, and resetting it
+    /// would put the old number back into `tasks.json` too.
+    #[test]
+    fn force_keeps_the_port_and_output_dir_the_reader_chose() {
+        let body = carry_over(
+            settings_body(&[Language::Rust], None),
+            &previous(r#"{"port":3456,"output_dir":"build/graph","language":["go"]}"#),
+        );
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["port"].as_u64(), Some(3456));
+        assert_eq!(parsed["output_dir"].as_str(), Some("build/graph"));
+        // The language list is exactly what `--force` was reached for, so it
+        // is the one thing that must *not* survive.
+        assert_eq!(parsed["language"][0].as_str(), Some("rust"));
+    }
+
+    /// The first `mezz init` in a repo has nothing to carry, and must still
+    /// come out with the scaffolded defaults rather than no keys at all.
+    #[test]
+    fn a_first_run_carries_nothing_and_keeps_the_scaffolded_values() {
+        let body = carry_over(settings_body(&[Language::Rust], None), &Map::new());
+        assert_eq!(body, settings_body(&[Language::Rust], None));
+    }
+
+    /// A key this command does not own is not preserved: `--force` replaces
+    /// the file, and pretending otherwise would make it a merge nobody asked
+    /// for.
+    #[test]
+    fn force_carries_nothing_beyond_the_two_named_keys() {
+        let body = carry_over(
+            settings_body(&[Language::Rust], None),
+            &previous(r#"{"max_depth":9,"port":3456}"#),
+        );
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.get("max_depth").is_none());
+        assert_eq!(parsed["port"].as_u64(), Some(3456));
     }
 
     #[test]
@@ -749,7 +1328,13 @@ mod tests {
 
     #[test]
     fn every_generated_task_is_labelled_and_matcher_bearing() {
-        for task in [mezz_tasks(3100), spawn_tasks(true)].concat() {
+        for task in [
+            mezz_tasks(3100),
+            spawn_tasks(true),
+            editor_tool_tasks(true),
+        ]
+        .concat()
+        {
             assert!(task["label"]
                 .as_str()
                 .is_some_and(|l| l.starts_with("Mezzanine: ")));
@@ -788,10 +1373,111 @@ mod tests {
     /// Asking for the task without `--vscode` used to write nothing at all.
     #[test]
     fn asking_for_the_spawn_task_implies_the_vscode_scaffold() {
-        let t = Targets::new(false, false, false).with_agent_spawn(true);
+        let t = Targets::new(false, false, false, false).with_agent_spawn(true);
         assert!(t.vscode && t.agent_spawn);
         // `--all` is every optional *file*, not this.
-        assert!(!Targets::new(false, false, true).agent_spawn);
+        assert!(!Targets::new(false, false, false, true).agent_spawn);
+    }
+
+    /// Same two properties as the spawn task, for the same two reasons: it
+    /// has nowhere to live without `--vscode`, and it is volume rather than
+    /// a file, so `--all` must not pick it up.
+    #[test]
+    fn asking_for_the_editor_tools_implies_the_vscode_scaffold() {
+        let t = Targets::new(false, false, false, false).with_editor_tools(true);
+        assert!(t.vscode && t.editor_tools);
+        assert!(!Targets::new(false, false, false, true).editor_tools);
+        assert!(editor_tool_tasks(false).is_empty());
+    }
+
+    /// The whole point of these tasks is that they are *scoped*. One that
+    /// mentioned no editor variable would silently analyze the whole
+    /// repository under a label promising the open file — the failure a
+    /// reader would take longest to notice, because it still prints a
+    /// plausible report.
+    #[test]
+    fn every_editor_tool_names_the_open_file_or_its_folder() {
+        for task in editor_tool_tasks(true) {
+            let args = task["args"].to_string();
+            assert!(
+                args.contains(THIS_FILE) || args.contains(THIS_FOLDER),
+                "{} is not scoped to the editor: {args}",
+                task["label"]
+            );
+            // A path relative to the wrong root is the other way to get a
+            // plausible report about the wrong tree.
+            assert_eq!(task["options"]["cwd"], json!("${fileWorkspaceFolder}"));
+        }
+    }
+
+    /// `--line` is what turns `impact` from a report about the file into one
+    /// about the entity spanning a line, so the two tasks differ by exactly
+    /// that and must not drift into being the same call under two labels.
+    #[test]
+    fn the_file_and_cursor_impact_tasks_ask_different_questions() {
+        let tasks = editor_tool_tasks(true);
+        let args = |label: &str| {
+            tasks
+                .iter()
+                .find(|t| t["label"] == json!(format!("Mezzanine: {label}")))
+                .unwrap_or_else(|| panic!("no task labelled {label}"))["args"]
+                .clone()
+        };
+        assert_eq!(
+            args("What depends on this file"),
+            json!(["impact", "--path", THIS_FILE])
+        );
+        assert_eq!(
+            args("Impact of the entity at the cursor"),
+            json!(["impact", "--path", THIS_FILE, "--line", THIS_LINE])
+        );
+    }
+
+    /// Samples of the two row kinds `quality` prints, copied from a real run
+    /// over `src/mcp/tools.rs`. The matcher has to take the first and leave
+    /// the second: a "ranking, not a verdict" in the Problems panel is a
+    /// verdict, whatever the paragraph above it says.
+    const A_SMELL_ROW: &str =
+        "- function `trace` — tools.rs:2249 (L2249, loc 114, cx 18, cog 61, ws 18, in 1, \
+         out 50, ⚠ Overfull Head)";
+    const A_PRESSURE_ROW: &str =
+        "- [1.44] function `trace` — tools.rs:2249 (L2249, loc 114, cx 18, cog 61, ws 18, \
+         in 1, out 50, ⚠ Overfull Head, 6 of it identified)";
+
+    /// The one test that would catch `entity_row` in `mcp/tools.rs` drifting
+    /// away from the regex written here. Without it the drift shows up as an
+    /// empty Problems panel, which reads exactly like a clean file.
+    #[test]
+    fn the_quality_matcher_takes_smells_and_leaves_the_ranking() {
+        let matcher = tool_matcher("quality");
+        let pattern = matcher["pattern"]["regexp"].as_str().unwrap();
+        let re = regex::Regex::new(pattern).unwrap();
+
+        let caught = re
+            .captures(A_SMELL_ROW)
+            .unwrap_or_else(|| panic!("{pattern} no longer matches a smell row"));
+        assert_eq!(&caught[1], "tools.rs");
+        assert_eq!(&caught[2], "2249");
+        assert_eq!(&caught[3], "Overfull Head");
+
+        assert!(
+            !re.is_match(A_PRESSURE_ROW),
+            "the refactor-pressure ranking would land in the Problems panel"
+        );
+    }
+
+    /// A matcher that resolves `tools.rs:2249` has to say what folder to
+    /// resolve it against, and the only folder that is right is the one
+    /// holding the file the task was scoped to.
+    #[test]
+    fn only_quality_carries_a_matcher_and_it_is_anchored_to_the_open_folder() {
+        assert_eq!(
+            tool_matcher("quality")["fileLocation"],
+            json!(["relative", "${fileDirname}"])
+        );
+        for tool in ["map", "impact", "reshape", "hotspots"] {
+            assert_eq!(tool_matcher(tool), json!([]), "{tool} grew a matcher");
+        }
     }
 
     #[test]
@@ -878,24 +1564,132 @@ mod tests {
         assert_eq!(entry["args"], json!(["mcp"]));
     }
 
+    // -----------------------------------------------------------------------
+    // Claude Code hooks
+    // -----------------------------------------------------------------------
+
+    fn merged_stop(text: &str, force: bool) -> Vec<Value> {
+        merge_hooks(text, hook_group(), Path::new("settings.json"), force)
+            .unwrap()
+            .expect("a merge was expected")["hooks"]["Stop"]
+            .as_array()
+            .expect("Stop is an array")
+            .clone()
+    }
+
+    /// The three things the wrapper has to do, none of which the binary can do
+    /// for itself. Asserted on the string because the string is the contract:
+    /// this is what Claude Code executes.
+    #[test]
+    fn the_wrapper_blocks_routes_and_fails_safe() {
+        let cmd = hook_command("self-review");
+        assert!(cmd.contains("--block"), "{cmd}");
+        // Findings on stdout, chatter dropped, findings re-emitted on stderr —
+        // the only stream a blocked stop feeds back to the agent.
+        assert!(cmd.contains("2>/dev/null"), "{cmd}");
+        assert!(cmd.contains(">&2"), "{cmd}");
+        // Only exit 2 propagates: a missing mezz must not wedge every stop.
+        assert!(cmd.contains("[ $r -eq 2 ] && exit 2; exit 0"), "{cmd}");
+    }
+
+    #[test]
+    fn both_legs_are_wired() {
+        let legs = hook_group()["hooks"].as_array().unwrap().clone();
+        assert_eq!(legs.len(), 2);
+        assert!(legs[0]["command"].as_str().unwrap().contains("self-review"));
+        assert!(legs[1]["command"].as_str().unwrap().contains("hook check"));
+    }
+
+    /// The file holds a reader's permission allowlist before it holds our
+    /// hooks, and it is the only record of it.
+    #[test]
+    fn wiring_preserves_permissions_and_foreign_hooks() {
+        let text = r#"{"permissions":{"allow":["Bash(ls)"]},
+                       "hooks":{"Stop":[{"hooks":[{"type":"command","command":"make lint"}]}]}}"#;
+        let merged = merge_hooks(text, hook_group(), Path::new("settings.json"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged["permissions"]["allow"][0], "Bash(ls)");
+        let stop = merged["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "the foreign hook must survive: {stop:?}");
+        assert!(!is_mezz_group(&stop[0]));
+        assert!(is_mezz_group(&stop[1]));
+    }
+
+    /// Re-running `mezz init --hooks` must be a no-op, not a second copy.
+    #[test]
+    fn wiring_twice_changes_nothing() {
+        let text = serde_json::to_string(&json!({ "hooks": { "Stop": [hook_group()] } })).unwrap();
+        let again = merge_hooks(&text, hook_group(), Path::new("settings.json"), false).unwrap();
+        assert!(again.is_none(), "{again:?}");
+    }
+
+    /// `--force` replaces our leg and nobody else's — a reader who tuned the
+    /// redirection gets ours back, a reader with their own Stop hook keeps it.
+    #[test]
+    fn force_replaces_only_our_own_group() {
+        let text = r#"{"hooks":{"Stop":[
+            {"hooks":[{"type":"command","command":"make lint"}]},
+            {"hooks":[{"type":"command","command":"mezz hook self-review"}]}]}}"#;
+        let stop = merged_stop(text, true);
+        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert_eq!(stop[0]["hooks"][0]["command"], "make lint");
+        assert!(stop[1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--block"));
+    }
+
+    #[test]
+    fn a_file_without_a_hooks_key_gains_one() {
+        let stop = merged_stop(r#"{"permissions":{"allow":[]}}"#, false);
+        assert_eq!(stop.len(), 1);
+        assert!(is_mezz_group(&stop[0]));
+    }
+
+    #[test]
+    fn an_unparseable_settings_file_is_refused_rather_than_rewritten() {
+        let err = merge_hooks("{oops", hook_group(), Path::new("settings.json"), false).unwrap_err();
+        assert!(err.to_string().contains("Left untouched"), "{err}");
+    }
+
+    /// The three shapes that would panic if the group were written by indexing
+    /// instead of through [`stop_groups_of`].
+    #[test]
+    fn a_settings_file_of_the_wrong_shape_is_refused() {
+        for text in ["[]", r#"{"hooks":[]}"#, r#"{"hooks":{"Stop":{}}}"#] {
+            let err =
+                merge_hooks(text, hook_group(), Path::new("settings.json"), false).unwrap_err();
+            assert!(err.to_string().contains("Left untouched"), "{text}: {err}");
+        }
+    }
+
     #[test]
     fn all_turns_on_every_scaffold() {
         assert_eq!(
-            Targets::new(false, false, true),
+            Targets::new(false, false, false, true),
             Targets {
                 vscode: true,
                 mcp: true,
-                // Every optional *file*. The agent-spawn task is not one.
-                agent_spawn: false
+                hooks: true,
+                // Every optional *file*. Neither of the two task-only
+                // scaffolds below is one.
+                agent_spawn: false,
+                editor_tools: false
             }
         );
-        assert_eq!(Targets::new(false, false, false), Targets::default());
         assert_eq!(
-            Targets::new(true, false, false),
+            Targets::new(false, false, false, false),
+            Targets::default()
+        );
+        assert_eq!(
+            Targets::new(true, false, false, false),
             Targets {
                 vscode: true,
                 mcp: false,
-                agent_spawn: false
+                hooks: false,
+                agent_spawn: false,
+                editor_tools: false
             }
         );
     }

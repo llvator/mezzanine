@@ -13,10 +13,7 @@
 //! children (`int a, b;`), so both helpers return a `Vec`.
 
 use super::super::language_parser::{node_text, node_to_span};
-use super::helpers::{
-    annotation_name, declared_type, is_field_annotation, parse_modifier_attributes,
-    parse_visibility,
-};
+use super::helpers::{declared_type, parse_modifier_attributes, parse_visibility};
 use super::javadoc::extract_javadoc;
 use crate::models::{CodeEntity, EntityKind, Visibility};
 use std::path::Path;
@@ -55,41 +52,6 @@ pub(super) fn parse_class_field(
         }
     }
     entities
-}
-
-/// True when a `local_variable_declaration` carries a `@Field` (or
-/// fully-qualified `@groovy.transform.Field`) annotation. Used by the
-/// dispatcher to decide whether a script-scope `local_variable_declaration`
-/// should be promoted to a module-state entity.
-pub(super) fn has_field_annotation(node: &Node, source: &str) -> bool {
-    let modifiers = match node.child_by_field_name("modifiers") {
-        Some(m) => Some(m),
-        None => {
-            let mut cursor = node.walk();
-            let mut found = None;
-            for c in node.children(&mut cursor) {
-                if c.kind() == "modifiers" {
-                    found = Some(c);
-                    break;
-                }
-            }
-            found
-        }
-    };
-    let Some(modifiers) = modifiers else {
-        return false;
-    };
-    let mut cursor = modifiers.walk();
-    for child in modifiers.children(&mut cursor) {
-        if child.kind() == "marker_annotation" || child.kind() == "annotation" {
-            if let Some(name) = annotation_name(&child, source) {
-                if is_field_annotation(&name) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Parse a `@Field`-annotated `local_variable_declaration` at script

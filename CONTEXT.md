@@ -14,11 +14,23 @@ _Avoid_: Node, item, declaration.
 A typed edge between two Entities (`source_id` → `target_id`). The `kind` (Contains, Calls, References, Imports, …) determines visual treatment in the renderer.
 _Avoid_: Edge, link, dependency.
 
+**External target**:
+The far end of a Relationship that leaves the repository: a call or a type reference landing on the language's own standard library (`stdlib`) or on a module or type neither the language ships nor this repo declares (`third-party`). A dependency of the code, and named as one — grouped by the module or type it hangs off, counted per call site. Placed from the name alone, since mezz carries no external imports, so a qualifier is treated as proof of a module or a type only when it is capitalised or itself qualified — `Node::walk` and `std::fs::write` yes, `body::push` no.
+_Avoid_: Ghost (that is the *node* an unbound name attaches to, whichever of the two it turns out to be), library, vendor.
+
+**Unresolved target**:
+The far end of a Relationship that mezz could not bind to anything — a parser miss, a call form a language's extractor does not reach, or a receiver whose type nothing declared. Not an **External target** and never counted with one: it is a hole in the graph, and its presence makes every other count in the same response a floor rather than a total. Listed under the name it arrived with, qualifier included, because the reader may place what mezz cannot.
+_Avoid_: External, missing, broken edge (the edge exists; what it points at is unidentified).
+
 **LanguageParser**:
 The trait every per-language parser implements. Returns a `ParseResult` of Entities, Relationships, Imports, and Warnings for one source file. Per ADR 0001, parsers stay independent — no shared scaffolding beyond the trait.
 
 **Smell**:
-A named anti-pattern signal (God Class, Dispatcher, Feature Envy, Shotgun Surgery, Data Bag) detected by combining metrics in a post-parse pass. Surfaced in the UI's Quality panel.
+A named anti-pattern signal (God Class, Dispatcher, Feature Envy, Shotgun Surgery, Data Bag, Overfull Head) detected by combining metrics in a post-parse pass. Surfaced in the UI's Quality panel.
+
+**Working set**:
+How many distinct names one callable body puts in front of a reader at once: parameters + locals + the instance fields it reaches for through an explicit `self`/`this`. The only per-entity measure here that is not about control flow, which is the point of it — a body with no branches at all scores `cyclomatic 1, cognitive 0` however many names it juggles. Thresholded at Miller's 7±2 (green ≤7, amber ≤12, red >12); over the red line raises the **Overfull Head** Smell. A *floor*, not a total: fields go uncounted in languages that let a method write `total` for `this.total` (Java, Kotlin, Groovy, Go). Like **Folder shape** it feeds no ratio and stays out of `composite_score` (ADR 0032).
+_Avoid_: Cognitive load, variable count, live variables.
 
 **Population**:
 The set of Entities the Quality panel's numbers describe, chosen explicitly by the reader: the whole analysis scope, the scope tree selection, what the canvas is currently drawing (post-filter), the current selection, the file open in the editor, or the files a diff changed. One population governs the whole panel — summary, scatters, entity rows, and the file and folder rollups — so two figures in it always count the same Entities. Distinct from **scope**, which decides what is loaded and analysed, and from the **Files** visual filter, which decides what the canvas draws and deliberately leaves the population alone (ADR 0010).
@@ -56,6 +68,10 @@ _Avoid_: Tree-ness (which is what Layering was defined *against*), fan-in, coupl
 **Egress** (out at the bottom):
 The share of a folder's outgoing dependencies that start at a **leaf** — a child with no outgoing edge inside the folder — or at its **Door**. The mirror of **Entry concentration**: that one grades what arrives, this grades what leaves, and together they are what make a collapsed folder an honest single node in both directions. Only the near end is graded; where an exit *lands* stays its target's business (ADR 0031). Gates `Fractal` and is deliberately outside `compliance`, exactly as **Arborescence** is. A middle-layer child reaching outside makes the layering drawn above it a fiction — the drawing says it depends downward on its siblings, the program says it also reaches out of the building.
 _Avoid_: Efferent coupling, fan-out, leak (the first two count edges wherever they start, which is the distinction this exists to draw).
+
+**Uniformity**:
+A folder's breadth against its widest subfolder's, smaller over larger — the only score on a **Folder shape** that compares two zoom levels rather than reading one (ADR 0033). Every other one, `child_compliance` included, grades a single level against a fixed bar and then asks whether the level below clears that same bar; a tree can pass at all of them, at all of its levels, and still change scale abruptly between two of them, which is the shape a reader calls a mess. A folder of 11 children holding a subfolder of 57 scores 0.19 while every other number on it reads clean. Unlike **Arborescence** and **Egress** it gates *nothing* — not `Fractal`, not `compliance`, no tier at all — because its distribution across real repositories is not yet known and re-ranking every repo on a number nobody has seen is what ADR 0032 forbids. Unmeasured for a folder with no subfolder: one level is not a comparison.
+_Avoid_: Balance, symmetry, fractal score (the last would claim the whole property when this measures one dimension of it — breadth, not the drawing).
 
 **Folder picture**:
 The evidence behind a **Folder shape**: the same collapsed child graph the verdict is computed over, kept rather than discarded, with each child's level and each edge's **Edge verdict** marked on it, plus the one-hop traffic across the folder's boundary. Produced by the scoring pass itself, never rebuilt alongside it — a second derivation would be free to draw a picture the number denies. Computed for one folder on request, where the four scalars are cheap enough to carry for every folder.
@@ -207,6 +223,7 @@ _Avoid_: Camera, frame, window.
 - A **Saved view** holds one scope, one **Spec selection** and one set of visual filters; it never holds a **Population**, which the Quality panel chooses independently and which no view restores
 - A **Folder shape** is computed from the same dependency **Relationships** the coupling numbers use, and answers a different question of them: those ask how hard the code is to change, this asks whether its drawing can be followed. Neither reaches the other's score
 - A folder's **Shape pattern** is capped by its subfolders' — a parent cannot reach `Fractal` while any child sits below `Hierarchical`, which is what makes the measure recursive rather than one level's opinion
+- That recursion is a *conjunction* of a per-level property, not a comparison between levels: every gate behind `Fractal` grades one folder against a fixed bar, so **Uniformity** is the only reading that can tell a tree whose levels each pass from a tree whose levels resemble each other (ADR 0033)
 - The **Overview panel** reports the camera a **Saved view** deliberately omits: the view decides *what* the canvas draws, the panel says *where in it* the reader is standing, and neither can answer the other's question
 - Any spec entity declares zero or more **Code references**; the **Cross-filter** reads them rolled up over the `Contains`-subtree, while the reverse lookup ("who claims this file") reads only an entity's own — rolled up, every **Category** would claim most of the repo
 

@@ -12,7 +12,7 @@
 //! - [`javadoc`] — `/** ... */` extraction
 //! - [`types`] — `UsesType` edges from signature/field types (post-pass)
 
-mod bodies;
+pub(crate) mod bodies;
 mod complexity;
 mod ctx;
 mod declarations;

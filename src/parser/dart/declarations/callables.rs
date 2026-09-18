@@ -28,6 +28,7 @@ use super::attributes::is_modifier;
 use crate::models::{CodeEntity, EntityKind, Span};
 use crate::parser::language_parser::{node_text, node_to_span};
 use tree_sitter::Node;
+use crate::parser::working_set;
 
 /// The `*_signature` kinds that name a callable.
 const SIGNATURE_KINDS: &[&str] = &[
@@ -142,7 +143,7 @@ fn parse(
         entity.parameters = parse_parameters(&params, source);
     }
 
-    populate_body_metrics(callable, &mut entity);
+    populate_body_metrics(callable, source, &mut entity);
     entity.documentation = doc_comments::extract(&callable.anchor, source);
     entity.source_code = Some(source[span.start.offset..span.end.offset].to_string());
     Some(entity)
@@ -242,7 +243,7 @@ pub(super) fn annotations(anchor: &Node, source: &str) -> Vec<String> {
 /// scores `cyclomatic = 1` and zero nesting: it has one straight-through
 /// path by virtue of existing as a signature. Leaving the metrics unset
 /// instead would drop the entity out of `mezz quality` entirely.
-fn populate_body_metrics(callable: &Callable<'_>, entity: &mut CodeEntity) {
+fn populate_body_metrics(callable: &Callable<'_>, source: &str, entity: &mut CodeEntity) {
     entity.metrics.loc = (entity.span.end.line - entity.span.start.line + 1) as u32;
     entity.metrics.param_count = Some(entity.parameters.len() as u32);
     match callable.body {
@@ -258,6 +259,8 @@ fn populate_body_metrics(callable: &Callable<'_>, entity: &mut CodeEntity) {
             entity.metrics.cognitive_complexity = Some(0);
         }
     }
+    working_set::populate(entity, callable.body.as_ref(), source);
+    crate::parser::loops::populate(entity, callable.body.as_ref());
 }
 
 /// Read a `class_member` as a callable, if it declares one.

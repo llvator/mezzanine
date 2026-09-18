@@ -145,6 +145,14 @@ fn finding(label: &'static str, gloss: &'static str, value: f32, t: &WarnBad) ->
 ///
 /// Mirrors the callable arm of `populate_composite_scores`; keep the two in
 /// step so the prompt never cites a metric the ranking ignores.
+///
+/// One deliberate exception: **working set** is cited here and is not in the
+/// score. It measures names in view rather than control flow, so a body can
+/// be over its red line while every scored metric sits green — which is the
+/// case the prompt most needs to name, and the case a ranking tuned before
+/// the metric existed cannot surface on its own. Folding it into
+/// `composite_score` would re-rank every repo, and that is a separate change
+/// from measuring a new thing.
 fn callable_findings(e: &CodeEntity, t: &Thresholds) -> Vec<Finding> {
     let m = &e.metrics;
     vec![
@@ -172,6 +180,12 @@ fn callable_findings(e: &CodeEntity, t: &Thresholds) -> Vec<Finding> {
             "arguments taken, excluding self/this",
             m.param_count.unwrap_or(0) as f32,
             &t.params,
+        ),
+        finding(
+            "working set",
+            "distinct names in view at once — parameters, locals and fields reached through self/this;              the count a reader has to hold, which no other metric here measures",
+            m.working_set.unwrap_or(0) as f32,
+            &t.working_set,
         ),
         finding(
             "fan-out",
@@ -397,7 +411,8 @@ fn assert_smell_vocabulary_total(s: SmellKind) -> (&'static str, &'static str) {
         | SmellKind::Dispatcher
         | SmellKind::FeatureEnvy
         | SmellKind::ShotgunSurgery
-        | SmellKind::DataBag => (s.label(), s.hint()),
+        | SmellKind::DataBag
+        | SmellKind::OverfullHead => (s.label(), s.hint()),
     }
 }
 

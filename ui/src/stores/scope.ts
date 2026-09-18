@@ -744,6 +744,16 @@ export async function refreshData(): Promise<void> {
     // Reload the index
     await loadIndex();
 
+    // The full graph has readers no visual scope covers — the spec pane and
+    // Quality's analysis scope both slice `fullGraphDataStore` directly, and
+    // boot fills it whether or not a scope was ever picked. Invalidating the
+    // promise above is not enough for them: nobody would re-await it, so a
+    // refresh with nothing selected reloaded the index and left those panes
+    // on the data they booted with. Only when it was already loaded — an
+    // untouched store means nobody has asked for it yet, and fetching the
+    // whole repo on a refresh is not the moment to start.
+    if (get(fullGraphDataStore)) await ensureFullData();
+
     // Re-apply the selection against the new index/data
     if (previousSelection.size > 0) {
       await applySelection();

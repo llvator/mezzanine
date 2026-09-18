@@ -246,7 +246,11 @@ pub fn graded(path: &Path, config: Config, rules: &Rules) -> Outcome {
 /// [`structure`] reads the edges between files — but an author reads one
 /// list and works down it, so the order is a property of the report and not
 /// of either counter.
-fn violations(graph: &DependencyGraph, rules: &Rules, repo_root: &Path) -> Vec<Violation> {
+pub(crate) fn violations(
+    graph: &DependencyGraph,
+    rules: &Rules,
+    repo_root: &Path,
+) -> Vec<Violation> {
     let mut found = count::violations(graph, rules, repo_root);
     found.extend(structure::violations(graph, rules, repo_root));
     found.sort_by(|a, b| (&a.path, a.line, a.rule.name()).cmp(&(&b.path, b.line, b.rule.name())));

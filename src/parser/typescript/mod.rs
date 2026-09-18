@@ -14,7 +14,7 @@
 //! - [`types`] — `UsesType` edges from signature/member types (post-pass)
 //! - [`values`] — `UsesValue` edges from imported names read as values
 
-mod bodies;
+pub(crate) mod bodies;
 mod ctx;
 mod declarations;
 mod decorators;

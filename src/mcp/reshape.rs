@@ -60,7 +60,7 @@ use super::McpServer;
 /// `reshape` — one folder's drawn graph plus the single move that lifts it
 /// a tier.
 pub fn reshape(server: &McpServer, args: &Value) -> Result<String> {
-    let folder = target_folder(server, args)?;
+    let folder = target_folder(server, args, "reshape")?;
     // The whole repo, deliberately — see the module header.
     let graph = super::tools::analyze(server, &server.root)?;
 
@@ -218,6 +218,14 @@ fn verdict_section(shape: &FolderShape, t: &Thresholds, p: &FolderPicture) -> Ve
             t.shape_child,
         ),
         format!(
+            "- uniformity {} (below {:.2} this folder and the level inside it are \
+             drawn at different scales; gates NOTHING and is NOT part of \
+             compliance){}",
+            num(shape.uniformity),
+            t.shape_uniformity,
+            scale_note(shape),
+        ),
+        format!(
             "- compliance {:.2} (needs ≥ {:.2} for `fractal`) — a weighted blend of \
              acyclicity, layering, entry concentration and child compliance. \
              Branching is deliberately not in it, so this can read well while \
@@ -235,6 +243,14 @@ fn verdict_section(shape: &FolderShape, t: &Thresholds, p: &FolderPicture) -> Ve
          complexity and coupling scores elsewhere in mezz. The child count is the \
          exception and reads the ordinary way round — it is a count, not a ratio. \
          `—` means unmeasured, not perfect."
+            .to_string(),
+        String::new(),
+        "Every score above except `uniformity` grades this one folder against a \
+         fixed bar, `child compliance` included — it averages numbers each taken \
+         against that same bar. `uniformity` is the only one that compares two \
+         zoom levels, so a tree can clear every other gate at every level and \
+         still change scale abruptly between them. It gates nothing yet and a low \
+         reading is not a reason to keep working after the task below is done."
             .to_string(),
         String::new(),
     ];
@@ -283,6 +299,16 @@ fn formulas(shape: &FolderShape) -> Vec<String> {
             "- entry concentration = arrivals on the busiest file ÷ arrivals from \
              outside: {} ÷ {}",
             t.busiest, t.arrivals
+        ));
+    }
+    if t.widest_child > 0 {
+        let (lo, hi) = (
+            shape.child_count.min(t.widest_child),
+            shape.child_count.max(t.widest_child),
+        );
+        rows.push(format!(
+            "- uniformity = the smaller of this folder's breadth and its widest \
+             subfolder's ÷ the larger: {lo} ÷ {hi}"
         ));
     }
     let mut body = vec![
@@ -335,6 +361,26 @@ fn crowding_note(children: u32, ceiling: u32) -> &'static str {
     " — note that funnelling egress into leaves adds children, so this and the \
      funnel property push against each other. At the bar, group into subfolders \
      rather than stopping the funnel work; each subfolder then earns its own door."
+}
+
+/// The two breadths `uniformity` divides, for the folder where they differ
+/// enough to be worth going and looking at.
+///
+/// The ratio alone does not say which way round it is, and the two
+/// directions are opposite pieces of work. A folder of 11 holding a
+/// subfolder of 57 has one child doing all the carrying; a folder of 20
+/// holding subfolders of 2 is a level that never delegated. Both read
+/// 0.19-ish and neither is fixed by the other's remedy.
+fn scale_note(shape: &FolderShape) -> String {
+    let (own, inner) = (shape.child_count, shape.terms.widest_child);
+    if own == 0 || inner == 0 || own == inner {
+        return String::new();
+    }
+    let (wide, narrow) = if inner > own { ("inside", "here") } else { ("here", "inside") };
+    format!(
+        " — {own} children here, {inner} in the widest subfolder; the level {wide} \
+         holds what the level {narrow} does not"
+    )
 }
 
 /// The count `egress` rounds off, the way [`ways_in`] does for
@@ -2278,8 +2324,13 @@ pub(super) fn rel(path: &Path, root: &Path) -> String {
         .to_string()
 }
 
-/// Resolve the required `path` argument to a folder under the root.
-pub(super) fn target_folder(server: &McpServer, args: &Value) -> Result<PathBuf> {
+/// The `path` argument as an absolute path under the root, whatever it
+/// turns out to be. The root itself when `path` is absent.
+///
+/// Says nothing about folder or file: which of the two a tool can answer
+/// for is the tool's own question, and `boundaries` answers for both
+/// (MCP-040).
+pub(super) fn target_path(server: &McpServer, args: &Value) -> PathBuf {
     let raw = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -2290,15 +2341,38 @@ pub(super) fn target_folder(server: &McpServer, args: &Value) -> Result<PathBuf>
     } else {
         server.root.join(raw)
     };
-    let resolved = candidate.canonicalize().unwrap_or(candidate);
+    candidate.canonicalize().unwrap_or(candidate)
+}
+
+/// Resolve the required `path` argument to a folder under the root.
+///
+/// `asked_by` is the tool the caller actually invoked. The rationale here
+/// is about *shape*, which is `reshape`'s and `layout`'s subject and
+/// genuinely is a property of a folder's children — but the refusal used
+/// to name `reshape` whoever asked, sending a `layout` caller to a tool
+/// they had not chosen, and a `boundaries` caller to one that could not
+/// answer their question at all (MCP-040).
+pub(super) fn target_folder(server: &McpServer, args: &Value, asked_by: &str) -> Result<PathBuf> {
+    let resolved = target_path(server, args);
     if resolved.is_file() {
         bail!(
             "{} is a file. Shape is a property of a folder's children, and a file \
-             has none — call `reshape` on the folder holding it.",
+             has none — call `{asked_by}` on {}, the folder holding it.",
             rel(&resolved, &server.root),
+            holder(&resolved, &server.root),
         );
     }
     Ok(resolved)
+}
+
+/// The folder holding `file`, named as the caller would pass it.
+fn holder(file: &Path, root: &Path) -> String {
+    match file.parent().map(|p| rel(p, root)) {
+        Some(name) if !name.is_empty() => format!("`{name}`"),
+        // `rel` of the root against itself is the empty string, and a
+        // refusal that ends in an empty backtick pair names nothing.
+        _ => "the repository root".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -2371,6 +2445,7 @@ mod tests {
             entry_concentration: Some(0.4),
             egress: None,
             child_compliance: None,
+            uniformity: None,
             child_count: 3,
             blocker,
             terms: crate::models::ShapeTerms::default(),

@@ -11,12 +11,22 @@
   import FilterPanel from './FilterPanel.svelte';
   import QualityReport from './QualityReport.svelte';
   import Settings from './Settings.svelte';
+  import ChangedFiles from './ChangedFiles.svelte';
   import { sidebarTab } from '../stores/panes';
+  import { diffActive } from '../stores/diff';
 
-  /** Which tab is showing is a store rather than component state since
-   *  UI-075: `f`, `q` and `s` switch tabs from the keyboard, and the handler
-   *  that owns those keys is not inside this component. */
-  $: activeTab = $sidebarTab;
+  /**
+   * Which tab is showing is a store rather than component state since UI-075:
+   * `f`, `q`, `g` and `s` switch tabs from the keyboard, and the handler that
+   * owns those keys is not inside this component.
+   *
+   * `changes` is the one tab that can be unavailable. It is offered only while
+   * a comparison is loaded — with no diff it would be a permanently empty tab,
+   * and the picker that fills it is above the canvas, not in here — so a
+   * reader standing on it when the diff is stopped lands back on Filters
+   * rather than on nothing.
+   */
+  $: activeTab = $sidebarTab === 'changes' && !$diffActive ? 'filters' : $sidebarTab;
 </script>
 
 <div class="sidebar">
@@ -33,6 +43,16 @@
       class:active={activeTab === 'quality'}
       on:click={() => sidebarTab.set('quality')}
     >Quality</button>
+    {#if $diffActive}
+      <button
+        type="button"
+        class="tab"
+        class:active={activeTab === 'changes'}
+        data-probe="tab-changes"
+        title="The files git reports for the loaded comparison (G)"
+        on:click={() => sidebarTab.set('changes')}
+      >Changes</button>
+    {/if}
     <button
       type="button"
       class="tab tab-icon"
@@ -40,9 +60,12 @@
       on:click={() => sidebarTab.set('settings')}
       title="Settings"
     >
-      <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="10" cy="10" r="3" />
-        <path d="M10 1.5v2M10 16.5v2M3.4 3.4l1.4 1.4M15.2 15.2l1.4 1.4M1.5 10h2M16.5 10h2M3.4 16.6l1.4-1.4M15.2 4.8l1.4-1.4" />
+      <!-- A gear, not the sun this button used to wear: the pane behind it
+           stopped being about appearance alone once the settings report, the
+           view preferences and the mirror switch moved in. -->
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
       </svg>
     </button>
   </div>
@@ -59,6 +82,8 @@
       <FilterPanel />
     {:else if activeTab === 'quality'}
       <QualityReport />
+    {:else if activeTab === 'changes'}
+      <ChangedFiles />
     {:else}
       <Settings />
     {/if}

@@ -34,14 +34,23 @@
   import {
     canGoBack, canGoForward, backTitle, forwardTitle, backDepth, goBack, goForward,
   } from '../stores/viewHistory';
-  import { clearMarks, markCount } from '../stores/marks';
+  import { clearMarks, markCount, relatableCount } from '../stores/marks';
+  import { openRelate } from '../stores/relate';
   import { autoFitView } from '../stores/settings';
-  import type { GraphLevel } from '../types/graph';
+  import type { GraphLevel, ViewMode } from '../types/graph';
   import { HOVER_MODES, HOVER_MODE_LABELS, HOVER_MODE_TITLES } from '../viewmodels/hoverHighlight';
   import { toolbarCollapsed, splitViewOpen } from '../stores/panes';
   import { focusedPane } from '../stores/keymap';
   import { PANE_DIGIT } from '../viewmodels/keymap';
   import { specGraph } from '../stores/crossFilter';
+
+  /** What the collapsed bar calls each mode. A record rather than a ternary
+   *  chain: the summary is the only place the mode is visible once the
+   *  controls are folded away, and a fourth mode silently reading "Tree" is
+   *  exactly the invisible state the summary exists to prevent. */
+  const VIEW_MODE_LABEL: Record<ViewMode, string> = {
+    graph: 'Graph', tree: 'Tree', shape: 'Shape', flow: 'Flow',
+  };
 
   /** Bound instance of the graph, for the viewport actions. Undefined until
    *  App's `bind:this` lands, which is after this component's first render. */
@@ -122,7 +131,7 @@
         <span class="toolbar-summary">
           {$viewMode === 'shape'
             ? `Shape: ${$shapeFolder || '(root)'}`
-            : `${$viewMode === 'graph' ? 'Graph' : 'Tree'} · ${$graphLevel}`}
+            : `${VIEW_MODE_LABEL[$viewMode] ?? 'Graph'} · ${$graphLevel}`}
           {$autoFitView ? ' · auto-fit' : ''}
           <!-- A marked set has a ring on the canvas but its only *control* is
                inside this bar, so a collapsed toolbar would leave the reader
@@ -217,6 +226,21 @@
           <button class="control-btn" on:click={() => graphView?.toggleViewMode()}>
             {$viewMode === 'graph' ? 'Tree View' : 'Graph View'}
           </button>
+          <!-- UI-146 — the same picture, laid out by which way the
+               dependencies run. A toggle rather than a stop on the Graph/Tree
+               button: it re-lays out what Graph view is showing, so a reader
+               flips it on to ask about direction and off again with the
+               population unchanged. Pressed state carries the answer to
+               "which layout am I looking at", which the columns alone do not
+               once the canvas is zoomed into one of them. -->
+          <button
+            class="control-btn"
+            class:active={$viewMode === 'flow'}
+            aria-pressed={$viewMode === 'flow'}
+            data-probe="flow-view-toggle"
+            on:click={() => graphView?.toggleFlowMode()}
+            title="Lay the graph out in dependency layers — what everything stands on at the left, what stands on it at the right"
+          >Flow</button>
           <!-- UI-108 — the way OUT of the shape view, and the only thing on
                screen that says which folder it is drawing. Offered only in
                that mode: unlike Graph and Tree there is nothing to switch
@@ -319,6 +343,21 @@
                  it here rather than silently return another file view. -->
             {#if !$markedStats.fitsEntityLevel}
               <span class="mark-note">{$markedStats.entities} entities · opens at file level</span>
+            {/if}
+            <!-- The other thing a marked set is for (UI-147). Offered only from
+                 two scopes up, because one scope has nothing to relate to — and
+                 counted after compacting, so marking a folder and a file inside
+                 it does not offer to compare that pair with itself. Unlike the
+                 drill this changes nothing on the canvas, which is the point:
+                 the picture that raised the question stays up while it is
+                 answered. -->
+            {#if $relatableCount >= 2}
+              <button
+                class="control-btn"
+                data-probe="relate-marks"
+                on:click={() => void openRelate()}
+                title="Read how the {$relatableCount} marked scopes relate — direction, what they share, and what connects them — without changing the view"
+              >Relate {$relatableCount} marked</button>
             {/if}
             <button class="control-btn" on:click={() => clearMarks()}>Clear Marks</button>
           {/if}

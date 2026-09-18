@@ -81,7 +81,7 @@ fn parse_function(
         entity.parameters = parse_parameters(&params, source);
     }
 
-    populate_body_metrics(find_child_by_kind(node, "function_body"), &mut entity);
+    populate_body_metrics(find_child_by_kind(node, "function_body"), source, &mut entity);
 
     entity.documentation = extract_kdoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());

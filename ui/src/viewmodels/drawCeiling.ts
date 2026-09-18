@@ -85,9 +85,25 @@ export interface DrawOverflow {
  * number the ceiling is compared against is the number that gets built.
  */
 export function drawnIdsOf(plan: DisplayPlan): Set<string> {
-  const ids = new Set(plan.visibleNodeIds);
-  if (plan.dimOpacity > 0) {
-    for (const id of plan.dimmedNodeIds) ids.add(id);
+  return drawnNodeSet(plan.visibleNodeIds, plan.dimmedNodeIds, plan.dimOpacity);
+}
+
+/**
+ * The same rule, before there is a plan to ask it about.
+ *
+ * `compute` needs this answer partway through — the edge tiers are decided
+ * against the drawn set, and a line whose end was never built renders as an
+ * arrow into empty space. Sharing the function rather than restating it is
+ * what keeps the ceiling charging for the set the View actually makes.
+ */
+export function drawnNodeSet(
+  visible: ReadonlySet<string>,
+  dimmed: ReadonlySet<string>,
+  dimOpacity: number,
+): Set<string> {
+  const ids = new Set(visible);
+  if (dimOpacity > 0) {
+    for (const id of dimmed) ids.add(id);
   }
   return ids;
 }
@@ -102,9 +118,14 @@ export function gateByDrawCeiling(
     ...plan,
     visibleNodeIds: new Set(),
     visibleLinkKeys: new Set(),
+    dimmedLinkKeys: new Set(),
     dimmedNodeIds: new Set(),
     contextNodeIds: new Set(),
     treePositions: new Map(),
+    // Nothing is drawn, so nothing is layered. An axis left standing would
+    // caption columns the overflow card replaced.
+    flowAxis: [],
+    flowCycleIds: new Set(),
     nodeDistances: null,
     selectedId: null,
     dimOpacity: 0,

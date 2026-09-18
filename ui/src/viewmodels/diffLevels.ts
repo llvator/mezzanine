@@ -210,3 +210,34 @@ export function planDiffLevel(
 
   return { visible, context, dimmed, changedEdgesOnly: level !== 'neighbourhood' };
 }
+
+/**
+ * Which tier one line belongs to (UI-144).
+ *
+ * The edge counterpart to `LevelPlan.dimmed`, and it exists for the same
+ * reason. A rung leaves nodes out and they are dimmed rather than dropped, so
+ * the Rest slider can fade them back as context — but the lines between them
+ * were dropped outright, and what the slider then faded in was a field of
+ * unconnected circles. That answers "what else is in here" and not "what shape
+ * does it make", which is the question a reader raising it actually has.
+ *
+ * Two ways to land in the Rest tier, and they are the same thing said twice:
+ * an end the rung did not draw, or an edge below `neighbourhood` that did not
+ * move. Both are untouched wiring around a change.
+ *
+ * The caller has already established that both ends are *drawn* — this only
+ * decides how loudly the line between them is. `changedLinkKeys` is null at
+ * `neighbourhood`, where untouched wiring is the point and every line that
+ * survived the other filters is the view's own.
+ */
+export function linkTier(
+  src: string,
+  tgt: string,
+  key: string,
+  visible: ReadonlySet<string>,
+  changedLinkKeys: ReadonlySet<string> | null,
+): 'visible' | 'rest' {
+  if (!visible.has(src) || !visible.has(tgt)) return 'rest';
+  if (changedLinkKeys && !changedLinkKeys.has(key)) return 'rest';
+  return 'visible';
+}

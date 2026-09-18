@@ -5,7 +5,7 @@ import type {
 } from '../types/graph';
 import { graphData, rawEntityGraph, selectedNode } from './graph';
 import { diffData } from './diff';
-import { analysisGraphData } from './scope';
+import { analysisGraphData, fullGraphDataStore } from './scope';
 import { displayPlan } from '../viewmodels/displayPlan';
 import {
   ancestorDirs,
@@ -13,6 +13,7 @@ import {
   narrowRollups,
   selectionPopulation,
 } from '../viewmodels/qualityPopulation';
+import { baselinesFor, type Baselines } from '../viewmodels/qualityBaseline';
 
 /** Where the Quality view pulls entities from:
  *    'scope'            — entities in the Analysis Scope tree (default)
@@ -126,6 +127,7 @@ const FALLBACK_THRESHOLDS = {
   locCallable: { warn: 30, bad: 60 },
   locContainer: { warn: 100, bad: 200 },
   params: { warn: 4, bad: 6 },
+  workingSet: { warn: 7, bad: 12 },
   fanOut: { warn: 7, bad: 15 },
   fields: { warn: 8, bad: 15 },
   variants: { warn: 6, bad: 12 },
@@ -150,6 +152,7 @@ function resolveThresholds(bt?: BackendThresholds): typeof FALLBACK_THRESHOLDS {
     locCallable: bt.loc_callable ?? FALLBACK_THRESHOLDS.locCallable,
     locContainer: bt.loc_container ?? FALLBACK_THRESHOLDS.locContainer,
     params: bt.params ?? FALLBACK_THRESHOLDS.params,
+    workingSet: bt.working_set ?? FALLBACK_THRESHOLDS.workingSet,
     fanOut: bt.fan_out ?? FALLBACK_THRESHOLDS.fanOut,
     fields: bt.fields ?? FALLBACK_THRESHOLDS.fields,
     variants: bt.variants ?? FALLBACK_THRESHOLDS.variants,
@@ -203,6 +206,7 @@ export const SUMMARY_METRIC_THRESHOLDS: Record<string, { keys: string[]; unit: s
   nest:             { keys: ['nest'], unit: 'levels' },
   loc:              { keys: ['locCallable', 'locContainer'], unit: 'lines' },
   params:           { keys: ['params'], unit: 'params' },
+  workingSet:       { keys: ['workingSet'], unit: 'names' },
   fanOut:           { keys: ['fanOut'], unit: 'deps' },
   fieldCount:       { keys: ['fields', 'variants'], unit: 'fields' },
   methodCount:      { keys: ['methodCount'], unit: 'methods' },
@@ -260,6 +264,15 @@ export const METRIC_EXPLANATIONS: Record<string, { title: string; body: string }
     body:
       'Number of parameters (self excluded). Long lists usually mean a missing abstraction (group related params into a struct) ' +
       'or a function doing too much. Green ≤4, amber ≤6, red >6.',
+  },
+  working_set: {
+    title: 'Working set',
+    body:
+      'Distinct names in view at once: parameters + locals + fields reached through self/this. ' +
+      'The one metric here that is not about control flow — a body with no branches at all can still be over it. ' +
+      'Green ≤7, amber ≤12, red >12 (Miller\'s 7±2). Remedy: extract the lower-level steps behind meaningful names, ' +
+      'or group related parameters into one object. A floor, not a total: fields go uncounted where the language ' +
+      'lets a method say `total` for `this.total` (Java, Kotlin, Groovy, Go).',
   },
   fan_in: {
     title: 'Fan-in',
@@ -380,6 +393,14 @@ export const SMELL_META: Record<string, { label: string; hint: string }> = {
     label: 'Shotgun Surgery',
     hint: 'Very high fan-in — any change here ripples widely. Stabilise the interface or apply dependency inversion.',
   },
+  data_bag: {
+    label: 'Data Bag',
+    hint: 'Many fields, little behaviour — group related fields into nested sub-structs to make the hierarchy explicit.',
+  },
+  overfull_head: {
+    label: 'Overfull Head',
+    hint: 'More names in view than a reader can hold — extract the lower-level steps behind meaningful names, or group related parameters into one object.',
+  },
 };
 
 /** What each shape verdict means, in the same words as `ShapePattern::hint()`
@@ -457,6 +478,12 @@ export function tierParams(v: number | undefined): Tier {
   if (v == null) return 'na';
   if (v <= THRESHOLDS.params.warn) return 'ok';
   if (v <= THRESHOLDS.params.bad) return 'warn';
+  return 'bad';
+}
+export function tierWorkingSet(v: number | undefined): Tier {
+  if (v == null) return 'na';
+  if (v <= THRESHOLDS.workingSet.warn) return 'ok';
+  if (v <= THRESHOLDS.workingSet.bad) return 'warn';
   return 'bad';
 }
 export function tierFanOut(v: number): Tier {
@@ -571,6 +598,7 @@ export interface QualityRow {
     nest: Tier;
     loc: Tier;
     params: Tier;
+    workingSet: Tier;
     fanOut: Tier;
     fieldCount: Tier;
     methodCount: Tier;
@@ -592,6 +620,7 @@ export interface QualitySummary {
   nest: TierCounts;
   loc: TierCounts;
   params: TierCounts;
+  workingSet: TierCounts;
   fanOut: TierCounts;
   fieldCount: TierCounts;
   methodCount: TierCounts;
@@ -631,6 +660,7 @@ export const qualityRows = derived(analysisGraph, ($g): QualityRow[] => {
         nest: tierNest(m.max_nesting),
         loc: tierLoc(m.loc, callable),
         params: tierParams(m.param_count),
+        workingSet: callable ? tierWorkingSet(m.working_set) : 'na',
         fanOut: tierFanOut(m.fan_out),
         fieldCount: callable ? 'na' : tierFieldCount(m.field_count, isEnum),
         methodCount: callable ? 'na' : tierMethodCount(m.method_count),
@@ -902,6 +932,57 @@ export const repoQuality = derived(qualityRows, ($rows): AggregatedScore =>
   aggregateRows($rows),
 );
 
+// --- Repo-wide score baselines (the mean a single score is read against) ---
+
+// The rules live in `viewmodels/qualityBaseline.ts`, store-free so they can be
+// unit-tested; re-exported here because this module is where the rest of the
+// app already looks for anything quality-shaped.
+export {
+  grainOfKind,
+  nodeScore,
+  compareToBaseline,
+  baselineNoun,
+  type Baseline,
+  type Baselines,
+  type ScoreGrain,
+  type ScoreComparison,
+} from '../viewmodels/qualityBaseline';
+
+/**
+ * Which graph the baselines are computed over, and whether it is the repo.
+ *
+ * Deliberately NOT `analysisGraph`: a mean that moves with the population
+ * selector is not a reference point, it is a second reading of the same
+ * narrowing — narrow to one file and that file scores exactly the average, by
+ * construction. Nor `analysisGraphData`, which is derived from the store below
+ * and empty whenever it is null, so it could only ever answer second.
+ *
+ * `fullGraphDataStore` is the whole repo and is what every ordinary boot
+ * holds. `graphData` is the fallback for the one that never fetches it — a
+ * static `__GRAPH_DATA__` page — and for the moment before the first fetch
+ * resolves. It is the whole repo at boot and a subset the moment a visual
+ * scope is picked, which is why `whole` says which answered: a mean labelled
+ * "repo" that moves when the reader changes level is worse than no label.
+ */
+const baselineGraph = derived(
+  [fullGraphDataStore, graphData],
+  ([$full, $shown]): { graph: GraphData | null; whole: boolean } =>
+    $full ? { graph: $full, whole: true } : { graph: $shown, whole: false },
+);
+
+/**
+ * Mean composite score per grain — one for files, one for folders, one for
+ * entities — so the Details pane can say whether what you selected is above or
+ * below the middle of its own kind.
+ */
+export const repoBaselines = derived(
+  baselineGraph,
+  ($b): { baselines: Baselines; whole: boolean } => ({
+    baselines: baselinesFor($b.graph, scopeCompositeScore, compositeScore),
+    whole: $b.whole,
+  }),
+);
+
 // The engine's own `avg_quality` / `quality_ok|warn|bad` rollup used to feed
 // this column via a `scopeToAggregated` adapter. It was dropped when the
 // rollups started following the population: those fields are computed over the
@@ -922,6 +1003,7 @@ export const qualitySummary = derived(qualityRows, ($rows): QualitySummary => {
     fieldCount: emptyCounts(),
     methodCount: emptyCounts(),
     publicFieldRatio: emptyCounts(),
+    workingSet: emptyCounts(),
     inCycle: 0,
   };
   for (const r of $rows) {
@@ -934,6 +1016,7 @@ export const qualitySummary = derived(qualityRows, ($rows): QualitySummary => {
     s.fieldCount[r.tiers.fieldCount]++;
     s.methodCount[r.tiers.methodCount]++;
     s.publicFieldRatio[r.tiers.publicFieldRatio]++;
+    s.workingSet[r.tiers.workingSet]++;
     if (r.node.metrics?.in_cycle) s.inCycle++;
   }
   return s;

@@ -5,7 +5,7 @@
 //! names that consistently produce noise in the call graph — anything
 //! ambiguous (e.g. `each` may be user-defined too) stays in.
 
-pub(super) fn is_stdlib_method(name: &str) -> bool {
+pub(crate) fn is_stdlib_method(name: &str) -> bool {
     matches!(
         name,
         // Java Object/Collection ancestry

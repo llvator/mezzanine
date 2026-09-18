@@ -9,6 +9,8 @@ export interface EntityMetrics {
   max_nesting?: number;
   loc: number;
   param_count?: number;
+  local_count?: number;
+  working_set?: number;
   fan_in: number;
   fan_out: number;
   in_cycle: boolean;
@@ -123,6 +125,37 @@ export interface D3Node {
   index?: number;
 }
 
+/**
+ * The parts of a SQL relationship a reader looks at the edge to learn: which
+ * columns carry the join, and whether it is one-to-one, many-to-one or
+ * many-to-many.
+ *
+ * Read off the relationship's metadata in `transform.ts`, which is the one
+ * place that knows the backend's key spellings. A nested object rather than
+ * seven more flat fields on `D3Link`, so `d.fk` is a single presence check
+ * for "is this a schema edge".
+ */
+export interface FkFacts {
+  /** `n:1`, `1:1` or `n:m` — the stable token, not display text. */
+  cardinality: string;
+  /** Referencing columns, comma-joined. Absent on an inferred N:M edge,
+   *  where no single key carries the join. */
+  columns?: string;
+  /** Referenced columns. Absent when the target sits outside the analyzed
+   *  migration set and declares no primary key here. */
+  targetColumns?: string;
+  /** Constraint name, so a reader can go find it in the DDL. */
+  constraint?: string;
+  /** `CASCADE`, `SET NULL`, … when the key declares one. */
+  onDelete?: string;
+  /** Join table this many-to-many was read from. Its presence is what marks
+   *  the edge as inferred rather than declared. */
+  junctionTable?: string;
+  /** The join table's columns reaching each end of the N:M. */
+  junctionSourceColumns?: string;
+  junctionTargetColumns?: string;
+}
+
 export interface D3Link {
   source: string | D3Node;
   target: string | D3Node;
@@ -154,6 +187,10 @@ export interface D3Link {
    *  separate from `binds_to` so the renderer can distinguish a fresh
    *  binding from an update. */
   rebinds_to?: string;
+
+  /** What a SQL foreign key joins, and how many rows sit at each end
+   *  (SQL-006). Absent on every edge that is not a schema edge. */
+  fk?: FkFacts;
 
   /**
    * Ids this edge was re-routed off, when it is the lifted twin of an edge
@@ -200,6 +237,7 @@ export interface BackendThresholds {
   variants: WarnBad;
   method_count: WarnBad;
   public_field_ratio: WarnBad;
+  working_set?: WarnBad;
   file_entity_count: WarnBad;
   file_loc: WarnBad;
   file_fan_out: WarnBad;
@@ -253,6 +291,21 @@ export interface FolderShape {
   egress?: number;
   /** Mean compliance of the subfolders inside. Absent when there are none. */
   child_compliance?: number;
+  /** This folder's breadth against its widest subfolder's, smaller over
+   *  larger. Absent when there is no subfolder to compare against — one
+   *  level is not a comparison.
+   *
+   *  The only term here that compares two zoom levels rather than reading
+   *  one. Every other score grades a folder against a fixed bar and then
+   *  asks whether its children clear that same bar — `child_compliance`
+   *  included, since it averages numbers each taken against it — so a tree
+   *  can pass at every level and still change scale abruptly between two of
+   *  them (ADR 0033).
+   *
+   *  Gates NOTHING, not even `fractal`, and is not a term in `compliance`:
+   *  it is reported while its distribution across real repos is still being
+   *  learned (ADR 0032). */
+  uniformity?: number;
   /** Immediate children, files and subfolders together. Reported, not scored. */
   child_count: number;
   /** Why this folder is not one tier higher. Absent only for `fractal`. */
@@ -418,8 +471,13 @@ export interface ScopeMetrics {
  * picture `FolderShape` scores, which neither of the other two draws:
  * `graph` shows the whole hairball and `tree` treats every relationship as
  * the same kind of thing, which is exactly the distinction shape is about.
+ *
+ * `flow` is the fourth (UI-146): the same set `graph` draws, laid out in
+ * dependency layers instead of by force. Not a narrowing and not a different
+ * population — a reader switches to it to ask which way the dependencies run,
+ * and switches back with the picture unchanged underneath.
  */
-export type ViewMode = 'graph' | 'tree' | 'shape';
+export type ViewMode = 'graph' | 'tree' | 'shape' | 'flow';
 
 /** Aggregation level for the graph view: show every entity, collapse to
  * one node per file, or collapse to one node per directory.
@@ -542,6 +600,17 @@ export const NODE_COLORS: Record<string, string> = {
   TemplateFile: '#8D6E63',
   K8sResource: '#326CE5',
   HelmChart: '#3949AB',
+  /** docker: build-side kinds in the Docker brand blue family, with the
+   * stage — the unit that owns the edges — carrying the brand colour and
+   * the external image greyed back, since it is the edge of what the
+   * repo controls rather than part of it. */
+  Stage: '#2496ED',
+  BaseImage: '#78909C',
+  /** docker: the run-side shared resources. Amber and green to separate
+   * "state two services share" from "reachability two services share" —
+   * the two ways a Compose file couples things without naming them. */
+  Volume: '#FFA726',
+  Network: '#66BB6A',
   Unknown: '#9E9E9E',
 };
 
@@ -570,6 +639,12 @@ export const LINK_COLORS: Record<string, string> = {
   /** Templating dimension: template → {{ variable }}. Muted light indigo
    * so this high-volume layer recedes behind the structural topology. */
   Interpolates: '#9FA8DA',
+  /** docker: BuildsFrom is the load-bearing service→stage link, in the
+   * Docker brand blue for the same reason RendersFrom wears Kubernetes
+   * blue. CopiesFrom is the multi-stage lineage — a lighter tint of the
+   * same hue, since it is the same build dimension one level down. */
+  BuildsFrom: '#2496ED',
+  CopiesFrom: '#81D4FA',
 };
 
 export const LANGUAGE_COLORS: Record<string, string> = {
@@ -601,6 +676,10 @@ export const LANGUAGE_COLORS: Record<string, string> = {
   /** ansible-deploy — Ansible brand red, so a deploy repo reads as its
    * own language in the filter / scope tree. */
   'Ansible Deploy': '#D32F2F',
+  /** Docker — the brand blue, matching the Stage kind that dominates its
+   * nodes, so the language identity holds across the language filter and
+   * the node-colour view. */
+  Docker: '#2496ED',
   /** Markdown — the same slate as the Note kind (its only node), so the
    * doc layer looks the same whether the reader is colouring by language
    * or by kind. */

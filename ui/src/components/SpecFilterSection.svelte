@@ -19,6 +19,7 @@
   import ColorChip from './ColorChip.svelte';
   import {
     specGraph, visibleSpecGraph, specSelection, specScopeState,
+    specPinnedHighlight, clearPinnedHighlight, togglePinnedHighlight,
     toggleSpecSelection, clearSpecFocus, setSpecSelection,
   } from '../stores/crossFilter';
   import { matchesSpecQuery, specOptions } from '../viewmodels/specGraph';
@@ -110,6 +111,18 @@
         </p>
       {/if}
 
+      {#if $specPinnedHighlight.size > 0}
+        <!-- Pins are made in the pane and outlive it, so the same argument
+             that put the filter's control here applies to them: rings on the
+             canvas whose only explanation was a pane the reader has since
+             collapsed. Shown whether or not the pane is open — unlike the
+             filter, a pin has no row in the lists below to find it by. -->
+        <p class="note">
+          <strong>{$specPinnedHighlight.size}</strong> pinned, lighting their code on the graph.
+          <button type="button" class="link-btn" on:click={clearPinnedHighlight}>Unpin</button>
+        </p>
+      {/if}
+
       {#if $visibleSpecGraph.empty}
         <p class="hint">
           Nothing reaches the analysis scope. Untick <em>Follow scope</em>, or widen it.
@@ -148,14 +161,37 @@
                    moved every time the sidebar was resized. -->
               <div class="rows">
                 {#each tier.shown as node (node.id)}
-                  <label class="row" title={markFor(node.id) || node.qualified_name}>
-                    <input
-                      type="checkbox"
-                      checked={$specSelection.has(node.id)}
-                      on:change={() => toggleSpecSelection(node.id)} />
-                    <span class="kind-code">{KIND_CODES[node.kind_raw] ?? ''}</span>
-                    <span class="name" class:marked={markFor(node.id) !== ''}>{node.name}</span>
-                  </label>
+                  <!-- The label no longer wraps the whole row, because the row
+                       now holds a second control: a click anywhere inside a
+                       label activates its input, so a pin button under one
+                       would tick the checkbox beside it every time. -->
+                  <div class="row">
+                    <label class="pick" title={markFor(node.id) || node.qualified_name}>
+                      <input
+                        type="checkbox"
+                        checked={$specSelection.has(node.id)}
+                        on:change={() => toggleSpecSelection(node.id)} />
+                      <span class="kind-code">{KIND_CODES[node.kind_raw] ?? ''}</span>
+                      <span class="name" class:marked={markFor(node.id) !== ''}>{node.name}</span>
+                    </label>
+                    <!-- The other half of the pane's shift-click, and the only
+                         way to make a pin that a keyboard can reach: the pane
+                         draws entities as 5px circles with no tab stop, so the
+                         gesture there is a modifier on a pointer and cannot be
+                         anything else. Same split the checkbox already rests
+                         on — the pane is spatial and the list is explicit — and
+                         the same reason it is a real <button> and not another
+                         glyph on a canvas. -->
+                    <button
+                      type="button"
+                      class="pin"
+                      class:pinned={$specPinnedHighlight.has(node.id)}
+                      aria-pressed={$specPinnedHighlight.has(node.id)}
+                      aria-label="{$specPinnedHighlight.has(node.id) ? 'Unpin' : 'Pin'} {node.name}"
+                      title="Light this entity's code on the graph and keep it lit"
+                      on:click={() => togglePinnedHighlight(node.id)}
+                    ><span class="ring" aria-hidden="true"></span></button>
+                  </div>
                 {/each}
               </div>
             {/if}
@@ -249,14 +285,58 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 5px;
     width: 100%;
     padding: 2px 4px;
     border-radius: 3px;
-    cursor: pointer;
   }
 
   .row:hover { background: var(--bg-hover); }
+
+  /* The label keeps the row's old shape and its whole clickable width; only
+     the pin sits outside it. `min-width: 0` so the truncation on `.name`
+     still has something to truncate against once the row is a flex parent
+     of a flex child. */
+  .pick {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex: 1;
+    min-width: 0;
+    cursor: pointer;
+  }
+
+  /* Quiet until it matters. Not hidden until hover: a control that appears
+     only under a pointer is one a keyboard reader never finds, and this is
+     the surface that exists *because* the pane's gesture needs a pointer.
+     Faint, focusable, and loud once it is pinned or reached. */
+  .pin {
+    background: none;
+    border: none;
+    padding: 2px;
+    margin-left: 4px;
+    line-height: 0;
+    cursor: pointer;
+    opacity: 0.25;
+    flex-shrink: 0;
+  }
+
+  .row:hover .pin,
+  .pin:focus-visible,
+  .pin.pinned { opacity: 1; }
+
+  /* The same ring the entity wears in the spec pane and on the graph, so the
+     three surfaces are recognisably one thing. The literal is `PIN_COLOR`
+     from `SpecGraphView` — a channel identity rather than themed text, for
+     the reason given where that constant is declared. */
+  .ring {
+    display: block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 2px solid var(--text-muted);
+  }
+
+  .pin.pinned .ring { border-color: #7C4DFF; }
 
   .none {
     font-size: 0.68rem;

@@ -20,7 +20,7 @@
 //! tree, and it understands the whole language, including records, patterns,
 //! extension types and the Dart 3 class modifiers.
 
-mod bodies;
+pub(crate) mod bodies;
 mod complexity;
 mod ctx;
 mod declarations;

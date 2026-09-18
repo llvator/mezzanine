@@ -1,6 +1,6 @@
 [package]
 name = "mezzanine"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 description = "Visualize code relationships, dependencies, and quality metrics"
 authors = ["llvator"]
@@ -35,6 +35,12 @@ tree-sitter-typescript = "0.21"
 tree-sitter-java = "0.21"
 tree-sitter-go = "0.21"
 tree-sitter-kotlin = "0.3"
+# C and C++ share one grammar here. tree-sitter-cpp is pinned to the 0.22
+# line because 0.23+ exposes the language as a `tree_sitter_language::LanguageFn`
+# that only converts to `tree_sitter::Language` in tree-sitter 0.23+, the same
+# wall the Groovy note below describes. C++ is a superset of C for everything
+# `parser/cpp` reads, so `.c` files are parsed by it too — see that module's doc.
+tree-sitter-cpp = "0.22"
 # Groovy grammar — pulled in for the C parser symbol; the published Rust
 # bindings expose the language as a `tree_sitter_language::LanguageFn`,
 # which only converts to `tree_sitter::Language` in tree-sitter 0.23+.
@@ -104,6 +110,14 @@ colored = "2.1"
 # Progress bars
 indicatif = "0.17"
 
+# Terminal dashboard for `mezz monitor` (MON-001). Pure Rust and small —
+# ratatui, its crossterm backend and a couple of unicode-width crates — so it
+# is built by default rather than hidden behind a feature: a command that
+# exists or not depending on how the binary was installed is a support trap.
+# Crossterm is used through `ratatui::crossterm`, so the two versions cannot
+# drift apart.
+ratatui = "0.29"
+
 # Parallel processing
 rayon = "1.10"
 
@@ -119,6 +133,11 @@ blake3 = "1.5"
 # tests exercise the real layer stack without binding a port.
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Tests only. `mezz init --editor-tools` writes a VS Code problem matcher
+# whose regex is tied to the row `quality` prints, and the only way to keep
+# the two from drifting apart silently is to run the one against samples of
+# the other. Already in the tree as a transitive dependency.
+regex = "1"
 
 [features]
 default = []

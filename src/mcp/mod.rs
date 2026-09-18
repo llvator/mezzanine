@@ -11,15 +11,27 @@
 //! the tree and the message loop fits in this file. Protocol JSON goes
 //! to stdout exclusively; all diagnostics go to stderr.
 
+mod answer;
 mod baseline;
 mod boundaries;
+mod census;
+mod chains;
+pub(crate) mod cost;
+mod effects;
+pub(crate) mod externals;
+mod file_impact;
 mod format;
 mod layout;
 pub mod push;
+mod radius;
 mod recipes;
 mod reshape;
 mod slice;
-mod tools;
+/// `pub(crate)` for the three helpers `mezz monitor` counts with — the smell
+/// split, the test-code predicate and the path spelling. The dashboard has to
+/// agree with `quality` about the same tree, and the only way to guarantee
+/// that is to count with the same code.
+pub(crate) mod tools;
 
 /// What an entity listing shows: no ghosts, no parameters, no fields.
 ///
@@ -36,6 +48,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde_json::{json, Value};
+
+use answer::Answer;
 
 use crate::config::Config;
 use crate::graph::DependencyGraph;
@@ -142,54 +156,6 @@ impl McpServer {
 pub(crate) fn scope_id(config: &Config) -> String {
     let digest = blake3::hash(crate::diff::scope_fingerprint(config).as_bytes()).to_hex();
     digest[..6].to_string()
-}
-
-/// What produced this answer, appended to every tool response (CFG-014).
-///
-/// Two facts, because the two ways a long-running server goes stale are
-/// not detectable the same way. A scope change the server can see, so the
-/// digest moves on its own. A replaced binary it cannot see at all — the
-/// process goes on running the code it was started with — so the version
-/// is printed for the *reader*, who can compare it against the one they
-/// just installed. That asymmetry is why this is a footer rather than a
-/// reload.
-fn scope_footer(server: &McpServer) -> String {
-    format!(
-        "\n\n_scope {} · mezz {}{}_",
-        server.scope_id(),
-        env!("CARGO_PKG_VERSION"),
-        import_coverage_note(server),
-    )
-}
-
-/// What the footer says when some of what the parsers read did not reach the
-/// graph — and nothing at all when it all did.
-///
-/// Every verdict these tools give is computed over the graph, so a hole in it
-/// becomes a confident wrong answer: a folder is reported as a funnel because
-/// the imports that would have shown otherwise are missing, not because
-/// nothing leaves it. Silence is indistinguishable from cleanliness, and this
-/// is the line that separates them. Reported next to the scope digest for the
-/// same reason that is there (CFG-014): it is a fact about what produced the
-/// answer, not part of the answer.
-///
-/// Quiet when whole, so a sound graph costs no tokens and the line means
-/// something when it appears. The analysis is the warm-cached one the tool
-/// just used; a failure to obtain it says nothing here, because the tool's
-/// own error already has.
-fn import_coverage_note(server: &McpServer) -> String {
-    let Ok(graph) = tools::analyze(server, &server.root) else {
-        return String::new();
-    };
-    let (landed, seen) = graph.import_coverage();
-    if landed >= seen {
-        return String::new();
-    }
-    format!(
-        " · {landed} of {seen} imports in the graph — {} missing, so any verdict \
-         over the folders they cross is unsound",
-        seen - landed,
-    )
 }
 
 pub fn run(root: PathBuf, include_tests: bool, languages: Option<Vec<String>>) -> Result<()> {
@@ -346,7 +312,28 @@ fn initialize_result(server: &McpServer, params: &Value) -> Value {
 }
 
 /// One tool's implementation, as stored in the dispatch table.
-type ToolFn = fn(&McpServer, &Value) -> Result<String>;
+///
+/// Two arms because the move from prose to a value is incremental
+/// (ADR 0035). A `Prose` tool builds its answer by pushing formatted lines
+/// into a vector and has no value in the middle to serialize; a
+/// `Structured` one computes a value and renders it twice. Which is which
+/// is a fact about the *code*, so the dispatcher reads it off the table —
+/// rather than a consumer discovering it from an empty object.
+enum Tool {
+    Prose(fn(&McpServer, &Value) -> Result<String>),
+    Structured(fn(&McpServer, &Value) -> Result<Answer>),
+}
+
+impl Tool {
+    /// Run it, whichever kind it is. A prose tool's answer simply has no
+    /// data beside it.
+    fn call(&self, server: &McpServer, args: &Value) -> Result<Answer> {
+        match self {
+            Tool::Prose(run) => run(server, args).map(Answer::prose),
+            Tool::Structured(run) => run(server, args),
+        }
+    }
+}
 
 /// Tool name → implementation. A table rather than a `match`, so adding a
 /// tool costs no branch in the dispatcher. CI-001 is the same problem on
@@ -354,23 +341,141 @@ type ToolFn = fn(&McpServer, &Value) -> Result<String>;
 /// existing function, which makes a growing `match` unextendable.
 /// `tool_definitions` below declares the same names to clients; the two
 /// are kept in step by `every_advertised_tool_is_dispatchable`.
-const TOOLS: &[(&str, ToolFn)] = &[
-    ("overview", tools::overview),
-    ("map", tools::map),
-    ("quality", tools::quality),
-    ("impact", tools::impact),
-    ("context", tools::context),
-    ("hotspots", tools::hotspots),
-    ("tests_for", tools::tests_for),
-    ("trace", tools::trace),
-    ("similar", tools::similar),
-    ("dead_code", tools::dead_code),
-    ("assess_change", tools::assess_change),
-    ("spec_slice", slice::spec_slice),
-    ("reshape", reshape::reshape),
-    ("layout", layout::layout),
-    ("boundaries", boundaries::boundaries),
+const TOOLS: &[(&str, Tool)] = &[
+    ("overview", Tool::Prose(tools::overview)),
+    ("map", Tool::Structured(tools::map)),
+    ("quality", Tool::Structured(tools::quality)),
+    ("impact", Tool::Prose(tools::impact)),
+    ("context", Tool::Prose(tools::context)),
+    ("hotspots", Tool::Structured(tools::hotspots)),
+    ("tests_for", Tool::Prose(tools::tests_for)),
+    ("trace", Tool::Prose(tools::trace)),
+    ("similar", Tool::Prose(tools::similar)),
+    ("dead_code", Tool::Structured(tools::dead_code)),
+    ("assess_change", Tool::Prose(tools::assess_change)),
+    ("spec_slice", Tool::Prose(slice::spec_slice)),
+    ("reshape", Tool::Prose(reshape::reshape)),
+    ("layout", Tool::Prose(layout::layout)),
+    ("boundaries", Tool::Prose(boundaries::boundaries)),
+    ("cost", Tool::Prose(cost::cost)),
 ];
+
+/// The tool by that name, or the error a caller should see for a typo.
+fn lookup(name: &str) -> Result<&'static Tool> {
+    TOOLS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, tool)| tool)
+        .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))
+}
+
+/// The tools that can answer as JSON, in the order they are listed.
+///
+/// Public because the honest way to run a partial migration is to be able
+/// to name what is in it (ADR 0035): this list is what `--format json`
+/// prints when it is asked for a tool that is not on it.
+pub fn structured_tools() -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter(|(_, t)| matches!(t, Tool::Structured(_)))
+        .map(|(n, _)| *n)
+        .collect()
+}
+
+/// Every tool name the CLI can ask for, in the order they are listed.
+///
+/// The CLI builds its subcommands by hand rather than from this, because
+/// each one needs its own typed flags — but `every_tool_has_a_cli_command`
+/// compares the two lists, so a tool added to [`TOOLS`] and not to the CLI
+/// fails the build's tests rather than silently existing on one front door.
+pub fn tool_names() -> Vec<&'static str> {
+    TOOLS.iter().map(|(n, _)| *n).collect()
+}
+
+/// Run one tool once and return its rendered body, footer included.
+///
+/// The second front door onto [`TOOLS`] (CLI-002). Same implementations and
+/// same footer as the stdio server — only the envelope differs, which is the
+/// point: two ways to ask one question that disagree is the defect this is
+/// meant to remove, not repeat.
+///
+/// No invalidation watcher and no warm cache worth the name: a one-shot
+/// process exits before either could pay for itself. That makes a CLI call
+/// cost a full analysis where the long-lived server would often answer from
+/// memory — the price of the second door, paid by the caller who chose it.
+pub fn run_tool(
+    root: PathBuf,
+    include_tests: bool,
+    languages: Option<Vec<String>>,
+    name: &str,
+    args: &Value,
+) -> Result<String> {
+    let server = one_shot_server(root, include_tests, languages)?;
+    let answer = lookup(name)?.call(&server, args)?;
+    let footer = answer::footer(&server);
+    Ok(answer.into_text() + &footer)
+}
+
+/// The same call, rendered for a machine (CLI-003).
+///
+/// Refuses before it analyses anything. A tool that has not been converted
+/// cannot answer this question, and the caller should find that out in
+/// milliseconds rather than after a full walk of the tree — and by name,
+/// rather than by receiving prose from a flag that claimed to produce JSON.
+pub fn run_tool_json(
+    root: PathBuf,
+    include_tests: bool,
+    languages: Option<Vec<String>>,
+    name: &str,
+    args: &Value,
+) -> Result<Value> {
+    let tool = lookup(name)?;
+    if !matches!(tool, Tool::Structured(_)) {
+        anyhow::bail!(
+            "`{}` has no JSON rendering yet — its answer is still prose only.\n\
+             Converted so far: {}.\n\
+             The rest are tracked by CLI-004; call `{}` without `--format json` \
+             to read it as text.",
+            name,
+            structured_tools().join(", "),
+            name,
+        );
+    }
+
+    let server = one_shot_server(root, include_tests, languages)?;
+    let answer = tool.call(&server, args)?;
+    let data = answer
+        .data()
+        .cloned()
+        // Unreachable: the table says this tool is structured, and a
+        // structured tool returns its value. Stated rather than unwrapped
+        // so a future arm that forgets cannot panic in a user's CI job.
+        .ok_or_else(|| anyhow::anyhow!("`{}` returned no value to render", name))?;
+    Ok(answer::envelope(&server, name, data))
+}
+
+/// The server a one-shot call runs against: no watcher, and a cache that
+/// dies with the process.
+fn one_shot_server(
+    root: PathBuf,
+    include_tests: bool,
+    languages: Option<Vec<String>>,
+) -> Result<McpServer> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("Cannot resolve root path {}: {}", root.display(), e))?;
+    Ok(McpServer {
+        shape_baselines: baseline::ShapeBaselines::rooted_at(&root),
+        rules_spelled_out: std::sync::atomic::AtomicBool::new(false),
+        layout_caveat_spelled_out: std::sync::atomic::AtomicBool::new(false),
+        root,
+        include_tests,
+        languages,
+        graph_cache: Mutex::new(HashMap::new()),
+        base_cache: Mutex::new(HashMap::new()),
+        generation: Arc::new(AtomicU64::new(0)),
+    })
+}
 
 fn handle_tools_call(server: &McpServer, id: Value, params: &Value) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -379,26 +484,20 @@ fn handle_tools_call(server: &McpServer, id: Value, params: &Value) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let Some((_, run)) = TOOLS.iter().find(|(n, _)| *n == name) else {
+    let Ok(tool) = lookup(name) else {
         return error_response(id, -32602, &format!("Unknown tool: {}", name));
     };
-    let result = run(server, &args);
+    let result = tool.call(server, &args);
     // On the failure branch too: "Path not found" is exactly what an
     // exclude pattern added to the settings file produces, and that
     // answer needs to name its scope more than a successful one does.
-    let footer = scope_footer(server);
+    let footer = answer::footer(server);
 
     // Per MCP, tool execution failures are reported inside the result
     // (isError: true) so the model can see and react to them; only
     // protocol-level problems use JSON-RPC errors.
     match result {
-        Ok(text) => ok_response(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": text + &footer }],
-                "isError": false,
-            }),
-        ),
+        Ok(answer) => ok_response(id, tool_result(server, name, &answer, &footer)),
         Err(e) => ok_response(
             id,
             json!({
@@ -407,6 +506,26 @@ fn handle_tools_call(server: &McpServer, id: Value, params: &Value) -> Value {
             }),
         ),
     }
+}
+
+/// A successful call's result: the text every client can read, plus
+/// `structuredContent` for the ones that would rather not re-read it
+/// (CLI-003).
+///
+/// The text is sent either way. `structuredContent` is an addition to the
+/// protocol that older clients ignore, and an agent that has just been
+/// handed the prose should not have to ask twice to get the rows — so it
+/// travels beside the prose in the same response, rendered from the same
+/// value.
+fn tool_result(server: &McpServer, name: &str, answer: &Answer, footer: &str) -> Value {
+    let mut result = json!({
+        "content": [{ "type": "text", "text": answer.text().to_string() + footer }],
+        "isError": false,
+    });
+    if let Some(data) = answer.data() {
+        result["structuredContent"] = answer::envelope(server, name, data.clone());
+    }
+    result
 }
 
 fn tool_definitions() -> Value {
@@ -492,12 +611,24 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "impact",
-            "description": "Blast radius of a potential change to one entity: what it uses \
-                (code it relies on — its contract with the rest of the codebase) and what \
-                uses it (direct dependents, plus transitive dependents level by level), \
-                each with file:line positions. Use this before refactoring a function, \
-                class, or type to know exactly which code must be checked or updated. \
-                Target by `entity` name, or by `path` + `line` for a position in a file.",
+            "description": "Blast radius of a potential change, at either of two grains. \
+                Given `entity`, or `path` + `line`: what that entity uses (code it relies \
+                on — its contract with the rest of the codebase) and what uses it (direct \
+                dependents, plus an outline of every transitive dependent **nested under \
+                the one it was reached through**, so a row says through what and not only \
+                how far), each with file:line. `direction: out` turns that outline around \
+                and draws the call tree under the entity instead. Given `path` alone, the \
+                same question asked of the **file**: \
+                what outside it depends on it and what it depends on outside itself, both \
+                grouped by the file at the other end, with edges internal to the file \
+                counted rather than listed — the question to ask before moving, splitting \
+                or deleting a file, and one a per-entity walk cannot answer without \
+                double-counting the file's own wiring. Both grains also report the \
+                **effect surface**: which of `fs`, `net`, `proc` and `env` the target \
+                reaches and through which call, so \"does changing this touch the disk or \
+                the network\" is answered here rather than by reading the callees. \
+                Classified from call target names, so a language mezz has no table for \
+                says so rather than reporting none.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -507,18 +638,23 @@ fn tool_definitions() -> Value {
                     },
                     "path": {
                         "type": "string",
-                        "description": "File containing the entity, relative to the project root. Use together with `line` as an alternative to `entity`."
+                        "description": "A file, relative to the project root. With `line`, it targets the entity spanning that line; on its own, the file itself is the subject. A directory is refused — call `map`, `reshape` or `boundaries` for a folder."
                     },
                     "line": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-based line inside the entity. The innermost entity spanning this line is targeted."
+                        "description": "1-based line inside the entity. The innermost entity spanning this line is targeted. Omit to ask about the whole file."
                     },
                     "depth": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 5,
-                        "description": "How many dependency hops to follow for the transitive blast radius (default 2)."
+                        "description": "How many dependency hops to follow for the transitive blast radius (default 2). Entity-level only: the file view is one hop in each direction."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["in", "out"],
+                        "description": "Which way the radius walks. `in` (default) is what breaks if this entity changes, across every kind of dependency edge. `out` is the call tree under it — what runs when it runs, calls only. Entity-level only."
                     }
                 },
                 "additionalProperties": false
@@ -732,8 +868,9 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "boundaries",
-            "description": "Which of this folder's own imports reach past another folder's door \
-                into its interior — the cross-folder tangle, asked of the folder that wrote it. \
+            "description": "Which of this folder's (or this file's) own imports reach past another \
+                folder's door into its interior — the cross-folder tangle, asked of the code that \
+                wrote it. \
                 Every other tool grades a folder on what arrives; `reshape` says outright that \
                 where its outgoing dependencies land 'stays their own folder's business', and \
                 since every folder says that, a file deep in one area importing a file deep in \
@@ -742,16 +879,19 @@ fn tool_definitions() -> Value {
                 the folder's outgoing dependencies three ways — landed on a door, landed on shared \
                 vocabulary several folders reach (leave alone), or reached past a door (the work \
                 list) — names each offending import with its line, the door it bypassed, and which \
-                of four fixes applies. Use it when asked to untangle cross-folder dependencies, to \
-                enforce that folders talk through their entry points, or after `reshape` and \
-                `layout` have made one folder's own drawing clean and the mess is between folders. \
-                Reads only.",
+                of four fixes applies. Point it at a single file to grade only the imports written \
+                in that file, against the doors of the folder holding it — the grain at which \
+                somebody actually fixes an import. Use it when asked to untangle cross-folder \
+                dependencies, to enforce that folders talk through their entry points, when \
+                picking up one file and asking which of its imports are a liability, or after \
+                `reshape` and `layout` have made one folder's own drawing clean and the mess is \
+                between folders. Reads only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Folder whose outgoing dependencies to grade, relative to the project root, e.g. `src/parser`. Omit for the repository root, which has nothing outside it."
+                        "description": "What to grade the outgoing dependencies of, relative to the project root. A folder (`src/parser`) grades every import its files write; a file (`src/parser/rust.rs`) grades only that file's, against the boundary of the folder holding it. Omit for the repository root, which has nothing outside it."
                     }
                 },
                 "additionalProperties": false
@@ -804,6 +944,70 @@ fn tool_definitions() -> Value {
             },
             // Proposes and scores; every move is the caller's to make.
             "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "cost",
+            "description": "How code **scales**, and on what — the question every other \
+                complexity number here answers wrongly. `cyclomatic`, `cognitive` and \
+                `max_nesting` measure how hard a body is to *read*, so a flat 40-arm `match` \
+                scores far worse than a doubly-nested loop, and the doubly-nested loop is \
+                the one that falls over at 10k rows. Given `entity`, or `path` + `line`, \
+                returns an estimated worst-case time complexity — `O(1)`, `O(n)`, \
+                `O(n log n)`, `O(n^k)` for k nested loops — with one evidence line per \
+                contributing construct: each loop with its `file:line` and the header \
+                the author wrote, each recognised library operation that walks (`sort`, \
+                `indexOf`, `Iterator::position`) and how many loops it sits inside, and the \
+                recursion shape. **It composes along the call chain**, which is where real \
+                cost lives: a cheap-looking function calling a cheap-looking helper from \
+                inside a loop, three frames down, is the O(n³) no other tool will say. Each \
+                frame reached to `depth` hops is charged its own cost times the loops the \
+                chain passed through to reach it, and the report names the frame the total \
+                is charged to with its `file:line`. `from` + `to` prices one named route \
+                instead (`trace`'s targeting, with the loops `trace` drops). Ask it before \
+                optimising, before accepting a loop over a collection that grows, or when a \
+                review asks 'is this a problem on a large input'. The exponent counts loop \
+                *levels*, not one shared `n`: two loops over different collections are \
+                `n × m`. Structural worst case, not dataflow and not a proof — it \
+                over-reports a loop whose bound it cannot see is constant and under-reports \
+                a linear call it has no rule for, and the report names both directions. \
+                Recursion is classified, never solved; a ring stops the chain and is \
+                reported unsolved. A language mezz has no loop table for says so rather than \
+                raising `max_nesting` to a power, and an unbindable call makes the total a \
+                floor rather than an answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "Name or qualified name of the callable (e.g. `compute_diff` or `diff::compute_diff`). If ambiguous, the response lists candidates."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "A file, relative to the project root. Needs `line`: `cost` answers about one body, so a file on its own is not a subject it has."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line inside the callable. With `path`, targets the innermost entity spanning it."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5,
+                        "description": "Call hops to compose the cost over (default 2, max 5). `0` answers about this body alone. Raising it widens the walk fast; the report says when it stopped early."
+                    },
+                    "from": {
+                        "type": "string",
+                        "description": "With `to`: price one named route instead of everything an entry point reaches. Both are entity names, as `trace` takes them."
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "With `from`: the far end of the route. The worst chain reaching it within `depth` hops is the one priced."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
         }
     ])
 }
@@ -846,7 +1050,8 @@ mod tests {
     /// Every tool response names the configuration that produced it —
     /// the failure branch included, since "Path not found" is exactly
     /// what an exclude pattern added to the settings file produces
-    /// (CFG-014).
+    /// (CFG-014). What the caveat beside it says is asserted in
+    /// [`super::answer`], which now owns both renderings of it.
     #[test]
     fn a_tool_response_names_the_scope_and_version_that_produced_it() {
         let server = McpServer {
@@ -876,6 +1081,386 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )) && text.trim_end().ends_with('_'),
             "the answer does not say what produced it:\n{text}"
+        );
+    }
+
+    /// A fixture that reads as production source: `dead_code` classifies by
+    /// path, and a directory named "test" makes every entity in it test code.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            // The counter, not just the clock: tests run in parallel
+            // threads of one process, and two of them reaching this line
+            // inside the same clock tick got the same directory — so the
+            // first to finish deleted the other's tree mid-analysis and
+            // the victim reported an empty graph. Found the honest way.
+            static NTH: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "mezz-doors-{}-{}-{}-{}",
+                name,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                NTH.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TmpDir(path)
+        }
+
+        fn write(&self, rel: &str, body: &str) {
+            let full = self.0.join(rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, body).unwrap();
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The stdio door, called the way a client calls it — a fresh server per
+    /// call, because that is what the CLI door gets and the once-per-server
+    /// latches (`rules_spelled_out`, `layout_caveat_spelled_out`) would
+    /// otherwise make the second call of a session differ from the first for
+    /// a reason that has nothing to do with the two doors.
+    fn through_stdio(root: &Path, name: &str, args: &Value) -> String {
+        let server = McpServer {
+            shape_baselines: baseline::ShapeBaselines::rooted_at(root),
+            rules_spelled_out: std::sync::atomic::AtomicBool::new(false),
+            layout_caveat_spelled_out: std::sync::atomic::AtomicBool::new(false),
+            root: root.to_path_buf(),
+            include_tests: false,
+            languages: None,
+            graph_cache: Mutex::new(HashMap::new()),
+            base_cache: Mutex::new(HashMap::new()),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let call = json!({ "name": name, "arguments": args });
+        let response = handle_tools_call(&server, json!(1), &call);
+        assert_eq!(
+            response["result"]["isError"],
+            json!(false),
+            "{name} failed over stdio: {}",
+            response["result"]["content"][0]["text"]
+        );
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a tool response carries text")
+            .to_string()
+    }
+
+    /// One implementation, two front doors (CLI-002). The risk the ticket was
+    /// written about is a second implementation drifting from the first —
+    /// which is what `stats` against `quality` and `find` against `similar`
+    /// already are. Name parity is checked in `main.rs`; this is the other
+    /// half, that the same arguments get the same answer, footer included.
+    ///
+    /// Four tools rather than sixteen: one per argument shape (a path, a path
+    /// plus a count, a flag, a query). They share `run_tool`, so a fork would
+    /// have to be in the dispatch both go through, and these four cross it.
+    #[test]
+    fn both_doors_give_the_same_answer_to_the_same_question() {
+        let dir = TmpDir::new("same-body");
+        dir.write(
+            "src/lib.rs",
+            r#"
+pub mod shape;
+
+pub fn resolve_git_ref(git_ref: &str) -> String {
+    shape::normalise(git_ref)
+}
+"#,
+        );
+        dir.write(
+            "src/shape.rs",
+            r#"
+pub fn normalise(name: &str) -> String {
+    name.trim().to_string()
+}
+
+fn never_called(name: &str) -> String {
+    name.to_string()
+}
+"#,
+        );
+        let root = dir.0.canonicalize().unwrap();
+
+        let calls: [(&str, Value); 4] = [
+            ("map", json!({ "path": "src", "depth": 2 })),
+            ("quality", json!({ "path": "src", "top": 5 })),
+            ("dead_code", json!({ "include_public": true })),
+            ("similar", json!({ "query": "normalise" })),
+        ];
+
+        for (name, args) in &calls {
+            let cli = run_tool(root.clone(), false, None, name, args)
+                .unwrap_or_else(|e| panic!("{name} failed on the CLI door: {e:#}"));
+            let mcp = through_stdio(&root, name, args);
+            // Equality is only worth asserting over a real answer: two empty
+            // strings match, and a tool that silently returned nothing would
+            // pass a bare `assert_eq!` while proving nothing at all.
+            assert!(
+                cli.lines().count() > 3 && cli.contains("_scope "),
+                "`{name}` returned nothing worth comparing:\n{cli}"
+            );
+            assert_eq!(
+                cli, mcp,
+                "`{name}` answers the two doors differently — one implementation is the point"
+            );
+        }
+    }
+
+    /// A tree with six mutually-recursive pairs, so the cycle list is
+    /// longer than the five the prose prints — the smallest fixture that
+    /// can tell a complete JSON list from a capped one.
+    fn six_cycles(name: &str) -> TmpDir {
+        let dir = TmpDir::new(name);
+        let mut src = String::from("pub mod widget;\n");
+        for i in 0..6 {
+            src.push_str(&format!(
+                "pub fn ping{i}(n: u32) -> u32 {{ if n == 0 {{ 0 }} else {{ pong{i}(n - 1) }} }}\n\
+                 pub fn pong{i}(n: u32) -> u32 {{ if n == 0 {{ 0 }} else {{ ping{i}(n - 1) }} }}\n",
+            ));
+        }
+        dir.write("src/lib.rs", &src);
+        dir.write("src/widget.rs", "pub fn draw() -> u32 { 1 }\n");
+        // A file no parser reads, so the census has something to hold back
+        // and `map`'s two numbers are genuinely two numbers.
+        dir.write("src/page.astro", "<h1>hello</h1>\n");
+        dir
+    }
+
+    /// The number a heading states, e.g. `2` from
+    /// `## Dependency cycles (2)`.
+    fn heading_count(text: &str, heading: &str) -> usize {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(heading))
+            .unwrap_or_else(|| panic!("no `{heading}` heading in:\n{text}"));
+        let digits: String = line
+            .split_once('(')
+            .expect("the heading states a count")
+            .1
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().expect("the count is a number")
+    }
+
+    /// The drift CLI-002 was written about, one level down: two renderings
+    /// of one call that disagree about how many things there are.
+    ///
+    /// Counts rather than whole bodies, because that is what a CI job
+    /// reads — "how many smells, and did that number go up" is the
+    /// question CLI-003 exists to let it ask without grepping a heading.
+    #[test]
+    fn the_prose_and_the_json_report_the_same_counts() {
+        let dir = six_cycles("same-counts");
+        let root = dir.0.canonicalize().unwrap();
+        let args = json!({ "path": "src", "top": 5 });
+
+        let text = run_tool(root.clone(), false, None, "quality", &args).expect("quality as text");
+        let json = run_tool_json(root, false, None, "quality", &args).expect("quality as json");
+        let data = &json["data"];
+
+        assert_eq!(
+            heading_count(&text, "## Dependency cycles ("),
+            data["cycles"]["total"].as_u64().expect("a cycle count") as usize,
+        );
+        assert_eq!(
+            heading_count(&text, "## Smells ("),
+            data["smells"]["total"].as_u64().expect("a smell count") as usize,
+        );
+        assert_eq!(
+            heading_count(&text, "## Folder shape ("),
+            data["folder_shape"]["tally"]["total"]
+                .as_u64()
+                .expect("a folder count") as usize,
+        );
+    }
+
+    /// `map`'s two numbers — what it listed against what the folder holds
+    /// — are the ones a reader is most likely to mistake for each other,
+    /// which is why the prose spells them "19 of 21 files listed".
+    #[test]
+    fn the_json_map_says_what_the_listing_could_not_show() {
+        let dir = six_cycles("map-census");
+        let root = dir.0.canonicalize().unwrap();
+        let args = json!({ "path": "src", "depth": 1 });
+
+        let text = run_tool(root.clone(), false, None, "map", &args).expect("map as text");
+        let data = run_tool_json(root, false, None, "map", &args).expect("map as json")["data"]
+            .clone();
+
+        assert_eq!(data["listed"], json!(2), "two .rs files are listed");
+        assert_eq!(data["held"], json!(3), "the .astro file is held and unread");
+        assert_eq!(data["unread"]["unsupported"], json!(1));
+        assert_eq!(data["unread"]["extensions"], json!([".astro"]));
+        assert!(
+            text.contains("2 of 3 files listed"),
+            "the prose states the same two numbers:\n{text}"
+        );
+    }
+
+    /// The prose caps its cycle list at five and says so; a script wants
+    /// all of them (ADR 0035). A cap the *renderer* chose is a property of
+    /// prose, not of the answer.
+    #[test]
+    fn a_cap_the_prose_chose_does_not_reach_the_json() {
+        let dir = six_cycles("prose-cap");
+        let root = dir.0.canonicalize().unwrap();
+        let args = json!({ "path": "src" });
+
+        let text = run_tool(root.clone(), false, None, "quality", &args).expect("quality as text");
+        let data = run_tool_json(root, false, None, "quality", &args).expect("quality as json")
+            ["data"]
+            .clone();
+
+        let total = data["cycles"]["total"].as_u64().expect("a cycle count");
+        assert!(
+            total > SHOWN_CYCLES_IN_PROSE,
+            "the fixture has to out-run the cap to prove anything: {total}"
+        );
+        assert_eq!(
+            data["cycles"]["cycles"].as_array().map(Vec::len),
+            Some(total as usize),
+            "the JSON carries every cycle it counted"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("- ") && l.contains(" → ")).count(),
+            SHOWN_CYCLES_IN_PROSE as usize,
+            "the prose still prints five:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "… and {} more cycles.",
+                total - SHOWN_CYCLES_IN_PROSE
+            )),
+            "and still says how many it left out:\n{text}"
+        );
+    }
+
+    /// What `quality`'s prose prints before it summarises — stated here so
+    /// the test above fails loudly if the budget moves, rather than
+    /// silently asserting the new one.
+    const SHOWN_CYCLES_IN_PROSE: u64 = 5;
+
+    /// A bound the *caller* passed is part of the question, so both
+    /// renderings honour it — and both say how many there were.
+    #[test]
+    fn a_bound_the_caller_set_is_honoured_by_both_renderings() {
+        let dir = six_cycles("caller-bound");
+        let root = dir.0.canonicalize().unwrap();
+        let args = json!({ "path": "src", "top": 2 });
+
+        let data = run_tool_json(root, false, None, "quality", &args).expect("quality as json")
+            ["data"]
+            .clone();
+
+        let pressure = &data["pressure"];
+        assert_eq!(pressure["entities"].as_array().map(Vec::len), Some(2));
+        assert_eq!(pressure["shown"], json!(2));
+        assert!(
+            pressure["total"].as_u64().expect("a total") > 2,
+            "the fixture has more entities than `top` asked for"
+        );
+    }
+
+    /// Twelve tools still answer in prose, and a caller asking one of them
+    /// for JSON has to be told which — not handed prose from a flag that
+    /// promised JSON, and not an empty object (ADR 0035).
+    #[test]
+    fn a_tool_with_no_json_rendering_refuses_by_name() {
+        let dir = six_cycles("no-json");
+        let root = dir.0.canonicalize().unwrap();
+        let error = run_tool_json(root, false, None, "reshape", &json!({ "path": "src" }))
+            .expect_err("reshape has no JSON rendering yet")
+            .to_string();
+
+        assert!(
+            error.contains("`reshape`"),
+            "the refusal names the tool:\n{error}"
+        );
+        for converted in structured_tools() {
+            assert!(
+                error.contains(converted),
+                "the refusal lists `{converted}` as somewhere to go:\n{error}"
+            );
+        }
+    }
+
+    /// The footer's two facts, and the caveat beside them, are fields
+    /// rather than a trailing string a consumer has to regex (CLI-003).
+    #[test]
+    fn the_envelope_names_the_scope_that_produced_it() {
+        let dir = six_cycles("envelope");
+        let root = dir.0.canonicalize().unwrap();
+        let json = run_tool_json(root.clone(), false, None, "map", &json!({ "path": "src" }))
+            .expect("map as json");
+
+        assert_eq!(json["schema_version"], json!(answer::SCHEMA_VERSION));
+        assert_eq!(json["tool"], json!("map"));
+        assert_eq!(json["mezz_version"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(json["scope"]["include_tests"], json!(false));
+        assert_eq!(json["scope"]["root"], json!(root.display().to_string()));
+        assert_eq!(
+            json["scope"]["digest"].as_str().map(str::len),
+            Some(6),
+            "the digest is the same six characters the footer prints"
+        );
+        assert!(
+            json["caveats"].is_array(),
+            "caveats are always an array, empty when the graph is whole"
+        );
+    }
+
+    /// An agent that has just been handed the prose should not have to ask
+    /// twice to get the rows. Converted tools carry both in one response;
+    /// the rest carry text alone rather than an empty structure.
+    #[test]
+    fn the_stdio_door_carries_the_value_beside_the_prose() {
+        let dir = six_cycles("stdio-pair");
+        let root = dir.0.canonicalize().unwrap();
+        let server = McpServer {
+            shape_baselines: baseline::ShapeBaselines::rooted_at(&root),
+            rules_spelled_out: std::sync::atomic::AtomicBool::new(false),
+            layout_caveat_spelled_out: std::sync::atomic::AtomicBool::new(false),
+            root,
+            include_tests: false,
+            languages: None,
+            graph_cache: Mutex::new(HashMap::new()),
+            base_cache: Mutex::new(HashMap::new()),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+
+        let converted = handle_tools_call(
+            &server,
+            json!(1),
+            &json!({ "name": "map", "arguments": { "path": "src" } }),
+        );
+        assert_eq!(converted["result"]["structuredContent"]["tool"], json!("map"));
+        assert!(
+            converted["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("# Map of")),
+            "the prose still travels with it"
+        );
+
+        let prose_only = handle_tools_call(
+            &server,
+            json!(2),
+            &json!({ "name": "reshape", "arguments": { "path": "src" } }),
+        );
+        assert!(
+            prose_only["result"]["structuredContent"].is_null(),
+            "an unconverted tool sends no structure at all, not an empty one"
         );
     }
 }

@@ -54,9 +54,12 @@ import { searchMatchIds, searchNeighborIds } from './filterViewModel';
 import { diffActive, diffLevel, diffSeedFacet, diffFiltersEnabled, diffStatusMap, diffSourceChangedMap, diffScopeChanges, diffChangedEdges, diffAddedEntityIds, diffDimOpacity, diffContextOpacity, diffHeadIsWorking, normalizeEntityId, type ChangeStatus } from '../stores/diff';
 import type { ScopeChange } from './diffRollup';
 import { editKind, type DiffFacts } from './diffVerdict';
-import { planDiffLevel, splitEdits, type DiffLevel, type DiffSeedFacet, type EditKind, type LevelEdge } from './diffLevels';
-import { gateByDrawCeiling, type DrawOverflow } from './drawCeiling';
+import { linkTier, planDiffLevel, splitEdits, type DiffLevel, type DiffSeedFacet, type EditKind, type LevelEdge } from './diffLevels';
+import { drawnNodeSet, gateByDrawCeiling, type DrawOverflow } from './drawCeiling';
 import { rankHubs } from './hubs';
+import { flowFields, type FlowRung } from './flowPlacement';
+import { carriesFlux } from './scopeFlow';
+import type { FlowEdge } from './flowLayers';
 import { demoteHubs, hubCount } from '../stores/settings';
 import { crossFilterPaths } from '../stores/crossFilter';
 import { splitViewOpen } from '../stores/panes';
@@ -72,17 +75,55 @@ export interface DisplayPlan {
    *  come from. What makes 'shape' its own mode rather than a second source
    *  of tree positions is what it means: a tree is a reach around a
    *  selection, a shape is a claim about one folder's structure, and the
-   *  edges carry a verdict in the second case and not the first. */
-  mode: 'force' | 'tree' | 'shape';
+   *  edges carry a verdict in the second case and not the first.
+   *
+   *  'flow' is the fourth, and the only one that is a pure re-layout: it draws
+   *  exactly what force mode drew, in dependency layers. It shares the pinning
+   *  path with the other two — positions in `treePositions`, nothing
+   *  simulated — and adds `flowAxis`, which is the part the reader needs and
+   *  no pixel can carry: which end is upstream. */
+  mode: 'force' | 'tree' | 'shape' | 'flow';
   /** Ids of nodes that should be visible in the current view. Includes
    *  filter, search, and selection-distance gating. */
   visibleNodeIds: Set<string>;
   /** Stable per-link identifiers for visible links. Format: `${src}->${tgt}|${kind}` */
   visibleLinkKeys: Set<string>;
+  /**
+   * The Rest tier's wiring — lines that run between drawn nodes but that the
+   * view did not choose (UI-144). Drawn at `dimOpacity`, like the nodes.
+   *
+   * The counterpart to `dimmedNodeIds`, and it exists for the same reason: the
+   * Rest slider is how a reader asks "what else is there", and an answer made
+   * of unconnected circles is a census, not a shape. Two kinds of line land
+   * here — one with an end in `dimmedNodeIds`, and one between two visible
+   * nodes that a rung below `neighbourhood` declined to draw because it had
+   * not changed. Both are untouched wiring, which is exactly what this tier is.
+   *
+   * Empty when `dimOpacity` is 0, because then the Rest tier is not on screen
+   * and naming its lines would have the View build DOM for nothing.
+   */
+  dimmedLinkKeys: Set<string>;
   /** Selected node id, or null. Plain pass-through for the .selected class. */
   selectedId: string | null;
-  /** Tree-mode positions, keyed by node id. Empty in force mode. */
+  /** Tree-mode positions, keyed by node id. Empty in force mode. Flow mode
+   *  fills the same map — the View's pinning path is shared. */
   treePositions: Map<string, { x: number; y: number }>;
+  /**
+   * One entry per dependency layer the Flow view drew, left to right (UI-146).
+   * Empty in every other mode.
+   *
+   * Carried on the plan rather than recomputed in the View for the reason the
+   * positions are: the columns and their captions have to come from the same
+   * layering, or the canvas would label a column that the nodes are not in.
+   */
+  flowAxis: FlowRung[];
+  /**
+   * Nodes the Flow view found in a dependency cycle. Empty in every other
+   * mode, and empty in Flow mode when the drawn graph is acyclic — which is
+   * the reading worth having, so it is said by an absence of marks rather
+   * than by a badge on every node.
+   */
+  flowCycleIds: Set<string>;
   /** BFS distance from the selection to each node, capped at maxLevel.
    *  Populated in BOTH modes when there's a selection — used by the View
    *  to dim non-neighbours and to classify edges in tree mode. */
@@ -142,6 +183,43 @@ const linkKey = (src: string, tgt: string, kind: string, order?: number | null) 
   order == null ? `${src}->${tgt}|${kind}` : `${src}->${tgt}|${kind}#${order}`;
 const sourceIdOf = (l: D3Link): string => typeof l.source === 'object' ? (l.source as D3Node).id : l.source;
 const targetIdOf = (l: D3Link): string => typeof l.target === 'object' ? (l.target as D3Node).id : l.target;
+
+/**
+ * The lines the Flow layout is derived from (UI-146).
+ *
+ * Read back off the key sets rather than collected in the edge loop, and that
+ * is a deliberate trade: one extra pass over `graph.links`, paid only when the
+ * Flow view is on, against three branches inside `compute` — a function that
+ * is already the largest in the codebase and should not grow by three for a
+ * mode it spends most of its life not being in.
+ *
+ * Both tiers feed it. The Rest tier's wiring is drawn, so a layout that
+ * ignored it would route lines across columns the reader can see are wrong.
+ * Structural edges are left out — see `carriesFlux`. A `Contains` line does
+ * not make a class stand on its own methods.
+ */
+function fluxEdgesOf(
+  links: readonly D3Link[],
+  visible: ReadonlySet<string>,
+  dimmed: ReadonlySet<string>,
+): FlowEdge[] {
+  const out: FlowEdge[] = [];
+  for (const l of links) {
+    if (!carriesFlux(l.kind_raw)) continue;
+    const source = sourceIdOf(l);
+    const target = targetIdOf(l);
+    const key = linkKey(source, target, l.kind_raw, l.order);
+    if (!visible.has(key) && !dimmed.has(key)) continue;
+    out.push({ source, target });
+  }
+  return out;
+}
+
+/** Is a committed search contributing to the dim tier? Only when one is
+ *  running and it was set to fade non-matches rather than remove them. */
+function searchDims(args: { searchMatched: Set<string>; searchHides: boolean }): boolean {
+  return args.searchMatched.size > 0 && !args.searchHides;
+}
 
 function getMaxLevel(lo: Record<number, LevelOverrides>, depthCap: number): number {
   for (let i = depthCap; i >= 1; i--) {
@@ -253,8 +331,11 @@ function emptyPlan(): DisplayPlan {
     mode: 'force',
     visibleNodeIds: new Set(),
     visibleLinkKeys: new Set(),
+    dimmedLinkKeys: new Set(),
     selectedId: null,
     treePositions: new Map(),
+    flowAxis: [],
+    flowCycleIds: new Set(),
     nodeDistances: null,
     searchMatched: new Set(),
     searchNeighbors: new Set(),
@@ -1088,20 +1169,28 @@ function compute(args: ComputeArgs): DisplayPlan {
     // direct / same-level / cross-level visibility toggles still apply.
     const nodeKind = new Map(graph.nodes.map((n) => [n.id, n.kind_raw]));
     const visibleLinkKeys = new Set<string>();
+    const dimmedLinkKeys = new Set<string>();
+    // Every node this branch will put on screen — the rung's own set plus the
+    // Rest tier, when the slider is off 0 and that tier is actually drawn.
+    // Same definition `drawnIdsOf` uses, because a line whose end was never
+    // built renders as an arrow into empty space.
+    const treeDrawn = drawnNodeSet(treeVisible, treeDimmed, args.diffDim);
     for (const l of graph.links) {
       const s = sourceIdOf(l), t = targetIdOf(l);
-      if (!treeVisible.has(s) || !treeVisible.has(t)) {
+      if (!treeDrawn.has(s) || !treeDrawn.has(t)) {
         continue;
       }
       if (!linkDrawable(l, treeVisible, args)) {
         continue;
       }
-      // Below `neighbourhood` an edge has to have moved to earn a line, the
-      // same rule force mode applies. Without it the tree drew every untouched
-      // call between two changed nodes and called that a diff.
-      if (treeChangedLinks && !treeChangedLinks.has(linkKey(s, t, l.kind_raw, l.order))) {
-        continue;
-      }
+      // Two tiers rather than a gate (UI-144). Below `neighbourhood` an edge
+      // has to have moved to earn a *line* — the same rule force mode applies,
+      // and without it the tree drew every untouched call between two changed
+      // nodes and called that a diff. What changed is where the rejects go: an
+      // edge the rung declined, or one with an end in the Rest tier, is now
+      // that tier's wiring instead of nothing at all.
+      const key = linkKey(s, t, l.kind_raw, l.order);
+      const tier = linkTier(s, t, key, treeVisible, treeChangedLinks);
       const sLevel = levels.get(s)!;
       const tLevel = levels.get(t)!;
       const linkLevel = Math.max(sLevel, tLevel);
@@ -1120,7 +1209,10 @@ function compute(args: ComputeArgs): DisplayPlan {
       if (!involvesBranch && isCrossLevel && !args.showCross) {
         continue;
       }
-      visibleLinkKeys.add(linkKey(s, t, l.kind_raw, l.order));
+      // Same rule as force mode: a hidden Rest tier earns no lines, so its
+      // wiring cannot move the layout at the diff's default setting.
+      if (tier === 'visible') visibleLinkKeys.add(key);
+      else if (args.diffDim > 0) dimmedLinkKeys.add(key);
     }
     // Inject parameter nodes for the selected callable.
     injectParams(treeVisible, visibleLinkKeys, positions, levels);
@@ -1130,8 +1222,11 @@ function compute(args: ComputeArgs): DisplayPlan {
       mode: 'tree',
       visibleNodeIds: treeVisible,
       visibleLinkKeys,
+      dimmedLinkKeys,
       selectedId: selected!.id,
       treePositions: positions,
+      flowAxis: [],
+      flowCycleIds: new Set(),
       nodeDistances: levels,
       searchMatched: args.searchMatched,
       searchNeighbors: args.searchNeighbors,
@@ -1204,20 +1299,44 @@ function compute(args: ComputeArgs): DisplayPlan {
     ? new Set(rankHubs(graph.nodes.filter((n) => visibleNodeIds.has(n.id)), args.hubCount))
     : new Set<string>();
 
+  // Search dimming and diff dimming have different defaults; when both are in
+  // play the more visible wins so neither can black out the other's set.
+  //
+  // Read here rather than only at the return, because the edge loop below has
+  // to know whether the Rest tier is on screen before it can decide which
+  // lines belong to it.
+  const dimOpacity = searchDims(args)
+    ? Math.max(args.searchDim, args.diffDim)
+    : args.diffDim;
+
   const visibleLinkKeys = new Set<string>();
+  const dimmedLinkKeys = new Set<string>();
   const maxLevel = getMaxLevel(args.lo, args.maxDepth);
   const searchActive = args.searchMatched.size > 0;
   const nodeKind = new Map(graph.nodes.map((n) => [n.id, n.kind_raw]));
+  // Every node the View will build — `drawnIdsOf` is the same definition, and
+  // the two have to agree or the plan names a line with an end that was never
+  // made. At `dimOpacity === 0` the Rest tier is hidden outright, so it
+  // contributes no nodes here and earns no lines below.
+  const drawnNodeIds = drawnNodeSet(visibleNodeIds, dimmedIds, dimOpacity);
   for (const l of graph.links) {
     const s = sourceIdOf(l), t = targetIdOf(l);
-    if (!visibleNodeIds.has(s) || !visibleNodeIds.has(t)) continue;
+    if (!drawnNodeIds.has(s) || !drawnNodeIds.has(t)) continue;
     if (!linkDrawable(l, visibleNodeIds, args)) continue;
     if (!args.rels.has(l.kind_raw)) continue;
-    // Below `neighbourhood`, an edge has to have moved to earn a line. This
-    // is the whole point of the ladder: three quarters of what the old view
-    // drew was untouched wiring that merely happened to run between two
-    // changed entities.
-    if (changedLinkKeys && !changedLinkKeys.has(linkKey(s, t, l.kind_raw, l.order))) continue;
+    // Two tiers rather than a gate (UI-144). Below `neighbourhood`, an edge has
+    // to have moved to earn a *line*: that is the whole point of the ladder —
+    // three quarters of what the old view drew was untouched wiring that merely
+    // happened to run between two changed entities.
+    //
+    // But "not part of the diff" is what the Rest tier is *for*, and a reader
+    // who raises that slider is asking for the code around the change. Getting
+    // back a field of unconnected circles answers half the question. So an edge
+    // the ladder declined — because it did not move, or because one end is in
+    // the Rest tier — is demoted to that tier rather than dropped, and fades in
+    // and out with the nodes it joins.
+    const key = linkKey(s, t, l.kind_raw, l.order);
+    const tier = linkTier(s, t, key, visibleNodeIds, changedLinkKeys);
     // Suppress edges *into* a demoted hub. Inbound is what makes a utility
     // module unreadable — everything points at it — while its own outgoing
     // edges are few and carry real information. The node stays drawn, so the
@@ -1251,31 +1370,66 @@ function compute(args: ComputeArgs): DisplayPlan {
       if (!involvesBranch && isCrossLevel && !args.showCross) continue;
     }
 
-    visibleLinkKeys.add(linkKey(s, t, l.kind_raw, l.order));
+    // The Rest tier earns keys only while it is on screen. At 0 the View sets
+    // `display: none` on it, and a key it cannot draw would still cost the
+    // build a DOM element and the simulation a link force — which would move
+    // the layout at the diff's *default* setting, for lines nobody sees.
+    if (tier === 'visible') visibleLinkKeys.add(key);
+    else if (dimOpacity > 0) dimmedLinkKeys.add(key);
   }
 
-  // Inject parameter nodes for the selected callable.
-  injectParams(visibleNodeIds, visibleLinkKeys);
-  // Inject class-field Variables (force mode: only add to visible set;
-  // positions come from d3 simulation).
-  injectClassFields(visibleNodeIds, visibleLinkKeys);
+  // Inject parameter nodes for the selected callable, and class-field
+  // Variables for a selected class (force mode: only add to the visible set;
+  // positions come from d3's simulation).
+  //
+  // Not in Flow mode. Parameters are reached by `TakesParam` and fields by
+  // `Contains`, neither of which carries flux — so every injected node would
+  // arrive with no edge the layout can read and pile into column 0 as an
+  // isolated node, putting a method's five parameters at the upstream end of
+  // the repo. The selection still opens them in Graph and Tree view, where a
+  // position that is merely *near the method* is all they need.
+  //
+  // This `if` is the whole of what a fourth canvas mode costs this function.
+  // It reads as one branch either way — moved inside the two closures it
+  // guards it costs two, since they are declared here and their complexity is
+  // this function's. Getting it to nothing means indexing a per-mode kind
+  // table instead of asking the question, which trades a branch the ceiling
+  // counts for a sentence the next reader has to decode. Not worth it.
+  if (viewMode !== 'flow') {
+    injectParams(visibleNodeIds, visibleLinkKeys);
+    injectClassFields(visibleNodeIds, visibleLinkKeys);
+  }
 
   return {
-    mode: 'force',
+    // The Flow view, last, over exactly what force mode just decided to draw.
+    //
+    // Deliberately at the tail rather than as its own branch beside
+    // `wantsTree`: Flow is not a different population, it is the same one laid
+    // out by dependency depth instead of by force. Every filter, the diff
+    // ladder, hub demotion and the selection reach have already run, so
+    // switching modes moves the circles and changes nothing about which
+    // circles there are — which is what makes it safe to flip back and forth
+    // while reading.
+    //
+    // One call rather than four conditionals, because this function is the
+    // largest in the codebase and a fourth mode should cost it as close to
+    // nothing as a fourth mode can.
+    ...flowFields(
+      args.viewMode === 'flow',
+      drawnNodeIds,
+      () => fluxEdgesOf(graph.links, visibleLinkKeys, dimmedLinkKeys),
+      args.density,
+    ),
     visibleNodeIds,
     visibleLinkKeys,
+    dimmedLinkKeys,
     demotedHubIds,
     selectedId: selectionInGraph ? selected!.id : null,
-    treePositions: new Map(),
     nodeDistances,
     searchMatched: args.searchMatched,
     searchNeighbors: args.searchNeighbors,
     dimmedNodeIds: dimmedIds,
-    // Search dimming and diff dimming have different defaults; when both are
-    // in play the more visible wins so neither can black out the other's set.
-    dimOpacity: args.searchMatched.size > 0 && !args.searchHides
-      ? Math.max(args.searchDim, args.diffDim)
-      : args.diffDim,
+    dimOpacity,
     contextNodeIds: contextIds,
     // Nothing recruited, nothing to weight — and `1` keeps every other reason
     // a node is drawn out of this tier's reach.

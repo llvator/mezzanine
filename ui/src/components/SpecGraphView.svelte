@@ -24,9 +24,12 @@
   import {
     specGraph, visibleSpecGraph, drawnSpecGraph, specScopeState, specFocus,
     specSelection, specSelectedNodes, specTrail, specHighlightIds,
+    specPinnedHighlight, specClaimHighlightIds,
     focusSpecEntity, clearSpecFocus, drillTo,
+    hoverSpecEntity, togglePinnedHighlight, clearPinnedHighlight,
   } from '../stores/crossFilter';
-  import { followAnalysisScope } from '../stores/panes';
+  import { followAnalysisScope, filterOnSpecClick } from '../stores/panes';
+  import { refreshData, refreshing } from '../stores/scope';
   import type { SpecScopeState } from '../viewmodels/specGraph';
   import {
     layoutSpecGraph, tierOf, COL_PITCH, type SpecGraph, type SpecLayout,
@@ -103,6 +106,17 @@
   function nodeOpacity(node: D3Node): number {
     return markOf(node) ? 0.45 : 1;
   }
+
+  /**
+   * The violet the code canvas rings a claimed entity in (`.node.spec-claim`).
+   *
+   * A literal, and one of the deliberate exceptions CONTRIBUTING names: this
+   * identifies a channel rather than styling text, and the whole point of it
+   * is that the same hue means the same thing on both canvases. Themed, it
+   * would drift from the value in `GraphView`'s stylesheet and the pairing
+   * would be gone.
+   */
+  const PIN_COLOR = '#7C4DFF';
 
   /** The open path, as a set, for the ring tests. */
   $: onTrail = new Set($specTrail.map((n) => n.id));
@@ -227,17 +241,51 @@
       .attr('transform', (d) => `translate(${at(d.id).x},${at(d.id).y})`)
       .on('click', (event: MouseEvent, d: D3Node) => {
         event.stopPropagation();
-        focusSpecEntity(d);
-      });
+        // Shift is the pin. A modifier rather than a second target because
+        // the targets here are 5px circles — anything with its own hitbox
+        // would be smaller than the thing it hangs off — and shift because
+        // it is the one modifier no other gesture on either canvas claims.
+        if (event.shiftKey) togglePinnedHighlight(d.id);
+        else focusSpecEntity(d);
+      })
+      // `mouseenter`/`mouseleave` and not `mouseover`/`mouseout`: the group
+      // holds a circle and three texts, and the bubbling pair fire a leave
+      // every time the pointer crosses from one child to the next — which
+      // reads on the other canvas as the highlight blinking off and back on
+      // while the pointer holds still.
+      .on('mouseenter', (_event: MouseEvent, d: D3Node) => hoverSpecEntity(d))
+      .on('mouseleave', () => hoverSpecEntity(null));
 
     nodeSel.append('title').text((d) => {
       const mark = markOf(d);
-      return mark ? `${d.kind} ${d.qualified_name} — ${mark.why}` : `${d.kind} ${d.qualified_name}`;
+      const head = mark
+        ? `${d.kind} ${d.qualified_name} — ${mark.why}`
+        : `${d.kind} ${d.qualified_name}`;
+      // The gestures spelled out on the thing they apply to. The footer says
+      // this too, but the footer is one line for the whole pane and by the
+      // time a reader wonders "what does shift do here" the pointer is
+      // already on the entity they want it to do it to.
+      return `${head}\nShift-click to pin its code on the graph`;
     });
 
     nodeSel.append('circle')
       .attr('r', radiusOf)
       .attr('fill', (d) => NODE_COLORS[d.kind_raw] ?? colors.arrowFill);
+
+    // The pin ring, drawn on every node and shown on the pinned ones. Same
+    // violet dash as the ring the pinned entity is putting on the code canvas
+    // — that is the whole message, and a hue the reader has to look up in a
+    // legend would not carry it. Appended unconditionally so `applyEmphasis`
+    // can pin and unpin without a relayout, and outside the ring the emphasis
+    // block draws, which is already saying two other things about a node.
+    nodeSel.append('circle')
+      .attr('class', 'pin-ring')
+      .attr('r', (d) => radiusOf(d) + 3.5)
+      .attr('fill', 'none')
+      .attr('stroke', PIN_COLOR)
+      .attr('stroke-width', 1.5)
+      .attr('stroke-dasharray', '3,2')
+      .attr('pointer-events', 'none');
 
     nodeSel.append('text')
       .attr('text-anchor', 'middle')
@@ -279,9 +327,13 @@
     if (!plot) return;
     const nodeSel = plot.selectAll<SVGGElement, D3Node>('g.spec-node');
     nodeSel.attr('opacity', (d) => nodeOpacity(d));
+    // `select` takes the first matching child, which is the kind circle — the
+    // pin ring is appended after it and is addressed by class below.
     nodeSel.select<SVGCircleElement>('circle')
       .attr('stroke', (d) => ringColor(d))
       .attr('stroke-width', (d) => ringWidth(d));
+    nodeSel.select<SVGCircleElement>('circle.pin-ring')
+      .attr('display', (d) => ($specPinnedHighlight.has(d.id) ? null : 'none'));
     plot.selectAll<SVGLineElement, D3Link>('line')
       .attr('stroke-opacity', (d) => (d ? linkOpacity(d) : 0.15));
   }
@@ -312,7 +364,7 @@
   // onto SVG attributes at join time; a CSS variable swap alone leaves the
   // canvas stale (UI-009).
   $: rebuild($drawnSpecGraph, paneWidth, $activeTheme, $specScopeState, svgEl);
-  $: repaint(onTrail, $specSelection, $specHighlightIds, plot);
+  $: repaint(onTrail, $specSelection, $specHighlightIds, $specPinnedHighlight, plot);
 
   function rebuild(
     graph: SpecGraph,
@@ -340,14 +392,52 @@
     _trail: Set<string>,
     _selection: Set<string>,
     _highlight: Set<string>,
+    _pinned: Set<string>,
     target: typeof plot,
   ): void {
     if (!target) return;
     applyEmphasis();
   }
+
+  /**
+   * Re-read the spec from the engine, on demand.
+   *
+   * The whole dataset, not some spec-only slice, because the pane draws more
+   * than the `.elv` says: the ◌/○/✖ marks are the spec measured against the
+   * analysed code, so a spec refreshed alone would report drift against a
+   * graph from before the edit that fixed it. `refreshData` is the same
+   * reload the bottom bar's button and live reload both run.
+   *
+   * It re-fetches; it does not re-analyse. `mezz watch` re-analyses on save
+   * and pushes, so this button is for when that push was missed or is not
+   * running — and under `mezz serve`, where nothing watches, it picks up
+   * whatever the server has since been given.
+   */
+  async function reloadSpec(): Promise<void> {
+    await refreshData();
+  }
 </script>
 
-<div class="spec-pane" bind:this={container} data-pane="spec">
+<!-- The pane clears the hover as a backstop. A node's own `mouseleave` is the
+     normal path; it is not dispatched when the element is removed from under
+     a stationary pointer, and a rebuild removes every node — so a pointer
+     that then leaves the pane without crossing another node would otherwise
+     leave the code canvas lit by an entity nobody is pointing at.
+
+     Nothing here for the keyboard, and that is a property of the canvas
+     rather than of this handler: entities are 5px circles with no tab stop,
+     so every gesture the pane offers is a pointer gesture and always was.
+     What the keyboard needs is a surface with rows on it, which is the
+     Filters pane's Spec section — it carries the checkbox for selecting and,
+     since the highlight shipped, a pin button per row for this. Nothing on
+     this element would be reachable to bind a key to. -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="spec-pane"
+  bind:this={container}
+  data-pane="spec"
+  on:mouseleave={() => hoverSpecEntity(null)}
+>
   <header>
     <span class="title">Spec</span>
     {#if !$specGraph.empty}
@@ -356,15 +446,45 @@
       <span class="count">
         {$drawnSpecGraph.empty ? 0 : $drawnSpecGraph.nodes.length}<span class="of"> of {$specGraph.nodes.length}</span>
       </span>
+    {/if}
+    <!-- Right-hand group. The two live together so one auto margin pushes
+         both: a second one on the button would split the free space and
+         strand the toggle in the middle of the header. The reload sits
+         outside the emptiness check — a pane showing "no spec" is exactly
+         where a reader who has just written their first `.elv` looks. -->
+    <div class="actions">
+      {#if !$specGraph.empty}
+        <!-- What the click costs. Off, a click still opens the entity, still
+             drills and still moves the Details and Description panes — it just
+             stops emptying the canvas to do it. -->
+        <button
+          type="button"
+          class="toggle"
+          class:active={$filterOnSpecClick}
+          aria-pressed={$filterOnSpecClick}
+          data-probe="spec-filter-on-click"
+          title="Whether clicking an entity also narrows the code graph to what it declares. Off, a click only opens it and moves the Details pane — hover to see its code instead."
+          on:click={() => filterOnSpecClick.update((v) => !v)}
+        >Filter on click</button>
+        <button
+          type="button"
+          class="toggle"
+          class:active={$followAnalysisScope}
+          aria-pressed={$followAnalysisScope}
+          title="Draw only entities whose cr: reaches code the analysis scope has loaded"
+          on:click={() => followAnalysisScope.update((v) => !v)}
+        >Follow scope</button>
+      {/if}
       <button
         type="button"
-        class="toggle"
-        class:active={$followAnalysisScope}
-        aria-pressed={$followAnalysisScope}
-        title="Draw only entities whose cr: reaches code the analysis scope has loaded"
-        on:click={() => followAnalysisScope.update((v) => !v)}
-      >Follow scope</button>
-    {/if}
+        class="reload"
+        data-probe="spec-reload"
+        disabled={$refreshing}
+        aria-label="Reload the spec"
+        title="Re-read the spec from the engine"
+        on:click={reloadSpec}
+      ><span class="glyph" class:spinning={$refreshing}>↻</span></button>
+    </div>
   </header>
 
   <!-- The trail. It is the pane's only record of where you are: the canvas
@@ -417,8 +537,36 @@
         <span class="legend">◌</span> out of scope ·
         <span class="legend">○</span> no <code>cr:</code> ·
         <span class="legend">✖</span> drift
-      {:else}
+      {:else if $filterOnSpecClick}
         Click an entity to open it and filter the code graph
+      {:else}
+        Click an entity to open it · hover to light its code
+      {/if}
+
+      <!-- The highlight, on its own line and never instead of the line above.
+           The two channels can be running at once — that is the arrangement
+           the pin exists for — and a footer that showed only the louder one
+           would go quiet about the filter every time the pointer moved. -->
+      {#if $specClaimHighlightIds.size > 0 || $specPinnedHighlight.size > 0}
+        <div class="lit" data-probe="spec-lit">
+          <span class="swatch" aria-hidden="true"></span>
+          {#if $specClaimHighlightIds.size > 0}
+            <strong>{$specClaimHighlightIds.size}</strong> drawn {$specClaimHighlightIds.size === 1 ? 'entity' : 'entities'} lit
+          {:else}
+            <!-- Pinned, and nothing lit. Three different reasons — no `cr:`,
+                 code outside the scope, code the level has collapsed away —
+                 and the ◌/○/✖ mark on the pinned node is what separates them,
+                 so this only has to keep the reader from reading the empty
+                 canvas as a broken pin. -->
+            Pinned, but none of its code is drawn
+          {/if}
+          {#if $specPinnedHighlight.size > 0}
+            · {$specPinnedHighlight.size} pinned
+            <button type="button" class="link" on:click={clearPinnedHighlight}>unpin</button>
+          {:else}
+            · shift-click to pin
+          {/if}
+        </div>
       {/if}
     </footer>
   {/if}
@@ -453,8 +601,14 @@
   .count { font-size: 0.7rem; color: var(--text-muted); }
   .of { color: var(--text-dim); }
 
-  .toggle {
+  .actions {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .toggle {
     background: none;
     border: 1px solid var(--border);
     border-radius: 3px;
@@ -466,6 +620,32 @@
 
   .toggle:hover { background: var(--bg-hover); color: var(--text); }
   .toggle.active { border-color: var(--accent); color: var(--accent); }
+
+  .reload {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.72rem;
+    line-height: 1;
+    padding: 3px 6px;
+  }
+
+  .reload:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
+  .reload:disabled { cursor: default; color: var(--text-dim); }
+
+  /* The glyph turns while the reload is in flight — the glyph, not the
+     button, so the border stays square instead of tumbling with it. It is
+     the only sign the click landed: most refreshes redraw the same spec,
+     and a button that looks identical before and after reads as dead. */
+  .glyph { display: inline-block; }
+  .glyph.spinning { animation: spin 0.9s linear infinite; }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
 
   .link {
     background: none;
@@ -532,4 +712,27 @@
   }
 
   footer strong { color: var(--text-secondary); }
+
+  /* The highlight's own line. Indented by nothing and separated by space
+     alone: it is a second fact about the same pane, not a subordinate one. */
+  .lit {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 3px;
+  }
+
+  /* The violet, said once here rather than described in words. It is the only
+     way a reader connects "3 entities lit" to the rings across the window, and
+     the value is the literal `PIN_COLOR` for the reason given where that
+     constant is declared. Solid, unlike the rings it stands for: at 9px a
+     dashed border renders as three dots and reads as a dotted circle, which
+     is a different glyph from the one it is quoting. */
+  .swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 2px solid #7C4DFF;
+    flex-shrink: 0;
+  }
 </style>

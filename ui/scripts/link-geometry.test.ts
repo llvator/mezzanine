@@ -1,5 +1,6 @@
 /**
- * Unit tests for edge geometry — arrow-head placement and link thickness.
+ * Unit tests for edge geometry — arrow-head placement, link thickness, and
+ * where a mark that rides on an edge is allowed to sit.
  *
  * What makes this worth a suite rather than a look at the canvas: the defect
  * it fixes was invisible at file level and obvious at module level, because
@@ -17,7 +18,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ARROW_GAP, ARROW_LEN, arrowHeadPoint, linkStrokeWidth } from '../src/viewmodels/linkGeometry.ts';
+import {
+  ARROW_GAP, ARROW_LEN, EDGE_MARK_GAP, ORDER_BADGE_R,
+  arrowHeadPoint, edgeAnchorPoint, linkStrokeWidth,
+} from '../src/viewmodels/linkGeometry.ts';
+
+/** Distance from a tail at the origin to an anchor on its line. */
+const along = (p: { x: number; y: number }) => Math.hypot(p.x, p.y);
 
 test('the head stops one gap short of the rim, not at the centre', () => {
   // Tail at the origin, head node of radius 20 centred 100 px to the right.
@@ -52,6 +59,80 @@ test('overlapping nodes never push the head behind the tail', () => {
 test('a degenerate line is left alone', () => {
   const p = arrowHeadPoint(50, 50, 50, 50, 20);
   assert.deepEqual(p, { x: 50, y: 50 });
+});
+
+// ── Edge-anchored marks (order badges, kind labels) ────────────────────
+//
+// The defect these cover: the badge was placed at a flat 25 % of the
+// centre-to-centre line. Node radius is a user-chosen channel, so turning the
+// size scale up in the legend grows the tail circle past that mark and the
+// number disappears under it — no movement on screen to explain where it
+// went. Every case below is one the fraction alone gets wrong.
+
+const CLEAR = ORDER_BADGE_R + EDGE_MARK_GAP;
+
+test('a roomy edge keeps the badge at the fraction it asked for', () => {
+  // 300 px apart, small circles: 25 % is nowhere near either rim, so the
+  // clamp must not move it and the picture must not change.
+  const p = edgeAnchorPoint({ x: 0, y: 0, radius: 10 }, { x: 300, y: 0, radius: 10 }, 0.25, CLEAR);
+  assert.equal(p.x, 75);
+  assert.equal(p.y, 0);
+});
+
+test('a tail circle grown past the fraction pushes the badge off its rim', () => {
+  // 120 px apart puts the flat 25 % mark at x = 30. A 34 px tail radius —
+  // the top of the encoding's range — covers it whole.
+  const p = edgeAnchorPoint({ x: 0, y: 0, radius: 34 }, { x: 120, y: 0, radius: 10 }, 0.25, CLEAR);
+  assert.equal(p.x, 34 + CLEAR);
+  assert.ok(p.x > 34, 'the badge must clear the rim it was buried under');
+});
+
+test('the head circle cannot swallow a mark aimed at the middle', () => {
+  // The kind label sits at 50 %; a hub as the head node reaches past it.
+  const p = edgeAnchorPoint({ x: 0, y: 0, radius: 8 }, { x: 100, y: 0, radius: 60 }, 0.5, CLEAR);
+  assert.equal(p.x, 100 - 60 - CLEAR);
+});
+
+test('the clamp follows the rim as the size scale moves', () => {
+  // Same edge, two points on the size channel: the anchor has to travel with
+  // the radius, which is the whole reason a fraction could not do the job.
+  const small = edgeAnchorPoint({ x: 0, y: 0, radius: 20 }, { x: 120, y: 0, radius: 10 }, 0.25, CLEAR);
+  const large = edgeAnchorPoint({ x: 0, y: 0, radius: 34 }, { x: 120, y: 0, radius: 10 }, 0.25, CLEAR);
+  assert.equal(large.x - small.x, 34 - 20);
+});
+
+test('the clamp is measured along the line, not along an axis', () => {
+  // 3-4-5 again: a 50 px tail radius on a 100 px diagonal edge.
+  const p = edgeAnchorPoint({ x: 0, y: 0, radius: 50 - EDGE_MARK_GAP - ORDER_BADGE_R }, { x: 60, y: 80, radius: 5 }, 0.25, CLEAR);
+  assert.equal(Math.round(along(p)), 50);
+});
+
+test('two circles that leave no free line still get a placed mark', () => {
+  // Overlapping discs: there is no uncovered spot, so the anchor lands
+  // between them rather than shooting off the end of the line.
+  const p = edgeAnchorPoint({ x: 0, y: 0, radius: 50 }, { x: 60, y: 0, radius: 50 }, 0.25, CLEAR);
+  assert.ok(p.x >= 0 && p.x <= 60, `expected a point on the line, got ${p.x}`);
+});
+
+test('a mark never lands past either end of its own edge', () => {
+  // A tail hub far larger than the edge is long: clamping to its rim alone
+  // would put the badge beyond the head node entirely.
+  for (const [tailR, headR] of [[200, 0], [0, 200], [200, 200]]) {
+    const p = edgeAnchorPoint({ x: 0, y: 0, radius: tailR }, { x: 30, y: 0, radius: headR }, 0.25, CLEAR);
+    assert.ok(p.x >= 0 && p.x <= 30, `radii ${tailR}/${headR} put the mark at ${p.x}`);
+  }
+});
+
+test('a degenerate edge falls back to the plain fraction', () => {
+  const p = edgeAnchorPoint({ x: 50, y: 50, radius: 20 }, { x: 50, y: 50, radius: 20 }, 0.25, CLEAR);
+  assert.deepEqual(p, { x: 50, y: 50 });
+});
+
+test('the badge clearance is read off the disc actually drawn', () => {
+  // The clearance arithmetic is only right while it uses the badge's own
+  // radius; a constant here would drift the first time the disc is resized.
+  const p = edgeAnchorPoint({ x: 0, y: 0, radius: 40 }, { x: 100, y: 0, radius: 5 }, 0.25, CLEAR);
+  assert.ok(p.x - 40 >= ORDER_BADGE_R, 'the whole disc must clear the rim');
 });
 
 test('stroke width still ranks weights, within a range an arrow can sit on', () => {

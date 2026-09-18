@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::analyzer::Analyzer;
@@ -97,6 +97,11 @@ pub(crate) struct SettingsView {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub tx: Arc<broadcast::Sender<ReloadKind>>,
+    /// What the engine is doing right now, for `/api/activity` and the
+    /// `activity` SSE event (UI-138). The same sink is installed process-wide
+    /// in [`crate::activity`], which is how messages from inside the analyzer
+    /// — several frames below anything holding this state — reach it.
+    pub activity: Arc<crate::activity::Sink>,
     pub output_dir: std::path::PathBuf,
     pub repo_root: Arc<RwLock<std::path::PathBuf>>,
     pub include_tests: bool,
@@ -132,6 +137,17 @@ pub(crate) struct AppState {
     /// overlay everyone just dismissed comes back. `run_diff` snapshots this
     /// before starting and declines to publish if it moved (UI-100).
     pub diff_epoch: Arc<AtomicU64>,
+    /// Flipped to `true` to ask the diff that is running to stop (UI-141).
+    ///
+    /// Separate from `cancel`, which is the analysis-scope handler's: the two
+    /// runs overlap — a diff analyzes its two sides while the watcher
+    /// re-analyzes the working tree — and one flag would mean each could only
+    /// be stopped by killing the other.
+    ///
+    /// Reset at the start of every run rather than by whoever set it, so a
+    /// stop that lands in the moment a diff is finishing cannot carry over
+    /// and abort the next one.
+    pub diff_cancel: Arc<AtomicBool>,
     /// False when `--pin-diff` asked for the diff to stay where it was put.
     pub follow_diff: bool,
     /// Flipped to `true` to ask the active analyzer to abort. The
@@ -158,6 +174,25 @@ pub(crate) fn write_json(
     write_json_with_cancel(config, output_dir, &cancel)
 }
 
+/// `fs::write`, with the path in the error.
+///
+/// A helper rather than a `.with_context` closure at each call site: a
+/// closure is a nesting level, and the gate fails a function whose metrics
+/// rise at all — the caller is already doing the work of a whole analysis
+/// run (CI-001).
+fn write_named(path: &Path, body: &str) -> Result<()> {
+    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+/// `create_dir_all`, with the path in the error. Same reason as
+/// [`write_named`], and the failure this exists for: `output_dir` defaults to
+/// the repo-relative `ui/public`, so it lands on whatever the reader happens
+/// to keep under that name (CFG-016).
+fn make_output_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("creating output directory {}", path.display()))
+}
+
 /// Cancellable variant of `write_json`. Returns `Err` (downcastable to
 /// `analyzer::Cancelled`) without touching disk if the flag is flipped
 /// during analysis — the caller decides whether that's an error or a
@@ -173,16 +208,21 @@ pub(crate) fn write_json_with_cancel(
     let rel_count = result.relationships.len();
     let graph = DependencyGraph::from_analysis(&result);
 
-    std::fs::create_dir_all(output_dir)?;
+    // Every disk operation below names its path. The default `output_dir` is
+    // a repo-relative guess (`ui/public`), so the common failure here is a
+    // collision with something the reader already has — and a bare
+    // `Not a directory (os error 20)` says nothing about which path collided
+    // with what (CFG-016).
+    make_output_dir(output_dir)?;
     let data_path = output_dir.join("data.json");
     let output_str = output::render(&graph, config)?;
-    std::fs::write(&data_path, &output_str)?;
+    write_named(&data_path, &output_str)?;
 
     let details_str = JsonRenderer::render_details(&graph, config)?;
-    std::fs::write(data_path.with_extension("details.json"), &details_str)?;
+    write_named(&data_path.with_extension("details.json"), &details_str)?;
 
     let index_str = JsonRenderer::render_index(&graph, config)?;
-    std::fs::write(data_path.with_extension("index.json"), &index_str)?;
+    write_named(&data_path.with_extension("index.json"), &index_str)?;
 
     Ok((entity_count, rel_count, graph))
 }

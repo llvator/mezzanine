@@ -9,7 +9,7 @@
 //! deliberately do not, because in a Flutter codebase those are the most
 //! interesting edges in the graph.
 
-pub(super) fn is_core_method(name: &str) -> bool {
+pub(crate) fn is_core_method(name: &str) -> bool {
     matches!(
         name,
         "toString"

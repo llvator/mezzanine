@@ -11,6 +11,7 @@
 //! - [`docstrings`] — docstring extraction and dedenting
 //! - [`generics`] — PEP 695 type parameters and `TypeVar` factory calls
 //! - [`types`] — `UsesType` edges from annotations (post-pass)
+//! - [`values`] — `UsesValue` edges from imported names read as values
 
 mod bodies;
 mod ctx;
@@ -19,6 +20,7 @@ mod decorators;
 mod docstrings;
 mod generics;
 mod types;
+mod values;
 
 #[cfg(test)]
 mod tests;
@@ -69,6 +71,11 @@ impl LanguageParser for PythonParser {
 
         // Emit UsesType edges from annotations (PY-025).
         types::emit_uses_type_edges(&mut result);
+
+        // Emit UsesValue edges for imported names read as values (PY-030).
+        // After the declaration walk because it sources each edge from the
+        // entity whose span encloses the read.
+        values::emit_uses_value_edges(&tree.root_node(), content, &mut result);
 
         Ok(result)
     }

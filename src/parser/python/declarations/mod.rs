@@ -20,21 +20,34 @@ mod classes;
 mod functions;
 mod imports;
 
+use super::bodies::inference;
 use super::ctx::ExtractCtx;
+use super::docstrings;
 use crate::parser::language_parser::{ImportCondition, ImportInfo, ParseResult};
 use std::path::Path;
 use tree_sitter::Node;
 
 /// Extract every declaration in one parsed file into `result`.
 pub(super) fn extract_file(root: Node, path: &Path, source: &str, result: &mut ParseResult) {
+    // Read before the walk: a builder's `set_size` may be declared below the
+    // `build` that chains off it, so what a call yields cannot depend on how
+    // far the walk has got (PY-032).
+    let returns = inference::return_types(&root, source);
     let mut ctx = ExtractCtx {
         source,
         path,
         result,
         import_condition: None,
         in_type_checking: false,
+        returns: &returns,
     };
     extract_entities(root, None, &mut ctx);
+
+    // The module's own opening docstring. It documents no entity — the
+    // module the import graph resolves against is minted by the analyzer
+    // from the file, not declared here — so it travels beside the entities
+    // and the analyzer lifts it onto `FileInfo` (PY-029).
+    result.file_documentation = docstrings::module_docstring(&root, source);
 }
 
 /// Walk a node's children and dispatch to the appropriate extractor for each

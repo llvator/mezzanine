@@ -10,6 +10,7 @@
  */
 
 import { endpoint, withToken } from './endpoint';
+import type { ChangedFilesPayload } from './viewmodels/changedFiles';
 
 export interface VscodeConfig {
   apiBase: string;
@@ -229,6 +230,19 @@ export function reportDiff(state: {
   changedFileCount: number;
   filtersEnabled: boolean;
   hasSelection: boolean;
+  /**
+   * Git's own list of the files this comparison touched, already joined
+   * against the graph, for the native Changes tree (UI-137).
+   *
+   * The *finished reading* crosses the bridge, not the raw rows: the join
+   * lives once, in `viewmodels/changedFiles.ts`, and a second copy on the
+   * extension side would be a join that can disagree with itself — about
+   * `onlyInGraph` above all, whose entire value is being zero.
+   *
+   * It travels inside the diff state rather than as a message of its own so
+   * the rows and the ref pair they describe cannot arrive out of step.
+   */
+  changedFiles?: ChangedFilesPayload;
 }): void {
   if (window.__MEZZ_VSCODE__) {
     window.__MEZZ_VSCODE__.postMessage({ type: 'diffChanged', state });

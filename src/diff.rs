@@ -115,6 +115,60 @@ fn moved_key(key: &EntityKey) -> EntityKey {
     }
 }
 
+/// Index the base entities the file-keyed passes could not place by
+/// [`moved_key`], each group left in a stable order.
+///
+/// The order matters as much as the grouping. These groups used to be built
+/// straight into a `HashMap` and read back in its iteration order, which Rust
+/// seeds afresh per process — so whenever a group held more than one
+/// candidate, which one a head entity claimed changed between runs on a tree
+/// that had not changed at all. A hook that blocks a session on structural
+/// regressions named a different set of them each time it was asked, and
+/// re-running it — the reader's usual way to check a surprising answer —
+/// disagreed with the first run rather than confirming it.
+fn candidates_by_moved_key<'a>(
+    loose: HashMap<EntityKey, Vec<&'a CodeEntity>>,
+    base_root: &std::path::Path,
+) -> HashMap<EntityKey, Vec<&'a CodeEntity>> {
+    let mut anywhere: HashMap<EntityKey, Vec<&CodeEntity>> = HashMap::new();
+    for e in loose.into_values().flatten() {
+        anywhere
+            .entry(moved_key(&entity_key(e, base_root)))
+            .or_default()
+            .push(e);
+    }
+    for group in anywhere.values_mut() {
+        group.sort_by(|a, b| (&a.file_path, &a.id).cmp(&(&b.file_path, &b.id)));
+    }
+    anywhere
+}
+
+/// Claim a moved entity's counterpart, preferring a candidate that kept its
+/// file name.
+///
+/// [`moved_key`] drops the path, which is the point of the pass — but it also
+/// makes every same-named, same-arity callable moved in one commit a single
+/// group, and [`match_group`]'s signature tie-break cannot separate them in a
+/// language that does not annotate its parameters. A `git mv` of two files
+/// each holding a `state(x)` paired each head entity with its namesake as
+/// readily as with itself, and then reported the difference between two
+/// untouched bodies as a complexity delta on both — a phantom regression
+/// whose two ends cancel, on a commit that inserted no lines.
+///
+/// The file name is what a move preserves and a rewrite does not, so it is
+/// what separates the group. A file renamed as well as moved matches nothing
+/// here and falls through to [`match_group`], exactly as before.
+fn match_relocated<'a>(
+    group: &mut Vec<&'a CodeEntity>,
+    head: &CodeEntity,
+) -> Option<&'a CodeEntity> {
+    let want = head.file_path.file_name();
+    match group.iter().position(|b| b.file_path.file_name() == want) {
+        Some(i) => Some(group.remove(i)),
+        None => match_group(group, head),
+    }
+}
+
 /// Pair head entities with their base counterparts.
 ///
 /// Returns the rows for everything on the head side, where each survivor
@@ -238,25 +292,19 @@ fn match_moved<'a>(
     loose: HashMap<EntityKey, Vec<&'a CodeEntity>>,
     base_root: &std::path::Path,
 ) -> Vec<&'a CodeEntity> {
-    // Re-keyed from the entities, not from `loose`'s keys. Those have
-    // already been through `loose_key`, which drops arity — so indexing
-    // them under `moved_key` produced a map whose keys all carried
-    // `arity: None`, while every lookup below carries the head entity's
-    // real arity. The two never met, and *every callable* in a moved file
-    // stayed an addition plus a removal underneath a `## Moved` header
-    // promising otherwise. Only non-callables, which have no arity on
-    // either side, were matched.
-    let mut anywhere: HashMap<EntityKey, Vec<&CodeEntity>> = HashMap::new();
-    for e in loose.into_values().flatten() {
-        anywhere
-            .entry(moved_key(&entity_key(e, base_root)))
-            .or_default()
-            .push(e);
-    }
+    // Re-keyed from the entities, not from `loose`'s keys — see
+    // [`candidates_by_moved_key`]. Those have already been through
+    // `loose_key`, which drops arity, so indexing them under `moved_key`
+    // produced a map whose keys all carried `arity: None`, while every
+    // lookup below carries the head entity's real arity. The two never met,
+    // and *every callable* in a moved file stayed an addition plus a removal
+    // underneath a `## Moved` header promising otherwise. Only non-callables,
+    // which have no arity on either side, were matched.
+    let mut anywhere = candidates_by_moved_key(loose, base_root);
     for (e, key, file_path) in relocated {
         match anywhere
             .get_mut(&moved_key(&key))
-            .and_then(|group| match_group(group, e))
+            .and_then(|group| match_relocated(group, e))
         {
             Some(base_e) => {
                 moves.insert(entity_key(base_e, base_root), key.clone());
@@ -434,6 +482,14 @@ fn compare_metrics(base: &EntityMetrics, head: &EntityMetrics) -> (Vec<MetricDel
         "max_nesting",
         base.max_nesting.map(|v| v as f64),
         head.max_nesting.map(|v| v as f64),
+        true,
+    );
+    // A level of loop nesting added is the one metric change that alters
+    // how the body *scales* rather than how it reads (MCP-046).
+    check(
+        "loop_nesting",
+        base.loop_nesting.map(|v| v as f64),
+        head.loop_nesting.map(|v| v as f64),
         true,
     );
     check("loc", Some(base.loc as f64), Some(head.loc as f64), true);
@@ -861,7 +917,7 @@ pub fn compute_diff(
 // ------------------------------------------------------------------
 
 use anyhow::Result as AnyhowResult;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Verify the given path is inside a git repository.
@@ -1039,6 +1095,50 @@ pub fn changed_files(repo_root: &Path, base_ref: &str) -> Vec<String> {
     files.into_iter().collect()
 }
 
+/// One row of `git diff --name-status -z`: a status letter and the path it
+/// applies to, with the source path of a rename or copy kept.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NameStatusRow {
+    pub status: String,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+/// Parse `git diff --name-status -z`.
+///
+/// `-z` rather than lines, and for the same reason `git_lines` is not enough
+/// here: a path
+/// may contain anything a filesystem allows, a newline included, and line
+/// splitting would turn one path into two half-paths. It also stops git
+/// quoting non-ASCII names, so what arrives is the path as it is on disk.
+///
+/// Records alternate status then path — **except** a rename or copy, whose
+/// status carries a similarity score and is followed by *two* paths, source
+/// then destination. Reading the source as the next row's status is what
+/// desynchronises every row after the first rename.
+pub fn parse_name_status(stdout: &str) -> Vec<NameStatusRow> {
+    let mut records = stdout.split('\0').filter(|r| !r.is_empty());
+    let mut rows = Vec::new();
+    while let Some(status) = records.next() {
+        let Some(first) = records.next() else { break };
+        let letter = status.chars().next().unwrap_or('?');
+        let (path, old_path) = if letter == 'R' || letter == 'C' {
+            match records.next() {
+                Some(dest) => (dest.to_string(), Some(first.to_string())),
+                None => break,
+            }
+        } else {
+            (first.to_string(), None)
+        };
+        rows.push(NameStatusRow {
+            status: letter.to_string(),
+            path,
+            old_path,
+        });
+    }
+    rows
+}
+
 /// Which of `paths` git currently ignores, as the same strings passed in.
 ///
 /// Asked of git rather than re-derived from a config, so the answer follows
@@ -1169,9 +1269,14 @@ pub fn mirror_local_ignores(repo_root: &Path, dir: &Path) -> usize {
         .filter(|rel| copy_into(repo_root, dir, rel))
         .count();
     if copied > 0 {
-        eprintln!(
-            "    Applied {} local ignore file(s) to the checkout",
-            copied
+        // Through the activity feed rather than straight to stderr: a
+        // checkout is made under `mezz monitor` too, and there the alternate
+        // screen is up — a bare `eprintln!` would be written over the
+        // dashboard's own drawing. With no sink installed this prints exactly
+        // what it always did.
+        crate::activity::step(
+            crate::activity::DIFF,
+            format!("    Applied {} local ignore file(s) to the checkout", copied),
         );
     }
     copied
@@ -1316,6 +1421,44 @@ pub fn rooted_at(config: &Config, dir: &Path) -> Config {
     rooted
 }
 
+/// The path inside a fresh checkout that corresponds to `root` (SRV-021).
+///
+/// `git worktree add` always materialises the **whole repository**, while the
+/// head side of a diff keeps whatever directory the analysis was pointed at.
+/// At the git top level those coincide, which is why this went unseen for so
+/// long. Below it they do not: rooting the base at the checkout's top pairs
+/// the entire repository against one subtree of it, and the two sides then
+/// disagree about the universe *and* about the prefix `rel_path` strips.
+///
+/// Measured, from `ui/` in this repo: base 18 998 entities, head 6 531. The
+/// join then finds no counterpart for anything, so a type whose `fan_in` is
+/// 19 on both sides is reported as a **new** smell — it is keyed under
+/// `src/stores/quality.ts` on one side and `ui/src/stores/quality.ts` on the
+/// other. That non-existent path is the tell, and two field reports
+/// (2026-08-31) arrived at it from opposite ends: one that the address was
+/// wrong, one that the finding was not real either. Both are this.
+///
+/// Asked of git rather than derived by hand, because `repo_root` and the git
+/// top level are not the same thing anywhere in this code — git commands run
+/// from the analyzed path resolve upward on their own, which is what kept
+/// this quiet.
+pub fn checkout_root(root: &Path, worktree_dir: &Path) -> PathBuf {
+    worktree_dir.join(git_prefix(root))
+}
+
+/// Where `root` sits below its git top level: empty at the top level, `ui/`
+/// one down, `a/b/` nested.
+///
+/// Empty whenever git cannot answer — not a repository, no git on PATH — so
+/// [`checkout_root`] degrades to the behaviour it had, which is correct
+/// wherever the question does not arise.
+fn git_prefix(root: &Path) -> String {
+    git_lines(root, &["rev-parse", "--show-prefix"])
+        .first()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// A string that changes whenever anything about what an analysis *includes*
 /// changes, for keying cached analyses.
 ///
@@ -1323,20 +1466,76 @@ pub fn rooted_at(config: &Config, dir: &Path) -> Config {
 /// on a live scope change. A cache keyed on the git ref alone will happily
 /// serve a base analyzed under the scope in force ten seconds ago.
 pub fn scope_fingerprint(config: &Config) -> String {
-    serde_json::to_string(&(&config.analysis, &config.filters))
-        .unwrap_or_else(|_| format!("{:?}{:?}", config.analysis, config.filters))
+    let Ok(mut scope) = serde_json::to_value((&config.analysis, &config.filters)) else {
+        return format!("{:?}{:?}", config.analysis, config.filters);
+    };
+
+    // Three of these fields are `HashSet`s, and `HashSet` iteration order is
+    // seeded per process — so serializing them as they come gives a
+    // fingerprint that differs between two runs of the same binary over the
+    // same tree. That is the one thing the digest built from this promises
+    // cannot happen: "two answers printing the same six characters were
+    // produced under the same configuration". Sorting the three makes the
+    // fingerprint a function of the configuration alone (CFG-018).
+    //
+    // Sorted here rather than by making the sets ordered: `Language`,
+    // `EntityKind` and `RelationshipKind` derive neither `Ord` nor
+    // `PartialOrd`, so `BTreeSet` would mean ordering three public enums for
+    // the sake of one digest. Every other array in the config comes from a
+    // `Vec` whose order is the caller's and is left alone.
+    for (half, field) in [
+        (0, "languages"),
+        (1, "entity_kinds"),
+        (1, "relationship_kinds"),
+    ] {
+        sort_in_place(&mut scope, half, field);
+    }
+
+    scope.to_string()
+}
+
+/// Sort one named array inside one half of the serialized scope.
+///
+/// Split out of [`scope_fingerprint`] rather than left inline: the `for` and
+/// the `if let` together put that function three deep to do one thing, and a
+/// missing or non-array field is a no-op either way.
+fn sort_in_place(scope: &mut serde_json::Value, half: usize, field: &str) {
+    if let Some(serde_json::Value::Array(values)) = scope.get_mut(half).and_then(|h| h.get_mut(field))
+    {
+        values.sort_by_key(|v| v.to_string());
+    }
 }
 
 /// Analyze `config.root_path` with a config the caller has already settled.
 pub fn analyze_with(config: Config, label: &str) -> AnyhowResult<(DependencyGraph, Config)> {
-    eprintln!("  Analyzing {} ...", label);
+    let never = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    analyze_with_cancel(config, label, &never)
+}
+
+/// [`analyze_with`], abortable partway through.
+///
+/// The two sides of a diff are where a server spends its minutes, and a
+/// comparison the reader has asked to stop has to stop *inside* one of them —
+/// waiting for the analysis to finish before noticing is the same as not
+/// stopping (UI-141). `Err` is downcastable to [`crate::analyzer::Cancelled`]
+/// when the flag is what ended it, so the caller can tell an abort it asked
+/// for from a failure it did not.
+pub fn analyze_with_cancel(
+    config: Config,
+    label: &str,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> AnyhowResult<(DependencyGraph, Config)> {
+    crate::activity::step(crate::activity::ANALYSIS, format!("  Analyzing {label} ..."));
     let mut analyzer = Analyzer::new(config.clone());
-    let result = analyzer.analyze()?;
+    let result = analyzer.analyze_with_cancel(cancel)?;
     let graph = DependencyGraph::from_analysis(&result);
-    eprintln!(
-        "    {} entities, {} relationships",
-        result.entities.len(),
-        result.relationships.len()
+    crate::activity::step(
+        crate::activity::ANALYSIS,
+        format!(
+            "    {} entities, {} relationships",
+            result.entities.len(),
+            result.relationships.len()
+        ),
     );
     Ok((graph, config))
 }
@@ -1413,9 +1612,84 @@ pub fn write_diff_outputs(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_rename_is_three_records_and_keeps_both_paths() {
+        // status, source, destination — and then an ordinary two-record row,
+        // which is the one that would be wrong if the source were read as a
+        // status.
+        let out = "R096\0old/name.rs\0new/name.rs\0M\0src/other.rs\0";
+        assert_eq!(
+            parse_name_status(out),
+            vec![
+                NameStatusRow {
+                    status: "R".into(),
+                    path: "new/name.rs".into(),
+                    old_path: Some("old/name.rs".into()),
+                },
+                NameStatusRow {
+                    status: "M".into(),
+                    path: "src/other.rs".into(),
+                    old_path: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_path_holding_a_newline_stays_one_path() {
+        let out = "A\0src/two\nlines.rs\0";
+        let rows = parse_name_status(out);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "src/two\nlines.rs");
+    }
+
     use super::*;
     use crate::analyzer::AnalysisResult;
     use crate::models::{Parameter, Relationship, Span};
+
+    /// Two configs that include the same things fingerprint the same.
+    ///
+    /// The sets behind `languages` and the two kind filters iterate in an
+    /// order seeded per process, so before CFG-018 this held within one run
+    /// and failed across runs — `mezz map` on an unchanged tree printed
+    /// `scope 54c30c` and then `scope 496eca`. Building both sets here by
+    /// inserting in opposite orders is the in-process stand-in for that:
+    /// same contents, different insertion history, one fingerprint.
+    #[test]
+    fn a_scope_fingerprint_does_not_depend_on_set_order() {
+        let build = |langs: &[Language]| {
+            let mut config = Config::default();
+            config.analysis.languages = langs.iter().copied().collect();
+            config.filters.entity_kinds =
+                [EntityKind::Function, EntityKind::Struct].into_iter().collect();
+            config
+        };
+
+        let forward = build(&[Language::Rust, Language::TypeScript, Language::Python]);
+        let backward = build(&[Language::Python, Language::TypeScript, Language::Rust]);
+
+        assert_eq!(
+            scope_fingerprint(&forward),
+            scope_fingerprint(&backward),
+            "same languages inserted in a different order must fingerprint the same"
+        );
+    }
+
+    /// The fingerprint still notices a scope that really did change.
+    ///
+    /// Sorting the sets must not flatten them into something that ignores
+    /// their contents — a digest that never moves is worse than one that
+    /// moves too often.
+    #[test]
+    fn a_scope_fingerprint_still_moves_when_the_languages_do() {
+        let mut narrow = Config::default();
+        narrow.analysis.languages = [Language::Rust].into_iter().collect();
+        let mut wide = Config::default();
+        wide.analysis.languages = [Language::Rust, Language::Python].into_iter().collect();
+
+        assert_ne!(scope_fingerprint(&narrow), scope_fingerprint(&wide));
+    }
 
     fn entity(file: &str, line: usize, name: &str, kind: EntityKind) -> CodeEntity {
         CodeEntity::new(name, kind, file, Span::from_positions(line, 0, line, 0))
@@ -1575,6 +1849,67 @@ mod tests {
         let d = diff_of(&base, &head);
         assert_eq!(row(&d, "note").status, ChangeStatus::Modified);
         assert!(row(&d, "note").base_entity_id.is_some());
+    }
+
+    /// Two same-named functions moved in the same commit share one
+    /// `moved_key` — same name, same kind, same arity, no parent — and on an
+    /// unannotated language they share a signature too, so nothing in the
+    /// pass told them apart. Whichever base entity the candidate list
+    /// happened to yield first was claimed, which paired each head with its
+    /// namesake half the time and reported the difference between two
+    /// untouched functions as a complexity delta on both.
+    ///
+    /// A move keeps the file's name; that is what separates them.
+    #[test]
+    fn same_named_functions_moved_together_keep_their_own_files() {
+        let at = |file: &str, cx: u32| {
+            let mut e = entity(file, 1, "state", EntityKind::Function);
+            e.metrics.param_count = Some(1);
+            e.metrics.cyclomatic = Some(cx);
+            e
+        };
+        let in_file = |d: &DiffResult, path: &str| {
+            d.entities
+                .iter()
+                .find(|e| e.file_path == path)
+                .unwrap_or_else(|| panic!("no row for {path}"))
+                .clone()
+        };
+        let base = graph_of(
+            vec![at("/repo/pkg/alpha.py", 6), at("/repo/pkg/beta.py", 1)],
+            &[],
+        );
+        let head = graph_of(
+            vec![
+                at("/repo/pkg/sub/alpha.py", 6),
+                at("/repo/pkg/sub/beta.py", 1),
+            ],
+            &[],
+        );
+        // The pairing came out of a `HashMap`, so one diff proves nothing:
+        // the wrong answer showed up on roughly half of otherwise identical
+        // runs, and re-running was the reader's only escape hatch.
+        for _ in 0..64 {
+            let d = diff_of(&base, &head);
+            assert!(
+                d.entities
+                    .iter()
+                    .all(|e| e.status == ChangeStatus::Unchanged),
+                "{:?}",
+                d.entities
+                    .iter()
+                    .map(|e| (&e.file_path, e.status, &e.metric_deltas))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                in_file(&d, "pkg/sub/alpha.py").moved_from.as_deref(),
+                Some("pkg/alpha.py")
+            );
+            assert_eq!(
+                in_file(&d, "pkg/sub/beta.py").moved_from.as_deref(),
+                Some("pkg/beta.py")
+            );
+        }
     }
 
     fn fns(names: &[&str]) -> Vec<CodeEntity> {
@@ -1849,6 +2184,100 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(work.join("src/vendor/.ignore")).unwrap(),
             "*.min.js\n",
+        );
+
+        remove_worktree(&repo, &work);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// SRV-021, and the two field reports that arrived at it from opposite
+    /// ends (2026-08-31): a diff rooted below the git top level paired the
+    /// **whole repository** against one subtree of it, because
+    /// `git worktree add` always materialises everything while the head keeps
+    /// whatever directory it was pointed at. Measured from `ui/` in this
+    /// repo: base 18 998 entities, head 6 531.
+    ///
+    /// The identity at the top level is what makes the fix safe to land —
+    /// every existing test and every ordinary run measures the case that does
+    /// not move.
+    #[test]
+    fn a_checkout_root_is_the_subtree_the_analysis_was_pointed_at() {
+        let repo = git_repo("checkout-root");
+        std::fs::create_dir_all(repo.join("ui/src/stores")).unwrap();
+        std::fs::write(repo.join("ui/src/stores/quality.ts"), "export const a = 1;\n").unwrap();
+        let checkout = std::env::temp_dir().join(format!("mezz-co-{}", std::process::id()));
+
+        // Top level: `--show-prefix` is empty and `join("")` is the identity.
+        assert_eq!(checkout_root(&repo, &checkout), checkout);
+        // One level down, and nested.
+        assert_eq!(
+            checkout_root(&repo.join("ui"), &checkout),
+            checkout.join("ui")
+        );
+        assert_eq!(
+            checkout_root(&repo.join("ui/src/stores"), &checkout),
+            checkout.join("ui/src/stores")
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Outside a checkout git cannot answer, and the helper has to degrade to
+    /// what it did before rather than inventing a subtree.
+    #[test]
+    fn a_root_git_cannot_place_keeps_the_checkout_top() {
+        let loose = std::env::temp_dir().join(format!("mezz-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&loose);
+        std::fs::create_dir_all(&loose).unwrap();
+        let checkout = std::env::temp_dir().join("mezz-co-loose");
+        assert_eq!(checkout_root(&loose, &checkout), checkout);
+        let _ = std::fs::remove_dir_all(&loose);
+    }
+
+    /// The pairing itself, not just the helper — the shape this bug already
+    /// has is a correct helper that one call site does not use. A subtree
+    /// root must analyse the *same* subtree on both sides, so the two graphs
+    /// hold the same file and `compute_diff` strips the same prefix from
+    /// each.
+    #[test]
+    fn both_sides_of_a_subtree_diff_see_the_same_files() {
+        let repo = git_repo("subtree-pairing");
+        std::fs::create_dir_all(repo.join("ui/src")).unwrap();
+        std::fs::write(repo.join("ui/src/app.ts"), "export function app() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+        };
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=m@e",
+            "-c",
+            "user.name=M",
+            "commit",
+            "-qm",
+            "ui",
+        ]);
+
+        let root = repo.join("ui");
+        let work = std::env::temp_dir().join(format!("mezz-pair-{}", std::process::id()));
+        create_worktree(&repo, &work, "HEAD").unwrap();
+        let base_root = checkout_root(&root, &work);
+
+        // The base side must hold `ui/`'s own files at `ui/`'s own spelling —
+        // `src/app.ts` relative to each root, not `ui/src/app.ts` on one side
+        // and `src/app.ts` on the other.
+        assert!(
+            base_root.join("src/app.ts").is_file(),
+            "the base was rooted at the checkout's top, not at {}",
+            base_root.display()
+        );
+        assert!(
+            !base_root.join("ui/src/app.ts").exists(),
+            "the base is still one level up from the head"
         );
 
         remove_worktree(&repo, &work);

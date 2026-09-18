@@ -70,6 +70,60 @@ mezz analyze ./my-project -l rust -l python -d 5
 
 `mezz watch` is what the VS Code extension uses internally. You only run it directly if you want to inspect the JSON output, drive the UI from a browser, or wire Mezzanine into an external tool.
 
+### `mezz monitor` — quality, over time
+
+```bash
+mezz monitor .
+```
+
+A terminal dashboard, and the one surface with a time axis. It re-measures the
+tree whenever it settles and shows each figure — smells, complexity, cycles,
+folder shape, declared-rule breaches — with how far it has moved since the
+baseline, a sparkline, and a list of which files and folders moved.
+
+It is built for the case where you are not the one editing: a pane beside a
+swarm of agents, answering "is this getting better or worse, and since when"
+at a glance. No browser, no port, no build step.
+
+**The baseline is the last commit.** Everything on screen is a delta against
+`HEAD`, measured out of a checkout of it, so the work already sitting
+uncommitted in the tree is inside the numbers from the first frame rather than
+being the zero they are measured from. `--baseline <ref>` names a different
+one (`main`, `HEAD~5`, a SHA); `--baseline working` measures from the tree as
+found when the session starts.
+
+The ref is pinned for the session — a swarm that commits four times an hour
+would otherwise reset your numbers four times. When HEAD moves past the pin
+the header says so, and `B` re-measures the baseline there.
+
+```
+q  quit          b  make now the new baseline
+p  pause         B  re-baseline at whatever HEAD is now
+↑↓ scroll the movers list
+```
+
+**Two commits, without watching anything.** `--against <ref>` pins the head
+side to a commit as well, and the dashboard becomes a still of the distance
+between two states:
+
+```bash
+mezz monitor . --baseline v0.4.0 --against HEAD     # what the release cost
+mezz monitor . --baseline main --against my-branch  # what the branch did
+```
+
+Both sides are measured out of a checkout, so nothing uncommitted is in either
+figure and either end can be a state you are nowhere near. There is no tree
+being watched and no time axis, so the sparklines are empty and the three keys
+that move a zero — `b`, `B`, `p` — are not offered; `q` and the movers list
+are. Everything else reads the same, the movers list included: it is the list
+of files and folders that differ between the two commits.
+
+Useful flags: `--debounce-ms` (how long the tree must be quiet before it is
+measured, default 1000), `--min-interval-ms` (never measure more often than
+this, default 2000), and `--log session.jsonl` to keep one JSON line per
+reading for afterwards — including the baseline, marked `"baseline": true`,
+so a session's deltas can be recomputed from the file.
+
 ### Browser UI, served yourself
 
 The visualizer is an ordinary static site and does not have to come from the
@@ -140,6 +194,12 @@ a **Run Task** away rather than a terminal you have to keep:
 | `Mezzanine: Open web UI in browser` | opens the port, starting the engine first |
 | `Mezzanine: Stop web UI` | kills the engine holding that port — and only if it *is* mezz |
 
+All three carry a port number, baked in when the file is written. It is read
+from `.mezz/settings.json`, which `mezz init` pins in the same run — so the
+three tasks and the engine they drive cannot drift apart, and moving the port
+is one edit in one file followed by `mezz init --vscode --force`. Repos you
+open side by side each need their own: the tasks bind, they do not negotiate.
+
 A fourth is written only when asked for, because it is the one that runs code
 rather than serving data:
 
@@ -161,6 +221,61 @@ means every optional *file*, and this is not a file. See
 The stop task exists because `mezz watch` has no idle shutdown: closing the
 browser tab leaves the engine running and the port taken. All three agree on
 one port — whatever `.mezz/settings.json` pins, else 3000.
+
+### VS Code tasks for the graph tools
+
+The tasks above are about the browser UI. `--editor-tools` writes a different
+kind: eleven of the graph tools, each already pointed at whatever file the
+editor has open, so asking one costs a **Run Task** instead of a path you have
+to type.
+
+```sh
+mezz init --vscode --editor-tools
+```
+
+| Task | Runs |
+|---|---|
+| `Mezzanine: Map this file` | `mezz map <file>` |
+| `Mezzanine: Quality of this file` | `mezz quality <file>` |
+| `Mezzanine: Dead code in this file` | `mezz dead-code <file>` |
+| `Mezzanine: What depends on this file` | `mezz impact --path <file>` |
+| `Mezzanine: Impact of the entity at the cursor` | `mezz impact --path <file> --line <cursor>` |
+| `Mezzanine: Context for the entity at the cursor` | `mezz context --path <file> --line <cursor>` |
+| `Mezzanine: Tests covering the entity at the cursor` | `mezz tests-for --path <file> --line <cursor>` |
+| `Mezzanine: Reshape this file's folder` | `mezz reshape <folder>` |
+| `Mezzanine: Layout of this file's folder` | `mezz layout <folder>` |
+| `Mezzanine: Boundaries of this file's folder` | `mezz boundaries <folder>` |
+| `Mezzanine: Hotspots in this file's folder` | `mezz hotspots <folder>` |
+
+The substitution is VS Code's, not mezz's: `${relativeFile}`,
+`${relativeFileDirname}` and `${lineNumber}` are resolved before the process
+starts. With no editor open there is nothing to resolve, and VS Code says so
+instead of running the task against the wrong thing.
+
+Two tasks ask about `impact` because it answers two questions. Without
+`--line` the file is the subject — who breaks if this file changes, and what
+it owes the rest of the tree. With `--line` the subject is the entity spanning
+the cursor, and the answer is that entity's blast radius.
+
+`Quality of this file` is the one task that also fills the **Problems** panel:
+its smells arrive as warnings on the lines that carry them, so they are
+clickable rather than terminal text you re-read. Its refactor-pressure ranking
+deliberately does not — that list opens by calling itself "a ranking, not a
+verdict", and the Problems panel is where verdicts go.
+
+Like `--allow-agent-spawn`, this is outside `--all`, for a plainer reason:
+eleven entries land in a list you share with your own builds and tests. That is
+worth choosing rather than inheriting from a flag that means "everything".
+
+Four of the fifteen tools have no task, because the editor has no answer to
+give them: `overview`, `similar` and `trace` want a name, a query or a pair of
+entities; `assess_change` wants a git ref and is about the working tree rather
+than any one file. `spec-slice` is left out too — it writes a file, which is a
+command to run deliberately.
+
+Each task re-analyzes from the repository root, because a question about one
+file's coupling is a question about everything that could reach it. The graph
+cache makes the runs after the first one cheap.
 
 An existing `tasks.json` is merged into by label, leaving your own tasks
 alone; `--force` replaces Mezzanine tasks whose bodies have since changed. One
@@ -190,6 +305,40 @@ build on purpose — until `--force`. A file mezz cannot parse as
 `{"mcpServers": {…}}` is left **untouched**, with the entry printed for you
 to paste, for the same reason as `tasks.json`: what is registered there is
 worth more than what we came to add.
+
+### Push-mode hooks for agents
+
+`mezz init --hooks` wires the two push-mode legs into `.claude/settings.json`
+as `Stop` hooks. `--mcp` above gives an agent tools it has to *remember* to
+call; this is the half that arrives on its own:
+
+```json
+{ "type": "command",
+  "command": "o=$(mezz hook self-review --block 2>/dev/null); r=$?; [ -n \"$o\" ] && echo \"$o\" >&2; [ $r -eq 2 ] && exit 2; exit 0" }
+```
+
+An agent that ends a turn having introduced a new smell, dependency cycle,
+complexity jump, folder-shape fall or `.mezz/rules.json` breach is stopped
+once, handed the finding, and can fix it before the turn ends. A clean tree
+says nothing at all.
+
+The wrapper is not decoration. `mezz` writes findings to stdout and its
+progress to stderr precisely so a caller can drop one and keep the other; a
+`Stop` hook that exits 0 has its stdout sent to a debug log rather than the
+agent, so `--block` exits **2** instead — the one channel `Stop` has — and the
+findings are re-emitted on stderr where a blocked stop reads them. Only exit 2
+propagates, so a `mezz` that is missing or half-built ends the hook quietly
+instead of wedging every stop in the repo.
+
+Nothing blocks twice: a finding is recorded as it is emitted, so the next run
+no longer counts it as new. Each regression costs at most one extra turn, and
+a finding that gets fixed reports `✓ resolved` without blocking at all.
+
+Your own `Stop` hooks are merged around, never replaced, and `--force`
+replaces only the legs mezz itself wrote. A file mezz cannot parse is left
+**untouched** — your permission allowlist is worth more than our hooks.
+
+Full detail: [Push review](workflows/cli/push-review.md).
 
 One file `mezz init` deliberately does **not** write is
 `.vscode/settings.json`. The extension's `mezz.language` and
@@ -270,9 +419,12 @@ directory:
 mezz init                 # in the repo you want set up
 mezz init --vscode        # also add the browser-UI tasks (below)
 mezz init --mcp           # also register the MCP server in .mcp.json (below)
+mezz init --hooks         # also wire the push-mode Stop hooks (below)
 mezz init --all           # every optional file above
 mezz init --allow-agent-spawn  # also the VS Code task that starts the engine
                               # with --allow-agent-spawn (implies --vscode)
+mezz init --editor-tools  # also a VS Code task per graph tool, each scoped
+                          # to the open file (implies --vscode, below)
 mezz init --force         # replace what is already there
 ```
 
@@ -313,14 +465,44 @@ to override that:
 A flag always beats the file, and the repo file beats the user file:
 
 ```text
-CLI flag  →  env var  →  repo settings  →  user settings  →  built-in defaults
+CLI flag  →  env var  →  your repos entry  →  repo settings  →  user settings  →  built-in defaults
 ```
+
+### Your own settings for one repo
+
+`repos` is the one link that breaks the "repo beats user" rule, and it sits in
+the user file. It holds repo-scope settings keyed by a checkout's path:
+
+```json
+{
+  "repos": {
+    "~/src/app": { "spec_dir": "/abs/path/sibling-docs" },
+    "~/work/monorepo/services/api": { "language": ["go"], "max_depth": 2 }
+  }
+}
+```
+
+An entry may set anything a repo file may set, it wins against that repo's own
+`.mezz/settings.json`, and a flag still beats it. Keys are matched by resolved
+directory, so `~`, a symlinked path and a trailing slash all find the same
+entry — and an entry for a repo you are not analyzing is simply dormant.
+
+Reach for it when a setting is true of one checkout *on your machine* and does
+not belong in a file everyone clones — most often a `spec_dir` outside the
+tree, which the repo file may not name at all (below). Anything true of the
+repo for everyone belongs in the repo file, where it is version-controlled
+beside the code.
+
+`repos` is user-scope only, and it is **rejected** in a repo file rather than
+merely ignored: a block a stranger shipped would choose what mezz reads for
+every checkout on the machine, not just its own.
 
 ### What goes where
 
 | Key | User | Repo |
 |---|:---:|:---:|
 | `ui_dir`, `content_fallback` | ✓ | — |
+| `repos` | ✓ | — |
 | `output_dir`, `spec_dir` | — | ✓ |
 | `language`, `kind` | ✓ | ✓ |
 | `include_tests`, `include_external` | ✓ | ✓ |
@@ -341,9 +523,15 @@ over what it already found. A repo-scope one must therefore stay inside the
 repo — relative, no `..` — for the same reason as the last row. Specs that
 live somewhere else entirely (a sibling docs repo, or the top of a monorepo
 whose services you watch one at a time) are a real layout, but naming that
-directory takes an operator: `mezz watch . --spec-dir ../docs/domain`, or the
-**Spec folder** field in the browser UI's Analysis scope panel, which changes
-the running session without touching any file.
+directory takes an operator. Three ways to be one, from least durable to most:
+
+- `mezz watch . --spec-dir ../docs/domain` — this invocation only.
+- The **Spec folder** field in the browser UI's Analysis scope panel — the
+  running session only, without touching any file. Saving it as the repo's
+  default is refused, for the reason above.
+- A `repos` entry in your user file (above) — every command, every session,
+  including `mezz watch`, `mezz mcp` and the VS Code extension, none of which
+  is launched with a flag you could add.
 
 Three behaviours worth knowing:
 

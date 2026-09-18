@@ -2,7 +2,22 @@
   "name": "mezzanine",
   "displayName": "Mezzanine — Code Visualizer",
   "description": "Visualize code relationships and dependencies for the file open in your editor",
-  "version": "1.4.0",
+  "icon": "resources/icon.png",
+  "galleryBanner": {
+    "color": "#0a0c0f",
+    "theme": "dark"
+  },
+  "keywords": [
+    "code visualization",
+    "dependency graph",
+    "architecture",
+    "code quality",
+    "mcp",
+    "refactoring",
+    "tree-sitter"
+  ],
+  "qna": "https://github.com/llvator/mezzanine/issues",
+  "version": "1.5.0",
   "publisher": "llvator",
   "license": "AGPL-3.0-only OR LicenseRef-Commercial",
   "repository": {
@@ -181,6 +196,12 @@
           "visibility": "collapsed"
         },
         {
+          "id": "mezz.changes",
+          "name": "Changes",
+          "visibility": "collapsed",
+          "size": 3
+        },
+        {
           "type": "webview",
           "id": "mezz.selection",
           "name": "Inspector",
@@ -345,7 +366,10 @@
         },
         "mezz.analysisScopeFollowMode": {
           "type": "string",
-          "enum": ["file", "folder"],
+          "enum": [
+            "file",
+            "folder"
+          ],
           "default": "folder",
           "description": "Granularity for the Analysis Scope's 'Follow Active Editor' toggle: 'file' narrows scope to the active file, 'folder' narrows to its parent folder. Toggled from the Analysis Scope view's title bar."
         },
@@ -355,7 +379,14 @@
           "description": "Show Mezzanine Educator content in the editor hover for Java source. Educator rules teach good-practice patterns at the cursor; disable to suppress them entirely. The educator contributes only when at least one rule matches at the cursor — hover popups on uninteresting tokens are unaffected."
         }
       }
-    }
+    },
+    "viewsWelcome": [
+      {
+        "view": "mezz.changes",
+        "contents": "No comparison is loaded.\n\nPick one in the Diff view above and the files it touched will be listed here.\n",
+        "when": "!mezz.hasChanges"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run build:all",

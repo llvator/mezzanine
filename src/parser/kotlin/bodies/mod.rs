@@ -14,4 +14,4 @@
 pub(super) mod calls;
 pub(super) mod complexity;
 mod flow;
-mod stdlib;
+pub(crate) mod stdlib;

@@ -9,8 +9,17 @@
   import {
     METRIC_EXPLANATIONS,
     SMELL_META,
+    SCORE_SCALE_LABEL,
+    baselineNoun,
+    compareToBaseline,
+    compositeScore,
+    grainOfKind,
+    nodeScore,
+    repoBaselines,
+    scopeCompositeScore,
     tierCognitive,
     tierFieldCount,
+    tierFromScore,
     tierMethodCount,
     tierPublicFieldRatio,
   } from '../stores/quality';
@@ -19,12 +28,40 @@
   import { exceedsLcsBudget } from '../utils/lineDiff';
   import SourceDiff from './SourceDiff.svelte';
   import RelationshipChanges from './RelationshipChanges.svelte';
+  import SpecComposer from './SpecComposer.svelte';
+  import { composerPhase, openComposer, specWritable } from '../stores/specDraft';
   import { couplingCell } from '../viewmodels/scopeCoupling';
+  import FlowLadder from './FlowLadder.svelte';
+  import type { FlowSubject } from '../viewmodels/scopeFlow';
 
   export let entity: D3Node | null;
   export let showSource: boolean = true;
   export let showRelationships: boolean = true;
   export let compact: boolean = false;
+
+  /**
+   * The scope whose insides the Flow ladder reads, and the row to mark in it
+   * (UI-146).
+   *
+   * A rollup is asked about ITSELF — a Folder node's ladder is its files, a
+   * File node's is its entities. An entity has no insides at this grain, so
+   * the subject is the file around it and the entity is marked: the useful
+   * reading for a function is not what it contains but where it sits among
+   * its neighbours.
+   *
+   * Null for a ghost, which has no file to be placed in.
+   */
+  $: flowSubject = ((): { subject: FlowSubject; highlight: string | null } | null => {
+    if (!entity) return null;
+    if (entity.kind_raw === 'Folder') {
+      return { subject: { grain: 'folder', path: entity.original_id }, highlight: null };
+    }
+    if (entity.kind_raw === 'File') {
+      return { subject: { grain: 'file', path: entity.original_id }, highlight: null };
+    }
+    if (!entity.file_path) return null;
+    return { subject: { grain: 'file', path: entity.file_path }, highlight: entity.id };
+  })();
 
   // Load details lazily when entity changes
   let detail: EntityDetails | null = null;
@@ -267,6 +304,30 @@
     ? $codeRefIndex.claimsFor(entity.file_path)
     : [];
 
+  // ─── UI-145 — writing the entity that is missing ────────────────────
+  //
+  // What the composer would document. A code entity contributes its file
+  // and its name: `cr:` anchors to paths, so the claim is the file, while
+  // the name is the better seed — a Feature is more often named after what
+  // the code does than after the file it sits in.
+  //
+  // A spec entity contributes neither. It is a *parent*, and seeding the
+  // child with the parent's name and a claim over the parent's own `.elv`
+  // would produce a Functionality that documents the spec instead of the
+  // code — so both are left empty and the reader fills them.
+  $: specSubject = !entity
+    ? null
+    : isSpec
+      ? { grain: 'spec' as const, path: '', entityName: '', label: `under ${entity.qualified_name}` }
+      : { grain: 'entity' as const, path: entity.file_path, entityName: entity.name };
+
+  // A Category takes Features, a Feature takes Functionalities. Anything
+  // else has no child tier, so the composer opens on a Feature and the
+  // reader picks the parent themselves.
+  $: childKind = entity?.kind === 'category' ? 'f' as const
+    : entity?.kind === 'feature' ? 'fu' as const
+    : 'f' as const;
+
   $: tagChips = (entity?.tags ?? [])
     .filter((t) => Object.prototype.hasOwnProperty.call(TAG_CHIP_LABELS, t))
     .map((t) => TAG_CHIP_LABELS[t]);
@@ -303,6 +364,29 @@
     const e = METRIC_EXPLANATIONS[key];
     return `${e.title} — ${e.body}`;
   }
+
+  /**
+   * The composite score, and the repo's mean for things of the same kind.
+   *
+   * The panel listed every input to the score and never the score itself, so
+   * the one number the Quality table ranks by — and the one the canvas colours
+   * by — was the one thing a reader could not see after selecting a node. It
+   * is `nodeScore`, not a local formula: a File node is a scope rollup and the
+   * per-entity formula run on its promoted fields would return a confident
+   * number that means nothing.
+   *
+   * The mean beside it is of the *same grain* — files against files, folders
+   * against folders, entities against entities — because the two formulas are
+   * not the same measurement. Absent when the repo holds nothing of that kind
+   * (a one-file analysis has no folder population worth a mean).
+   */
+  $: score = entity ? nodeScore(entity, scopeCompositeScore, compositeScore) : undefined;
+  $: baseline = entity ? $repoBaselines.baselines[grainOfKind(entity.kind_raw)] : null;
+  $: comparison = score != null && baseline ? compareToBaseline(score, baseline) : null;
+  /** A baseline drawn from a visual scope is not the repo's, and saying so
+   *  costs one word — the alternative is a number labelled "repo mean" that
+   *  moves when the reader changes level. */
+  $: baselineScope = $repoBaselines.whole ? 'Repo' : 'Shown';
 
   let copyFeedback = '';
   let copyPathFeedback = '';
@@ -346,10 +430,17 @@
     const pfr = metrics.public_field_ratio != null
       ? `${Math.round(metrics.public_field_ratio * 100)}%`
       : '—';
-    const header = '| Name | Kind | CC | Nest | LOC | Params | Fan-in | Fan-out | Fields/Variants | Methods | Pub% | Cycle |';
-    const sep = '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
-    const row = `| ${entity.name} | ${entity.kind} | ${fmtNum(metrics.cyclomatic)} | ${fmtNum(metrics.max_nesting)} | ${metrics.loc} | ${fmtNum(metrics.param_count)} | ${metrics.fan_in} | ${metrics.fan_out} | ${fmtNum(metrics.field_count)} | ${metrics.method_count} | ${pfr} | ${metrics.in_cycle ? 'yes' : 'no'} |`;
-    return `${header}\n${sep}\n${row}`;
+    // Score leads the row for the same reason it leads the grid, and the
+    // baseline follows the table as a line rather than a column: it describes
+    // the repo, not this entity, and a per-row copy of it invites pasting two
+    // rows under one header where the number silently means two things.
+    const header = '| Name | Kind | Score | CC | Nest | LOC | Params | Fan-in | Fan-out | Fields/Variants | Methods | Pub% | Cycle |';
+    const sep = '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
+    const row = `| ${entity.name} | ${entity.kind} | ${score != null ? score.toFixed(2) : '—'} | ${fmtNum(metrics.cyclomatic)} | ${fmtNum(metrics.max_nesting)} | ${metrics.loc} | ${fmtNum(metrics.param_count)} | ${metrics.fan_in} | ${metrics.fan_out} | ${fmtNum(metrics.field_count)} | ${metrics.method_count} | ${pfr} | ${metrics.in_cycle ? 'yes' : 'no'} |`;
+    const note = baseline
+      ? `\n\n${baselineScope} mean over ${baseline.count} ${baselineNoun(baseline.grain)}s: ${baseline.mean.toFixed(2)} (${SCORE_SCALE_LABEL}).`
+      : '';
+    return `${header}\n${sep}\n${row}${note}`;
   }
   async function copyMetrics() {
     const md = buildMetricsMarkdown();
@@ -482,6 +573,20 @@
           </button>
         </div>
         <div class="metrics-grid">
+          <!-- First, because it is the headline: every other cell here is an
+               input to it, and it is what the ranked table and the node's
+               colour on the canvas are both showing. -->
+          {#if score != null}
+            <div
+              class="metric metric-{tierFromScore(score)} help"
+              data-probe="entity-score"
+              data-tip={`${explain('score')} Scale: ${SCORE_SCALE_LABEL}.`}
+              aria-label={`${explain('score')} Scale: ${SCORE_SCALE_LABEL}.`}
+            >
+              <span class="metric-label">Score</span>
+              <span class="metric-value">{score.toFixed(2)}</span>
+            </div>
+          {/if}
           {#if metrics.cyclomatic != null}
             <div class="metric metric-{tierComplexity(metrics.cyclomatic)} help" data-tip={explain('cc')} aria-label={explain('cc')}>
               <span class="metric-label">CC</span>
@@ -556,6 +661,27 @@
             </div>
           {/if}
         </div>
+        <!-- The frame the score needs to be read at all. A file at 0.42 is
+             only high or low against what the rest of the repo scores, and
+             that differs enormously between a parser crate and a UI. -->
+        {#if score != null && baseline && comparison}
+          <div
+            class="score-vs"
+            class:worse={comparison.verdict === 'above'}
+            class:better={comparison.verdict === 'below'}
+            data-probe="score-vs-mean"
+            title="Mean composite score of every {baselineNoun(baseline.grain)} in the {baselineScope === 'Repo' ? 'repo' : 'current view'} ({baseline.count} measured). {SCORE_SCALE_LABEL}. Compared within its own kind: a file and a function are scored by different formulas."
+          >
+            <span class="vs-mean">
+              {baselineScope} mean ({baselineNoun(baseline.grain)}s): {baseline.mean.toFixed(2)}
+            </span>
+            <span class="vs-verdict">
+              {comparison.verdict === 'at'
+                ? 'about average'
+                : `${comparison.delta > 0 ? '+' : '−'}${Math.abs(comparison.delta).toFixed(2)} · ${comparison.text}`}
+            </span>
+          </div>
+        {/if}
         {#if metrics.smells?.length}
           <div class="smell-row">
             {#each metrics.smells as s}
@@ -565,6 +691,15 @@
           </div>
         {/if}
       </div>
+    {/if}
+
+    <!-- Which way the dependencies run around this entity (UI-146). Under
+         Quality, because it answers a different question from the metrics
+         above it: those say how healthy this one thing is, this says what it
+         is holding up and what is holding IT up. The same component the
+         folder card uses, so the two panels read alike. -->
+    {#if flowSubject && !compact}
+      <FlowLadder subject={flowSubject.subject} highlight={flowSubject.highlight} />
     {/if}
 
     <!-- UI-006 — structured attribute rows for known prefixes
@@ -657,6 +792,33 @@
               {/if}
             </div>
           {/each}
+        </div>
+      </div>
+    {/if}
+
+    <!-- UI-145 — the other half of "Claimed by": the case where nothing
+         claims it. The absence is where the offer belongs, because that is
+         where the reader finds out the explanation they went looking for was
+         never written. Offered for a spec entity too, where it declares a
+         child rather than a claim — a Category's Features and a Feature's
+         verbs are exactly what a reader deepening a branch adds next. -->
+    {#if $specWritable && specSubject}
+      <div class="detail-row">
+        <div class="detail-label">Spec</div>
+        <div class="detail-value">
+          {#if $composerPhase.kind === 'closed'}
+            <button
+              type="button"
+              class="claim-btn add-spec"
+              data-probe="entity-add-spec"
+              title={isSpec
+                ? `Declare a child of ${entity.qualified_name}`
+                : `Nothing in the spec claims ${entity.file_path}. Write the entity that would.`}
+              on:click={() => openComposer(specSubject, isSpec ? childKind : 'f')}
+            >+ {isSpec ? 'Add a child' : 'Document this'}</button>
+          {:else}
+            <SpecComposer />
+          {/if}
         </div>
       </div>
     {/if}
@@ -1244,6 +1406,31 @@
   .metric-bad { background: rgba(244, 67, 54, 0.15); border-color: rgba(244, 67, 54, 0.5); color: var(--text); }
   .metric-na { background: rgba(158, 158, 158, 0.1); border-color: rgba(158, 158, 158, 0.3); color: var(--text); }
 
+  /* A sentence, not a fifth chip: the score cell above already carries the
+     tier colour, and a second tinted box would read as a second measurement.
+     The verdict alone is coloured, and by direction rather than by tier —
+     "worse than average" is the claim being made, and it can be true of a
+     green score in a very green repo. */
+  .score-vs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+    margin-top: 6px;
+    font-size: 0.7rem;
+    cursor: help;
+  }
+  .vs-mean {
+    color: var(--text-dim);
+    font-family: 'Monaco', 'Menlo', monospace;
+  }
+  .vs-verdict {
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .score-vs.worse .vs-verdict { color: #E57373; }
+  .score-vs.better .vs-verdict { color: #81C784; }
+
   .smell-row {
     display: flex;
     flex-wrap: wrap;
@@ -1402,6 +1589,20 @@
   }
   .claim-btn:hover {
     text-decoration: underline;
+  }
+  /* UI-145 — an offer, not a link to something that exists. Bordered so it
+     reads as an action beside the Claimed-by rows, which are navigation. */
+  .claim-btn.add-spec {
+    padding: 2px 8px;
+    border: 1px dashed var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+  }
+  .claim-btn.add-spec:hover {
+    text-decoration: none;
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .claim-path {
     color: var(--text-dim);

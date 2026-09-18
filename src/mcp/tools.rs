@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use crate::analyzer::TestPaths;
 use crate::diff;
 use crate::graph::DependencyGraph;
 use crate::models::{
@@ -19,6 +20,10 @@ use crate::models::{
 };
 use crate::Analyzer;
 
+use super::answer::{self, Answer};
+use super::census::FolderCensus;
+use super::chains::Direction;
+use super::externals::Externals;
 use super::McpServer;
 
 /// Line budget for a single tool response body.
@@ -48,10 +53,15 @@ pub(crate) fn is_listed(e: &CodeEntity) -> bool {
 /// heuristic, or (Rust inline `#[cfg(test)]` convention) an ancestor
 /// module's name marks it as tests — those live inside regular source
 /// files the path heuristic cannot see. The name rule is the same
-/// substring match `is_test_path` applies to paths, so `mod tests` and
+/// substring match [`TestPaths`] applies to paths, so `mod tests` and
 /// `mod locality_tests` classify alike.
-pub(crate) fn is_test_entity(graph: &DependencyGraph, e: &CodeEntity) -> bool {
-    if crate::analyzer::is_test_path(&e.file_path) {
+///
+/// `tests` is passed in rather than built here: it resolves the repo root
+/// off the filesystem, and this is asked once per entity over graphs of
+/// tens of thousands. Any path inside the checkout roots it correctly, so
+/// callers hand it whatever root they already hold.
+pub(crate) fn is_test_entity(graph: &DependencyGraph, e: &CodeEntity, tests: &TestPaths) -> bool {
+    if tests.matches(Path::new(&e.file_path)) {
         return true;
     }
     let is_test_module = |x: &CodeEntity| {
@@ -62,11 +72,244 @@ pub(crate) fn is_test_entity(graph: &DependencyGraph, e: &CodeEntity) -> bool {
     for _ in 0..16 {
         match cur {
             Some(x) if is_test_module(x) => return true,
-            Some(x) => cur = graph.parent(&x.id),
+            Some(x) => cur = parent_of(graph, x),
             None => break,
         }
     }
     false
+}
+
+/// The synthetic scope nodes a callable's body is cut into.
+///
+/// A call written inside an `if` or a `for` is not attached to the function
+/// containing it: the analyzer reattaches it to the `Branch` or `Loop` node,
+/// so the edge on the wire is `branch → callee`. Reading edges off the
+/// callable alone therefore misses it, and dropping unlisted endpoints drops
+/// it — which is the same fact from the two ends.
+pub(super) fn is_body_scope(e: &CodeEntity) -> bool {
+    matches!(e.kind, EntityKind::Branch | EntityKind::Loop)
+}
+
+/// The nearest ancestor a listing may name, or `None` when there is none.
+///
+/// Field report, 2026-08-31: `impact` on a function called twice from inside
+/// a `for` loop reported `Used by (0)`, while its own header said `in 2` —
+/// the metric counted the edges and the listing filtered their source out
+/// without traversing through it. Ten of one function's twelve callees were
+/// invisible for this reason, and in most real code the majority of call
+/// sites are inside a branch or a loop.
+///
+/// The browser UI has solved this since UI-113: `liftBodies` re-routes every
+/// edge with an end inside a body to the enclosing callable, and measured
+/// 1 100 calls on this repo that would otherwise silently vanish. This is
+/// that rule, on the MCP side, which never had it.
+///
+/// Bounded, because a `parent_id` chain that points at itself is cheaper to
+/// cap than to prove impossible — the same reasoning and the same depth as
+/// the UI's.
+/// `pub(crate)` because `mezz deps --reverse` asks the same question one
+/// grain coarser — which *files* depend on this one — and a caller lost to an
+/// unlifted branch node is lost there too.
+pub(crate) fn lifted<'g>(graph: &'g DependencyGraph, e: &'g CodeEntity) -> Option<&'g CodeEntity> {
+    let mut cur = e;
+    for _ in 0..64 {
+        if is_listed(cur) {
+            return Some(cur);
+        }
+        cur = parent_of(graph, cur)?;
+    }
+    None
+}
+
+/// The ids a call written *in* `target` actually leaves from: the target
+/// itself plus the body-scope nodes nested inside it.
+///
+/// The outgoing half of the same defect. Lifting an endpoint fixes
+/// `Used by`, because there the body node is the edge's *source* and can be
+/// walked up from. It cannot fix `Uses`: those edges never touch the target's
+/// id at all, so there is nothing to lift — they have to be gathered.
+pub(super) fn body_scope_ids(graph: &DependencyGraph, target: &CodeEntity) -> Vec<String> {
+    let mut ids = vec![target.id.clone()];
+    let mut frontier = vec![target.id.clone()];
+    for _ in 0..64 {
+        let mut next = Vec::new();
+        for id in &frontier {
+            for child in graph.children(id).into_iter().filter(|c| is_body_scope(c)) {
+                ids.push(child.id.clone());
+                next.push(child.id.clone());
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    ids
+}
+
+/// What the target relies on, in reading order, with the targets that are
+/// not code in this repo tallied beside it.
+///
+/// Read from the target *and* the branch/loop nodes its body is cut into: a
+/// call written inside an `if` leaves from the branch, so those edges never
+/// touch the target's own id. There is nothing to lift here — they have to
+/// be gathered (see [`body_scope_ids`]).
+///
+/// The second half used to be `raw - uses.len()`, printed as *plus N
+/// external/unresolved targets not listed*. That subtraction counted every
+/// dropped edge, parameters and body scopes included, and merged a library
+/// call with a parser miss — so it over-reported, and what it reported it
+/// would not name (MCP-039). The ghosts are gathered instead, and
+/// [`Externals`] places them.
+fn uses_of<'g>(
+    graph: &'g DependencyGraph,
+    target: &CodeEntity,
+) -> (Vec<(&'g CodeEntity, String)>, Externals<'g>) {
+    let all: Vec<_> = body_scope_ids(graph, target)
+        .iter()
+        .flat_map(|id| graph.dependencies(id))
+        .collect();
+    let mut outside = Externals::of_file(graph, &target.file_path);
+    outside.gather(&all);
+    let mut uses: Vec<(&CodeEntity, String)> = all
+        .into_iter()
+        .filter(|(e, _)| is_listed(e))
+        .map(|(e, r)| (e, edge_label(r)))
+        .collect();
+    uses.sort_by_key(|(e, _)| (e.file_path.clone(), e.span.start.line));
+    uses.dedup_by_key(|(e, l)| (e.id.clone(), l.clone()));
+    (uses, outside)
+}
+
+/// The callables that depend on the target, in reading order.
+///
+/// A dependent whose call sits in a branch or a loop arrives as that scope
+/// node. It is lifted to the callable a reader can actually go and edit,
+/// rather than dropped for not being listed — which is what produced
+/// `Used by (0)` beside a header reading `in 2` (see [`lifted`]).
+///
+/// The target is excluded from its own dependents: a call in one arm of a
+/// function to another part of itself lifts to the function, and "this
+/// function depends on itself" is not a row anyone can act on.
+fn dependents_of<'g>(
+    graph: &'g DependencyGraph,
+    target: &CodeEntity,
+) -> Vec<(&'g CodeEntity, String)> {
+    let mut used_by: Vec<(&CodeEntity, String)> = graph
+        .dependents(&target.id)
+        .into_iter()
+        .filter_map(|(e, r)| Some((lifted(graph, e)?, edge_label(r))))
+        .filter(|(e, _)| e.id != target.id)
+        .collect();
+    used_by.sort_by_key(|(e, _)| (e.file_path.clone(), e.span.start.line));
+    used_by.dedup_by_key(|(e, l)| (e.id.clone(), l.clone()));
+    used_by
+}
+
+/// An entity's parent, by the `parent_id` the parser recorded, falling back
+/// to the `Contains` edge.
+///
+/// Not `graph.parent` alone. That reads the edge, and a **single-file**
+/// analysis — `quality`/`map` with a file for `path`, which is how an agent
+/// narrows to one file — carries the entities without their `Contains`
+/// relationships, so every entity in it reports no parent. That is what
+/// made `quality(path: "src/activity.rs")` list seven `#[test]` functions
+/// as production smells while `quality(path: "src")` over the same file
+/// counted them as test code (field report, 2026-08-31). `parent_id` is
+/// populated either way, which is why `map`'s own top-level test reads it.
+pub(super) fn parent_of<'g>(graph: &'g DependencyGraph, e: &CodeEntity) -> Option<&'g CodeEntity> {
+    e.parent_id
+        .as_deref()
+        .and_then(|id| graph.get_entity(id))
+        .or_else(|| graph.parent(&e.id))
+}
+
+/// The graph and the rooted heuristic together, so a caller can ask whether
+/// an entity is test code without carrying two things to ask it with.
+///
+/// Built once per report: [`TestPaths::rooted_at`] climbs the filesystem for
+/// a repo root, and this question is asked once per entity.
+pub(crate) struct TestCode<'a> {
+    graph: &'a DependencyGraph,
+    paths: TestPaths,
+}
+
+impl<'a> TestCode<'a> {
+    /// Rooted at any path inside the checkout — they all resolve to the
+    /// same repo root.
+    pub(crate) fn of(graph: &'a DependencyGraph, root: &Path) -> Self {
+        Self {
+            graph,
+            paths: TestPaths::rooted_at(root),
+        }
+    }
+
+    /// Whether this entity is test code. `None` — a row whose entity is in
+    /// neither graph — is not test code, which keeps an unjoinable row
+    /// visible rather than silently filed under the count.
+    pub(crate) fn holds(&self, e: Option<&CodeEntity>) -> bool {
+        e.is_some_and(|e| is_test_entity(self.graph, e, &self.paths))
+    }
+}
+
+/// Why smells on test code are counted rather than listed.
+///
+/// A unit test exists to exercise one type, so it interacts more with that
+/// type than with itself — which is the exact shape Feature Envy fires on,
+/// and a shape a *correct* test cannot avoid. Two field reports (2026-08-31)
+/// reached this from `quality` and from `assess_change`: seven of seven new
+/// smells on `#[test]` functions in one file, none on the nineteen
+/// production functions above them, each row carrying the hint "move this
+/// method to the type it mostly interacts with". Followed, that instruction
+/// damages a passing test suite to silence a warning about nothing; behind a
+/// hook that exits 2, following it is the cheapest way out of a blocked turn.
+///
+/// The second-order cost is the one that decides it: a ⚠ section that is
+/// mostly noise teaches the reader to skim the section where a real smell
+/// would appear. And it inverts the signal — a file's smell count would rise
+/// with how well it is tested.
+///
+/// Counted, never silently dropped. A section that quietly shrinks is the
+/// failure this whole queue is otherwise about.
+fn smells_aside(shown: usize, in_tests: usize, label: &str) -> String {
+    match in_tests {
+        0 => format!("{label} ({shown})"),
+        n => format!("{label} ({shown}, plus {n} in test code — not listed)"),
+    }
+}
+
+/// The `, test` a row carries when it is test code, and nothing when it is
+/// not.
+///
+/// `quality`'s refactor-pressure ranking keeps test entities — a slow or
+/// tangled test suite is worth ranking — but a row reading `⚠ Feature Envy`
+/// beside a `#[test]` function is one a reader acts on wrongly. The
+/// reporter asked for exactly this token, in exactly this position
+/// (2026-08-31).
+fn test_marker(tests: &TestCode, e: &CodeEntity) -> &'static str {
+    match tests.holds(Some(e)) {
+        true => ", test",
+        false => "",
+    }
+}
+
+/// The smelly production entities, worst composite score first, and how
+/// many the test code beside them would have added — see [`smells_aside`].
+pub(crate) fn production_smells<'g>(
+    graph: &'g DependencyGraph,
+    tests: &TestCode,
+) -> (Vec<&'g CodeEntity>, usize) {
+    let smelly = graph
+        .entities()
+        .filter(|e| is_listed(e) && !e.metrics.smells.is_empty());
+    let (mut production, in_tests): (Vec<&CodeEntity>, Vec<&CodeEntity>) =
+        smelly.partition(|e| !tests.holds(Some(e)));
+    production.sort_by(|a, b| {
+        b.metrics
+            .composite_score
+            .total_cmp(&a.metrics.composite_score)
+    });
+    (production, in_tests.len())
 }
 
 /// Resolve the optional `path` argument against the server root.
@@ -159,7 +402,7 @@ fn analyze_with_tests(
 /// `pub(super)` because the push-mode findings join two graphs by
 /// path and the base one lives in a throwaway worktree, so it has the
 /// same root-stripping problem this solves for the reports here.
-pub(super) fn rel_path(file: &Path, base: &Path) -> String {
+pub(crate) fn rel_path(file: &Path, base: &Path) -> String {
     // When the analyzed target is itself a file, relativize against its
     // directory so the file keeps its name instead of becoming "".
     let base = if base.is_file() {
@@ -173,11 +416,31 @@ pub(super) fn rel_path(file: &Path, base: &Path) -> String {
         .to_string()
 }
 
+/// One node, the way a chain prints it: what it is, what it is called, and
+/// where to open it.
+///
+/// Shared by `trace` and [`super::radius`] rather than written twice. A
+/// second node renderer is how two chains of the same graph come to spell
+/// the same entity differently, and a reader comparing two reports reads
+/// that as two entities.
+pub(super) fn render_node(e: &CodeEntity, root: &Path) -> String {
+    if e.tags.contains("ghost") {
+        return format!("`{}` (external)", e.name);
+    }
+    format!(
+        "{} `{}` ({}:{})",
+        e.kind.display_name(),
+        e.name,
+        rel_path(&e.file_path, root),
+        e.span.start.line + 1
+    )
+}
+
 /// Edge label carrying its AN-004 precision marker, e.g. `calls ·exact` /
 /// `calls ·heuristic`. Only call edges carry precision; every other edge
 /// renders its plain label. Surfaces the exact-vs-heuristic distinction the
 /// agent needs to decide whether to trust a blast radius or fall back to grep.
-fn edge_label(r: &Relationship) -> String {
+pub(super) fn edge_label(r: &Relationship) -> String {
     match (r.kind, r.precision) {
         (RelationshipKind::Calls, Some(p)) => {
             format!("{} ·{}", r.kind.display_label(), p.marker())
@@ -225,7 +488,16 @@ fn unresolved_note(e: &CodeEntity, unresolved: u32) -> String {
     )
 }
 
-fn metric_suffix(e: &CodeEntity) -> String {
+/// `ws N` for a callable the parser measured, nothing for one it did not.
+///
+/// Printed for every callable, not only over the line: `ws 3` beside
+/// `cog 40` is the reading that says the body is branchy but narrow, and a
+/// metric shown only when it is bad cannot make that distinction.
+fn working_set_part(m: &crate::models::entity::EntityMetrics) -> Option<String> {
+    m.working_set.map(|w| format!("ws {w}"))
+}
+
+pub(crate) fn metric_suffix(e: &CodeEntity) -> String {
     let m = &e.metrics;
     let mut parts = vec![
         format!("L{}", e.span.start.line + 1),
@@ -237,6 +509,7 @@ fn metric_suffix(e: &CodeEntity) -> String {
     if let Some(c) = m.cognitive_complexity {
         parts.push(format!("cog {}", c));
     }
+    parts.extend(working_set_part(m));
     if m.method_count > 0 {
         parts.push(format!("methods {}", m.method_count));
     }
@@ -291,21 +564,7 @@ pub(super) fn cap_lines(body: Vec<String>, hint: &str) -> String {
 //  map
 // ------------------------------------------------------------------
 
-/// The listable entities of `path`, out of a graph built over the whole root.
-///
-/// The split is the point: what a report *lists* and what its numbers are
-/// *computed over* are different questions, and answering both with one
-/// scoped analysis is what made `map` report an exported function as
-/// uncoupled while `impact` showed eight dependents on the same entity.
-fn under<'a>(graph: &'a DependencyGraph, path: &Path) -> Vec<&'a CodeEntity> {
-    graph
-        .entities()
-        .filter(|e| is_listed(e))
-        .filter(|e| Path::new(&e.file_path).starts_with(path))
-        .collect()
-}
-
-pub fn map(server: &McpServer, args: &Value) -> Result<String> {
+pub fn map(server: &McpServer, args: &Value) -> Result<Answer> {
     let path = resolve_path(server, args)?;
     let depth = args
         .get("depth")
@@ -321,76 +580,25 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
     // `map` had it, and `map` is the tool people are told to reach for first
     // on unfamiliar code (MCP-021).
     let graph = analyze(server, &server.root)?;
-    let by_id: HashMap<&str, &CodeEntity> = graph.entities().map(|e| (e.id.as_str(), e)).collect();
 
-    // Top-level entities grouped by file, ordered by path then line.
-    let is_top_level = |e: &CodeEntity| match &e.parent_id {
-        None => true,
-        Some(pid) => by_id
-            .get(pid.as_str())
-            .map(|p| p.kind == EntityKind::File)
-            .unwrap_or(true), // unresolvable parent → treat as top-level
-    };
+    // Counted off the disk as well as out of the graph: a listing smaller
+    // than the folder that does not say so is read as the folder — see
+    // [`census`].
+    let census = FolderCensus::of(server, &graph, &path);
+    let mut body = census.header(&path);
+    body.extend(census.rows(&graph, depth));
 
-    let listed: Vec<&CodeEntity> = under(&graph, &path);
-    let mut files: BTreeMap<String, Vec<&CodeEntity>> = BTreeMap::new();
-    for e in listed.iter().copied().filter(|e| is_top_level(e)) {
-        files
-            .entry(rel_path(&e.file_path, &path))
-            .or_default()
-            .push(e);
-    }
-    for entities in files.values_mut() {
-        entities.sort_by_key(|e| e.span.start.line);
-    }
+    // Both renderings read the one census (ADR 0035). `depth` is the
+    // caller's bound and so applies to both; `cap_lines` is the prose's
+    // own reading budget and applies to neither the census nor the JSON.
+    let data = census.as_json(&graph, &path, &server.root, depth);
 
-    // Header: totals and a kind breakdown.
-    let mut kind_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for e in &listed {
-        *kind_counts.entry(e.kind.display_name()).or_default() += 1;
-    }
-    let breakdown = kind_counts
-        .iter()
-        .map(|(k, n)| format!("{} {}", n, k))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut body = vec![
-        format!("# Map of {}", path.display()),
-        format!("{} files — {}", files.len(), breakdown),
-        String::new(),
-    ];
-
-    for (file, entities) in &files {
-        body.push(format!("{} ({} entities)", file, entities.len()));
-        if depth >= 2 {
-            for e in entities {
-                body.push(format!(
-                    "  {} {} ({})",
-                    e.kind.display_name(),
-                    e.name,
-                    metric_suffix(e)
-                ));
-                if depth >= 3 {
-                    let mut members = graph.children(&e.id);
-                    members.retain(|c| is_listed(c));
-                    members.sort_by_key(|c| c.span.start.line);
-                    for m in members {
-                        body.push(format!(
-                            "    {} {} ({})",
-                            m.kind.display_name(),
-                            m.name,
-                            metric_suffix(m)
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(cap_lines(
-        body,
-        "Call `map` again with a narrower `path` or a smaller `depth`.",
+    Ok(Answer::structured(
+        cap_lines(
+            body,
+            "Call `map` again with a narrower `path` or a smaller `depth`.",
+        ),
+        data,
     ))
 }
 
@@ -398,7 +606,7 @@ pub fn map(server: &McpServer, args: &Value) -> Result<String> {
 //  quality
 // ------------------------------------------------------------------
 
-pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
+pub fn quality(server: &McpServer, args: &Value) -> Result<Answer> {
     let path = resolve_path(server, args)?;
     let top = args
         .get("top")
@@ -407,30 +615,28 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
         .clamp(1, 50) as usize;
 
     let graph = analyze(server, &path)?;
+    let tests = TestCode::of(&graph, &path);
     let entity_row = |e: &CodeEntity| {
         format!(
-            "- {} `{}` — {}:{} ({})",
+            "- {} `{}` — {}:{} ({}{})",
             e.kind.display_name(),
             e.name,
             rel_path(&e.file_path, &path),
             e.span.start.line + 1,
-            metric_suffix(e)
+            metric_suffix(e),
+            test_marker(&tests, e),
         )
     };
 
     let mut body = vec![format!("# Quality of {}", path.display()), String::new()];
 
-    // Smells, worst composite score first.
-    let mut smelly: Vec<&CodeEntity> = graph
-        .entities()
-        .filter(|e| is_listed(e) && !e.metrics.smells.is_empty())
-        .collect();
-    smelly.sort_by(|a, b| {
-        b.metrics
-            .composite_score
-            .total_cmp(&a.metrics.composite_score)
-    });
-    body.push(format!("## Smells ({})", smelly.len()));
+    // Smells, worst composite score first — test code counted apart, for
+    // the reasons in [`smells_aside`].
+    let (smelly, smells_in_tests) = production_smells(&graph, &tests);
+    body.push(format!(
+        "## {}",
+        smells_aside(smelly.len(), smells_in_tests, "Smells")
+    ));
     let mut hints_used: HashSet<SmellKind> = HashSet::new();
     for e in smelly.iter().take(top) {
         body.push(entity_row(e));
@@ -487,7 +693,7 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
     });
     for e in ranked.iter().take(top) {
         body.push(format!(
-            "- [{:.2}] {} `{}` — {}:{} ({}{})",
+            "- [{:.2}] {} `{}` — {}:{} ({}{}{})",
             e.metrics.composite_score,
             e.kind.display_name(),
             e.name,
@@ -495,6 +701,7 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
             e.span.start.line + 1,
             metric_suffix(e),
             unresolved_note(e, unresolved.get(e.id.as_str()).copied().unwrap_or(0)),
+            test_marker(&tests, e),
         ));
     }
 
@@ -514,9 +721,17 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
         .collect();
     body.push(String::new());
     body.push(format!("## Dependency cycles ({})", cycles.len()));
-    for members in cycles.iter().take(5) {
-        let names: Vec<&str> = members.iter().take(8).map(|e| e.name.as_str()).collect();
-        let ellipsis = if members.len() > 8 { " → …" } else { "" };
+    for members in cycles.iter().take(SHOWN_CYCLES) {
+        let names: Vec<&str> = members
+            .iter()
+            .take(NAMED_CYCLE_MEMBERS)
+            .map(|e| e.name.as_str())
+            .collect();
+        let ellipsis = if members.len() > NAMED_CYCLE_MEMBERS {
+            " → …"
+        } else {
+            ""
+        };
         body.push(format!(
             "- {} → {}{}",
             names.join(" → "),
@@ -524,13 +739,125 @@ pub fn quality(server: &McpServer, args: &Value) -> Result<String> {
             ellipsis
         ));
     }
-    if cycles.len() > 5 {
-        body.push(format!("… and {} more cycles.", cycles.len() - 5));
+    if cycles.len() > SHOWN_CYCLES {
+        body.push(format!(
+            "… and {} more cycles.",
+            cycles.len() - SHOWN_CYCLES
+        ));
     }
 
-    body.extend(folder_shape_section(&graph, &path, top));
+    // Scored once, read by both renderings — the shape section is the one
+    // part of this report whose value took its own pass over the graph.
+    let shapes = folder_shapes(&graph, &path);
+    body.extend(folder_shape_section(&shapes, &graph, &path, top));
 
-    Ok(cap_lines(body, "Call `quality` with a narrower `path`."))
+    let facts = QualityFacts {
+        path: &path,
+        root: &server.root,
+        top,
+        smelly: &smelly,
+        smells_in_tests,
+        ranked: &ranked,
+        unresolved: &unresolved,
+        cycles: &cycles,
+        shapes: &shapes,
+        tests: &tests,
+        graph: &graph,
+    };
+    Ok(Answer::structured(
+        cap_lines(body, "Call `quality` with a narrower `path`."),
+        facts.as_json(),
+    ))
+}
+
+/// How many cycles the prose names, and how many members of each. Both are
+/// reading budgets: a report that lists forty rings is not read, and the
+/// count above them is the part that carries the message. JSON carries
+/// every ring and every member (ADR 0035).
+const SHOWN_CYCLES: usize = 5;
+const NAMED_CYCLE_MEMBERS: usize = 8;
+
+/// What `quality` selected, held together so both renderings read the one
+/// selection (ADR 0035).
+///
+/// A parameter object rather than ten arguments, and borrowed throughout:
+/// the value here *is* which entities were picked and in what order, not
+/// a copy of them.
+struct QualityFacts<'g> {
+    path: &'g Path,
+    root: &'g Path,
+    top: usize,
+    smelly: &'g [&'g CodeEntity],
+    smells_in_tests: usize,
+    ranked: &'g [&'g CodeEntity],
+    unresolved: &'g HashMap<&'g str, u32>,
+    cycles: &'g [Vec<&'g CodeEntity>],
+    shapes: &'g [(String, &'g FolderShape)],
+    tests: &'g TestCode<'g>,
+    graph: &'g DependencyGraph,
+}
+
+impl QualityFacts<'_> {
+    /// The report as fields. Every section the prose has, and the counts
+    /// it states in its headings as numbers rather than inside them.
+    fn as_json(&self) -> Value {
+        json!({
+            "path": answer::scope_path(self.path, self.root),
+            "top": self.top,
+            "smells": {
+                "entities": self.rows(self.smelly.iter().take(self.top)),
+                "shown": self.smelly.len().min(self.top),
+                "total": self.smelly.len(),
+                "in_test_code": self.smells_in_tests,
+            },
+            "pressure": {
+                "entities": self.pressure_rows(),
+                "shown": self.ranked.len().min(self.top),
+                "total": self.ranked.len(),
+            },
+            "cycles": {
+                "cycles": self.cycles
+                    .iter()
+                    .map(|members| json!({
+                        "members": self.rows(members.iter()),
+                    }))
+                    .collect::<Vec<_>>(),
+                "total": self.cycles.len(),
+            },
+            "folder_shape": folder_shape_json(self.shapes, self.graph, self.path, self.top),
+        })
+    }
+
+    /// Entity rows, each carrying the `, test` marker the prose puts on it.
+    fn rows<'e>(&self, entities: impl Iterator<Item = &'e &'e CodeEntity>) -> Vec<Value> {
+        entities
+            .map(|e| {
+                let mut row = answer::entity_json(e, self.path);
+                row["test_code"] = json!(self.tests.holds(Some(e)));
+                row
+            })
+            .collect()
+    }
+
+    /// The pressure rows, plus the two numbers that row's prose carries
+    /// and no other row's does: the score it is ranked by, and how much of
+    /// its `fan_out` mezz actually identified — see [`unresolved_note`],
+    /// which says the same thing in words.
+    fn pressure_rows(&self) -> Vec<Value> {
+        self.ranked
+            .iter()
+            .take(self.top)
+            .map(|e| {
+                let mut row = answer::entity_json(e, self.path);
+                row["test_code"] = json!(self.tests.holds(Some(e)));
+                row["pressure"] = json!(e.metrics.composite_score);
+                row["identified_fan_out"] = json!(e.metrics.fan_out.saturating_sub(
+                    self.unresolved.get(e.id.as_str()).copied().unwrap_or(0)
+                ));
+                row
+            })
+            .collect()
+    }
 }
 
 /// Folders whose shape tier moved between the two graphs.
@@ -911,38 +1238,43 @@ fn split_caveat(split: usize) -> Vec<String> {
 /// whose file list a reviewer reads.
 const MAX_MOVED_FILES: usize = 40;
 
-fn folder_shape_section(graph: &DependencyGraph, base: &Path, top: usize) -> Vec<String> {
-    let scored: Vec<(String, &FolderShape)> = graph
+/// One folder in a shape listing: the path as the reader spells it, and
+/// what the shape pass scored it.
+type ShapeRow<'s> = (String, &'s FolderShape);
+
+/// Every folder under `base` the shape pass scored, named the way the
+/// reader spells it.
+///
+/// Lifted out of [`folder_shape_section`] so the prose and the JSON read
+/// one scoring rather than each taking their own pass (ADR 0035).
+fn folder_shapes<'g>(graph: &'g DependencyGraph, base: &Path) -> Vec<(String, &'g FolderShape)> {
+    graph
         .folder_metrics()
         .iter()
         .filter_map(|m| {
             let shape = m.metrics.shape.as_ref()?;
             Some((rel_path(Path::new(&m.path), base), shape))
         })
-        .collect();
+        .collect()
+}
+
+fn folder_shape_section(
+    scored: &[(String, &FolderShape)],
+    graph: &DependencyGraph,
+    base: &Path,
+    top: usize,
+) -> Vec<String> {
     if scored.is_empty() {
         return Vec::new();
     }
 
-    let mut body = shape_tally(&scored);
-    let short: Vec<(String, &FolderShape)> = scored
-        .into_iter()
-        .filter(|(_, s)| s.pattern < ShapePattern::Fractal)
-        .collect();
-    if short.is_empty() {
-        body.push("Every folder holds its shape.".to_string());
+    let mut body = shape_tally(scored);
+    body.extend(whole_tree(scored, graph, base));
+    let (here, elsewhere) = shape_groups(scored);
+    if here.is_empty() && elsewhere.is_empty() {
+        body.push("Every folder below the top level holds its shape.".to_string());
         return body;
     }
-
-    // A sub-fractal folder always carries a blocker — `folder_shape` has
-    // an invariant test for exactly that — so the `None` arm here is
-    // unreachable rather than a judgement. It falls to the second group,
-    // which is the harmless side: nothing is claimed to be actionable.
-    let (mut here, mut elsewhere): (Vec<_>, Vec<_>) = short
-        .into_iter()
-        .partition(|(_, s)| s.blocker.is_some_and(|b| b.is_own_drawing()));
-    here.sort_by(work_order);
-    elsewhere.sort_by(worst_first);
 
     body.extend(start_here_group(&here, top, graph, base));
     body.extend(blocked_group(&elsewhere, graph, base));
@@ -954,6 +1286,151 @@ fn folder_shape_section(graph: &DependencyGraph, base: &Path, top: usize) -> Vec
 /// `top`: they are not the work list, and the count plus the gates they
 /// are waiting on is the whole message.
 const SHAPE_BLOCKED_SHOWN: usize = 5;
+
+/// The shape section as fields: every scored folder, with the group the
+/// prose files it under.
+///
+/// Grouped rather than flat because the grouping *is* the finding —
+/// "start here" means the blocker is in the folder's own drawing and
+/// "answered elsewhere" means it is not, which is the difference between
+/// a work list and a waiting list. A consumer reading only `compliance`
+/// would re-derive that rule and get it wrong, as field reports about the
+/// prose version already showed.
+///
+/// Complete, unlike the prose: `top` caps the printed work list and
+/// `SHAPE_BLOCKED_SHOWN` the printed waiting list, and both are reading
+/// budgets rather than anything the caller asked for. `shown` records what
+/// the prose displayed so the two can be checked against each other.
+fn folder_shape_json(
+    scored: &[(String, &FolderShape)],
+    graph: &DependencyGraph,
+    base: &Path,
+    top: usize,
+) -> Value {
+    let (here, elsewhere) = shape_groups(scored);
+    json!({
+        "folders": scored
+            .iter()
+            .map(|(dir, shape)| shape_json(dir, shape, graph, base))
+            .collect::<Vec<_>>(),
+        "tally": {
+            "cyclic": shape_count(scored, ShapePattern::Cyclic),
+            "tangled": shape_count(scored, ShapePattern::Tangled),
+            "hierarchical": shape_count(scored, ShapePattern::Hierarchical),
+            "fractal": shape_count(scored, ShapePattern::Fractal),
+            "total": scored.len(),
+        },
+        "start_here": {
+            "folders": here.iter().map(|(dir, _)| dir.as_str()).collect::<Vec<_>>(),
+            "shown": here.len().min(top),
+            "total": here.len(),
+        },
+        "answered_elsewhere": {
+            "folders": elsewhere.iter().map(|(dir, _)| dir.as_str()).collect::<Vec<_>>(),
+            "shown": elsewhere.len().min(SHAPE_BLOCKED_SHOWN),
+            "total": elsewhere.len(),
+        },
+    })
+}
+
+/// The two lists the prose prints, in the order it prints them — the
+/// partition and both sorts, so neither rendering re-decides them.
+///
+/// The root is dropped: it is stated above whatever it scores
+/// ([`whole_tree`]), so leaving it in either list would say it twice. A
+/// sub-fractal folder always carries a blocker — `folder_shape` has an
+/// invariant test for exactly that — so the `None` arm of the partition is
+/// unreachable rather than a judgement, and it falls to the second group,
+/// which is the harmless side: nothing there is claimed to be actionable.
+fn shape_groups<'s>(scored: &'s [ShapeRow<'s>]) -> (Vec<ShapeRow<'s>>, Vec<ShapeRow<'s>>) {
+    let short: Vec<(String, &FolderShape)> = scored
+        .iter()
+        .map(|(dir, s)| (dir.clone(), *s))
+        .filter(|(dir, s)| !dir.is_empty() && s.pattern < ShapePattern::Fractal)
+        .collect();
+    let (mut here, mut elsewhere): (Vec<_>, Vec<_>) = short
+        .into_iter()
+        .partition(|(_, s)| s.blocker.is_some_and(|b| b.is_own_drawing()));
+    here.sort_by(work_order);
+    elsewhere.sort_by(worst_first);
+    (here, elsewhere)
+}
+
+fn shape_count(scored: &[(String, &FolderShape)], pattern: ShapePattern) -> usize {
+    scored.iter().filter(|(_, s)| s.pattern == pattern).count()
+}
+
+/// One folder's row: the shape scores as the pass computed them, plus the
+/// two things [`shape_line`] adds in words — what it is held back by, and
+/// whether its numbers were computed over a holed drawing.
+fn shape_json(dir: &str, shape: &FolderShape, graph: &DependencyGraph, base: &Path) -> Value {
+    json!({
+        "folder": dir,
+        "pattern": shape.pattern.label(),
+        "blocked_by": shape.blocker.map(|b| b.summary()),
+        "compliance": shape.compliance,
+        "acyclicity": shape.acyclicity,
+        "layering": shape.layering,
+        "arborescence": shape.arborescence,
+        "entry_concentration": shape.entry_concentration,
+        "egress": shape.egress,
+        "child_compliance": shape.child_compliance,
+        "uniformity": shape.uniformity,
+        "child_count": shape.child_count,
+        "terms": shape.terms,
+        "unresolved_imports": unresolved_imports_of(graph, base, dir),
+    })
+}
+
+/// How many of this folder's imports never reached the graph — the number
+/// behind [`unsound_marker`]'s ⚠, which is the only form the prose has
+/// room for.
+fn unresolved_imports_of(graph: &DependencyGraph, base: &Path, dir: &str) -> usize {
+    let folder = if dir.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(dir)
+    };
+    graph.unresolved_imports_touching(&folder.display().to_string())
+}
+
+/// The graph the top-level folders draw between them, stated rather than
+/// ranked.
+///
+/// The root is a folder like any other and has always been scored — its
+/// children are the top-level directories, each collapsed to one node. It
+/// was never *printed*, because both lists below are ranked and the root
+/// loses both: `work_order` sorts deepest first, so depth zero comes last
+/// of however many folders fall short, and the list is cut at `top`. A
+/// repository whose top-level folders sit in a dependency loop would report
+/// that loop nowhere while naming a leaf parser folder as the place to
+/// start. Reported by a maintainer who could see the tangle on the canvas
+/// in folder mode and could not find it in this output.
+///
+/// Deepest-first is right for the work list and is left alone: clearing a
+/// child can clear its parent's gate, so the root is genuinely the last
+/// thing to *fix*. It is the first thing to *know*, which is a different
+/// question, so it gets its own line instead of a place in the ranking.
+fn whole_tree(
+    scored: &[(String, &FolderShape)],
+    graph: &DependencyGraph,
+    base: &Path,
+) -> Vec<String> {
+    let Some((dir, shape)) = scored.iter().find(|(dir, _)| dir.is_empty()) else {
+        return Vec::new();
+    };
+    vec![
+        String::new(),
+        "### The top level".to_string(),
+        "The graph drawn between the immediate children of the folder you asked \
+         about — the whole repository, unless you passed a `path`. Every verdict \
+         below sits inside this one, and it is stated here rather than ranked with \
+         them because the work list is ordered deepest-first and would always put \
+         it last."
+            .to_string(),
+        shape_line(dir, shape, &unsound_marker(graph, base, dir)),
+    ]
+}
 
 /// The distribution across the ladder, and the two clauses a reader needs
 /// before any number below it can be read the right way round.
@@ -968,7 +1445,10 @@ fn shape_tally(scored: &[(String, &FolderShape)]) -> Vec<String> {
              children with each subfolder as one node. Higher is better here, \
              unlike the scores above. `branching` gates fractal but is not \
              part of `compliance`, so a folder can blend well and still be \
-             held back by it.",
+             held back by it. `uniformity` gates nothing at all: it is the \
+             one number here comparing a folder against the level inside it \
+             rather than against a fixed bar, and it is reported while its \
+             distribution is still being learned.",
             count(ShapePattern::Cyclic),
             count(ShapePattern::Tangled),
             count(ShapePattern::Hierarchical),
@@ -1024,12 +1504,7 @@ fn depth(rel: &str) -> usize {
 /// inbound edges to `bulk.ts` were invisible and a raw read of the imports
 /// found six ways in. The score was flattering it.
 fn unsound_marker(graph: &DependencyGraph, base: &Path, dir: &str) -> String {
-    let folder = if dir.is_empty() {
-        base.to_path_buf()
-    } else {
-        base.join(dir)
-    };
-    match graph.unresolved_imports_touching(&folder.display().to_string()) {
+    match unresolved_imports_of(graph, base, dir) {
         0 => String::new(),
         n => format!(" · ⚠ {n} unresolved"),
     }
@@ -1146,7 +1621,7 @@ fn blocked_group(
 fn shape_line(dir: &str, shape: &FolderShape, unsound: &str) -> String {
     format!(
         "- [{}] {} — held back by {}; compliance {:.2}, acyclic {:.2}, layered {}, \
-         branching {}, one-door-in {}, {} children{}",
+         branching {}, one-door-in {}, uniformity {}, {} children{}",
         shape.pattern.label(),
         if dir.is_empty() { "(root)" } else { dir },
         shape
@@ -1157,6 +1632,7 @@ fn shape_line(dir: &str, shape: &FolderShape, unsound: &str) -> String {
         ratio(shape.layering),
         ratio(shape.arborescence),
         ratio(shape.entry_concentration),
+        ratio(shape.uniformity),
         shape.child_count,
         unsound,
     )
@@ -1442,9 +1918,17 @@ pub fn impact(server: &McpServer, args: &Value) -> Result<String> {
         .and_then(|v| v.as_u64())
         .unwrap_or(2)
         .clamp(1, 5) as usize;
+    let direction = super::radius::direction_of(args)?;
 
     // Blast radius must see every dependent, so always analyze the full root.
     let graph = analyze(server, &server.root)?;
+
+    // `path` with no `line` and no `entity` asks about the file itself, which
+    // is a different unit and not the sum of the entities in it (MCP-038).
+    if let Some(file) = file_subject(server, args)? {
+        return Ok(super::file_impact::report(&graph, &file, &server.root));
+    }
+
     let target = match find_target(server, &graph, args)? {
         Found::One(e) => e,
         Found::Ambiguous(text) => return Ok(text),
@@ -1470,26 +1954,11 @@ pub fn impact(server: &McpServer, args: &Value) -> Result<String> {
 
     // Outgoing: what the target relies on — its contract with the rest
     // of the code. Sorted by position for stable output.
-    let all_deps = graph.dependencies(&target.id);
-    let raw_dep_count = all_deps.len();
-    let mut uses: Vec<(&CodeEntity, String)> = all_deps
-        .into_iter()
-        .filter(|(e, _)| is_listed(e))
-        .map(|(e, r)| (e, edge_label(r)))
-        .collect();
-    uses.sort_by_key(|(e, _)| (e.file_path.clone(), e.span.start.line));
-    uses.dedup_by_key(|(e, l)| (e.id.clone(), l.clone()));
-    let external = raw_dep_count - uses.len();
-    let external_note = if external > 0 {
-        format!(", plus {} external/unresolved targets not listed", external)
-    } else {
-        String::new()
-    };
+    let (uses, outside) = uses_of(&graph, target);
     body.push(String::new());
     body.push(format!(
-        "## Uses ({}) — code this entity relies on{}",
+        "## Uses ({}) — code this entity relies on, in this repo",
         uses.len(),
-        external_note
     ));
     for (e, label) in uses.iter().take(40) {
         body.push(row(e, label));
@@ -1497,95 +1966,31 @@ pub fn impact(server: &McpServer, args: &Value) -> Result<String> {
     if uses.len() > 40 {
         body.push(format!("… and {} more.", uses.len() - 40));
     }
+    // The rest of what it relies on: named, and split, because a library
+    // call and a call mezz could not bind mean opposite things (MCP-039).
+    body.extend(outside.sections("this entity"));
+    // And what those calls *do* — the one thing the sections above still
+    // cannot say, carried `depth` hops out because the effect a reader
+    // needs is usually not in the body they are editing (MCP-043).
+    body.extend(
+        super::effects::EffectSurface::of_entity(&graph, target, depth)
+            .section("this entity", Some(depth), root),
+    );
 
     // Incoming: direct dependents — first to break if the contract changes.
-    let mut used_by: Vec<(&CodeEntity, String)> = graph
-        .dependents(&target.id)
-        .into_iter()
-        .filter(|(e, _)| is_listed(e))
-        .map(|(e, r)| (e, edge_label(r)))
-        .collect();
-    used_by.sort_by_key(|(e, _)| (e.file_path.clone(), e.span.start.line));
-    used_by.dedup_by_key(|(e, l)| (e.id.clone(), l.clone()));
+    let used_by = dependents_of(&graph, target);
     body.extend(used_by_section(&graph, target, &used_by, root));
 
-    // Container targets: parsers emit no type-usage edges (a struct used
-    // as a parameter/field type gets no edge), so approximate "who uses
-    // this type" by aggregating callers of its methods.
     let children = graph.children(&target.id);
     let child_ids: HashSet<&str> = children.iter().map(|c| c.id.as_str()).collect();
-    if !children.is_empty() {
-        let mut via: BTreeMap<(PathBuf, usize), (&CodeEntity, Vec<&str>)> = BTreeMap::new();
-        for c in children.iter().filter(|c| is_listed(c)) {
-            for (caller, _) in graph.dependents(&c.id) {
-                if caller.id == target.id
-                    || child_ids.contains(caller.id.as_str())
-                    || !is_listed(caller)
-                {
-                    continue;
-                }
-                via.entry((caller.file_path.clone(), caller.span.start.line))
-                    .or_insert_with(|| (caller, Vec::new()))
-                    .1
-                    .push(&c.name);
-            }
-        }
-        body.push(String::new());
-        body.push(format!(
-            "## Used via members ({} callers of this type's methods)",
-            via.len()
-        ));
-        for (caller, methods) in via.values().take(40) {
-            let mut methods = methods.clone();
-            methods.sort();
-            methods.dedup();
-            body.push(format!(
-                "- {} `{}` — {}:{} (uses `{}`)",
-                caller.kind.display_name(),
-                caller.name,
-                rel_path(&caller.file_path, root),
-                caller.span.start.line + 1,
-                methods.join("`, `")
-            ));
-        }
-        if via.len() > 40 {
-            body.push(format!("… and {} more.", via.len() - 40));
-        }
-    }
+    body.extend(used_via_members(&graph, target, &children, &child_ids, root));
 
-    // Transitive dependents: the full blast radius, level by level. For
-    // containers, seed with the members too so method-mediated dependents
-    // are reached.
-    let mut seeds: Vec<&str> = vec![&target.id];
-    seeds.extend(child_ids.iter().copied());
-    let (levels, _exact_path) = transitive_dependents(&graph, &seeds, depth);
-    let total: usize = levels.iter().skip(1).map(|l| l.len()).sum();
-    if depth > 1 {
-        body.push(String::new());
-        body.push(format!(
-            "## Blast radius to depth {} ({} entities beyond direct dependents)",
-            depth, total
-        ));
-        let mut listed = 0;
-        for (d, level) in levels.iter().enumerate().skip(1) {
-            for e in level {
-                if listed >= 40 {
-                    break;
-                }
-                body.push(format!(
-                    "- [depth {}] {} `{}` — {}:{}",
-                    d + 1,
-                    e.kind.display_name(),
-                    e.name,
-                    rel_path(&e.file_path, root),
-                    e.span.start.line + 1
-                ));
-                listed += 1;
-            }
-        }
-        if total > listed {
-            body.push(format!("… and {} more.", total - listed));
-        }
+    // The radius as routes: every entity reached, nested under the one it
+    // was reached through, because "at depth 3" never said through what
+    // (MCP-048). `direction: out` asks the same machinery the opposite
+    // question — the call tree under the target.
+    if direction == Direction::Out || depth > 1 {
+        body.extend(super::radius::Radius::of(&graph, target, direction, depth).section(root));
     }
 
     Ok(cap_lines(
@@ -1594,7 +1999,74 @@ pub fn impact(server: &McpServer, args: &Value) -> Result<String> {
     ))
 }
 
-/// BFS over incoming dependency edges. Level 0 holds direct dependents,
+/// The `Used via members` section, empty for anything with no children.
+///
+/// Parsers emit no type-usage edges — a struct used as a parameter or a
+/// field type produces no edge at all — so "who uses this type" is
+/// approximated by aggregating the callers of its methods, one row per
+/// caller with the members it reaches.
+fn used_via_members(
+    graph: &DependencyGraph,
+    target: &CodeEntity,
+    children: &[&CodeEntity],
+    child_ids: &HashSet<&str>,
+    root: &Path,
+) -> Vec<String> {
+    if children.is_empty() {
+        return Vec::new();
+    }
+    let mut via: BTreeMap<(PathBuf, usize), (&CodeEntity, Vec<&str>)> = BTreeMap::new();
+    for c in children.iter().filter(|c| is_listed(c)) {
+        for (caller, _) in graph.dependents(&c.id) {
+            if caller.id == target.id
+                || child_ids.contains(caller.id.as_str())
+                || !is_listed(caller)
+            {
+                continue;
+            }
+            via.entry((caller.file_path.clone(), caller.span.start.line))
+                .or_insert_with(|| (caller, Vec::new()))
+                .1
+                .push(&c.name);
+        }
+    }
+
+    let mut body = vec![
+        String::new(),
+        format!(
+            "## Used via members ({} callers of this type's methods)",
+            via.len()
+        ),
+    ];
+    for (caller, methods) in via.values().take(40) {
+        let mut methods = methods.clone();
+        methods.sort();
+        methods.dedup();
+        body.push(format!(
+            "- {} `{}` — {}:{} (uses `{}`)",
+            caller.kind.display_name(),
+            caller.name,
+            rel_path(&caller.file_path, root),
+            caller.span.start.line + 1,
+            methods.join("`, `")
+        ));
+    }
+    if via.len() > 40 {
+        body.push(format!("… and {} more.", via.len() - 40));
+    }
+    body
+}
+
+/// BFS over incoming dependency edges, for the questions that want the
+/// reached *set* rather than the routes to it.
+///
+/// `impact` asks for routes and walks with [`super::chains`] (MCP-048).
+/// `tests_for` asks which tests cover an entity, groups them by file, and
+/// wants the AN-004 confidence flag this carries — the route is the obvious
+/// next thing to give it, and the walker it would move to already records
+/// predecessors and the edge each hop crossed.
+///
+/// Level 0 holds direct dependents,
 /// level N holds entities N+1 hops away. Ghosts and unlisted kinds are
 /// excluded from levels but still traversed through, so a dependency
 /// running through a field or import does not hide the code behind it.
@@ -1626,6 +2098,11 @@ fn transitive_dependents<'g>(
         for id in &frontier {
             let src_exact = exact_path.get(id).copied().unwrap_or(false);
             for (e, r) in graph.dependents(id) {
+                // Lifted at the read, so a branch or loop node does not spend
+                // a level of the radius on itself and push the callable
+                // behind it one hop deeper — or, at depth 1, out of the
+                // report entirely. See [`lifted`].
+                let Some(e) = lifted(graph, e) else { continue };
                 // A hop breaks confidence only when it's a heuristic call
                 // edge — the case AN-004 exists to flag. Structural/exact
                 // edges preserve it.
@@ -1641,21 +2118,52 @@ fn transitive_dependents<'g>(
             break;
         }
         frontier = next.iter().map(|e| e.id.as_str()).collect();
-        levels.push(next.into_iter().filter(|e| is_listed(e)).collect());
+        levels.push(next);
     }
     (levels, exact_path)
 }
 
-enum Found<'g> {
+pub(super) enum Found<'g> {
     One(&'g CodeEntity),
     /// Lookup produced zero or several candidates; the text explains and
     /// lists them so the agent can re-call with a disambiguated target.
     Ambiguous(String),
 }
 
+/// The file a call is asking about, or `None` when it is asking about an
+/// entity (MCP-038).
+///
+/// `path` on its own — no `line` narrowing it to one entity, and no
+/// `entity`, which keeps its precedence. A directory is refused rather than
+/// answered: "what does this folder depend on" is `reshape`'s and
+/// `boundaries`' question, and a file-shaped report over a folder would be
+/// a different tool wearing this one's name.
+fn file_subject(server: &McpServer, args: &Value) -> Result<Option<PathBuf>> {
+    let named = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let asks_for_a_line = args.get("line").and_then(|v| v.as_u64()).is_some();
+    let asks_for_an_entity = args
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .is_some_and(|e| !e.is_empty());
+    if named.is_empty() || asks_for_a_line || asks_for_an_entity {
+        return Ok(None);
+    }
+
+    let path = resolve_path(server, args)?;
+    if path.is_dir() {
+        bail!(
+            "`{named}` is a directory. `impact` answers for one file (`path` alone) or \
+             one entity (`entity`, or `path` + `line`). For a folder, call `map` for \
+             its shape, `reshape` for its drawing, or `boundaries` for what its imports \
+             reach past."
+        );
+    }
+    Ok(Some(path))
+}
+
 /// Locate the target entity from `entity` (name / qualified name) or
 /// `path` + `line` (1-based, innermost listed entity spanning the line).
-fn find_target<'g>(
+pub(super) fn find_target<'g>(
     server: &McpServer,
     graph: &'g DependencyGraph,
     args: &Value,
@@ -1694,7 +2202,7 @@ fn find_target<'g>(
 /// A `<path-suffix>:<name>` form (e.g. `src/main.rs:main`) narrows by
 /// file — the escape hatch when identically-named entities exist and
 /// their qualified names collide too.
-fn find_by_name<'g>(
+pub(super) fn find_by_name<'g>(
     server: &McpServer,
     graph: &'g DependencyGraph,
     name: &str,
@@ -1759,7 +2267,7 @@ fn find_by_name<'g>(
 //  hotspots
 // ------------------------------------------------------------------
 
-pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
+pub fn hotspots(server: &McpServer, args: &Value) -> Result<Answer> {
     let path = resolve_path(server, args)?;
     let days = args
         .get("days")
@@ -1835,6 +2343,10 @@ pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
 
+    // One ranking, rendered twice (ADR 0035). `top` is the caller's own
+    // bound, so both renderings honour it and both carry the total.
+    let shown = ranked.iter().take(top);
+
     let mut body = vec![
         format!("# Hotspots of {} (last {} days)", path.display(), days),
         "Risk = commits in window × LOC-weighted avg composite score. Renames count as fresh paths.".to_string(),
@@ -1843,7 +2355,7 @@ pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
     if ranked.is_empty() {
         body.push("No files with both churn and quality pressure in the window.".to_string());
     }
-    for (risk, commits, avg, file, agg) in ranked.iter().take(top) {
+    for (risk, commits, avg, file, agg) in shown.clone() {
         body.push(format!(
             "- [risk {:.2}] {} — {} commits, avg pressure {:.2}; worst: {} `{}` ({})",
             risk,
@@ -1862,7 +2374,26 @@ pub fn hotspots(server: &McpServer, args: &Value) -> Result<String> {
         ));
     }
 
-    Ok(cap_lines(body, "Raise `top` or narrow `path`."))
+    let data = json!({
+        "path": answer::scope_path(&path, &server.root),
+        "days": days,
+        "top": top,
+        "files": shown
+            .map(|(risk, commits, avg, file, agg)| json!({
+                "file": file,
+                "risk": risk,
+                "commits": commits,
+                "avg_pressure": avg,
+                "worst": answer::entity_json(agg.worst, &server.root),
+            }))
+            .collect::<Vec<_>>(),
+        "total": ranked.len(),
+    });
+
+    Ok(Answer::structured(
+        cap_lines(body, "Raise `top` or narrow `path`."),
+        data,
+    ))
 }
 
 // ------------------------------------------------------------------
@@ -1894,9 +2425,10 @@ pub fn tests_for(server: &McpServer, args: &Value) -> Result<String> {
     let mut by_file: BTreeMap<String, Vec<(usize, &CodeEntity)>> = BTreeMap::new();
     let mut total = 0usize;
     let mut heuristic_reached = 0usize;
+    let tests = TestPaths::rooted_at(root);
     for (i, level) in levels.iter().enumerate() {
         for e in level {
-            if is_test_entity(&graph, e) {
+            if is_test_entity(&graph, e, &tests) {
                 by_file
                     .entry(rel_path(&e.file_path, root))
                     .or_default()
@@ -1998,19 +2530,7 @@ pub fn trace(server: &McpServer, args: &Value) -> Result<String> {
     };
     let root = &server.root;
 
-    let render_node = |e: &CodeEntity| {
-        if e.tags.contains("ghost") {
-            format!("`{}` (external)", e.name)
-        } else {
-            format!(
-                "{} `{}` ({}:{})",
-                e.kind.display_name(),
-                e.name,
-                rel_path(&e.file_path, root),
-                e.span.start.line + 1
-            )
-        }
-    };
+    let render_node = |e: &CodeEntity| render_node(e, root);
 
     let mut body = vec![format!(
         "# Trace: {} → {}",
@@ -2470,8 +2990,8 @@ enum Excluded {
     PublicApi,
 }
 
-fn exclusion_reason(graph: &DependencyGraph, e: &CodeEntity) -> Option<Excluded> {
-    if is_test_entity(graph, e) {
+fn exclusion_reason(graph: &DependencyGraph, e: &CodeEntity, tests: &TestPaths) -> Option<Excluded> {
+    if is_test_entity(graph, e, tests) {
         Some(Excluded::Test)
     } else if is_entry_point(graph, e) {
         Some(Excluded::EntryPoint)
@@ -2576,6 +3096,10 @@ fn collect_candidates<'g>(
 ) -> (Vec<&'g CodeEntity>, ExcludedCounts) {
     let mut candidates: Vec<&CodeEntity> = Vec::new();
     let mut counts = ExcludedCounts::default();
+    // Rooted once for the whole walk: any path inside the checkout resolves
+    // to the same repo root, and resolving it per entity is a filesystem
+    // climb per entity.
+    let tests = TestPaths::rooted_at(scope);
     for e in graph.entities() {
         if !is_listed(e) || !is_deletable(e) || e.metrics.fan_in > 0 {
             continue;
@@ -2583,7 +3107,7 @@ fn collect_candidates<'g>(
         if !e.file_path.starts_with(scope) {
             continue;
         }
-        match exclusion_reason(graph, e) {
+        match exclusion_reason(graph, e, &tests) {
             Some(Excluded::Test) => counts.tests += 1,
             Some(Excluded::EntryPoint) => counts.entry_points += 1,
             Some(Excluded::ExternalBase) => counts.external_base += 1,
@@ -2604,7 +3128,7 @@ fn collect_candidates<'g>(
 /// evidence of death: tests, entry points, members of a class whose base
 /// type is outside the tree, public API, and names the source mentions
 /// somewhere the graph cannot see.
-pub fn dead_code(server: &McpServer, args: &Value) -> Result<String> {
+pub fn dead_code(server: &McpServer, args: &Value) -> Result<Answer> {
     let scope = resolve_path(server, args)?;
     let include_public = args
         .get("include_public")
@@ -2644,18 +3168,80 @@ pub fn dead_code(server: &McpServer, args: &Value) -> Result<String> {
         }
     }
 
-    Ok(render_dead_code(
-        by_file,
-        &counts,
-        &scope,
-        root,
-        include_public,
+    // The grouping is the value; the report and the JSON are two readings
+    // of it (ADR 0035). Nothing here is capped by the renderer, so both
+    // carry every candidate.
+    Ok(Answer::structured(
+        render_dead_code(&by_file, &counts, &scope, root, include_public),
+        dead_code_json(&by_file, &counts, &scope, root, include_public),
     ))
+}
+
+/// Files with the most candidates first, ties in path order, each file's
+/// entities in source order.
+///
+/// Shared by both renderings (ADR 0035) rather than sorted twice: two
+/// orderings of one list is how a reader comparing the prose against the
+/// JSON comes to think they disagree. Stable across runs, per AN-002.
+fn worst_files_first<'m, 'e>(
+    by_file: &'m BTreeMap<String, Vec<&'e CodeEntity>>,
+) -> Vec<(&'m String, Vec<&'e CodeEntity>)> {
+    let mut files: Vec<(&'m String, Vec<&'e CodeEntity>)> = by_file
+        .iter()
+        .map(|(file, hits)| {
+            let mut hits = hits.clone();
+            hits.sort_by_key(|e| e.span.start.line);
+            (file, hits)
+        })
+        .collect();
+    files.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    files
+}
+
+/// The same grouping as fields.
+///
+/// `excluded` mirrors the "_Also fan-in 0, not reported_" line exactly:
+/// those counts are what keeps a short list from reading as a clean tree,
+/// and a consumer comparing two runs needs them as much as a reader does.
+fn dead_code_json(
+    by_file: &BTreeMap<String, Vec<&CodeEntity>>,
+    counts: &ExcludedCounts,
+    scope: &Path,
+    root: &Path,
+    include_public: bool,
+) -> Value {
+    json!({
+        "path": answer::scope_path(scope, root),
+        "include_public": include_public,
+        "total": by_file.values().map(|v| v.len()).sum::<usize>(),
+        "files": worst_files_first(by_file)
+            .into_iter()
+            .map(|(file, hits)| json!({
+                "file": file,
+                "count": hits.len(),
+                "entities": hits
+                    .iter()
+                    .map(|e| {
+                        let mut row = answer::entity_json(e, root);
+                        row["public"] = json!(is_public_api(e));
+                        row
+                    })
+                    .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "excluded": {
+            "tests": counts.tests,
+            "entry_points": counts.entry_points,
+            "external_base": counts.external_base,
+            "public_api": counts.public_api,
+            "mentioned_elsewhere": counts.mentioned,
+        },
+    })
 }
 
 /// Render the grouped report: files worst-first, each with its count.
 fn render_dead_code(
-    by_file: BTreeMap<String, Vec<&CodeEntity>>,
+    by_file: &BTreeMap<String, Vec<&CodeEntity>>,
     counts: &ExcludedCounts,
     scope: &Path,
     root: &Path,
@@ -2723,12 +3309,7 @@ fn render_dead_code(
         return body.join("\n");
     }
 
-    // Files with the most candidates first; ties keep path order so the
-    // output is stable across runs (AN-002).
-    let mut files: Vec<(String, Vec<&CodeEntity>)> = by_file.into_iter().collect();
-    files.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-    for (file, mut hits) in files {
-        hits.sort_by_key(|e| e.span.start.line);
+    for (file, hits) in worst_files_first(by_file) {
         body.push(String::new());
         body.push(format!("{} ({})", file, hits.len()));
         for e in hits {
@@ -2790,8 +3371,13 @@ pub fn assess_change(server: &McpServer, args: &Value) -> Result<String> {
             // file the two disagree about as added or removed.
             let scope =
                 diff::build_analysis_config(repo_root, server.include_tests, &server.languages);
+            // The subtree corresponding to the analyzed root, not the
+            // checkout's top — see [`diff::checkout_root`]. Cached in place
+            // of the worktree dir because it is also the prefix
+            // `compute_diff` strips, and the two must be the same path.
+            let base_root = diff::checkout_root(repo_root, &base_dir);
             let analyzed = diff::analyze_with(
-                diff::rooted_at(&scope, &base_dir),
+                diff::rooted_at(&scope, &base_root),
                 &format!("base ({})", from_sha),
             );
             diff::remove_worktree(repo_root, &base_dir);
@@ -2800,8 +3386,8 @@ pub fn assess_change(server: &McpServer, args: &Value) -> Result<String> {
             if cache.len() >= 4 {
                 cache.clear();
             }
-            cache.insert(base_key, (graph.clone(), base_dir.clone()));
-            (graph, base_dir)
+            cache.insert(base_key, (graph.clone(), base_root.clone()));
+            (graph, base_root)
         }
     };
 
@@ -2914,6 +3500,298 @@ fn spec_claims(head_graph: &DependencyGraph, changed: &[String]) -> Vec<String> 
     lines.into_iter().collect()
 }
 
+/// What the informational section means, said once instead of per row.
+///
+/// The per-smell hint is written in the imperative — correct advice when you
+/// already decided the smell is a defect, and wrong here, where the finding is
+/// an observation about a threshold.
+const INFORMATIONAL_NOTE: &str =
+    "Observations, not regressions. A create-spec, a row mirror or a config \
+     record is meant to be flat — Introduce Parameter Object produces one — so \
+     group the fields only where they have a natural hierarchy.";
+
+/// Fields and methods behind a container smell.
+///
+/// A count next to the finding lets a reader see the rule is a threshold and
+/// not a judgement, which is the difference between a fact they note and a
+/// verdict they have to argue with.
+fn container_shape(e: Option<&CodeEntity>) -> String {
+    let Some(fields) = e.and_then(|e| e.metrics.field_count) else {
+        return String::new();
+    };
+    let methods = e.map(|e| e.metrics.method_count).unwrap_or(0);
+    format!(
+        " — {} field{}, {} method{}",
+        fields,
+        if fields == 1 { "" } else { "s" },
+        methods,
+        if methods == 1 { "" } else { "s" }
+    )
+}
+
+/// The smell lists a change report keeps, and what it deliberately left
+/// out of them.
+///
+/// One collector rather than three loose vectors so the fourth thing — the
+/// count of smells on test code — has somewhere to live that does not cost
+/// `render_change_report` another local.
+#[derive(Default)]
+struct SmellChurn {
+    red: Vec<String>,
+    informational: Vec<String>,
+    resolved: Vec<String>,
+    /// New smells on test code: counted here, listed nowhere. See
+    /// [`smells_aside`].
+    in_tests: usize,
+}
+
+impl SmellChurn {
+    /// File one new smell under the heading its severity belongs to.
+    ///
+    /// Informational rows carry their counts and drop the imperative hint;
+    /// the section carries the caveat for all of them. Test code takes
+    /// neither heading and is counted instead — a correct unit test cannot
+    /// help looking envious of the type it exercises.
+    fn file_new(&mut self, smell: SmellKind, loc: &str, head: Option<&CodeEntity>, is_test: bool) {
+        if is_test {
+            self.in_tests += 1;
+        } else if smell.is_informational() {
+            self.informational.push(format!(
+                "- {} on {}{}",
+                smell.label(),
+                loc,
+                container_shape(head)
+            ));
+        } else {
+            self.red
+                .push(format!("- {} on {} — {}", smell.label(), loc, smell.hint()));
+        }
+    }
+}
+
+/// One titled section, omitted when it has no rows.
+fn titled_rows(out: &mut Vec<String>, title: String, rows: Vec<String>, note: Option<&str>) {
+    if rows.is_empty() {
+        return;
+    }
+    out.push(String::new());
+    out.push(format!("## {}", title));
+    out.extend(rows);
+    if let Some(note) = note {
+        out.push(String::new());
+        out.push(note.to_string());
+    }
+}
+
+/// The smell churn of a change report, red flags and observations apart.
+///
+/// They used to share one `⚠ New smells` list, one marker and one imperative
+/// voice. A field report caught what that costs: `assess_change` recorded a
+/// function going from ten parameters to three, and eleven lines later told the
+/// reader to break up the parameter object that did it — advice a reviewer on a
+/// cold context would have complied with, undoing the improvement the same
+/// report measured.
+fn smell_sections(churn: SmellChurn) -> Vec<String> {
+    let mut out = Vec::new();
+    let heading = smells_aside(churn.red.len(), churn.in_tests, "⚠ New smells");
+    // A count with no rows still gets its heading. `⚠ New smells (0, plus 7
+    // in test code)` is the *whole* finding for a change that added a
+    // well-tested module, and `titled_rows` would drop it as empty — taking
+    // with it the one line that explains why the reader is not being shown
+    // seven Feature Envy warnings about their own tests.
+    match churn.red.is_empty() && churn.in_tests > 0 {
+        true => out.extend([String::new(), format!("## {heading}")]),
+        false => titled_rows(&mut out, heading, churn.red, None),
+    }
+    titled_rows(
+        &mut out,
+        format!("Informational ({})", churn.informational.len()),
+        churn.informational,
+        Some(INFORMATIONAL_NOTE),
+    );
+    titled_rows(
+        &mut out,
+        format!("Resolved smells ({})", churn.resolved.len()),
+        churn.resolved,
+        None,
+    );
+    out
+}
+
+const MAX_MODIFIED_LISTED: usize = 40;
+const MAX_STATUS_LISTED: usize = 30;
+
+/// The file a row's base half came from, when the two ends being compared
+/// are not the same file.
+///
+/// A cross-file pair is the one case where a metric delta need not be an
+/// edit. The move pass matches on everything but the path, so two same-named
+/// callables relocated in one commit are one candidate group, and in a
+/// language that does not annotate its parameters nothing in the signature
+/// separates them — `diff::match_relocated` settles it on the file name, but
+/// a file renamed as well as moved still falls through to a positional
+/// tie-break. When that goes wrong the difference between two untouched
+/// bodies is reported as a regression on both, and the row gives a reader no
+/// hint that a move was involved at all.
+///
+/// Naming the other end makes the pairing checkable: `+30 … (was bodymap.py)`
+/// reads as a match, where the same row unmarked sent an agent to "fix" a
+/// function that had not changed since the base.
+pub(crate) fn moved_note(d: &diff::EntityDiff) -> String {
+    match d.moved_from.as_deref() {
+        Some(was) => format!(" (was {was})"),
+        None => String::new(),
+    }
+}
+
+/// Where a row sits, in the one spelling every listing uses.
+fn row_loc(d: &diff::EntityDiff) -> String {
+    format!("{} `{}` — {}{}", d.kind, d.name, d.file_path, moved_note(d))
+}
+
+/// The listed rows of one status, in the order the diff produced them.
+fn of_status<'d>(
+    result: &'d diff::DiffResult,
+    status: diff::ChangeStatus,
+    skip: &dyn Fn(&diff::EntityDiff) -> bool,
+) -> Vec<&'d diff::EntityDiff> {
+    result
+        .entities
+        .iter()
+        .filter(|d| d.status == status && !skip(d))
+        .collect()
+}
+
+/// How much worse the change left one entity, for ordering the triage queue.
+///
+/// Growth is summed per metric with negatives clamped away, so an improvement
+/// in one metric cannot net off a regression in another: a function that shed
+/// branching while deepening its nesting still has to be looked at, and would
+/// sort last if the two were allowed to cancel.
+fn regression_score(d: &diff::EntityDiff) -> f64 {
+    d.metric_deltas
+        .iter()
+        .filter(|m| matches!(m.name.as_str(), "cyclomatic" | "max_nesting"))
+        .map(|m| m.delta.max(0.0))
+        .sum()
+}
+
+/// A modified row's metric movements, or a note that none moved — an empty
+/// delta list reads as missing data rather than as an entity that held still.
+fn metric_movements(d: &diff::EntityDiff) -> String {
+    let moved = d
+        .metric_deltas
+        .iter()
+        .map(|m| {
+            format!(
+                "{} {}→{} ({}{})",
+                m.name,
+                m.old.map(fmt_num).unwrap_or_else(|| "-".into()),
+                m.new.map(fmt_num).unwrap_or_else(|| "-".into()),
+                if m.delta > 0.0 { "+" } else { "" },
+                fmt_num(m.delta)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if moved.is_empty() {
+        "source changed, metrics stable".to_string()
+    } else {
+        moved
+    }
+}
+
+/// One listing: a heading carrying the whole population's count, the first
+/// `cap` rows, and a note naming what the cap dropped.
+///
+/// The heading's count and the note's count are the two numbers a reader
+/// checks against each other, so they are produced together here rather than
+/// at each call site — a cap that silently drops rows reads as a clean bill
+/// of health.
+fn listing(
+    rows: &[&diff::EntityDiff],
+    title: &str,
+    cap: usize,
+    noun: &str,
+    row: impl Fn(&diff::EntityDiff) -> String,
+) -> Vec<String> {
+    let mut body = vec![String::new(), format!("## {} ({})", title, rows.len())];
+    body.extend(rows.iter().take(cap).map(|d| row(d)));
+    if rows.len() > cap {
+        body.push(format!("… and {} more {}.", rows.len() - cap, noun));
+    }
+    body
+}
+
+/// Entities the change moved without touching: fan-in or fan-out shifted,
+/// source did not. A heading only when something sits under it — an empty
+/// section reads as a check that was made and came back clean, which is not
+/// what happened.
+fn ripple_heading(rippled: &[&diff::EntityDiff]) -> Vec<String> {
+    if rippled.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        format!(
+            "## Coupling ripples ({} entities with fan-in/out shifts, no source change)",
+            rippled.len()
+        ),
+    ]
+}
+
+/// The change's entities, one listing per status, in the order a reader
+/// triages them: what got worse, what arrived, what left, and what shifted
+/// underneath without being edited.
+///
+/// The modified rows split in two — those whose source changed lead the
+/// report worst-growth-first, and the remainder are the coupling ripples that
+/// close it — so the split happens once here rather than in two passes that
+/// could disagree about which rows are listed at all.
+fn entity_listings(
+    result: &diff::DiffResult,
+    head_by_id: &HashMap<&str, &CodeEntity>,
+    skip: &dyn Fn(&diff::EntityDiff) -> bool,
+) -> Vec<String> {
+    let (mut edited, rippled): (Vec<_>, Vec<_>) =
+        of_status(result, diff::ChangeStatus::Modified, skip)
+            .into_iter()
+            .partition(|d| d.source_changed);
+    edited.sort_by(|a, b| regression_score(b).total_cmp(&regression_score(a)));
+
+    let mut body = listing(
+        &edited,
+        "Modified",
+        MAX_MODIFIED_LISTED,
+        "modified entities",
+        |d| format!("- {}: {}", row_loc(d), metric_movements(d)),
+    );
+    // Added rows carry their metrics, so an oversized newcomer stands out at
+    // a glance — but only where the head graph resolves the row. One it
+    // cannot place still appears, because dropping it would under-report.
+    body.extend(listing(
+        &of_status(result, diff::ChangeStatus::Added, skip),
+        "Added",
+        MAX_STATUS_LISTED,
+        "added entities",
+        |d| match head_by_id.get(d.entity_id.as_str()) {
+            Some(e) => format!("- {} ({})", row_loc(d), metric_suffix(e)),
+            None => format!("- {}", row_loc(d)),
+        },
+    ));
+    // Removed rows are names only: the entity a metric would describe is gone
+    // from the head graph, and any number printed beside it would be the base's.
+    body.extend(listing(
+        &of_status(result, diff::ChangeStatus::Removed, skip),
+        "Removed",
+        MAX_STATUS_LISTED,
+        "removed entities",
+        |d| format!("- {}", row_loc(d)),
+    ));
+    body.extend(ripple_heading(&rippled));
+    body
+}
+
 pub(crate) fn render_change_report(
     result: &diff::DiffResult,
     base_graph: &DependencyGraph,
@@ -2950,11 +3828,10 @@ pub(crate) fn render_change_report(
         base_ref, result.from_ref
     )];
     body.extend(headline(result, &skip_row));
-    let row_loc = |d: &diff::EntityDiff| format!("{} `{}` — {}", d.kind, d.name, d.file_path);
 
     // Smell churn, joined across the two graphs by entity id.
-    let mut new_smells: Vec<String> = Vec::new();
-    let mut resolved_smells: Vec<String> = Vec::new();
+    let mut churn = SmellChurn::default();
+    let test_code = TestCode::of(head_graph, roots.1);
     for d in &result.entities {
         if d.status == diff::ChangeStatus::Removed || skip_row(d) {
             continue;
@@ -2969,129 +3846,23 @@ pub(crate) fn render_change_report(
             .and_then(|id| base_by_id.get(id))
             .map(|e| e.metrics.smells.iter().copied().collect())
             .unwrap_or_default();
+        let head = head_by_id.get(d.entity_id.as_str()).copied();
         for smell in head_smells.difference(&base_smells) {
-            new_smells.push(format!(
-                "- {} on {} — {}",
-                smell.label(),
-                row_loc(d),
-                smell.hint()
-            ));
+            churn.file_new(*smell, &row_loc(d), head, test_code.holds(head));
         }
         for smell in base_smells.difference(&head_smells) {
-            resolved_smells.push(format!("- {} on {}", smell.label(), row_loc(d)));
+            churn
+                .resolved
+                .push(format!("- {} on {}", smell.label(), row_loc(d)));
         }
     }
     body.extend(shape_moves(base_graph, head_graph, roots));
     body.extend(moved_files(result, &skip_row));
     body.extend(possible_renames(result, &base_by_id, &head_by_id, &skip_row));
 
-    if !new_smells.is_empty() {
-        body.push(String::new());
-        body.push(format!("## ⚠ New smells ({})", new_smells.len()));
-        body.append(&mut new_smells);
-    }
-    if !resolved_smells.is_empty() {
-        body.push(String::new());
-        body.push(format!("## Resolved smells ({})", resolved_smells.len()));
-        body.append(&mut resolved_smells);
-    }
+    body.extend(smell_sections(churn));
 
-    // Modified entities with source changes, worst complexity growth first.
-    let regression_score = |d: &diff::EntityDiff| -> f64 {
-        d.metric_deltas
-            .iter()
-            .filter(|m| matches!(m.name.as_str(), "cyclomatic" | "max_nesting"))
-            .map(|m| m.delta.max(0.0))
-            .sum()
-    };
-    let mut modified: Vec<&diff::EntityDiff> = result
-        .entities
-        .iter()
-        .filter(|d| d.status == diff::ChangeStatus::Modified && d.source_changed && !skip_row(d))
-        .collect();
-    modified.sort_by(|a, b| regression_score(b).total_cmp(&regression_score(a)));
-
-    body.push(String::new());
-    body.push(format!("## Modified ({})", modified.len()));
-    for d in modified.iter().take(40) {
-        let deltas = d
-            .metric_deltas
-            .iter()
-            .map(|m| {
-                format!(
-                    "{} {}→{} ({}{})",
-                    m.name,
-                    m.old.map(fmt_num).unwrap_or_else(|| "-".into()),
-                    m.new.map(fmt_num).unwrap_or_else(|| "-".into()),
-                    if m.delta > 0.0 { "+" } else { "" },
-                    fmt_num(m.delta)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let deltas = if deltas.is_empty() {
-            "source changed, metrics stable".to_string()
-        } else {
-            deltas
-        };
-        body.push(format!("- {}: {}", row_loc(d), deltas));
-    }
-    if modified.len() > 40 {
-        body.push(format!(
-            "… and {} more modified entities.",
-            modified.len() - 40
-        ));
-    }
-
-    // Added entities, with metrics so oversized newcomers stand out.
-    let added: Vec<&diff::EntityDiff> = result
-        .entities
-        .iter()
-        .filter(|d| d.status == diff::ChangeStatus::Added && !skip_row(d))
-        .collect();
-    body.push(String::new());
-    body.push(format!("## Added ({})", added.len()));
-    for d in added.iter().take(30) {
-        match head_by_id.get(d.entity_id.as_str()) {
-            Some(e) => body.push(format!("- {} ({})", row_loc(d), metric_suffix(e))),
-            None => body.push(format!("- {}", row_loc(d))),
-        }
-    }
-    if added.len() > 30 {
-        body.push(format!("… and {} more added entities.", added.len() - 30));
-    }
-
-    // Removed entities, names only.
-    let removed: Vec<&diff::EntityDiff> = result
-        .entities
-        .iter()
-        .filter(|d| d.status == diff::ChangeStatus::Removed && !skip_row(d))
-        .collect();
-    body.push(String::new());
-    body.push(format!("## Removed ({})", removed.len()));
-    for d in removed.iter().take(30) {
-        body.push(format!("- {}", row_loc(d)));
-    }
-    if removed.len() > 30 {
-        body.push(format!(
-            "… and {} more removed entities.",
-            removed.len() - 30
-        ));
-    }
-
-    // Coupling ripples: entities whose fan-in/out shifted without source edits.
-    let impact: Vec<&diff::EntityDiff> = result
-        .entities
-        .iter()
-        .filter(|d| d.status == diff::ChangeStatus::Modified && !d.source_changed && !skip_row(d))
-        .collect();
-    if !impact.is_empty() {
-        body.push(String::new());
-        body.push(format!(
-            "## Coupling ripples ({} entities with fan-in/out shifts, no source change)",
-            impact.len()
-        ));
-    }
+    body.extend(entity_listings(result, &head_by_id, &skip_row));
 
     // Spec claims (MCP-009): entities whose `cr:`-claimed paths the
     // change touched — the reminder lands at the one moment the domain
@@ -3188,6 +3959,7 @@ mod tests {
             entry_concentration: Some(0.80),
             egress: None,
             child_compliance: Some(0.90),
+            uniformity: None,
             child_count: 4,
             blocker: Some(blocker),
             terms: crate::models::ShapeTerms::default(),
@@ -3223,6 +3995,67 @@ mod tests {
         ];
         folders.sort_by(work_order);
         assert_eq!(folders[0].0, "src/a", "cyclic outranks tangled at equal depth");
+    }
+
+    /// An analysis with no entities and no imports — enough for the
+    /// unresolved-import marker, which is all `whole_tree` asks a graph.
+    fn bare_graph() -> DependencyGraph {
+        DependencyGraph::from_analysis(&crate::analyzer::AnalysisResult {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    /// The root has always been scored and was never printed. Both lists
+    /// under the tally are ranked; `work_order` sorts deepest-first, so
+    /// depth zero comes last of however many folders fall short, and the
+    /// list is then cut at `top`. A repository whose top-level folders sat
+    /// in a dependency loop reported that loop nowhere and sent the reader
+    /// to a leaf parser folder instead.
+    #[test]
+    fn the_top_level_is_stated_even_though_the_work_list_ranks_it_last() {
+        let root = shaped(ShapePattern::Cyclic, crate::models::ShapeBlocker::Cycles(0.43));
+        let leaf = shaped(ShapePattern::Tangled, crate::models::ShapeBlocker::Layering(0.5));
+        let scored = [
+            (String::new(), &root),
+            ("src/parser/rust".to_string(), &leaf),
+        ];
+
+        let out = whole_tree(&scored, &bare_graph(), Path::new("")).join("\n");
+        assert!(out.contains("### The top level"), "{out}");
+        assert!(out.contains("(root)"), "{out}");
+        assert!(out.contains("cyclic"), "{out}");
+        assert!(out.contains("a loop among its children"), "{out}");
+    }
+
+    /// A scope whose folder metrics do not reach a common root — nothing to
+    /// state, and a heading over nothing is worse than no heading.
+    #[test]
+    fn a_scope_without_a_root_folder_states_no_top_level() {
+        let leaf = shaped(ShapePattern::Tangled, crate::models::ShapeBlocker::Layering(0.5));
+        let scored = [("src".to_string(), &leaf)];
+        assert!(whole_tree(&scored, &bare_graph(), Path::new("")).is_empty());
+    }
+
+    /// Stated above and ranked below would say it twice, and the second
+    /// telling would be the one that reads as the plan.
+    #[test]
+    fn the_top_level_is_not_repeated_in_the_ranked_work_list() {
+        let root = shaped(ShapePattern::Cyclic, crate::models::ShapeBlocker::Cycles(0.43));
+        let leaf = shaped(ShapePattern::Tangled, crate::models::ShapeBlocker::Layering(0.5));
+        let scored = [
+            (String::new(), &root),
+            ("src/parser/rust".to_string(), &leaf),
+        ];
+        let short: Vec<&str> = scored
+            .iter()
+            .filter(|(dir, s)| !dir.is_empty() && s.pattern < ShapePattern::Fractal)
+            .map(|(dir, _)| dir.as_str())
+            .collect();
+        assert_eq!(short, vec!["src/parser/rust"]);
     }
 
     /// The root is depth 0 and must not be mistaken for a leaf by a
@@ -3292,6 +4125,7 @@ mod tests {
             entry_concentration: Some(0.5),
             egress: None,
             child_compliance: None,
+            uniformity: None,
             child_count: 2,
             blocker: None,
             terms: crate::models::ShapeTerms::default(),
@@ -3341,6 +4175,186 @@ fu f.protocol.creation {
     d: "Create a protocol."
 }
 "#;
+
+    /// The same two reports, end to end through `quality` on a real tree:
+    /// a type, its methods, and a `#[cfg(test)] mod tests` exercising it.
+    /// Inline test modules live inside admitted source files, so
+    /// `include_tests: false` never sees them and the path heuristic
+    /// cannot either — the module name is the only thing that can.
+    #[test]
+    fn quality_counts_inline_test_module_smells_apart_from_the_code() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "inline-module");
+        dir.write(
+            "src/lib.rs",
+            r#"
+pub struct Ring { items: Vec<u32>, cap: usize }
+
+impl Ring {
+    pub fn new(cap: usize) -> Self { Ring { items: Vec::new(), cap } }
+    pub fn push(&mut self, v: u32) { self.items.push(v); if self.items.len() > self.cap { self.items.remove(0); } }
+    pub fn len(&self) -> usize { self.items.len() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn the_ring_is_bounded() {
+        let mut r = Ring::new(2);
+        r.push(1);
+        r.push(2);
+        r.push(3);
+        assert_eq!(r.len(), 2);
+    }
+}
+"#,
+        );
+
+        // Both spellings of the same question. The reporter narrowed to one
+        // file, which takes the single-file analysis path — no `Contains`
+        // edges, so an ancestor walk over them finds nothing. See
+        // [`parent_of`].
+        for path in ["src", "src/lib.rs"] {
+            assert_test_smells_are_set_aside(
+                quality(&server_for(&dir), &json!({ "path": path }))
+                    .unwrap()
+                    .text(),
+            );
+        }
+    }
+
+    /// The shape both `quality` calls above have to produce.
+    fn assert_test_smells_are_set_aside(out: &str) {
+        let (smells, ranking) = out.split_once("## Top").expect("both sections render");
+        assert!(
+            smells.contains("## Smells (0, plus 1 in test code — not listed)"),
+            "the test function is still filed as a production smell:\n{smells}"
+        );
+        assert!(
+            !smells.contains("Move this method"),
+            "a #[test] function is still being handed a remediation hint:\n{smells}"
+        );
+        // The ranking keeps it — a slow test suite is worth ranking — but
+        // says what it is, so `⚠ Feature Envy` is not read as an instruction.
+        assert!(
+            ranking.contains("`the_ring_is_bounded`") && ranking.contains("⚠ Feature Envy, test"),
+            "the ranked test row is unmarked:\n{ranking}"
+        );
+        assert!(
+            !ranking.contains("`push` — lib.rs:6 (L6, loc 1, cx 2, cog 1, ws 3, in 1, out 3, 0 of it identified, test"),
+            "production code was marked as test code:\n{ranking}"
+        );
+    }
+
+    /// Field reports, 2026-08-31, from `quality` and from `assess_change`:
+    /// seven of seven new smells on `#[test]` functions inside one
+    /// `#[cfg(test)] mod tests`, none on the nineteen production functions
+    /// above them. A unit test exercises one type and so interacts more
+    /// with that type than with itself, which is the exact shape Feature
+    /// Envy fires on — the remediation hint told the reader to move their
+    /// test into the production type.
+    ///
+    /// The count is the other half. A section that quietly shrank would
+    /// trade one silence for another.
+    #[test]
+    fn new_smells_on_test_code_are_counted_and_never_listed() {
+        let mut churn = SmellChurn::default();
+        churn.file_new(
+            SmellKind::FeatureEnvy,
+            "function `the_ring_is_bounded` — src/activity.rs",
+            None,
+            true,
+        );
+        churn.file_new(
+            SmellKind::FeatureEnvy,
+            "function `since_returns_only_what_came_after` — src/activity.rs",
+            None,
+            true,
+        );
+
+        let body = smell_sections(churn).join("\n");
+        assert!(
+            body.contains("## ⚠ New smells (0, plus 2 in test code — not listed)"),
+            "the count went missing with the rows:\n{body}"
+        );
+        assert!(
+            !body.contains("the_ring_is_bounded") && !body.contains("Move this method"),
+            "a test function is still being handed a remediation hint:\n{body}"
+        );
+    }
+
+    /// The production half is untouched, and the aside is silent when
+    /// there is nothing to set aside — a caveat on every report is one
+    /// nobody reads.
+    #[test]
+    fn a_report_with_no_test_smells_reads_exactly_as_before() {
+        let mut churn = SmellChurn::default();
+        churn.file_new(
+            SmellKind::FeatureEnvy,
+            "function `run_diff` — src/server/diff_handler.rs",
+            None,
+            false,
+        );
+        let body = smell_sections(churn).join("\n");
+        assert!(
+            body.contains("## ⚠ New smells (1)") && !body.contains("test code"),
+            "{body}"
+        );
+    }
+
+    /// Field report, 2026-08-27: `assess_change` recorded `param_count 10→3`
+    /// and, eleven lines later, filed the parameter object that did it under
+    /// `⚠ New smells` with "group related fields into nested sub-structs" —
+    /// the standard fix for the thing it had just measured, reported as the
+    /// defect. Red flags and observations must not share a heading.
+    #[test]
+    fn a_data_bag_is_an_observation_and_not_a_new_smell() {
+        let mut bag = CodeEntity::new(
+            "NewRow".to_string(),
+            EntityKind::Struct,
+            "src/lib.rs".to_string(),
+            crate::models::Span::default(),
+        );
+        bag.metrics.field_count = Some(10);
+        bag.metrics.method_count = 1;
+
+        let mut churn = SmellChurn::default();
+        churn.file_new(
+            SmellKind::DataBag,
+            "struct `NewRow` — src/lib.rs",
+            Some(&bag),
+            false,
+        );
+        churn.file_new(
+            SmellKind::ShotgunSurgery,
+            "struct `McpServer` — src/mcp/mod.rs",
+            None,
+            false,
+        );
+
+        let body = smell_sections(churn).join("\n");
+        assert!(
+            body.contains("## ⚠ New smells (1)"),
+            "only the red smell is counted as new:\n{body}"
+        );
+        assert!(
+            body.contains("## Informational (1)"),
+            "the data bag gets its own heading:\n{body}"
+        );
+        let (alarm, note) = body.split_once("## Informational").unwrap();
+        assert!(
+            !alarm.contains("Data Bag"),
+            "the data bag must not appear under the alarm heading:\n{alarm}"
+        );
+        assert!(
+            note.contains("10 fields, 1 method"),
+            "the counts the threshold fired on travel with the row:\n{note}"
+        );
+        assert!(
+            !note.contains("Group related fields into nested sub-structs"),
+            "the imperative remediation is not the voice for an observation:\n{note}"
+        );
+    }
 
     #[test]
     fn overview_renders_full_domain_map_with_legend() {
@@ -3455,7 +4469,7 @@ fu f.protocol.creation {
             r#"{"exclude_patterns": ["**/generated/**"]}"#,
         );
 
-        let out = map(&code_server_for(&dir), &json!({})).unwrap();
+        let out = map(&code_server_for(&dir), &json!({})).unwrap().into_text();
         assert!(
             out.contains("kept_by_the_scope"),
             "the fixture never analyzed at all:\n{out}"
@@ -3483,7 +4497,7 @@ fu f.protocol.creation {
             r#"{"exclude_patterns": ["**/generated/**"]}"#,
         );
 
-        let out = map(&code_server_for(&dir), &json!({"path": "src"})).unwrap();
+        let out = map(&code_server_for(&dir), &json!({"path": "src"})).unwrap().into_text();
         assert!(
             out.contains("kept_by_the_scope"),
             "the subdirectory never analyzed at all:\n{out}"
@@ -3632,7 +4646,7 @@ fn main() {
     #[test]
     fn dead_code_reports_the_orphan_and_spares_the_rest() {
         let dir = dead_code_fixture("dead-code-basic");
-        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap().into_text();
 
         assert!(
             out.contains("`orphan`"),
@@ -3668,7 +4682,7 @@ fn main() {
     #[test]
     fn dead_code_spares_a_name_only_a_macro_body_mentions() {
         let dir = dead_code_fixture("dead-code-macro");
-        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap().into_text();
         // The only call site is inside `write!`, which reaches the parser
         // as an opaque token tree — fan-in is 0 and the textual scan is
         // the only thing standing between it and a false positive.
@@ -3709,7 +4723,7 @@ export default class MyPlugin extends Plugin {
 function looseHelper() {}
 "#,
         );
-        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap().into_text();
 
         // The entry point of the whole plugin, and its teardown.
         assert!(
@@ -3746,7 +4760,7 @@ function looseHelper() {}
     #[test]
     fn dead_code_include_public_reveals_the_unused_export() {
         let dir = dead_code_fixture("dead-code-public");
-        let out = dead_code(&code_server_for(&dir), &json!({"include_public": true})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({"include_public": true})).unwrap().into_text();
         assert!(
             out.contains("`exported_but_unused`"),
             "include_public did not reveal public API:\n{out}"
@@ -3761,7 +4775,7 @@ function looseHelper() {}
     fn dead_code_groups_by_file_with_a_per_file_count() {
         let dir = dead_code_fixture("dead-code-grouping");
         dir.write("extra.rs", "fn first_orphan() {}\nfn second_orphan() {}\n");
-        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap().into_text();
         assert!(
             out.contains("extra.rs (2)"),
             "per-file count missing:\n{out}"
@@ -3780,11 +4794,78 @@ function looseHelper() {}
             "app.rs",
             "fn live(x: i32) -> i32 { x }\n\nfn main() {\n    live(1);\n}\n",
         );
-        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap().into_text();
         assert!(out.contains("None —"), "clean run is not stated:\n{out}");
     }
 
     /// A test living in a regular source file under `mod locality_tests`
+    /// Field report, 2026-08-31: a function called twice from inside a `for`
+    /// loop reported `Used by (0)` while its own header read `in 2` — the
+    /// metric counted the edges, the listing filtered their source out
+    /// without traversing through it. The analyzer attaches a call written
+    /// in a branch or a loop to that scope node, so the edge on the wire is
+    /// `branch → callee` and dropping unlisted endpoints drops the call.
+    ///
+    /// The reporter checked all twelve of one function's callees by hand:
+    /// ten were invisible, and the two that resolved were the two with a
+    /// top-level call site. `calledAtTopLevel` is their control — it must
+    /// keep working, or the fix has only moved the blind spot.
+    ///
+    /// Both directions, because they fail for different reasons. Incoming,
+    /// the body node is the edge's source and can be walked up from.
+    /// Outgoing, the edges never touch the caller's id at all.
+    #[test]
+    fn a_call_inside_a_loop_or_a_branch_belongs_to_the_function_around_it() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "body-scope");
+        dir.write(
+            "src/helpers.ts",
+            "export function calledAtTopLevel(a: string): string { return a; }\n\
+             export function calledInsideALoop(a: string): string { return a; }\n\
+             export function calledInsideAnIf(a: string): string { return a; }\n",
+        );
+        dir.write(
+            "src/plan.ts",
+            r#"import { calledAtTopLevel, calledInsideALoop, calledInsideAnIf } from './helpers';
+
+export function compute(xs: string[], flag: boolean): string[] {
+  const out: string[] = [];
+  out.push(calledAtTopLevel('once'));
+  for (const x of xs) {
+    out.push(calledInsideALoop(x));
+  }
+  if (flag) {
+    out.push(calledInsideAnIf('yes'));
+  }
+  return out;
+}
+"#,
+        );
+        let server = code_server_for(&dir);
+
+        // Incoming: every callee names the function around the call, not the
+        // synthetic `l1` / `c1` the edge is anchored to.
+        for callee in [
+            "calledAtTopLevel",
+            "calledInsideALoop",
+            "calledInsideAnIf",
+        ] {
+            let out = impact(&server, &json!({ "entity": callee })).unwrap();
+            assert!(
+                out.contains("## Used by (1)") && out.contains("`compute`"),
+                "{callee} lost its caller to a body scope:\n{out}"
+            );
+        }
+
+        // Outgoing: the caller sees all three, not only the unnested one.
+        let out = impact(&server, &json!({ "entity": "compute" })).unwrap();
+        assert!(
+            out.contains("## Uses (3)")
+                && out.contains("`calledInsideALoop`")
+                && out.contains("`calledInsideAnIf`"),
+            "the caller's own calls are hidden behind its body scopes:\n{out}"
+        );
+    }
+
     /// is test code: the ancestor-module rule matches names the way
     /// `is_test_path` matches paths.
     #[test]
@@ -3804,7 +4885,7 @@ mod locality_tests {
 }
 "#,
         );
-        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap();
+        let out = dead_code(&code_server_for(&dir), &json!({})).unwrap().into_text();
         assert!(
             !out.contains("`a_case_nothing_calls`"),
             "an inline test was reported as dead:\n{out}"
@@ -3905,6 +4986,295 @@ mod locality_tests {
         );
     }
 
+    /// MCP-038. The same `path`, with and without a `line`, are two
+    /// questions: the entity spanning the line, and the file as a unit.
+    /// Both have to arrive intact — the file view was added beside the
+    /// entity one, not in front of it.
+    ///
+    /// The fixture is the shape the ticket is about: `here` and `there`
+    /// call each other inside `app.rs`, so a per-entity walk reports each
+    /// as a dependent of the other. Neither is a dependent of the *file*,
+    /// and summing their fan-in would say the file has two callers when it
+    /// has one.
+    #[test]
+    fn a_path_without_a_line_asks_about_the_file_and_with_one_about_the_entity() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-file-view");
+        dir.write(
+            "app.rs",
+            "pub fn here(x: i32) -> i32 { there(x) }\n\
+             pub fn there(x: i32) -> i32 { here(x) + 1 }\n",
+        );
+        dir.write(
+            "main.rs",
+            "use crate::app;\npub fn run() -> i32 { app::here(1) }\n",
+        );
+        let server = code_server_for(&dir);
+
+        let file = impact(&server, &json!({"path": "app.rs"})).unwrap();
+        assert!(
+            file.contains("# Impact of app.rs — the file"),
+            "`path` alone did not ask about the file:\n{file}"
+        );
+        assert!(
+            file.contains("## Depended on by (1 entity in 1 file)")
+                && file.contains("`run` L2 → `here`"),
+            "the outside dependent is missing, or the file's own wiring leaked \
+             into the section:\n{file}"
+        );
+        assert!(
+            file.contains("## Internal (2 edges)"),
+            "the file's own edges were not counted apart:\n{file}"
+        );
+
+        // The entity view is untouched, and it is the one that still sees
+        // `there` as a dependent of `here`.
+        let entity = impact(&server, &json!({"path": "app.rs", "line": 1})).unwrap();
+        assert!(
+            entity.contains("# Impact of function `here`") && entity.contains("`there`"),
+            "`path` + `line` no longer answers for the entity:\n{entity}"
+        );
+    }
+
+    /// MCP-039. The targets that are not code in this repo used to be one
+    /// number — *plus N external/unresolved targets not listed* — over two
+    /// populations that mean opposite things. Both views now name them,
+    /// and keep them apart.
+    ///
+    /// `Regex::new` is a call on a type nothing here declares: a
+    /// dependency. `whatever_this_is` binds to nothing at all: a hole. The
+    /// same file answers for both, so one fixture settles both views.
+    #[test]
+    fn external_and_unresolved_targets_are_named_and_never_merged() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-externals");
+        dir.write(
+            "app.rs",
+            "pub fn build(pattern: &str) -> String {\n\
+            \x20   let re = Regex::new(pattern);\n\
+            \x20   let mut out = Vec::new();\n\
+            \x20   out.push(whatever_this_is(re));\n\
+            \x20   out.join(\",\")\n\
+             }\n",
+        );
+        let server = code_server_for(&dir);
+
+        for out in [
+            impact(&server, &json!({"entity": "build"})).unwrap(),
+            impact(&server, &json!({"path": "app.rs"})).unwrap(),
+        ] {
+            assert!(
+                out.contains("- third-party `Regex` — `new` (1×)"),
+                "the library call was not named:\n{out}"
+            );
+            assert!(
+                out.contains("- stdlib `Vec` — ") && out.contains("`push` (1×)"),
+                "the standard-library call was not told apart from it:\n{out}"
+            );
+            assert!(
+                out.contains("## Unresolved (1 call to 1 name)")
+                    && out.contains("`whatever_this_is` (1×)"),
+                "the unbindable call was not reported as a hole:\n{out}"
+            );
+            assert!(
+                out.contains("floor, not a total"),
+                "the unresolved section did not caveat the counts above it:\n{out}"
+            );
+        }
+    }
+
+    /// A folder is somebody else's question, and answering it here with a
+    /// file-shaped report would be a different tool wearing this one's name.
+    #[test]
+    fn impact_refuses_a_directory_and_says_which_tool_takes_one() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-dir");
+        dir.write("src/app.rs", "pub fn here(x: i32) -> i32 { x }\n");
+        let err = impact(&code_server_for(&dir), &json!({"path": "src"})).unwrap_err();
+
+        let said = err.to_string();
+        assert!(
+            said.contains("is a directory") && said.contains("`reshape`"),
+            "the refusal does not point anywhere: {said}"
+        );
+    }
+
+    /// A chain three deep: the blast radius is what the direct dependents
+    /// hide, and MCP-048 is about *through what*. `top` is two hops out and
+    /// has to hang under `mid`, the frame a reader would have to open to
+    /// get there — which the old flat `[depth 2]` row could not say.
+    #[test]
+    fn the_blast_radius_hangs_each_dependent_under_the_route_to_it() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-blast");
+        dir.write(
+            "app.rs",
+            "pub fn leaf(x: i32) -> i32 { x }\n\
+             pub fn mid() -> i32 { leaf(1) }\n\
+             pub fn top() -> i32 { mid() }\n",
+        );
+        let out = impact(&code_server_for(&dir), &json!({"entity": "leaf"})).unwrap();
+
+        assert!(
+            out.contains("## Blast radius to depth 2 — 2 entities reach this"),
+            "the reached population was not counted:\n{out}"
+        );
+        let blast = out.split("## Blast radius").nth(1).unwrap_or("");
+        assert!(
+            blast.contains("- `1` function `mid` (app.rs:2)")
+                && blast.contains("  - `1.1` function `top` (app.rs:3)"),
+            "the outline does not say which route reaches `top`:\n{out}"
+        );
+        assert!(
+            blast.contains(
+                "**Furthest** — 2 hops: function `leaf` (app.rs:1) ← function `mid` (app.rs:2) \
+                 ← function `top` (app.rs:3)"
+            ),
+            "the chain rendering is missing or does not start at the target:\n{out}"
+        );
+    }
+
+    /// `direction: out` is the same walk with the arrows reversed: the call
+    /// tree under an entity, which nothing else in the tool set draws.
+    #[test]
+    fn direction_out_draws_the_call_tree_under_the_entity() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-out");
+        dir.write(
+            "app.rs",
+            "pub fn leaf(x: i32) -> i32 { x }\n\
+             pub fn mid() -> i32 { leaf(1) }\n\
+             pub fn top() -> i32 { mid() }\n",
+        );
+        let server = code_server_for(&dir);
+
+        let out = impact(&server, &json!({"entity": "top", "direction": "out"})).unwrap();
+        assert!(
+            out.contains("## Call tree to depth 2 — 2 callables run under this"),
+            "the outgoing direction was not walked:\n{out}"
+        );
+        assert!(
+            out.contains("- `1` function `mid` (app.rs:2)")
+                && out.contains("  - `1.1` function `leaf` (app.rs:1)"),
+            "the call tree is not nested:\n{out}"
+        );
+        assert!(
+            out.contains("→ function `leaf`"),
+            "the outgoing chain still points inwards:\n{out}"
+        );
+
+        let bad = impact(&server, &json!({"entity": "top", "direction": "sideways"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            bad.contains("`in`") && bad.contains("`out`"),
+            "an unknown direction was not refused with its two values: {bad}"
+        );
+    }
+
+    /// Depth 1 asks only for direct dependents, and "beyond direct
+    /// dependents" is empty by definition there. The section is omitted
+    /// rather than printed with a zero, because a zero here would read as
+    /// a walk that ran and found nothing.
+    #[test]
+    fn depth_one_asks_for_no_blast_radius_at_all() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-blast-depth1");
+        dir.write(
+            "app.rs",
+            "pub fn leaf(x: i32) -> i32 { x }\n\
+             pub fn mid() -> i32 { leaf(1) }\n\
+             pub fn top() -> i32 { mid() }\n",
+        );
+        let server = code_server_for(&dir);
+
+        let deep = impact(&server, &json!({"entity": "leaf", "depth": 2})).unwrap();
+        assert!(deep.contains("## Blast radius"), "{deep}");
+
+        let shallow = impact(&server, &json!({"entity": "leaf", "depth": 1})).unwrap();
+        assert!(
+            !shallow.contains("Blast radius"),
+            "depth 1 still printed a blast radius:\n{shallow}"
+        );
+    }
+
+    /// The outline is capped, the heading counts the whole population, and
+    /// the note underneath says what the reader is not seeing. Chains are
+    /// wide, so the cap is stricter than the forty flat rows it replaced —
+    /// and it counts the routes, ancestors included.
+    #[test]
+    fn the_blast_radius_caps_its_routes_and_says_how_many_it_dropped() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-blast-flood");
+        let mut src = String::from(
+            "pub fn leaf(x: i32) -> i32 { x }\npub fn mid() -> i32 { leaf(1) }\n",
+        );
+        for i in 0..45 {
+            src.push_str(&format!("pub fn top{i:02}() -> i32 {{ mid() }}\n"));
+        }
+        dir.write("app.rs", &src);
+        let out = impact(&code_server_for(&dir), &json!({"entity": "leaf"})).unwrap();
+
+        assert!(
+            out.contains("## Blast radius to depth 2 — 46 entities reach this"),
+            "the heading does not count the whole population:\n{out}"
+        );
+        let blast = out.split("## Blast radius").nth(1).unwrap_or("");
+        let listed = blast.lines().filter(|l| l.trim_start().starts_with("- `")).count();
+        assert_eq!(listed, 25, "the cap did not hold:\n{out}");
+        assert!(
+            blast.contains("… and 21 more reached, not shown."),
+            "the cap dropped routes silently:\n{out}"
+        );
+    }
+
+    /// An entity in a ring with the target is reached, labelled, and not
+    /// expanded — rather than quietly arriving by the long way round and
+    /// reading as a third party.
+    #[test]
+    fn a_dependent_that_closes_a_ring_is_labelled_rather_than_walked() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-ring");
+        dir.write(
+            "app.rs",
+            "pub fn a(x: i32) -> i32 { b(x) }\npub fn b(x: i32) -> i32 { a(x) }\n",
+        );
+        let out = impact(&code_server_for(&dir), &json!({"entity": "a", "depth": 3})).unwrap();
+
+        let blast = out.split("## Blast radius").nth(1).unwrap_or("");
+        assert!(
+            blast.contains("- `1` function `b` (app.rs:2)"),
+            "the direct dependent is missing:\n{out}"
+        );
+        assert!(
+            blast.contains("**a ring**"),
+            "the re-entry was not labelled:\n{out}"
+        );
+    }
+
+    /// The ordering rule the report states has to be the one it follows:
+    /// siblings in the order their call sites were written, file then line.
+    #[test]
+    fn siblings_come_out_in_the_order_the_call_sites_were_written() {
+        let dir = TmpDir::with_prefix("mezz-mcp-fixture", "impact-order");
+        dir.write("leaf.rs", "pub fn leaf(x: i32) -> i32 { x }\n");
+        dir.write(
+            "b_late.rs",
+            "use crate::leaf;\npub fn zebra() -> i32 { leaf::leaf(1) }\n",
+        );
+        dir.write(
+            "a_early.rs",
+            "use crate::leaf;\n\
+             pub fn alpha() -> i32 { leaf::leaf(1) }\n\
+             pub fn beta() -> i32 { leaf::leaf(2) }\n",
+        );
+        let out = impact(&code_server_for(&dir), &json!({"entity": "leaf"})).unwrap();
+
+        let blast = out.split("## Blast radius").nth(1).unwrap_or("");
+        let names: Vec<&str> = blast
+            .lines()
+            .filter(|l| l.starts_with("- `"))
+            .filter_map(|l| l.split('`').nth(3))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "beta", "zebra"],
+            "siblings are not in written order:\n{out}"
+        );
+    }
+
     #[test]
     fn signature_stays_on_one_line_and_within_budget() {
         let inline_object = "{\n    fromRef: string;\n    toRef: string;\n    files: string[];\n    additions: number;\n    deletions: number;\n    renames: Array<{ from: string; to: string }>;\n}";
@@ -3997,5 +5367,274 @@ pub fn entry() -> i32 { middle() + other() }
                 && chains.iter().any(|c| c.contains("`other`")),
             "both routes should be listed:\n{out}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    //  render_change_report
+    //
+    //  Characterisation. This is the body of `assess_change` — the report
+    //  an agent reads to decide whether its own edit made things worse —
+    //  and until these tests it had no coverage at all. The listing rules
+    //  below (what is ordered how, what is capped where, what stays
+    //  silent) are the part a reader trusts without re-deriving, so they
+    //  are pinned before the function is touched.
+    // ------------------------------------------------------------------
+
+    /// The counts under the headline are recomputed from the rows, so the
+    /// summary a fixture carries is never read.
+    fn no_summary() -> diff::DiffSummary {
+        diff::DiffSummary {
+            total_base: 0,
+            total_head: 0,
+            added: 0,
+            removed: 0,
+            modified: 0,
+            modified_source: 0,
+            modified_impact: 0,
+            unchanged: 0,
+            relationships_added: 0,
+            relationships_removed: 0,
+        }
+    }
+
+    /// One change row, with the id `CodeEntity::new` would mint for the
+    /// same name and file — so a fixture can choose whether the head graph
+    /// resolves the row by whether it holds that entity.
+    fn row_of(name: &str, kind: &str, status: diff::ChangeStatus) -> diff::EntityDiff {
+        diff::EntityDiff {
+            entity_id: format!("src/{name}.rs:0:{name}"),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            file_path: format!("src/{name}.rs"),
+            status,
+            source_changed: status == diff::ChangeStatus::Modified,
+            metric_deltas: Vec::new(),
+            rel_deltas: Vec::new(),
+            base_entity_id: None,
+            moved_from: None,
+        }
+    }
+
+    fn grew(mut d: diff::EntityDiff, metric: &str, delta: f64) -> diff::EntityDiff {
+        d.metric_deltas.push(diff::MetricDelta {
+            name: metric.to_string(),
+            old: Some(0.0),
+            new: Some(delta),
+            delta,
+        });
+        d
+    }
+
+    fn report_of(entities: Vec<diff::EntityDiff>, head: &DependencyGraph) -> String {
+        let result = diff::DiffResult {
+            from_ref: "abc1234".to_string(),
+            to_ref: "working tree".to_string(),
+            summary: no_summary(),
+            entities,
+        };
+        render_change_report(
+            &result,
+            &bare_graph(),
+            head,
+            "HEAD",
+            &[],
+            (Path::new(""), Path::new("")),
+        )
+    }
+
+    /// The modified list is a triage queue, so it leads with whichever
+    /// entity the change made worst. Growth is summed per metric with
+    /// negatives clamped away, which means an improvement in one metric
+    /// does not net off a regression in another: a function that shed
+    /// branching while deepening its nesting still has to be looked at,
+    /// and would sort last if the two were allowed to cancel.
+    #[test]
+    fn the_modified_list_leads_with_the_worst_complexity_growth() {
+        let rows = vec![
+            grew(
+                row_of("mild", "Function", diff::ChangeStatus::Modified),
+                "cyclomatic",
+                1.0,
+            ),
+            grew(
+                row_of("worst", "Function", diff::ChangeStatus::Modified),
+                "cyclomatic",
+                9.0,
+            ),
+            grew(
+                grew(
+                    row_of("mixed", "Function", diff::ChangeStatus::Modified),
+                    "cyclomatic",
+                    -5.0,
+                ),
+                "max_nesting",
+                3.0,
+            ),
+        ];
+
+        let out = report_of(rows, &bare_graph());
+        let order: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("- Function "))
+            .collect();
+        assert_eq!(order.len(), 3, "{out}");
+        assert!(order[0].contains("`worst`"), "{out}");
+        assert!(
+            order[1].contains("`mixed`"),
+            "deepened nesting outranks mild branching even beside a big \
+             cyclomatic improvement:\n{out}"
+        );
+        assert!(order[2].contains("`mild`"), "{out}");
+    }
+
+    /// Every listing is capped, and a cap that silently drops rows reads
+    /// as a clean bill of health. The count in the heading is the whole
+    /// population; the note underneath is what the reader is not seeing.
+    #[test]
+    fn the_modified_list_caps_at_forty_and_says_how_many_it_dropped() {
+        let rows: Vec<diff::EntityDiff> = (0..43)
+            .map(|i| {
+                row_of(
+                    &format!("f{i:02}"),
+                    "Function",
+                    diff::ChangeStatus::Modified,
+                )
+            })
+            .collect();
+
+        let out = report_of(rows, &bare_graph());
+        let listed = out.lines().filter(|l| l.starts_with("- Function ")).count();
+        assert_eq!(listed, 40, "{out}");
+        assert!(out.contains("## Modified (43)"), "{out}");
+        assert!(out.contains("… and 3 more modified entities."), "{out}");
+        // A row whose source changed without moving a metric says so,
+        // rather than printing an empty delta list.
+        assert!(out.contains("source changed, metrics stable"), "{out}");
+    }
+
+    /// An added entity is printed with its metrics so an oversized
+    /// newcomer stands out at a glance — but only when the head graph
+    /// resolves it. A row the graph cannot place still has to appear,
+    /// because dropping it would under-report the change.
+    #[test]
+    fn an_added_entity_shows_its_metrics_only_when_the_graph_knows_it() {
+        let mut known = crate::models::CodeEntity::new(
+            "known",
+            EntityKind::Function,
+            "src/known.rs",
+            crate::models::Span::from_positions(0, 0, 0, 0),
+        );
+        known.metrics.loc = 42;
+        known.metrics.cyclomatic = Some(7);
+        let head = DependencyGraph::from_analysis(&crate::analyzer::AnalysisResult {
+            entities: vec![known],
+            relationships: Vec::new(),
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        });
+
+        let out = report_of(
+            vec![
+                row_of("known", "Function", diff::ChangeStatus::Added),
+                row_of("stranger", "Function", diff::ChangeStatus::Added),
+            ],
+            &head,
+        );
+
+        assert!(out.contains("## Added (2)"), "{out}");
+        let known_line = out.lines().find(|l| l.contains("`known`")).unwrap_or("");
+        assert!(
+            known_line.contains("loc 42") && known_line.contains("cx 7"),
+            "{out}"
+        );
+        let stranger_line = out.lines().find(|l| l.contains("`stranger`")).unwrap_or("");
+        assert!(
+            !stranger_line.contains("loc "),
+            "an unresolved row carries no invented metrics:\n{out}"
+        );
+    }
+
+    /// The ripple list names entities the change moved without touching —
+    /// fan-in or fan-out shifted, source did not. It is a heading only
+    /// when something sits under it: an empty section reads as a finding
+    /// that was made and came back clean, which is not what happened.
+    #[test]
+    fn coupling_ripples_are_a_heading_only_when_there_are_ripples() {
+        let quiet = report_of(
+            vec![row_of("touched", "Function", diff::ChangeStatus::Modified)],
+            &bare_graph(),
+        );
+        assert!(!quiet.contains("Coupling ripples"), "{quiet}");
+
+        let mut rippled = row_of("rippled", "Function", diff::ChangeStatus::Modified);
+        rippled.source_changed = false;
+        let loud = report_of(vec![rippled], &bare_graph());
+        assert!(loud.contains("## Coupling ripples (1 "), "{loud}");
+    }
+
+    /// A File row stands for the entities inside it, so printing both
+    /// says everything twice. It is dropped from the listings and from
+    /// the headline tally — but counted in the note beneath, because a
+    /// change with nothing else in it would otherwise report as no
+    /// change at all.
+    #[test]
+    fn file_rows_are_dropped_from_the_listings_and_counted_apart() {
+        let out = report_of(
+            vec![
+                row_of("lib", "File", diff::ChangeStatus::Modified),
+                row_of("real", "Function", diff::ChangeStatus::Modified),
+            ],
+            &bare_graph(),
+        );
+
+        assert!(out.contains("## Modified (1)"), "{out}");
+        assert!(!out.contains("File `lib`"), "{out}");
+        assert!(out.contains("1 entity changed"), "{out}");
+        assert!(out.contains("Function `real`"), "{out}");
+    }
+
+    /// A modified row whose two halves live in different files says so.
+    ///
+    /// Field report, 2026-09-07: a `git mv` of two files each holding a
+    /// `state(x)` had each head entity paired against its namesake, and the
+    /// difference between the two untouched bodies was reported as a
+    /// complexity jump on both. `diff::match_relocated` is what stops that
+    /// pairing; this is the row that lets a reader check it, because nothing
+    /// in the old wording suggested a move was involved at all.
+    #[test]
+    fn a_modified_row_matched_across_files_names_the_file_it_came_from() {
+        let mut relocated = grew(
+            row_of("state", "Function", diff::ChangeStatus::Modified),
+            "cyclomatic",
+            5.0,
+        );
+        relocated.moved_from = Some("pkg/beta.py".to_string());
+        let out = report_of(vec![relocated], &bare_graph());
+        assert!(out.contains("(was pkg/beta.py)"), "{out}");
+
+        // An entity that did not move carries no such note.
+        let stayed = grew(
+            row_of("still", "Function", diff::ChangeStatus::Modified),
+            "cyclomatic",
+            5.0,
+        );
+        let out = report_of(vec![stayed], &bare_graph());
+        assert!(!out.contains("(was "), "{out}");
+    }
+
+    /// Removed entities are names only — no metrics, because the entity
+    /// they would describe is gone from the head graph and any number
+    /// printed beside it would be the base's.
+    #[test]
+    fn removed_entities_are_listed_by_name_without_metrics() {
+        let out = report_of(
+            vec![row_of("gone", "Function", diff::ChangeStatus::Removed)],
+            &bare_graph(),
+        );
+
+        assert!(out.contains("## Removed (1)"), "{out}");
+        let line = out.lines().find(|l| l.contains("`gone`")).unwrap_or("");
+        assert_eq!(line, "- Function `gone` — src/gone.rs", "{out}");
     }
 }

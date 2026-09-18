@@ -54,7 +54,7 @@ use super::McpServer;
 /// `layout` — the folder rearranged the way its own drawing says, scored
 /// against the arrangement it has.
 pub fn layout(server: &McpServer, args: &Value) -> Result<String> {
-    let folder = target_folder(server, args)?;
+    let folder = target_folder(server, args, "layout")?;
     let absolute = folder.display().to_string();
     // The whole repo, for the reason `reshape` analyses the whole repo:
     // half of what a folder's shape says is a fact about who reaches in
@@ -1279,6 +1279,7 @@ mod tests {
             entry_concentration: Some(0.43),
             egress: None,
             child_compliance: None,
+            uniformity: None,
             child_count: 7,
             blocker: Some(blocker),
             terms: crate::models::ShapeTerms::default(),

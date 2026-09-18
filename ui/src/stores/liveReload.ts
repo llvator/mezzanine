@@ -24,6 +24,7 @@ import { apiUrl, isVscode } from '../vscodeAdapter';
 import { endpoint } from '../endpoint';
 import { probe } from './connection';
 import { isServeMode } from './serveMode';
+import { fetchActivity, ingestUpdate, resetActivity, type Update } from './activity';
 
 /** True while a live-reload refresh is in progress. */
 export const liveReloading = writable(false);
@@ -89,7 +90,18 @@ export function connectLiveReload(url?: string): void {
       attempt = 0;
       liveConnected.set(true);
       liveStatus.set({ kind: 'live' });
+      // Catch up on what happened before this stream existed. A page opened
+      // mid-analysis, or one that has just reconnected, has missed the
+      // notices that would have told it the engine is busy — and "busy" is
+      // exactly the state it most needs to show (UI-138).
+      void fetchActivity();
     });
+
+    // The one event that carries its payload rather than telling us to come
+    // and get it: it is sent *during* work, and a round trip per status line
+    // would be a request every few hundred milliseconds for the length of an
+    // analysis.
+    eventSource.addEventListener('activity', onActivityFrame);
 
     eventSource.addEventListener('reload', async () => {
       console.log('[liveReload] reload signal received — refreshing data');
@@ -135,6 +147,21 @@ export function connectLiveReload(url?: string): void {
   }
 }
 
+/**
+ * One activity frame off the stream.
+ *
+ * A named handler rather than an inline closure so `connectLiveReload` keeps
+ * the shape it had — it is a list of listener registrations, and a `try`
+ * block inside one of them made it a list with a branch in it.
+ */
+function onActivityFrame(e: Event): void {
+  try {
+    ingestUpdate(JSON.parse((e as MessageEvent).data) as Update);
+  } catch {
+    // A frame we cannot read is not worth dropping the stream over.
+  }
+}
+
 export function disconnectLiveReload(): void {
   liveConnected.set(false);
   if (eventSource) {
@@ -152,6 +179,12 @@ export function stopLiveReload(reason: LiveStopReason = 'off'): void {
   }
   attempt = 0;
   liveStatus.set({ kind: 'stopped', reason });
+  // Only here, not on the transient disconnects a retry recovers from: a run
+  // that was in flight when the stream blinked is very likely still in
+  // flight, and the reconnect re-asks anyway. Having given up, though, we no
+  // longer have any grounds for the claim — leaving "Analyzing…" on screen
+  // would make a dead connection look like a busy engine.
+  resetActivity();
 }
 
 /** Start over after a give-up, from a user action. */

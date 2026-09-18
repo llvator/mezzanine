@@ -97,17 +97,36 @@ jobs:
     name: ${{ matrix.target }}
     needs: ui
     runs-on: ${{ matrix.os }}
+    # Caps a build that hangs — a linker spinning, a network step with no
+    # timeout of its own — instead of letting it hold `vsix` and `publish`
+    # until GitHub's own 6-hour ceiling.
+    #
+    # Read what this does NOT cover: the clock starts when a runner picks the
+    # job up, so a leg that is never scheduled is never running and never
+    # times out. That is exactly how v1.4.0 stalled, and it ends at GitHub's
+    # 24-hour queue limit rather than here.
+    timeout-minutes: 45
     strategy:
-      # One target failing should not throw away three good archives — the
-      # release job publishes what it gets, and a missing target can be
-      # filled in with a workflow_dispatch re-run.
+      # One target failing should not throw away three good archives.
+      #
+      # Note the gap this leaves, because v1.4.0 fell into it: `publish`
+      # needs the whole matrix, so fail-fast only helps when a leg FAILS. A
+      # leg that never starts blocks the release outright, and the
+      # workflow_dispatch re-run below cannot fill in a missing target when
+      # there is no release to fill it into.
       fail-fast: false
       matrix:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
+          # x86_64-apple-darwin is absent, not forgotten. It built on the
+          # `macos-13` label until v1.4.0, when that label stopped being
+          # scheduled at all: every other leg picked up a runner in ~22s and
+          # finished, while this one sat queued for hours and held the whole
+          # release behind it. Restoring it needs a live Intel image named, or
+          # a deliberate cross-build — a decision worth making with evidence
+          # rather than guessing at here. See CI-002. Until then Intel Mac
+          # takes the universal VSIX and builds the engine from source.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
@@ -259,7 +278,6 @@ jobs:
           }
 
           package_for aarch64-apple-darwin      darwin-arm64
-          package_for x86_64-apple-darwin       darwin-x64
           package_for x86_64-unknown-linux-gnu  linux-x64
           package_for x86_64-pc-windows-msvc    win32-x64      mezz.exe
 

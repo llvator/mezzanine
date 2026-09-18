@@ -123,6 +123,7 @@ pub(super) fn interface_methods(
         entity.metrics.cyclomatic = Some(1);
         entity.metrics.max_nesting = Some(0);
         entity.metrics.cognitive_complexity = Some(0);
+        crate::parser::working_set::populate(&mut entity, None, source);
         methods.push(entity);
     }
     methods

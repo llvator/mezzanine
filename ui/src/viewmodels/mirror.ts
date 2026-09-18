@@ -53,6 +53,23 @@ export interface Attention {
   selected: string | null;
   /** Entity id under the pointer, or `null`. */
   hovered: string | null;
+  /**
+   * The Changes-tab row the reader opened, as a repo-relative path (UI-142).
+   *
+   * Here because the Details pane has *two* contents, and `selected` only
+   * names one of them: a file opened from the Changes tab wins the pane over
+   * the selected entity (UI-134), and it is the whole file's source rather
+   * than an entity's. Mirroring the selection alone left the second window
+   * showing the file's node — name, metrics, relationships — beside a first
+   * window showing the file.
+   *
+   * A path and not the row itself, for the same reason `selected` is an id:
+   * what a window may open is what its *own* comparison lists. The loaded
+   * comparison is deliberately not part of `ViewState`, so two windows are
+   * not guaranteed to be on the same one, and shipping the peer's row would
+   * render it against refs this window never compared.
+   */
+  file: string | null;
   /** A preview the reader froze (`L`), which outlives the pointer leaving. */
   hoverLocked: boolean;
   mode: ViewMode;
@@ -60,6 +77,34 @@ export interface Attention {
    *  sequence rather than as a set — `[a, b]` and `[b, a]` are two different
    *  descents. */
   specPath: string[];
+  /**
+   * The spec entity under the pointer in the spec pane, or `null`.
+   *
+   * The second pointer this app has, and the one the two-window setup exists
+   * to carry. `hovered` above is a pointer on the *code* canvas; this is a
+   * pointer on the spec pane, and what it moves is a ring on the code canvas
+   * — so in the arrangement this whole feature is for, canvas on one screen
+   * and panes on the other, it is the only one of the two that can ever fire.
+   * Left out, the highlight was a feature that worked in every window except
+   * the one shaped like its use case.
+   *
+   * Attention and not `ViewState` by that file's own test: it hides nothing,
+   * costs no refetch, and a saved view has no business recording where a
+   * pointer was resting.
+   */
+  specHover: string | null;
+  /**
+   * Spec entities pinned to keep their code lit, unordered.
+   *
+   * Travels beside the hover rather than inside it because it answers to a
+   * different gesture — a pin is a click, and clicks are the newest word
+   * whichever window made them, the way `selected` already is. Compared as a
+   * **set**, unlike `specPath` directly above: two windows holding the same
+   * two pins in the other order are looking at the same picture, and treating
+   * that as a difference would put the two into a publish-apply loop over
+   * nothing.
+   */
+  specPinned: string[];
 }
 
 /**
@@ -83,19 +128,33 @@ const MODES: ViewMode[] = ['graph', 'tree'];
 /** Standing nowhere in particular — the shape a message that predates this
  *  field, or cannot be read, falls back to. */
 export function emptyAttention(): Attention {
-  return { selected: null, hovered: null, hoverLocked: false, mode: 'graph', specPath: [] };
+  return {
+    selected: null, hovered: null, file: null, hoverLocked: false, mode: 'graph',
+    specPath: [], specHover: null, specPinned: [],
+  };
 }
 
 export function sameAttention(a: Attention, b: Attention): boolean {
   return a.selected === b.selected
     && a.hovered === b.hovered
+    && a.file === b.file
     && a.hoverLocked === b.hoverLocked
     && a.mode === b.mode
-    && samePath(a.specPath, b.specPath);
+    && a.specHover === b.specHover
+    && samePath(a.specPath, b.specPath)
+    && sameSet(a.specPinned, b.specPinned);
 }
 
 function samePath(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((step, i) => step === b[i]);
+}
+
+/** Membership only. See `Attention.specPinned` for why the pins are compared
+ *  this way and the path directly above them is not. */
+function sameSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const held = new Set(a);
+  return b.every((id) => held.has(id));
 }
 
 /**
@@ -146,6 +205,14 @@ export function whatToApply(incoming: MirrorMessage, mine: MirrorMessage): Mirro
  * pointer moves somewhere else it is a new gesture and gets adopted again,
  * which is what keeps this from becoming "a mirror that stops mirroring the
  * moment you touch it".
+ *
+ * **Both pointers use this**, the one on the code canvas and the one on the
+ * spec pane (`Attention.specHover`) — "local wins, and a borrowed hover is
+ * given back when the local pointer leaves" is the same rule for either.
+ * The spec pointer passes no `declined`, and that is not an omission: the
+ * refusal exists because a borrowed *code* hover competes with a local click
+ * for the Details and Description panes, and the spec hover competes with
+ * nothing — it lights rings on the canvas and nothing else reads it.
  */
 export function hoverToShow(
   local: string | null,
@@ -205,10 +272,15 @@ function normalizeAttention(raw: unknown): Attention {
   return {
     selected: typeof a.selected === 'string' ? a.selected : null,
     hovered: typeof a.hovered === 'string' ? a.hovered : null,
+    file: typeof a.file === 'string' ? a.file : null,
     hoverLocked: a.hoverLocked === true,
     mode: MODES.includes(a.mode as ViewMode) ? (a.mode as ViewMode) : 'graph',
     specPath: Array.isArray(a.specPath)
       ? a.specPath.filter((s): s is string => typeof s === 'string')
+      : [],
+    specHover: typeof a.specHover === 'string' ? a.specHover : null,
+    specPinned: Array.isArray(a.specPinned)
+      ? a.specPinned.filter((s): s is string => typeof s === 'string')
       : [],
   };
 }

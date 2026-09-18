@@ -8,6 +8,7 @@
 //! depends on neither.
 
 use super::super::language_parser::{ImportCondition, ParseResult};
+use super::bodies::inference::Returns;
 use std::path::Path;
 
 /// Shared context threaded through the entity-extraction walk.
@@ -27,4 +28,8 @@ pub(super) struct ExtractCtx<'a> {
     /// `if sys.platform == 'win32': import winreg` is just as guarded and
     /// very much executed.
     pub in_type_checking: bool,
+    /// What a call to each name declared in this file evaluates to, built
+    /// before the walk so a chain can land on a method declared below it
+    /// (PY-032).
+    pub returns: &'a Returns,
 }

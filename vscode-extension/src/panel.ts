@@ -154,6 +154,11 @@ export interface DiffState {
    *  which is what that build draws. */
   contextOpacity?: number;
   computing: boolean;
+  /** Whether a stop has been asked for and the run has not yet ended
+   *  (UI-141). Optional: a webview built before this existed sends no such
+   *  field, and the view reads its absence as "not stopping" — which is what
+   *  that build can report, since it has no way to ask. */
+  stopping?: boolean;
   error?: string | null;
   /** Whether any scope is currently selected. Without one, the graph is
    *  empty even if a diff is loaded. */
@@ -166,7 +171,80 @@ export interface DiffState {
   /** Whether a node is currently selected — selection changes how the diff
    *  filters behave (non-matching nodes get hidden rather than dimmed). */
   hasSelection: boolean;
+  /** Git's own list of the files this comparison touched, for the native
+   *  Changes tree (UI-137). Optional: a webview built before this existed
+   *  sends no such field, and the tree reads its absence as "nothing to
+   *  show" rather than as an empty change. */
+  changedFiles?: ChangedFilesState;
 }
+/**
+ * One file in the change, as git listed it and the graph answered for it.
+ *
+ * The agreement arrives as a finished `label`/`hint` pair rather than as
+ * something to word here. `ui/src/viewmodels/changedFiles.ts` owns the join
+ * and owns the sentences, so the native tree and the browser tab cannot
+ * describe the same row differently (UI-137).
+ */
+export interface ChangedFileRowState {
+  path: string;
+  oldPath?: string;
+  /** Git's own letter — `A`, `M`, `D`, `R`, `C`, `T`. Kept as given. */
+  status: string;
+  /** The letter a reader sees — `U` where git said `A` and has never followed
+   *  the file. Worded on the webview end by `statusLetter`, not re-derived
+   *  here, so the tree and the browser tab cannot disagree about a row. */
+  letter: string;
+  /** The same distinction in words, for the tooltip. */
+  phrase: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  untracked: boolean;
+  agreement: { kind: string; label: string; hint: string };
+}
+
+/**
+ * Git's reading of the loaded comparison, mirrored for the native Changes
+ * tree (UI-137).
+ *
+ * `active: false` is a value and not an absence: it is how leaving diff mode
+ * tells the tree to empty itself, which is a different state from "a diff is
+ * loaded and git lists nothing".
+ */
+/**
+ * Rides inside `DiffState` rather than arriving as a message of its own.
+ *
+ * Two reasons, and the second is the one that made the choice. `handleMessage`
+ * is grandfathered over the cyclomatic ceiling, and the gate fails a change
+ * that pushes an existing function higher — a new `case` costs it a point it
+ * cannot afford. And the file rows and the ref pair they describe then cannot
+ * arrive out of step, which is the property the tree depends on: rows labelled
+ * with the previous comparison's refs would fetch every side against the wrong
+ * pair and open a diff that looks entirely plausible.
+ *
+ * It is also the shape [UI-124] already states for everything else the native
+ * diff views render — `DiffState` carries it, the view draws it.
+ */
+export interface ChangedFilesState {
+  active: boolean;
+  fromRef?: string;
+  /** As `diff.json` spells it — `working`, `staged`, or a sha. For display. */
+  toRef?: string;
+  /** The same head in the spelling `/api/file-diff` takes, mapped once by
+   *  `headRefFor` on the webview end rather than re-derived here. */
+  headRef?: string;
+  /** How the two sides are named — hash plus subject for a commit, a word for
+   *  the working tree or the index (UI-139). Resolved on the webview end,
+   *  which is the only side holding the commit list to resolve against. */
+  fromLabel?: { text: string; title: string; live: boolean };
+  toLabel?: { text: string; title: string; live: boolean };
+  rows: ChangedFileRowState[];
+  /** Paths the diff claims changed entities for and git does not list. Empty
+   *  on a healthy comparison — see the residue's note in `changedFiles.ts`. */
+  onlyInGraph: string[];
+  totals: { files: number; additions: number; deletions: number };
+}
+
 /**
  * The branch label the webview computed, or `null` for "say nothing" — a root
  * that is not a checkout, or an engine too old to answer (UI-114).

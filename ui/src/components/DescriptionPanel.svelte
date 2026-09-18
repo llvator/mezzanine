@@ -9,6 +9,7 @@
    */
   import { description, describeOnHover } from '../stores/description';
   import { focusNode, rawEntityGraph } from '../stores/graph';
+  import { isRegionEntry } from '../viewmodels/regionSubject';
   import { NODE_COLORS } from '../types/graph';
 
   $: chain = $description?.chain ?? [];
@@ -52,7 +53,8 @@
 
   {#if chain.length === 0}
     <p class="empty">
-      Hover a node in the graph to read its description, and its parents'.
+      Hover a node in the graph to read its description, and its parents' —
+      or a folder's name, for whatever the spec says about it.
     </p>
   {:else}
     <div class="source-badge" class:hovering={source === 'hover'}>
@@ -66,13 +68,27 @@
         {/if}
         <div class="head">
           <span class="kind" style="background: {kindColor(entry.kind)}">{entry.kind}</span>
-          <button
-            type="button"
-            class="name"
-            title={entry.qualifiedName || entry.name}
-            on:click={() => select(entry.entityId)}
-          >{entry.name}</button>
+          {#if isRegionEntry(entry)}
+            <!-- A folder answers to nothing in the graph, so it gets no
+                 button: an underline on hover would promise a selection this
+                 pane cannot make (UI-141). Focusing it is the canvas's
+                 gesture — a click on the same name out there. -->
+            <span class="name static" title={entry.qualifiedName || entry.name}>{entry.name}</span>
+          {:else}
+            <button
+              type="button"
+              class="name"
+              title={entry.qualifiedName || entry.name}
+              on:click={() => select(entry.entityId)}
+            >{entry.name}</button>
+          {/if}
         </div>
+        <!-- Whose sentence this is, when it isn't the rung's own (UI-141).
+             A folder's description belongs to the spec entity that claims it,
+             and unattributed it would read as the folder describing itself. -->
+        {#if entry.attribution}
+          <div class="attribution" data-probe="description-attribution">{entry.attribution}</div>
+        {/if}
         {#if entry.documentation}
           <p class="doc">{entry.documentation}</p>
         {:else}
@@ -238,6 +254,12 @@
     overflow: hidden;
   }
 
+  .attribution {
+    font-size: 0.68rem;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+  }
+
   .parent-of {
     font-size: 0.64rem;
     text-transform: uppercase;
@@ -277,6 +299,8 @@
     text-align: left;
   }
   .name:hover { color: var(--accent); text-decoration: underline; }
+  .name.static { cursor: default; }
+  .name.static:hover { color: var(--text); text-decoration: none; }
 
   .doc {
     margin: 0;

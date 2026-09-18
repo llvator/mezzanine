@@ -82,12 +82,13 @@ export type Command =
   // any pane that can be collapsed
   | 'pane.collapse'
   // sidebar
-  | 'sidebar.tab.filters' | 'sidebar.tab.quality' | 'sidebar.tab.settings'
+  | 'sidebar.tab.filters' | 'sidebar.tab.quality' | 'sidebar.tab.changes'
+  | 'sidebar.tab.settings'
   // graph
   | 'graph.pin' | 'graph.clear' | 'graph.fit' | 'graph.fitWidth'
   | 'graph.zoomIn' | 'graph.zoomOut' | 'graph.resetZoom'
   | 'graph.toggleView' | 'graph.toggleLabels'
-  | 'graph.mark' | 'graph.markDrill'
+  | 'graph.mark' | 'graph.markDrill' | 'graph.markRelate'
   // view controls
   | 'view.toggleMode' | 'view.level.entity' | 'view.level.file' | 'view.level.folder'
   | 'view.autoFit' | 'view.spacing' | 'view.highlightDepth' | 'view.hoverMode'
@@ -154,6 +155,9 @@ export const BINDINGS: readonly Binding[] = [
   // --- sidebar ---
   { keys: 'f', scope: 'sidebar', command: 'sidebar.tab.filters', label: 'Filters' },
   { keys: 'q', scope: 'sidebar', command: 'sidebar.tab.quality', label: 'Quality' },
+  // `g` for git: `c` is the sidebar's collapse key, and the tab is a reading
+  // of what git reports rather than of the graph (UI-134).
+  { keys: 'g', scope: 'sidebar', command: 'sidebar.tab.changes', label: 'Changes' },
   { keys: 's', scope: 'sidebar', command: 'sidebar.tab.settings', label: 'Settings' },
   { keys: '/', scope: 'sidebar', command: 'search.focus', label: 'Search' },
   { keys: 'c', scope: 'sidebar', command: 'pane.collapse', label: 'Collapse' },
@@ -175,6 +179,12 @@ export const BINDINGS: readonly Binding[] = [
   // whole point of scoped bindings.
   { keys: 'm', scope: 'graph', command: 'graph.mark', label: 'Mark hovered' },
   { keys: 'd', scope: 'graph', command: 'graph.markDrill', label: 'Drill into marks' },
+  // The set's other use (UI-147): `d` narrows to it, `v` asks about it and
+  // leaves the canvas alone. `v` for versus — the reading is about the space
+  // between two scopes, and the two verbs sit next to each other so a reader
+  // who knows one finds the other. `r` would have read better and is the
+  // canvas's zoom reset.
+  { keys: 'v', scope: 'graph', command: 'graph.markRelate', label: 'Relate marks' },
 
   // --- view controls ---
   { keys: 't', scope: 'view', command: 'view.toggleMode', label: 'Tree/Graph' },

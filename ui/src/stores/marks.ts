@@ -19,6 +19,7 @@
 import { derived, get, writable } from 'svelte/store';
 import type { D3Node } from '../types/graph';
 import { markPathOf, prunedMarks, toggleMarked } from '../viewmodels/markSet';
+import { compactSides } from '../viewmodels/markRelation';
 
 /** The marked scopes, as paths. See `viewmodels/markSet.ts` for why paths. */
 export const markedPaths = writable<ReadonlySet<string>>(new Set<string>());
@@ -26,6 +27,21 @@ export const markedPaths = writable<ReadonlySet<string>>(new Set<string>());
 /** How many scopes are marked — the count the toolbar and the collapsed
  *  summary both render, so neither has to subscribe to the set itself. */
 export const markCount = derived(markedPaths, ($marks) => $marks.size);
+
+/**
+ * How many *distinct* scopes are marked — `markCount` after dropping marks
+ * that live inside another one (UI-147).
+ *
+ * The two counts differ for one gesture and it is a common one: mark a folder,
+ * then mark a file inside it. For the drill that is harmless, because
+ * `setScopes` compacts and the narrowing is the same either way. For a
+ * *relationship* it is not — those two marks name one scope, and offering to
+ * relate them would offer to compare a thing with itself.
+ */
+export const relatableCount = derived(
+  markedPaths,
+  ($marks) => compactSides([...$marks]).length,
+);
 
 /** Can this node be marked at all? The canvas asks before offering the
  *  gesture, so a ⌘-click on a ghost reads as "not that" rather than as a

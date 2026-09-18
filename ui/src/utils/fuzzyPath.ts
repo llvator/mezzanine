@@ -46,7 +46,13 @@ export interface Term {
   anchorStart: boolean;
   /** `foo$` */
   anchorEnd: boolean;
-  /** Smart-case: true when the term itself carries an uppercase character. */
+  /**
+   * Smart-case: true when the term itself carries an uppercase character.
+   *
+   * Invariant, relied on by `scoreTerm`: when this is false the `needle` is
+   * already lowercase, because that is precisely how `buildTerm` decides it.
+   * Build terms through `parseQuery` and it holds for free.
+   */
   caseSensitive: boolean;
 }
 
@@ -143,10 +149,24 @@ function scorePositions(original: string, positions: number[]): number {
   return score - gapPenalty - original.length * LENGTH_TIEBREAK;
 }
 
-/** Score one term against one candidate. `null` means "does not match". */
-function scoreTerm(term: Term, candidate: string): number | null {
-  const hay = term.caseSensitive ? candidate : candidate.toLowerCase();
-  const needle = term.caseSensitive ? term.needle : term.needle.toLowerCase();
+/**
+ * Score one term against one candidate. `null` means "does not match".
+ *
+ * `lowered` lets a caller that scores a fixed corpus hand in the folded form
+ * it already holds. Both halves of the scope search do: a repo's paths and
+ * entity names don't change between keystrokes, so folding them per query —
+ * per *term*, in fact — was allocating a throwaway string for every candidate
+ * in the repo on each character typed.
+ *
+ * Positions are still scored against `candidate`, never the folded form:
+ * `scorePositions` reads boundaries and camelCase humps out of it, and both
+ * are gone from a lowercased string.
+ */
+function scoreTerm(term: Term, candidate: string, lowered?: string): number | null {
+  const hay = term.caseSensitive ? candidate : (lowered ?? candidate.toLowerCase());
+  // No fold needed on the needle: a term is case-insensitive exactly when it
+  // has no uppercase in it, so it is already its own lowercase form.
+  const needle = term.needle;
 
   if (term.anchorStart && term.anchorEnd) return hay === needle ? LITERAL_SCORE : null;
   if (term.anchorStart) return hay.startsWith(needle) ? LITERAL_SCORE : null;
@@ -215,12 +235,16 @@ export function parseQuery(raw: string): Term[] {
  * any negated term that matches rejects the candidate outright.
  *
  * Returns `null` for no match, so `0` stays a legitimate score.
+ *
+ * `lowered` is `candidate.toLowerCase()`, when the caller keeps a folded copy
+ * of its corpus — see `scoreTerm`. Omitting it costs a fold per term and is
+ * the right call for one-off comparisons.
  */
-export function scoreQuery(terms: Term[], candidate: string): number | null {
+export function scoreQuery(terms: Term[], candidate: string, lowered?: string): number | null {
   if (terms.length === 0) return null;
   let total = 0;
   for (const term of terms) {
-    const score = scoreTerm(term, candidate);
+    const score = scoreTerm(term, candidate, lowered);
     if (term.negated) {
       if (score !== null) return null;
       continue;

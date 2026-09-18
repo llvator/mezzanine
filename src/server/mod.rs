@@ -1,8 +1,10 @@
 mod access;
 mod agent_terminal;
 mod analysis_handler;
+mod cache_handler;
 mod diff_handler;
 mod educator_handler;
+mod files_handler;
 mod handlers;
 mod jobs;
 mod refactor_prompt;
@@ -11,7 +13,11 @@ mod scope_handler;
 mod serve;
 mod settings_handler;
 mod shape_handler;
-mod state;
+mod spec_handler;
+mod spec_write;
+/// `pub(crate)` for `build_config`, which `mezz monitor` needs to turn the
+/// same flags-then-settings answer into the same `Config` this server does.
+pub(crate) mod state;
 mod types;
 mod ui_dir;
 mod views_handler;
@@ -257,8 +263,8 @@ fn spawn_file_watcher(
                     if worth_it.is_empty() {
                         continue;
                     }
-                    log_changed_files(&worth_it);
-                    handle_reanalysis(&config, &output_dir, &graph, &shared_config, &tx);
+                    let run = begin_reanalysis(&worth_it);
+                    handle_reanalysis(&config, &output_dir, &graph, &shared_config, &tx, run);
                 }
                 Ok(Err(e)) => eprintln!("   ⚠ Watch error: {:?}", e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -296,7 +302,7 @@ fn watch_outside_spec(watcher: &mut dyn notify::Watcher, config: &crate::config:
 /// and, in diff mode, re-checked-out and re-analyzed the base worktree with
 /// it. The result never changed, since those paths are excluded from the
 /// analysis anyway. It was pure churn on every build.
-fn analyzable_changes(
+pub(crate) fn analyzable_changes(
     events: &[notify_debouncer_mini::DebouncedEvent],
     config: &crate::config::Config,
 ) -> Vec<String> {
@@ -362,8 +368,18 @@ fn names_head_ref(path: &std::path::Path) -> bool {
         || path.components().any(|c| c.as_os_str() == "heads")
 }
 
-fn log_changed_files(changed: &[String]) {
-    eprintln!("📝 Change detected in: {}", changed.join(", "));
+/// Announce the batch that woke the watcher, and open the run it is about to
+/// trigger.
+///
+/// The announcement *is* the opening line — it prints exactly what it always
+/// printed — so a browser watching this engine sees the same first sentence
+/// the terminal does, and sees it when the work starts rather than when it
+/// finishes (UI-138).
+fn begin_reanalysis(changed: &[String]) -> crate::activity::Run {
+    crate::activity::begin(
+        crate::activity::ANALYSIS,
+        format!("📝 Change detected in: {}", changed.join(", ")),
+    )
 }
 
 /// Re-analyze after a file change and publish the result.
@@ -391,6 +407,7 @@ fn handle_reanalysis(
     graph: &Arc<std::sync::RwLock<crate::graph::DependencyGraph>>,
     shared_config: &Arc<std::sync::RwLock<crate::config::Config>>,
     tx: &Arc<broadcast::Sender<ReloadKind>>,
+    run: crate::activity::Run,
 ) {
     let config = &with_live_scope(config, shared_config);
     match write_json(config, output_dir) {
@@ -401,10 +418,15 @@ fn handle_reanalysis(
             if let Ok(mut c) = shared_config.write() {
                 *c = config.clone();
             }
-            eprintln!("   Re-analyzed: {} entities, {} relationships", ents, rels);
+            run.end(format!(
+                "   Re-analyzed: {ents} entities, {rels} relationships"
+            ));
             let _ = tx.send(ReloadKind::Graph);
         }
-        Err(e) => eprintln!("   ⚠ Re-analysis failed: {}", e),
+        // The failure closes the run as surely as the success does; a status
+        // line still claiming "analyzing" after this would be the one thing
+        // worse than not having one.
+        Err(e) => run.end(format!("   ⚠ Re-analysis failed: {e}")),
     }
 }
 
@@ -503,8 +525,15 @@ async fn run_http_server(
         None => crate::educator::Educator::empty(),
     };
 
+    // Installed as well as held: `AppState` is what serves it, and the
+    // process global is what lets the analyzer reach it from inside a rayon
+    // parallel iterator with no state handle in sight (UI-138).
+    let activity = crate::activity::Sink::new();
+    crate::activity::install(activity.clone());
+
     let state = AppState {
         tx: tx.clone(),
+        activity,
         output_dir: output_dir.clone(),
         repo_root: Arc::new(tokio::sync::RwLock::new(repo_root)),
         include_tests,
@@ -522,6 +551,7 @@ async fn run_http_server(
         live_diff: Arc::new(std::sync::RwLock::new(None)),
         base_cache: Arc::new(std::sync::RwLock::new(None)),
         diff_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        diff_cancel: Arc::new(AtomicBool::new(false)),
         follow_diff: !pin_diff,
         cancel: Arc::new(AtomicBool::new(false)),
         educator: Arc::new(educator),
@@ -585,7 +615,14 @@ fn build_router(
 
     let app = Router::new()
         .route("/events", get(handlers::sse_handler))
+        .route("/api/activity", get(handlers::activity_handler))
         .route("/api/branch", get(handlers::branch_handler))
+        // Which branches exist, and where any two of them diverged — the two
+        // questions a comparison across branches asks before it can name its
+        // own base (UI-143). Both are read-only git calls that touch no
+        // analysis, so they answer while a diff is still computing.
+        .route("/api/branches", get(handlers::branches_handler))
+        .route("/api/merge-base", get(handlers::merge_base_handler))
         .route("/api/commits", get(handlers::commits_handler))
         .route("/api/stashes", get(handlers::stashes_handler))
         .route("/api/staged", get(handlers::staged_handler))
@@ -595,15 +632,38 @@ fn build_router(
                 .post(diff_handler::diff_handler)
                 .delete(diff_handler::stop_diff_handler),
         )
+        // Stopping the *computation* is not the same as leaving diff mode,
+        // which is why it is not the DELETE above: a reader who stops a
+        // comparison that is taking too long keeps whatever overlay they were
+        // already looking at (UI-141).
+        .route(
+            "/api/diff/cancel",
+            post(diff_handler::cancel_diff_handler),
+        )
         .route(
             "/api/root",
             get(handlers::get_root_handler).post(diff_handler::set_root_handler),
         )
+        // The same change as git reports it, beside the analysis's reading of
+        // it (UI-134). Neither route touches the analyzer, so both answer
+        // while a diff is still computing.
+        .route(
+            "/api/changed-files",
+            post(files_handler::changed_files_handler),
+        )
+        .route("/api/file-diff", post(files_handler::file_diff_handler))
         .route("/api/graph", get(handlers::graph_handler))
         .route("/api/index", get(handlers::index_handler))
         .route("/api/details", get(handlers::details_handler))
         .route("/api/details/base", get(handlers::base_details_handler))
         .route("/api/scope", post(scope_handler::scope_handler))
+        // Disk cache (UI-153) — watch-only, and deliberately so. This is the
+        // one thing the server describes that is machine-global rather than
+        // repo-scoped, and `serve` hosts repositories somebody else submitted:
+        // a submitted repo must not reach a route that deletes another
+        // repository's cache.
+        .route("/api/cache", get(cache_handler::cache_handler))
+        .route("/api/cache/clear", post(cache_handler::clear_cache_handler))
         .route("/api/shape", get(shape_handler::shape_handler))
         .route("/api/settings", get(settings_handler::settings_handler))
         .route(
@@ -621,6 +681,14 @@ fn build_router(
         .route(
             "/api/views",
             get(views_handler::get_views_handler).put(views_handler::put_views_handler),
+        )
+        // Writing one Elevator entity from the panel that noticed it was
+        // missing (SRV-022). Repo-scope like the views above and for a
+        // stronger reason — this one writes tracked source — so `mezz serve`
+        // never gets it. See `spec_handler.rs` and ADR 0008.
+        .route(
+            "/api/spec/entity",
+            post(spec_handler::create_entity_handler),
         )
         .route(
             "/api/educator/position",
@@ -676,7 +744,9 @@ fn print_startup_banner(port: u16, policy: &AccessPolicy, ui: Option<&std::path:
         port
     );
     eprintln!("   API:            GET  /api/branch    - which branch this checkout is on");
-    eprintln!("                   GET  /api/commits   - list recent commits");
+    eprintln!("                   GET  /api/branches  - every branch, local and remote-tracking");
+    eprintln!("                   GET  /api/commits   - recent commits, of HEAD or of any ref");
+    eprintln!("                   GET  /api/merge-base - where two refs diverged");
     eprintln!("                   POST /api/diff      - compute diff between commits");
     eprintln!("                   DEL  /api/diff      - leave diff mode");
     eprintln!("                   GET  /api/root      - get current analyzed path");

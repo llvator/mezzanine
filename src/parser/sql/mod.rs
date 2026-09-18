@@ -25,6 +25,7 @@ mod tests;
 use crate::models::file_info::Language;
 use crate::models::{FileInfo, Position, Span};
 use crate::parser::language_parser::{LanguageParser, ParseResult};
+use crate::parser::sql::ops::SchemaOp;
 use anyhow::Result;
 use sqlparser::ast::{ObjectType, Statement};
 use sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
@@ -111,22 +112,33 @@ impl SqlParser {
     /// table finally looks like is not knowable from one file, so the fold
     /// builds them (ADR-0007).
     fn emit(&self, statement: &Statement, span: Span, result: &mut ParseResult) {
-        let ops = match statement {
-            Statement::CreateTable(ct) => vec![schema::from_create_table(ct)],
-            Statement::CreateView(cv) => vec![schema::from_create_view(cv)],
-            Statement::AlterTable(at) => schema::from_alter_table(&at.name, &at.operations),
-            Statement::Drop {
-                object_type: ObjectType::Table,
-                names,
-                ..
-            } => schema::from_drop_tables(names),
-            // Everything else — DML, indexes, grants, procedural blocks — is
-            // valid SQL that changes no table topology.
-            _ => Vec::new(),
-        };
         result
             .schema_ops
-            .extend(ops.into_iter().map(|op| ops::PositionedOp { op, span }));
+            .extend(statement_ops(statement).into_iter().map(|op| ops::PositionedOp { op, span }));
+    }
+}
+
+/// The statements this parser models, and what each one says about the
+/// schema. A free function rather than more of [`SqlParser::emit`]: the list
+/// is the module's contract with the fold, and it should be readable without
+/// the plumbing that stamps spans onto it.
+fn statement_ops(statement: &Statement) -> Vec<SchemaOp> {
+    match statement {
+        Statement::CreateTable(ct) => vec![schema::from_create_table(ct)],
+        Statement::CreateView(cv) => vec![schema::from_create_view(cv)],
+        Statement::AlterTable(at) => schema::from_alter_table(&at.name, &at.operations),
+        // Only the unique ones say anything: uniqueness is what separates a
+        // one-to-one from a one-to-many (SQL-006). A plain index is still
+        // topology-free and still produces nothing.
+        Statement::CreateIndex(ci) => schema::from_create_index(ci),
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names,
+            ..
+        } => schema::from_drop_tables(names),
+        // Everything else — DML, non-unique indexes, grants, procedural
+        // blocks — is valid SQL that changes no table topology.
+        _ => Vec::new(),
     }
 }
 

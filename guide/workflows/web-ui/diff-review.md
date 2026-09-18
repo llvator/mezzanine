@@ -27,6 +27,34 @@ Two comparison modes behave differently on purpose:
 Pass `--pin-diff` to `mezz watch` if you want a working-tree diff frozen at
 the moment you computed it instead of tracking your edits.
 
+## Comparing two branches
+
+**Branches** in the picker compares one branch against another without
+checking either one out. Pick the base — usually `main` — and the branch under
+review; the panel says in one sentence what it is about to compare, then runs
+it.
+
+It compares **from where the two branches diverged**, not from the base
+branch's tip, and that difference is the whole point. A branch cut a week ago
+differs from `main` by its own work *and* by everything that has landed on
+main since, so a tip-to-tip comparison reports main's own recent commits as
+things the branch deleted. Measuring from the fork point is the same
+comparison a pull request shows you.
+
+Untick **Measure from where the two branches diverged** for the tip-to-tip
+reading. That one answers a different question — "how do these two trees
+differ right now", which is what you want before a merge rather than during a
+review.
+
+Commits from other branches are reachable in the **Compare Commits** tab too:
+the list has a branch selector above it, and `From` and `To` hold the commits
+you picked, so a base on one branch and a target on another is two clicks.
+Either side also still takes a typed ref — a branch name, a tag, `HEAD~3`.
+
+The canvas keeps drawing your working tree throughout. Only the overlay
+describes the branch, because the engine analyses the checkout it was pointed
+at and a comparison does not re-point it.
+
 ## The workflow that pays: review before reading
 
 Run the overlay on someone else's branch **before** you read their diff.

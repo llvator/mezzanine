@@ -102,7 +102,7 @@ fn parse_method(
         entity.return_type = Some(extract_type_text(&ret, source));
     }
 
-    populate_body_metrics(node.child_by_field_name("body"), &mut entity);
+    populate_body_metrics(node.child_by_field_name("body"), source, &mut entity);
 
     entity.documentation = extract_tsdoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());
@@ -139,7 +139,7 @@ pub(super) fn parse_abstract_method(
         entity.return_type = Some(extract_type_text(&ret, source));
     }
 
-    populate_body_metrics(None, &mut entity);
+    populate_body_metrics(None, source, &mut entity);
 
     entity.documentation = extract_tsdoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());
@@ -257,7 +257,7 @@ pub(super) fn parse_method_signature(
     }
 
     // An interface method signature has no body — one straight-through path.
-    populate_body_metrics(None, &mut entity);
+    populate_body_metrics(None, source, &mut entity);
 
     entity.documentation = extract_tsdoc(node, source);
     entity.source_code = Some(node_text(node, source).to_string());

@@ -83,7 +83,7 @@ export const STAGE_ORDER: readonly FilterStageId[] = [
  * offered a `×` that would change nothing — the exact failure UI-099 exists to
  * remove, made worse by looking operable.
  */
-export type CanvasView = 'force' | 'tree' | 'shape';
+export type CanvasView = 'force' | 'tree' | 'shape' | 'flow';
 
 /**
  * The modes each stage actually bites in, read off `displayPlan.compute`.
@@ -96,21 +96,27 @@ export type CanvasView = 'force' | 'tree' | 'shape';
  * reach; the rest are gaps, and until they close, silence is the honest report.
  *
  * Shape draws nothing but the folder picture, so no stage is listed for it.
+ *
+ * Flow (UI-146) is listed wherever force is, and every entry is identical for
+ * a reason that is not a coincidence: the Flow view IS force mode's exit, one
+ * layout step further on. Every stage below has already run by the time it
+ * places anything, so a chip that went quiet on the way into Flow would be
+ * hiding a filter that is still narrowing the canvas.
  */
 const RUNS_IN: Record<FilterStageId, readonly CanvasView[]> = {
-  ghosts: ['force', 'tree'],
-  'template-vars': ['force'],
-  spec: ['force'],
-  structure: ['force', 'tree'],
-  kinds: ['force', 'tree'],
-  languages: ['force'],
-  files: ['force', 'tree'],
-  search: ['force'],
-  diff: ['force', 'tree'],
-  focus: ['force', 'tree'],
-  relations: ['force', 'tree'],
-  levels: ['force', 'tree'],
-  hubs: ['force'],
+  ghosts: ['force', 'flow', 'tree'],
+  'template-vars': ['force', 'flow'],
+  spec: ['force', 'flow'],
+  structure: ['force', 'flow', 'tree'],
+  kinds: ['force', 'flow', 'tree'],
+  languages: ['force', 'flow'],
+  files: ['force', 'flow', 'tree'],
+  search: ['force', 'flow'],
+  diff: ['force', 'flow', 'tree'],
+  focus: ['force', 'flow', 'tree'],
+  relations: ['force', 'flow', 'tree'],
+  levels: ['force', 'flow', 'tree'],
+  hubs: ['force', 'flow'],
 };
 
 /** Whether a stage narrows anything in the mode the canvas is currently in. */

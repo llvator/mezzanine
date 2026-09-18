@@ -3,11 +3,13 @@
 //! Nothing here decides what the schema *is* — that is the fold's job. This
 //! module only restates each statement in a form the fold can replay.
 
-use super::ops::{implicit_fk_name, ForeignKey, SchemaOp};
+use super::ops::{
+    implicit_fk_name, implicit_pk_name, implicit_unique_name, ForeignKey, SchemaOp, UniqueKey,
+};
 use crate::models::Parameter;
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView, ObjectName,
-    RenameTableNameKind, TableConstraint,
+    AlterTableOperation, ColumnDef, ColumnOption, CreateIndex, CreateTable, CreateView, Expr,
+    IndexColumn, ObjectName, RenameTableNameKind, TableConstraint,
 };
 
 /// Schema assumed when a name is not qualified. Matches PostgreSQL's default
@@ -38,29 +40,70 @@ fn ident(i: &sqlparser::ast::Ident) -> String {
 
 pub fn from_create_table(ct: &CreateTable) -> SchemaOp {
     let (schema, name) = split_name(&ct.name);
-    let mut columns = Vec::new();
-    let mut foreign_keys = Vec::new();
+    let columns = ct.columns.iter().map(column_field).collect();
 
-    for column in &ct.columns {
-        columns.push(column_field(column));
-        if let Some(fk) = column_foreign_key(&name, column) {
-            foreign_keys.push(fk);
-        }
-    }
-    for constraint in &ct.constraints {
-        if let Some(fk) = table_foreign_key(&name, constraint) {
-            foreign_keys.push(fk);
-        }
-    }
+    // Inline and table-level forms say the same things, so each kind of
+    // constraint is gathered across both rather than once per syntax. The
+    // three passes read as three sentences; folding them into one loop with
+    // two accumulators saved nothing and hid which form contributes what.
+    let mut foreign_keys: Vec<ForeignKey> = ct
+        .columns
+        .iter()
+        .filter_map(|c| column_foreign_key(&name, c))
+        .collect();
+    foreign_keys.extend(ct.constraints.iter().filter_map(|c| table_foreign_key(&name, c)));
+
+    let mut unique_keys: Vec<UniqueKey> = ct
+        .columns
+        .iter()
+        .filter_map(|c| column_unique_key(&name, c))
+        .collect();
+    unique_keys.extend(ct.constraints.iter().filter_map(|c| table_unique_key(&name, c)));
 
     SchemaOp::CreateTable {
         schema,
         name,
         columns,
         foreign_keys,
+        unique_keys,
         if_not_exists: ct.if_not_exists,
         is_view: false,
     }
+}
+
+/// `CREATE UNIQUE INDEX one_profile ON profiles (user_id)` — uniqueness
+/// declared outside the table, which is how a migration adds it to a table
+/// that already exists. A non-unique index says nothing about cardinality
+/// and produces no operation.
+pub fn from_create_index(ci: &CreateIndex) -> Vec<SchemaOp> {
+    // A partial index — `… WHERE deleted_at IS NULL` — constrains only the
+    // rows matching its predicate. Reading it as unconditional uniqueness
+    // would call an edge one-to-one that is one-to-many everywhere outside
+    // that subset, which is a worse answer than saying nothing.
+    if !ci.unique || ci.predicate.is_some() {
+        return Vec::new();
+    }
+    let (schema, table) = split_name(&ci.table_name);
+    let columns = index_columns(&ci.columns);
+    if columns.is_empty() {
+        // An expression index — `LOWER(email)` — constrains a computed value,
+        // not a column set, so no foreign key can be matched against it.
+        return Vec::new();
+    }
+    let name = ci
+        .name
+        .as_ref()
+        .map(|n| split_name(n).1)
+        .unwrap_or_else(|| implicit_unique_name(&table, &columns));
+    vec![SchemaOp::AddUniqueKey {
+        schema,
+        table,
+        unique_key: UniqueKey {
+            name,
+            columns,
+            is_primary: false,
+        },
+    }]
 }
 
 pub fn from_create_view(cv: &CreateView) -> SchemaOp {
@@ -77,6 +120,7 @@ pub fn from_create_view(cv: &CreateView) -> SchemaOp {
             })
             .collect(),
         foreign_keys: Vec::new(),
+        unique_keys: Vec::new(),
         if_not_exists: false,
         is_view: true,
     }
@@ -141,14 +185,7 @@ fn alter_op(schema: &str, table: &str, op: &AlterTableOperation) -> Vec<SchemaOp
             }]
         }
         AlterTableOperation::AddConstraint { constraint, .. } => {
-            table_foreign_key(table, constraint)
-                .map(|fk| SchemaOp::AddForeignKey {
-                    schema: schema.into(),
-                    table: table.into(),
-                    foreign_key: fk,
-                })
-                .into_iter()
-                .collect()
+            added_constraint(schema, table, constraint)
         }
         AlterTableOperation::DropConstraint { name, .. } => vec![SchemaOp::DropConstraint {
             schema: schema.into(),
@@ -180,18 +217,18 @@ fn column_foreign_key(table: &str, column: &ColumnDef) -> Option<ForeignKey> {
         ColumnOption::ForeignKey(fk) => Some(fk),
         _ => None,
     })?;
-    let local = ident(&column.name);
+    let columns = vec![ident(&column.name)];
     let (target_schema, target_table) = split_name(&fk.foreign_table);
     Some(ForeignKey {
         name: fk
             .name
             .as_ref()
             .map(ident)
-            .unwrap_or_else(|| implicit_fk_name(table, &local)),
-        column: local,
+            .unwrap_or_else(|| implicit_fk_name(table, &columns)),
+        columns,
         target_schema,
         target_table,
-        target_column: fk.referred_columns.first().map(ident),
+        target_columns: fk.referred_columns.iter().map(ident).collect(),
         on_delete: fk.on_delete.map(|a| a.to_string()),
     })
 }
@@ -202,18 +239,120 @@ fn table_foreign_key(table: &str, constraint: &TableConstraint) -> Option<Foreig
     let TableConstraint::ForeignKey(fk) = constraint else {
         return None;
     };
-    let local = ident(fk.columns.first()?);
+    let columns: Vec<String> = fk.columns.iter().map(ident).collect();
+    if columns.is_empty() {
+        return None;
+    }
     let (target_schema, target_table) = split_name(&fk.foreign_table);
     Some(ForeignKey {
         name: fk
             .name
             .as_ref()
             .map(ident)
-            .unwrap_or_else(|| implicit_fk_name(table, &local)),
-        column: local,
+            .unwrap_or_else(|| implicit_fk_name(table, &columns)),
+        columns,
         target_schema,
         target_table,
-        target_column: fk.referred_columns.first().map(ident),
+        target_columns: fk.referred_columns.iter().map(ident).collect(),
         on_delete: fk.on_delete.map(|a| a.to_string()),
     })
+}
+
+/// `ADD CONSTRAINT …` — a foreign key or a uniqueness constraint, whichever
+/// it turns out to be.
+///
+/// Its own function rather than two arms in [`alter_op`]: that match is the
+/// list of statements this module models, and a reader scanning it should see
+/// one line per statement rather than the body of the one that happens to
+/// carry two.
+fn added_constraint(schema: &str, table: &str, constraint: &TableConstraint) -> Vec<SchemaOp> {
+    if let Some(fk) = table_foreign_key(table, constraint) {
+        return vec![SchemaOp::AddForeignKey {
+            schema: schema.into(),
+            table: table.into(),
+            foreign_key: fk,
+        }];
+    }
+    table_unique_key(table, constraint)
+        .map(|unique_key| SchemaOp::AddUniqueKey {
+            schema: schema.into(),
+            table: table.into(),
+            unique_key,
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The column names an index or key constraint is written over.
+///
+/// `IndexColumn` wraps an `OrderByExpr`, so `(created_at DESC)` and
+/// `(LOWER(email))` arrive in the same shape as a plain column. Only bare
+/// identifiers answer; anything computed is dropped by the caller, because a
+/// foreign key can never be matched against an expression.
+fn index_columns(columns: &[IndexColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter_map(|c| match &c.column.expr {
+            Expr::Identifier(i) => Some(ident(i)),
+            Expr::CompoundIdentifier(parts) => parts.last().map(ident),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `id UUID PRIMARY KEY` / `email TEXT UNIQUE` — the inline forms.
+fn column_unique_key(table: &str, column: &ColumnDef) -> Option<UniqueKey> {
+    let local = vec![ident(&column.name)];
+    column.options.iter().find_map(|o| match &o.option {
+        ColumnOption::PrimaryKey(pk) => Some(UniqueKey {
+            name: pk
+                .name
+                .as_ref()
+                .map(ident)
+                .unwrap_or_else(|| implicit_pk_name(table)),
+            columns: local.clone(),
+            is_primary: true,
+        }),
+        ColumnOption::Unique(u) => Some(UniqueKey {
+            name: u
+                .name
+                .as_ref()
+                .map(ident)
+                .unwrap_or_else(|| implicit_unique_name(table, &local)),
+            columns: local.clone(),
+            is_primary: false,
+        }),
+        _ => None,
+    })
+}
+
+/// `PRIMARY KEY (a, b)` / `UNIQUE (a, b)`, including the `ALTER TABLE … ADD
+/// CONSTRAINT` form. Composite by nature — which is the whole reason a join
+/// table can be recognised at all.
+fn table_unique_key(table: &str, constraint: &TableConstraint) -> Option<UniqueKey> {
+    match constraint {
+        TableConstraint::PrimaryKey(pk) => Some(UniqueKey {
+            name: pk
+                .name
+                .as_ref()
+                .map(ident)
+                .unwrap_or_else(|| implicit_pk_name(table)),
+            columns: index_columns(&pk.columns),
+            is_primary: true,
+        }),
+        TableConstraint::Unique(u) => {
+            let columns = index_columns(&u.columns);
+            Some(UniqueKey {
+                name: u
+                    .name
+                    .as_ref()
+                    .map(ident)
+                    .unwrap_or_else(|| implicit_unique_name(table, &columns)),
+                columns,
+                is_primary: false,
+            })
+        }
+        _ => None,
+    }
+    .filter(|key| !key.columns.is_empty())
 }

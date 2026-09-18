@@ -9,11 +9,10 @@
 //! anonymous in the graph rather than getting their own entities.
 
 use super::super::language_parser::{node_text, node_to_span, ParseResult};
-use super::fields::has_field_annotation;
 use super::flow::{
     emit_branch_entity, emit_case_arm_entity, emit_loop_entity, emit_try_arm_entity,
 };
-use super::helpers::flow_keyword_invocation;
+use super::helpers::{flow_keyword_invocation, has_field_annotation};
 use super::stdlib::is_stdlib_method;
 use crate::models::{CodeEntity, EntityKind, Relationship, RelationshipKind, Visibility};
 use std::path::Path;

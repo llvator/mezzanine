@@ -27,6 +27,35 @@ fn is_synthetic(e: &CodeEntity) -> bool {
 /// The unit a folder is drawn in: a file directly inside it is its own node, a
 /// file deeper down is the subfolder standing for it, and two paths answering
 /// the same child are one node as far as this folder's picture is concerned.
+/// Missing imports counted per folder, worst first — the body of
+/// [`DependencyGraph::unresolved_imports_by_folder`], taken as an argument so
+/// the coverage pair and this ranking can come out of one graph scan.
+fn folders_of(missing: &std::collections::BTreeSet<(String, String)>) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (from, to) in missing {
+        let (a, b) = (folder_of(from), folder_of(to));
+        *counts.entry(a).or_insert(0) += 1;
+        if b != a {
+            *counts.entry(b).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(String, usize)> = counts
+        .into_iter()
+        .map(|(folder, n)| (folder.to_string(), n))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+/// The folder a file sits in — `.` for one at the analysis root.
+fn folder_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => ".",
+    }
+}
+
 fn immediate_child<'a>(folder: &str, path: &'a str) -> Option<&'a str> {
     let rest = path.strip_prefix(folder)?.strip_prefix('/')?;
     let end = rest.find('/').unwrap_or(rest.len());
@@ -161,6 +190,27 @@ struct FileEdgeData {
     /// `References` edges. Reported separately; they feed no ratio, no
     /// cycle and no composite score.
     refs: EdgeBuckets,
+}
+
+/// Raise `OverfullHead` when a callable holds more distinct names in view
+/// than a reader can keep — parameters, locals and explicitly-received
+/// fields, against the red line the same `Thresholds` draws for the metric.
+///
+/// A free function rather than another arm inside `detect_smells` because
+/// the rule needs no cross-entity pre-pass, and because the smell it raises
+/// is the only one here that says nothing about control flow: a body can
+/// trip it at `cyclomatic 1`.
+///
+/// `None` for a callable the parser could not measure — a language whose
+/// declaration kinds are not in `parser::working_set::BINDING_FIELDS`
+/// reports parameters only, and inferring a smell from a floor known to be
+/// low would flag the wrong bodies.
+fn overfull_head(
+    m: &crate::models::entity::EntityMetrics,
+    t: &crate::models::Thresholds,
+) -> Option<crate::models::SmellKind> {
+    let ws = m.working_set? as f32;
+    (ws > t.working_set.bad).then_some(crate::models::SmellKind::OverfullHead)
 }
 
 impl DependencyGraph {
@@ -322,6 +372,43 @@ impl DependencyGraph {
             .iter()
             .filter(|(from, to)| immediate_child(folder, from) != immediate_child(folder, to))
             .count()
+    }
+
+    /// Where the missing imports are, worst folder first.
+    ///
+    /// The footer that ships the count says "any verdict over the folders they
+    /// cross is unsound" and then names no folder, which a field report
+    /// (2026-08-27) could not spend:
+    ///
+    /// > I published `fan_out 38→34 (-4)` … as measured evidence that a
+    /// > refactor reduced coupling — while holding, unresolved, the tool's own
+    /// > statement that verdicts of that kind may be unsound over folders it
+    /// > would not name. … A caveat that cannot be localised gets applied
+    /// > either everywhere or nowhere, and both are wrong.
+    ///
+    /// Their guess was that the per-import detail is discarded before the
+    /// footer renders. It is not — [`Self::unresolved_imports`] holds the
+    /// pairs, and this only groups them.
+    ///
+    /// Attributed to **both** ends, so the counts overlap and do not sum to
+    /// the total. A dropped edge understates the source folder's fan-out and
+    /// the target's fan-in equally, and a reader scanning for their own folder
+    /// has to find it whichever side of the arrow it sits on.
+    pub fn unresolved_imports_by_folder(&self) -> Vec<(String, usize)> {
+        folders_of(&self.unresolved_imports())
+    }
+
+    /// [`Self::import_coverage`] and [`Self::unresolved_imports_by_folder`]
+    /// from the one expensive pass they share.
+    ///
+    /// The footer that wants both is appended to *every* MCP response, and
+    /// `file_graph` is rebuilt from two scans and a clone of every import site
+    /// on each call — so asking the two questions separately doubles the cost
+    /// of every answer the server gives.
+    pub fn import_coverage_by_folder(&self) -> (usize, usize, Vec<(String, usize)>) {
+        let seen = self.import_dependencies().len();
+        let missing = self.unresolved_imports();
+        (seen.saturating_sub(missing.len()), seen, folders_of(&missing))
     }
 
     /// The graph one folder draws, with a verdict on every node and edge —
@@ -556,10 +643,9 @@ impl DependencyGraph {
             };
             // Resolve the target relative to the caller's file, so a bare name
             // binds to the nearest definition rather than an arbitrary one.
-            let from_file = id_to_entity
-                .get(source_id.as_str())
-                .map(|e| e.file_path.as_path());
-            let target_id = match resolve(&rel.target_id, from_file) {
+            let from_entity = id_to_entity.get(source_id.as_str()).copied();
+            let from_file = from_entity.map(|e| e.file_path.as_path());
+            let target_id = match resolve_callee(rel, from_entity, from_file, &resolve) {
                 Some(id) => id,
                 None => {
                     // Create a ghost entity for the unresolved target
@@ -1025,6 +1111,8 @@ impl DependencyGraph {
                         smells.push(SmellKind::Dispatcher);
                     }
                 }
+
+                smells.extend(overfull_head(m, &t));
 
                 let total = outgoing_total.get(&idx).copied().unwrap_or(0) as usize;
                 if total >= t.feature_envy_min_edges as usize {
@@ -2316,20 +2404,24 @@ fn pick_nearest_unambiguous(
 /// The module name a `<module>::<name>` key uses for one file, or `None`
 /// when the file is not one a `::` path can name.
 ///
-/// The two entry-point spellings resolve to their directory for the reason
+/// The entry-point spellings resolve to their directory for the reason
 /// [`crate::analyzer::dependency_resolver`]'s `ENTRY_STEMS` gives: a Rust
-/// `mod.rs` and a TypeScript `index.ts` are the same thing, and neither is
-/// referred to by its stem. `lib.rs` and `main.rs` are crate roots rather
-/// than modules — nothing is referenced as `lib::foo`.
+/// `mod.rs`, a TypeScript `index.ts` and a Python `__init__.py` are the same
+/// thing, and none of them is referred to by its stem — `from .shapes import
+/// Circle` names the *package* `shapes`, whose code is in
+/// `shapes/__init__.py`. `lib.rs` and `main.rs` are crate roots rather than
+/// modules — nothing is referenced as `lib::foo`.
 fn module_segment<'a>(path: &'a std::path::Path, stem: &'a str) -> Option<&'a str> {
-    const QUALIFIED: [&str; 8] = ["rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "svelte"];
+    const QUALIFIED: [&str; 9] = [
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "svelte", "py",
+    ];
     let extension = path.extension().and_then(|e| e.to_str())?;
     if !QUALIFIED.contains(&extension) {
         return None;
     }
     match stem {
         "lib" | "main" if extension == "rs" => None,
-        "mod" | "index" => path.parent()?.file_name()?.to_str(),
+        "mod" | "index" | "__init__" => path.parent()?.file_name()?.to_str(),
         other => Some(other),
     }
 }
@@ -2398,6 +2490,71 @@ fn interoperable_candidates<'a>(
         .collect()
 }
 
+/// Resolve one edge's callee, having first refused a bare call that the
+/// caller's own signature already answers (AN-033).
+///
+/// `resolve` is the strategy chain built in `from_analysis`; every edge but a
+/// shadowed call goes straight to it.
+fn resolve_callee(
+    rel: &Relationship,
+    from_entity: Option<&CodeEntity>,
+    from_file: Option<&std::path::Path>,
+    resolve: impl Fn(&str, Option<&std::path::Path>) -> Option<String>,
+) -> Option<String> {
+    if rel.kind == RelationshipKind::Calls
+        && from_entity.is_some_and(|caller| binds_callee_as_parameter(caller, &rel.target_id))
+    {
+        return None;
+    }
+    resolve(&rel.target_id, from_file)
+}
+
+/// Whether the caller binds `callee` as one of its own parameters, which
+/// makes a bare call to that name the parameter rather than a same-named
+/// definition elsewhere in the tree (AN-033).
+///
+/// Declining leaves the call a ghost, which is the honest answer: the body
+/// behind a callback parameter is chosen by whoever passes it, and the graph
+/// does not know which. Dropping the edge instead would hide fan-out that
+/// really happens.
+///
+/// Qualified callees are left alone — `produce.run()` names a member of the
+/// parameter, not the parameter, and that edge is resolved on its own terms.
+fn binds_callee_as_parameter(caller: &CodeEntity, callee: &str) -> bool {
+    if callee.contains("::") || callee.contains('.') {
+        return false;
+    }
+    if !parameters_shadow_callables(&caller.file_path) {
+        return false;
+    }
+    caller.parameters.iter().any(|p| p.name == callee)
+}
+
+/// Languages where a parameter shadows a same-named callable at a bare call
+/// site, so `produce()` written inside a body that takes `produce` can only
+/// be the parameter.
+///
+/// Conservative on purpose, for the reason AN-029 gives: a lost true edge
+/// costs more than a kept false one. Java, Kotlin, C# and Scala resolve a
+/// call against methods before variables, Ruby lets the parens force the
+/// method, and PHP spells the variable with a sigil the parameter name may
+/// not carry — in all of them the call may genuinely name the callable, so
+/// the guard stays out.
+fn parameters_shadow_callables(file: &std::path::Path) -> bool {
+    use crate::models::file_info::Language;
+    matches!(
+        Language::from_path(file),
+        Language::Python
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Svelte
+            | Language::Rust
+            | Language::Go
+            | Language::Dart
+            | Language::Swift
+    )
+}
+
 /// A single-candidate lookup's answer, kept only if the languages agree
 /// (AN-014). `None` means the strategy declines and the next one may try.
 fn accept_interoperable(
@@ -2454,6 +2611,49 @@ mod tests {
     /// the sorted cycle output without guessing at IDs.
     fn entity(file: &str, line: usize, name: &str, kind: EntityKind) -> CodeEntity {
         CodeEntity::new(name, kind, file, Span::from_positions(line, 0, line, 0))
+    }
+
+    /// The `OverfullHead` rule reads one metric, so it is testable directly
+    /// rather than through a whole graph.
+    #[test]
+    fn overfull_head_fires_only_over_the_red_line() {
+        let t = crate::models::Thresholds::default();
+        let with_ws = |n: Option<u32>| {
+            let m = crate::models::entity::EntityMetrics {
+                working_set: n,
+                ..Default::default()
+            };
+            overfull_head(&m, &t)
+        };
+        assert_eq!(with_ws(Some(12)), None, "at the red line is not over it");
+        assert_eq!(
+            with_ws(Some(13)),
+            Some(crate::models::SmellKind::OverfullHead)
+        );
+        assert_eq!(
+            with_ws(None),
+            None,
+            "a callable the parser could not measure must not be guessed at"
+        );
+    }
+
+    /// The point of the metric: a body can be over its working-set line while
+    /// every control-flow metric reads its best possible value. Before this
+    /// existed such a function carried no smell at all.
+    #[test]
+    fn a_branchless_function_can_still_be_overfull() {
+        let t = crate::models::Thresholds::default();
+        let m = crate::models::entity::EntityMetrics {
+            cyclomatic: Some(1),
+            cognitive_complexity: Some(0),
+            max_nesting: Some(0),
+            working_set: Some(14),
+            ..Default::default()
+        };
+        assert_eq!(
+            overfull_head(&m, &t),
+            Some(crate::models::SmellKind::OverfullHead)
+        );
     }
 
     /// Build a graph from synthetic entities and `(source, target, kind)`
@@ -2678,6 +2878,61 @@ mod tests {
         let (landed, seen) = graph.import_coverage();
         assert_eq!((landed, seen), (1, 1));
         assert!(landed >= seen, "a whole graph must not read as holed");
+    }
+
+    /// Field report, 2026-08-27: the footer said 74 imports were missing and
+    /// that "any verdict over the folders they cross is unsound", then named
+    /// no folder — so a reader holding three `fan_out` deltas could not tell
+    /// whether the caveat applied to any of them.
+    #[test]
+    fn the_missing_imports_can_be_attributed_to_folders() {
+        let mut result = AnalysisResult {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![
+            // Neither target exists as a file, so neither edge lands.
+            import_site("web/ui/a.ts", "web/lib/missing.ts"),
+            import_site("web/ui/b.ts", "web/lib/gone.ts"),
+            import_site("api/main.rs", "api/absent.rs"),
+        ];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        let ranked = graph.unresolved_imports_by_folder();
+        assert_eq!(
+            ranked,
+            vec![
+                ("web/lib".to_string(), 2),
+                ("web/ui".to_string(), 2),
+                // Both ends of this one are the same folder: counted once.
+                ("api".to_string(), 1),
+            ],
+            "both ends of every dropped edge are named, worst folder first"
+        );
+    }
+
+    /// A file at the analysis root has no parent directory, and the folder it
+    /// is attributed to must still be printable.
+    #[test]
+    fn an_unresolved_import_at_the_root_is_attributed_to_the_root() {
+        let mut result = AnalysisResult {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+            files: Vec::new(),
+            import_sites: Vec::new(),
+            warnings: Vec::new(),
+        };
+        result.import_sites = vec![import_site("a.ts", "b.ts")];
+        let graph = DependencyGraph::from_analysis(&result);
+
+        assert_eq!(
+            graph.unresolved_imports_by_folder(),
+            vec![(".".to_string(), 1)],
+            "one edge inside one folder is counted once, not twice"
+        );
     }
 
     fn import_site(from: &str, to: &str) -> crate::models::ImportSite {
@@ -3121,6 +3376,90 @@ mod language_guard_tests {
         let forward = resolve_call(vec![x.clone(), y.clone(), caller.clone()], &caller, "dup");
         let reversed = resolve_call(vec![y, x, caller.clone()], &caller, "dup");
         assert_eq!(forward, reversed);
+    }
+}
+
+#[cfg(test)]
+mod parameter_shadow_tests {
+    //! AN-033: a call naming the caller's own parameter is that parameter.
+    //!
+    //! The measured failure came from a field report: a generic Python cache
+    //! helper `def cached(kind, produce)` calling `produce()` bound to an
+    //! unrelated nested `def produce()` in another module, and the edge closed
+    //! a three-node loop that does not exist in the source. `reshape` then
+    //! graded the folder **cyclic** and told the reader to break the loop.
+
+    use super::locality_tests::{func, resolve_call};
+    use crate::models::{CodeEntity, Parameter};
+
+    /// `func`, with one parameter of the given name — the whole trigger.
+    fn taking(mut f: CodeEntity, param: &str) -> CodeEntity {
+        f.parameters.push(Parameter {
+            name: param.to_string(),
+            ..Default::default()
+        });
+        f
+    }
+
+    #[test]
+    fn a_call_naming_the_callers_parameter_does_not_bind_a_stranger() {
+        let caller = taking(func("cached", "pkg/cache.py", 3), "produce");
+        let stranger = func("produce", "pkg/measures.py", 8);
+        let got = resolve_call(vec![stranger, caller.clone()], &caller, "produce");
+        assert!(
+            got.starts_with("ghost:"),
+            "expected the callback parameter to stay unresolved, got {got}"
+        );
+    }
+
+    #[test]
+    fn a_call_naming_no_parameter_still_binds() {
+        // The guard must cost nothing to every other call in the same body.
+        let caller = taking(func("cached", "pkg/cache.py", 3), "produce");
+        let helper = func("cache_key", "pkg/keys.py", 4);
+        let expected = helper.id.clone();
+        let got = resolve_call(vec![helper, caller.clone()], &caller, "cache_key");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_qualified_call_through_the_parameter_is_left_to_the_other_strategies() {
+        // `produce.run()` names a member of the parameter's type, not the
+        // parameter. Whatever the ordinary strategies make of it — here a
+        // ghost, since a dotted callee nothing registers is treated as
+        // external — the guard must not be what decided it.
+        let plain = func("cached", "pkg/cache.py", 3);
+        let shadowing = taking(plain.clone(), "produce");
+        let method = func("run", "pkg/runner.py", 2);
+        let with_param = resolve_call(
+            vec![method.clone(), shadowing.clone()],
+            &shadowing,
+            "produce.run",
+        );
+        let without_param = resolve_call(vec![method, plain.clone()], &plain, "produce.run");
+        assert_eq!(with_param, without_param);
+    }
+
+    #[test]
+    fn a_rust_function_typed_parameter_shadows_too() {
+        // AN-029 left exactly this survivor: `json_renderer.rs` calling
+        // `rel(path)` where `rel: &F` bound to a free function elsewhere.
+        let caller = taking(func("render", "src/output/json_renderer.rs", 40), "rel");
+        let stranger = func("rel", "src/mcp/reshape.rs", 100);
+        let got = resolve_call(vec![stranger, caller.clone()], &caller, "rel");
+        assert!(got.starts_with("ghost:"), "expected a ghost, got {got}");
+    }
+
+    #[test]
+    fn a_java_parameter_does_not_suppress_the_method_it_shares_a_name_with() {
+        // Java resolves a call against methods before variables, so the call
+        // may genuinely name the method — suppressing it would lose a true
+        // edge, which AN-029 rates the more expensive mistake.
+        let caller = taking(func("run", "src/Job.java", 10), "produce");
+        let method = func("produce", "src/Factory.java", 5);
+        let expected = method.id.clone();
+        let got = resolve_call(vec![method, caller.clone()], &caller, "produce");
+        assert_eq!(got, expected);
     }
 }
 

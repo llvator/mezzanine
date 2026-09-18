@@ -180,7 +180,7 @@ fn emit_function(
 
     // The span is the declarator, but the metrics describe the function it
     // holds — so the body measured here is the arrow's.
-    populate_body_metrics(value_node.child_by_field_name("body"), &mut entity);
+    populate_body_metrics(value_node.child_by_field_name("body"), ctx.source, &mut entity);
 
     entity.documentation = extract_tsdoc(doc_node, ctx.source);
     entity.source_code = Some(node_text(span_node, ctx.source).to_string());

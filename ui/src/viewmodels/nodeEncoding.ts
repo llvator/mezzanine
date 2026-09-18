@@ -206,6 +206,7 @@ const METRIC_FREE_KINDS = new Set([
   'Extension', 'Category', 'Feature', 'Concept', 'Functionality', 'UiPage',
   'Playbook', 'Role', 'HostGroup', 'DeploymentSet', 'DeploymentEntry',
   'TemplateFile', 'K8sResource', 'HelmChart',
+  'Stage', 'BaseImage', 'Volume', 'Network',
 ]);
 
 export function isMetricFreeKind(kindRaw: string): boolean {
@@ -224,7 +225,14 @@ export function isMetricFreeKind(kindRaw: string): boolean {
  * makes it the exact signal rather than a proxy for one.
  */
 export function isMetricFreeNode(d: D3Node): boolean {
-  return isMetricFreeKind(d.kind_raw) || (d.tags?.includes('ansible') ?? false);
+  return (
+    isMetricFreeKind(d.kind_raw) ||
+    (d.tags?.includes('ansible') ?? false) ||
+    // Same reason, same shape: the docker parser emits `File` and
+    // `Service` nodes, both real code kinds elsewhere, so only its own
+    // tag separates them (`new_entity` in `src/parser/docker/mod.rs`).
+    (d.tags?.includes('docker') ?? false)
+  );
 }
 
 /** True when the graph is a domain or topology view and metric encoding does

@@ -1,31 +1,33 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{extract::State, http::StatusCode, response::Json};
 
-use crate::analyzer::Analyzer;
+use crate::activity;
+use crate::analyzer::{Analyzer, FileWalker};
 use crate::config::Config;
 use crate::diff;
 use crate::graph::DependencyGraph;
-use crate::output::{self, JsonRenderer};
+use crate::output::JsonRenderer;
 
+use super::files_handler::{changed_files, head_side};
 use super::state::{build_config, AppState, CachedBase, LiveDiff, ReloadKind};
 use super::types::{
-    DiffRequest, DiffResponse, DiffSummaryResponse, RootPathRequest, RootPathResponse,
+    ChangedFile, DiffRequest, DiffResponse, DiffSummaryResponse, RootPathRequest, RootPathResponse,
 };
 
 /// The one `to_ref` that means "the tree this server is watching" rather
 /// than a git ref that has to be checked out into a temp worktree first.
-const WORKING_REF: &str = "WORKING";
+pub(crate) const WORKING_REF: &str = "WORKING";
 
 /// The `to_ref` that means the git index. A sentinel rather than a sha because
 /// the index is not a ref: the commit that names it is manufactured *inside*
 /// this call and is unreferenced, so a client that held one would be holding a
 /// commit that means whatever the index happened to be when it was made — the
 /// `stash@{N}` mistake with the failure moved to the other end (UI-111).
-const STAGED_REF: &str = "STAGED";
+pub(crate) const STAGED_REF: &str = "STAGED";
 
 /// What `diff.json` calls a staged head. The literal is the discriminator the
 /// UI reads to know which tree the comparison looked at, the same channel
@@ -60,23 +62,97 @@ struct Head {
 /// thing.
 const NOTHING_STAGED: &str = "Nothing is staged. `git add` the changes you want to look at first.";
 
-/// Sort a head-resolution failure into the two kinds a caller answers
-/// differently: a comparison the server *declines*, and one it could not make.
+/// The two ways a comparison does not happen, which a caller answers
+/// differently.
 ///
-/// Nothing staged is the only declined one, and the distinction is whose
-/// problem it is. A 500 tells the reader something broke and gives them
-/// nothing to do about it; `success: false` with a message tells them to
-/// `git add` something. Every other failure here — a ref that does not
-/// resolve, git absent — is the server failing to answer.
-fn declined(e: String) -> Result<DiffResponse, String> {
-    if e == NOTHING_STAGED {
-        Ok(DiffResponse {
-            success: false,
-            message: e,
-            summary: None,
-        })
+/// The distinction is whose problem it is. A 500 tells the reader something
+/// broke and gives them nothing to do about it; `success: false` with a
+/// message tells them to `git add` something, or names the files that put the
+/// change outside the analysis. A ref that does not resolve, or git absent, is
+/// the server failing to answer.
+///
+/// A type rather than the string equality against `NOTHING_STAGED` this
+/// replaces: SRV-020's decline names the files it found, so it is a different
+/// string every time and nothing could have recognised it by value.
+enum NoDiff {
+    /// The server declines, and the message says why.
+    Declined(String),
+    /// The server could not answer.
+    Failed(String),
+}
+
+/// Every bare-string error inside the pipeline is a failure to answer. Written
+/// as a conversion so that `?` on the existing `map_err(e2s)` call sites keeps
+/// meaning what it did once the pipeline started returning this type.
+impl From<String> for NoDiff {
+    fn from(e: String) -> Self {
+        NoDiff::Failed(e)
+    }
+}
+
+/// What a comparison the reader stopped answers with (UI-141).
+///
+/// A decline, not a failure: nothing broke, and the one thing the reader must
+/// not be told is that their own button produced an error.
+const STOPPED: &str = "Comparison stopped.";
+
+/// `Err(Declined)` once the reader has asked this run to stop.
+///
+/// Called at the phase boundaries the analyses do not cover, so that a stop
+/// pressed during a worktree checkout or the structural diff is noticed at the
+/// next seam rather than at the end of the run.
+fn stop_requested(cancel: &Arc<AtomicBool>) -> Result<(), NoDiff> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(NoDiff::Declined(STOPPED.to_string()))
     } else {
-        Err(e)
+        Ok(())
+    }
+}
+
+/// Sort an analysis that ended early: the reader's own stop, or a real
+/// failure. Asked of the error rather than of the flag, so a run that raced a
+/// stop it never actually saw is still reported as what it was.
+fn analysis_ended(e: anyhow::Error) -> NoDiff {
+    if e.downcast_ref::<crate::analyzer::Cancelled>().is_some() {
+        NoDiff::Declined(STOPPED.to_string())
+    } else {
+        NoDiff::Failed(e.to_string())
+    }
+}
+
+/// Remove the checkouts this run is responsible for.
+///
+/// `base_is_ours` is false for a base the previous diff analyzed and cached —
+/// that worktree is already gone, and asking git to remove it again just
+/// prints an error. `head_dir` is `None` for a working-tree head, which is the
+/// reader's own tree and not this call's to delete.
+fn drop_worktrees(repo_root: &Path, base_dir: &Path, base_is_ours: bool, head_dir: Option<&Path>) {
+    if base_is_ours {
+        diff::remove_worktree(repo_root, base_dir);
+    }
+    if let Some(dir) = head_dir {
+        diff::remove_worktree(repo_root, dir);
+    }
+}
+
+/// Turn a refusal into the response shape the caller returns.
+fn refused(no: NoDiff) -> Result<DiffResponse, String> {
+    match no {
+        NoDiff::Declined(message) => Ok(DiffResponse {
+            success: false,
+            message,
+            summary: None,
+        }),
+        NoDiff::Failed(e) => Err(e),
+    }
+}
+
+/// Sort a head-resolution failure. Nothing staged is the only declined one.
+fn head_failure(e: String) -> NoDiff {
+    if e == NOTHING_STAGED {
+        NoDiff::Declined(e)
+    } else {
+        NoDiff::Failed(e)
     }
 }
 
@@ -105,6 +181,114 @@ fn resolve_head(repo_root: &Path, to_ref: &str) -> Result<Head, String> {
             // same tree, and the name is what the log line reads as.
             git_ref: Some(r.to_string()),
         }),
+    }
+}
+
+/// How many paths a decline names before it starts counting instead.
+const NAMED_IN_DECLINE: usize = 3;
+
+/// What the reader is told when the two refs name the same tree.
+const NO_FILE_DIFFERS: &str = "Nothing to compare: git reports no file differing between these two refs.";
+
+/// `1 file` / `2 files`, so a decline reads as a sentence.
+fn files(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", n)
+    }
+}
+
+/// The decline for a change holding nothing this analysis would open.
+fn nothing_to_compare(rows: &[ChangedFile]) -> String {
+    if rows.is_empty() {
+        return NO_FILE_DIFFERS.to_string();
+    }
+    let shown = rows.len().min(NAMED_IN_DECLINE);
+    let mut named: Vec<String> = rows[..shown].iter().map(|c| c.path.clone()).collect();
+    if rows.len() > shown {
+        named.push(format!("and {} more", rows.len() - shown));
+    }
+    format!(
+        "Nothing to compare: {} changed and none is in a language this analysis parses ({}).",
+        files(rows.len()),
+        named.join(", ")
+    )
+}
+
+/// Refuse, before any checkout, a comparison whose changed files the walk
+/// would never open (SRV-020).
+///
+/// `Some(message)` declines. The cost this saves is two worktrees and two full
+/// analyses — on the repository this was reported from, ten thousand parsed
+/// files to discover that the change was two `.properties` files. Git answers
+/// the same question in milliseconds, and the answer it gives is *why*, where
+/// the analysis can only produce `+0 −0 ~0` — the string it also prints when a
+/// comparison genuinely changed nothing.
+///
+/// Three properties keep the guard on the safe side of its own error:
+///
+/// - **The list is [`changed_files`]**, the one UI-134's `Changes` tab reads,
+///   so what the guard calls the change and what the reader can browse are the
+///   same set by construction.
+/// - **The predicate is [`FileWalker::would_analyze`]**, the walk's own
+///   question. It is pure and answers for a deleted path as readily as a live
+///   one, and it exists precisely so that no second list of extensions can
+///   drift from the walk. A rename is asked under both its names.
+/// - **It declines only on unanimity.** One analysable path anywhere in the
+///   change, or a git call that fails, and the diff runs exactly as before.
+///
+/// A `WORKING` head is never guarded. Its graph is already in memory, so the
+/// only analysis at stake is the base's — which is cached across saves — and
+/// `refresh_live_diff` recomputes a pinned working diff on *every* save. A
+/// guard there would let a save that touched only a `.md` decline a comparison
+/// the reader asked to keep.
+fn analysable_change(
+    repo_root: &Path,
+    config: &Config,
+    req: &DiffRequest,
+    head: &Head,
+) -> Option<String> {
+    head.git_ref.as_ref()?;
+    let rows = changed_files(repo_root, &req.from_ref, &head_side(&req.to_ref))?;
+    let walker = FileWalker::new(config);
+    let analysed = |c: &ChangedFile| {
+        [Some(&c.path), c.old_path.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|p| walker.would_analyze(&repo_root.join(p)))
+    };
+    if rows.iter().any(analysed) {
+        return None;
+    }
+    Some(nothing_to_compare(&rows))
+}
+
+/// Everything decided before a diff is worth starting: the scope in force,
+/// which tree the head names, and whether the change between the two holds
+/// anything to analyze.
+///
+/// Takes the live config *lock* rather than a `Config` so that all three
+/// refusals — a poisoned lock, an unresolvable head, a change with nothing in
+/// it — come back through one `Err`. `run_diff` is already at the repo's
+/// complexity ceiling, and every branch left here is one it does not grow.
+///
+/// The clone is deliberate and matches `compute_diff_blocking`'s: the scope is
+/// read once, so a change landing mid-diff cannot reach the guard and the
+/// analysis differently.
+fn plan_diff(
+    repo_root: &Path,
+    config: &Arc<std::sync::RwLock<Config>>,
+    req: &DiffRequest,
+) -> Result<Head, NoDiff> {
+    let live = config
+        .read()
+        .map_err(|e| NoDiff::Failed(format!("Config lock: {}", e)))?
+        .clone();
+    let head = resolve_head(repo_root, &req.to_ref).map_err(head_failure)?;
+    match analysable_change(repo_root, &live, req, &head) {
+        Some(message) => Err(NoDiff::Declined(message)),
+        None => Ok(head),
     }
 }
 
@@ -203,18 +387,103 @@ fn acquire_base(
     from_sha: &str,
     scope: &str,
     base_config: Config,
-    base_cache: &Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
-) -> Result<((DependencyGraph, Config, String), bool), String> {
-    if let Some((graph, config, details)) = take_cached_base(base_cache, from_sha, scope) {
-        eprintln!("  Reusing base ({}) analysis", from_sha);
+    ctx: &DiffContext,
+) -> Result<((DependencyGraph, Config, String), bool), NoDiff> {
+    if let Some((graph, config, details)) = take_cached_base(&ctx.base_cache, from_sha, scope) {
+        activity::step(activity::DIFF, format!("  Reusing base ({from_sha}) analysis"));
         return Ok(((graph, config, details), false));
     }
     let e2s = |e: anyhow::Error| e.to_string();
     diff::create_worktree(repo_root, base_dir, from_ref).map_err(e2s)?;
-    let (graph, config) =
-        diff::analyze_with(base_config, &format!("base ({})", from_sha)).map_err(e2s)?;
+    // The checkout is this call's from here on: an analysis that stops
+    // partway leaves it on disk otherwise, and a reader who stops two
+    // comparisons has two of them.
+    let analysed = diff::analyze_with_cancel(base_config, &format!("base ({})", from_sha), &ctx.cancel)
+        .map_err(|e| {
+            diff::remove_worktree(repo_root, base_dir);
+            analysis_ended(e)
+        })?;
+    let (graph, config) = analysed;
     let details = diff::render_base_details(&graph, &config).map_err(e2s)?;
     Ok(((graph, config, details), true))
+}
+
+/// The head side: the graph, the config it was produced under, the directory
+/// the diff reads its sources from, and the checkout this run must remove.
+///
+/// That last one is `None` for a working-tree head — that is the reader's own
+/// tree, and this call neither made it nor may delete it.
+#[allow(clippy::type_complexity)]
+fn acquire_head(
+    repo_root: &Path,
+    head: &Head,
+    live: Config,
+    ctx: &DiffContext,
+    run: &activity::Run,
+) -> Result<(DependencyGraph, Config, PathBuf, Option<PathBuf>), NoDiff> {
+    let Some(head_ref) = &head.git_ref else {
+        run.step("   Using current working directory as head...");
+        let g = ctx.current_graph.as_ref().expect("a working head has a graph");
+        let graph = g.read().map_err(|e| format!("Graph lock: {}", e))?.clone();
+        let config = working_head_config(live, repo_root);
+        let dir = config.root_path.clone();
+        return Ok((graph, config, dir, None));
+    };
+    checked_out_head(repo_root, head, head_ref, live, ctx)
+}
+
+/// A head that is a commit: its own throwaway checkout, analysed at the
+/// subtree that corresponds to the analyzed root.
+///
+/// Split from [`acquire_head`] so the working-tree branch above stays the
+/// short one, and so the checkout's top and the subtree analysed under it
+/// are named apart — the returned `PathBuf` pair is (what `compute_diff`
+/// strips, what this run must remove), and they are different directories
+/// below the git top level.
+///
+/// The head has the same defect the base had and moves with it (SRV-021).
+/// It was invisible because both sides were wrong identically, so the
+/// comparison was self-consistent — of the wrong tree. Fixing one root and
+/// not the other would have made it visible and worse.
+fn checked_out_head(
+    repo_root: &Path,
+    head: &Head,
+    head_ref: &str,
+    live: Config,
+    ctx: &DiffContext,
+) -> Result<(DependencyGraph, Config, PathBuf, Option<PathBuf>), NoDiff> {
+    let hdir = std::env::temp_dir().join(format!("mezz-diff-head-{}", head.label));
+    diff::create_worktree(repo_root, &hdir, head_ref).map_err(|e| e.to_string())?;
+    let head_root = diff::checkout_root(repo_root, &hdir);
+    let (graph, config) = diff::analyze_with_cancel(
+        diff::rooted_at(&live, &head_root),
+        &format!("head ({})", head.label),
+        &ctx.cancel,
+    )
+    .map_err(|e| {
+        diff::remove_worktree(repo_root, &hdir);
+        analysis_ended(e)
+    })?;
+    Ok((graph, config, head_root, Some(hdir)))
+}
+
+/// The live server handles one diff run borrows, as one thing.
+///
+/// Bundled rather than passed one by one: they arrive together and mean one
+/// thing — this run's link back to the server that started it — and the
+/// blocking pipeline was already at the argument count clippy stops reading.
+struct DiffContext {
+    /// The scope both sides are analyzed under, whichever refs they name. It
+    /// is read once, so that a scope change landing mid-diff cannot reach one
+    /// side and not the other.
+    live_config: Arc<std::sync::RwLock<Config>>,
+    /// The working tree's graph, for a `WORKING` head. `None` for a ref,
+    /// which is checked out and analyzed instead.
+    current_graph: Option<Arc<std::sync::RwLock<DependencyGraph>>>,
+    /// The previous run's base analysis, reused when the ref and scope match.
+    base_cache: Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
+    /// Flipped when the reader asks this run to stop (UI-141).
+    cancel: Arc<AtomicBool>,
 }
 
 // ------------------------------------------------------------------
@@ -229,21 +498,26 @@ fn acquire_base(
 fn compute_diff_blocking(
     repo_root: &Path,
     output_dir: &Path,
-    live_config: &Arc<std::sync::RwLock<Config>>,
     from_ref: &str,
     head: &Head,
-    current_graph: Option<Arc<std::sync::RwLock<DependencyGraph>>>,
-    base_cache: Option<Arc<std::sync::RwLock<Option<CachedBase>>>>,
-) -> Result<(DiffResponse, DependencyGraph, Config, String, String), String> {
+    ctx: &DiffContext,
+) -> Result<Landed, NoDiff> {
     let is_working = head.git_ref.is_none();
     let to_sha = head.label.clone();
     let total_start = Instant::now();
     let to_label = if is_working { "Working Tree" } else { &to_sha };
-    eprintln!("🔄 Starting diff: {} → {}", from_ref, to_label);
+    // The guard, not a bare pair of messages: this function returns early
+    // from a dozen places below, and every one of them would otherwise leave
+    // the browser showing a diff that stopped as still running (UI-138).
+    let run = activity::begin(
+        activity::DIFF,
+        format!("🔄 Starting diff: {from_ref} → {to_label}"),
+    );
 
     let e2s = |e: anyhow::Error| e.to_string();
 
-    let live = live_config
+    let live = ctx
+        .live_config
         .read()
         .map_err(|e| format!("Config lock: {}", e))?
         .clone();
@@ -253,8 +527,13 @@ fn compute_diff_blocking(
         .map_err(|e| format!("Invalid from_ref: {}", e))?;
 
     // Create + analyze base worktree, unless the last diff already did.
-    let tmp = std::env::temp_dir();
-    let base_dir = tmp.join(format!("mezz-diff-base-{}", from_sha));
+    let base_dir = std::env::temp_dir().join(format!("mezz-diff-base-{}", from_sha));
+    // The checkout's top is what git made and what must be removed; the
+    // subtree corresponding to the analyzed root is what gets analyzed and
+    // what `compute_diff` strips (SRV-021). Below the git top level these are
+    // different directories, and pairing them wrongly compares the whole
+    // repository against one subtree of it.
+    let base_root = diff::checkout_root(repo_root, &base_dir);
     let worktree_start = Instant::now();
     let (base, base_is_ours) = acquire_base(
         repo_root,
@@ -262,58 +541,54 @@ fn compute_diff_blocking(
         from_ref,
         &from_sha,
         &scope,
-        diff::rooted_at(&live, &base_dir),
-        &base_cache,
+        diff::rooted_at(&live, &base_root),
+        ctx,
     )?;
     let (base_graph, base_config, base_details_str) = base;
 
     // Acquire head graph: from in-memory state (WORKING) or a new worktree.
     // The staged head goes down the worktree path like any commit — the
     // manufactured commit it checks out is an ordinary ref by then.
-    let (head_graph, head_config, head_dir_for_diff) = if let Some(head_ref) = &head.git_ref {
-        let hdir = tmp.join(format!("mezz-diff-head-{}", to_sha));
-        if let Err(e) = diff::create_worktree(repo_root, &hdir, head_ref) {
-            if base_is_ours {
-                diff::remove_worktree(repo_root, &base_dir);
-            }
-            return Err(e.to_string());
-        }
-        let (graph, config) =
-            diff::analyze_with(diff::rooted_at(&live, &hdir), &format!("head ({})", to_sha))
-                .map_err(e2s)?;
-        (graph, config, hdir)
-    } else {
-        eprintln!("   Using current working directory as head...");
-        let g = current_graph.unwrap();
-        let graph = g.read().map_err(|e| format!("Graph lock: {}", e))?.clone();
-        let config = working_head_config(live, repo_root);
-        let dir = config.root_path.clone();
-        (graph, config, dir)
-    };
+    let (head_graph, head_config, head_dir_for_diff, head_worktree) =
+        acquire_head(repo_root, head, live, ctx, &run).inspect_err(|_| {
+            // The head is where a stop most often lands — it is the side with
+            // no cache to skip it — and the base checkout is this call's to
+            // clean up either way.
+            drop_worktrees(repo_root, &base_dir, base_is_ours, None);
+        })?;
 
-    eprintln!(
+    run.step(format!(
         "   Worktree(s) created in {:.1}s",
         worktree_start.elapsed().as_secs_f32()
-    );
+    ));
+
+    // The last seam at which stopping still saves anything. Both analyses are
+    // done by now, so a stop after this point cannot end the run early — it is
+    // honoured instead by `discarded`, which keeps the finished answer off a
+    // canvas whose reader has already said they do not want it.
+    if let Err(no) = stop_requested(&ctx.cancel) {
+        drop_worktrees(repo_root, &base_dir, base_is_ours, head_worktree.as_deref());
+        return Err(no);
+    }
 
     // Compute structural diff
-    eprintln!("   Computing structural diff...");
+    run.step("   Computing structural diff...");
     let diff_start = Instant::now();
     let diff_result = diff::compute_diff(
         &base_graph,
         &head_graph,
-        &base_dir,
+        &base_root,
         &head_dir_for_diff,
         &from_sha,
         &to_sha,
     );
-    eprintln!(
+    run.step(format!(
         "   Diff computed in {:.1}s: +{} -{} ~{}",
         diff_start.elapsed().as_secs_f32(),
         diff_result.summary.added,
         diff_result.summary.removed,
         diff_result.summary.modified
-    );
+    ));
 
     // Write output files
     let diff_json = diff::write_diff_outputs(
@@ -329,21 +604,15 @@ fn compute_diff_blocking(
     // was removed by whichever call analyzed it, and asking git to remove it
     // again just prints an error.
     if base_is_ours || !is_working {
-        eprintln!("   Cleaning up worktrees...");
+        run.step("   Cleaning up worktrees...");
     }
-    if base_is_ours {
-        diff::remove_worktree(repo_root, &base_dir);
-    }
-    if !is_working {
-        let hdir = tmp.join(format!("mezz-diff-head-{}", to_sha));
-        diff::remove_worktree(repo_root, &hdir);
-    }
+    drop_worktrees(repo_root, &base_dir, base_is_ours, head_worktree.as_deref());
 
     // Keep the base for the next refresh. Its worktree is gone either way —
     // the graph is what the next diff needs, and re-deriving it from a
     // checkout that has not moved is the cost this avoids.
     store_cached_base(
-        &base_cache,
+        &ctx.base_cache,
         &from_sha,
         &scope,
         &base_graph,
@@ -351,10 +620,10 @@ fn compute_diff_blocking(
         &base_details_str,
     );
 
-    eprintln!(
+    run.end(format!(
         "✅ Diff complete in {:.1}s total",
         total_start.elapsed().as_secs_f32()
-    );
+    ));
 
     let resp = DiffResponse {
         success: true,
@@ -386,6 +655,13 @@ pub(crate) async fn diff_handler(
             }));
         }
         *in_progress = true;
+        // Start from an unset flag, and clear it under this lock (UI-141). A
+        // stop that landed in the moment the last run was finishing has
+        // nothing left to cancel, and clearing it *here* — rather than where
+        // it is set — is what stops it carrying over into this run. Under the
+        // lock because `cancel_diff_handler` takes the same one before
+        // setting it, which is what makes the two orderings the only two.
+        state.diff_cancel.store(false, Ordering::Relaxed);
     }
 
     let resp = run_diff(&state, &req).await;
@@ -440,6 +716,11 @@ pub(crate) async fn stop_diff_handler(State(state): State<AppState>) -> StatusCo
     // Before the clears, so a diff that is mid-flight sees the new epoch when
     // it goes to publish rather than racing the writes below.
     state.diff_epoch.fetch_add(1, Ordering::SeqCst);
+    // And stop the run itself, not just its result. The epoch alone keeps the
+    // overlay from coming back, but the engine would still spend the minute
+    // it had left computing an answer nobody will be shown — and hold the
+    // in-progress lock against the next comparison for all of it (UI-141).
+    state.diff_cancel.store(true, Ordering::Relaxed);
 
     if let Ok(mut live) = state.live_diff.write() {
         *live = None;
@@ -461,6 +742,31 @@ pub(crate) async fn stop_diff_handler(State(state): State<AppState>) -> StatusCo
     StatusCode::NO_CONTENT
 }
 
+/// POST /api/diff/cancel — stop the comparison that is running (UI-141).
+///
+/// Not the DELETE above, and the difference is what the reader is left
+/// looking at. Leaving diff mode drops the overlay; stopping a computation
+/// says nothing about the comparison already on screen — the case this exists
+/// for is a reader who asked for two commits, watched the estimate grow, and
+/// wants their previous view back rather than none at all.
+///
+/// The flag is only set while a run is in flight, and the run clears it as it
+/// starts. Between them, a stop cannot outlive the thing it stopped and abort
+/// the comparison the reader asks for next.
+///
+/// `202` when a run was told to stop, `204` when there was nothing running.
+/// Neither is a failure: pressing stop twice, or a moment after the diff
+/// landed, is not an error the caller could act on.
+pub(crate) async fn cancel_diff_handler(State(state): State<AppState>) -> StatusCode {
+    let in_progress = state.diff_in_progress.lock().await;
+    if !*in_progress {
+        return StatusCode::NO_CONTENT;
+    }
+    state.diff_cancel.store(true, Ordering::Relaxed);
+    eprintln!("⏹ Diff stop requested — the run will end at its next checkpoint");
+    StatusCode::ACCEPTED
+}
+
 /// Re-run the live working-tree diff, if there is one, against the graph the
 /// watcher just published (UI-067).
 ///
@@ -480,6 +786,9 @@ pub(crate) async fn refresh_live_diff(state: &AppState) {
         return;
     }
     *in_progress = true;
+    // Under the lock, for the reason `diff_handler` gives at its own copy of
+    // this line: a stop left over from the run before must not abort this one.
+    state.diff_cancel.store(false, Ordering::Relaxed);
     drop(in_progress);
 
     let req = DiffRequest {
@@ -507,6 +816,95 @@ pub(crate) async fn refresh_live_diff(state: &AppState) {
     }
 }
 
+/// Why a finished run must not be published, or `None` to go ahead.
+///
+/// Two ways a result outlives the reason it was computed, and both are the
+/// same mistake: putting something on a canvas whose reader has already said
+/// they do not want it.
+///
+/// - **Stopped.** The stop landed after the last checkpoint, so the run
+///   finished anyway. Publishing it would answer a question that was
+///   withdrawn, a second after the button reported it as withdrawn (UI-141).
+/// - **Diff mode was left.** The overlay would come back a moment after it
+///   was dismissed, and adopting a head graph would move the canvas for a
+///   comparison nobody is looking at any more (UI-100).
+///
+/// The stop is checked first because it is the narrower claim: `DELETE
+/// /api/diff` sets both, and "you stopped it" is the more useful of the two
+/// things that would then be true.
+fn discarded(state: &AppState, epoch: u64) -> Option<&'static str> {
+    if state.diff_cancel.load(Ordering::Relaxed) {
+        return Some("Diff discarded: it was stopped while it ran");
+    }
+    if state.diff_epoch.load(Ordering::SeqCst) != epoch {
+        return Some("Diff discarded: diff mode was left while it ran");
+    }
+    None
+}
+
+/// What a finished comparison hands back: the answer, the head it analyzed,
+/// and the two documents to serve. Named because three functions pass it
+/// between them and a bare five-tuple in each signature says nothing.
+type Landed = (DiffResponse, DependencyGraph, Config, String, String);
+
+/// One comparison, packed on the async side and run on a blocking thread.
+///
+/// A value rather than five locals in `run_diff`. They were all pieces of
+/// one thing — what to compare, where, and with which handles back to the
+/// server — and holding them separately is what put that function over the
+/// working-set line the repo's own gate draws.
+struct DiffJob {
+    repo_root: PathBuf,
+    output_dir: PathBuf,
+    from_ref: String,
+    head: Head,
+    ctx: DiffContext,
+}
+
+impl DiffJob {
+    /// Consumes the job: it owns the clones the blocking task needs, and
+    /// nothing after the run has a use for them.
+    fn run(self) -> Result<Landed, NoDiff> {
+        compute_diff_blocking(
+            &self.repo_root,
+            &self.output_dir,
+            &self.from_ref,
+            &self.head,
+            &self.ctx,
+        )
+    }
+}
+
+/// Everything decided before a comparison is worth starting, or the reason
+/// there is nothing to start.
+///
+/// Plans before paying for anything. Two cases answer without a diff at all —
+/// nothing staged, and a change holding no file the walk would open
+/// (SRV-020) — and discovering either after a checkout and two full analyses
+/// would be charging the reader for the answer.
+async fn plan_job(state: &AppState, req: &DiffRequest) -> Result<DiffJob, NoDiff> {
+    // Read before spawning the blocking task: it is behind an async lock.
+    let repo_root = state.repo_root.read().await.clone();
+    let head = plan_diff(&repo_root, &state.config, req)?;
+    let ctx = DiffContext {
+        // Handed over whatever the head is. Only a working-tree head *reads*
+        // its graph from here; both kinds take their analysis scope from it,
+        // which is what keeps a commit-to-commit diff looking at the same
+        // languages, docs and patterns as the tree it was asked for from.
+        live_config: state.config.clone(),
+        current_graph: head.git_ref.is_none().then(|| state.graph.clone()),
+        base_cache: Some(state.base_cache.clone()),
+        cancel: state.diff_cancel.clone(),
+    };
+    Ok(DiffJob {
+        repo_root,
+        output_dir: state.output_dir.clone(),
+        from_ref: req.from_ref.clone(),
+        head,
+        ctx,
+    })
+}
+
 /// Compute a diff and publish it, without touching the in-progress lock or
 /// the live-diff bookkeeping — both callers own those differently.
 async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, String> {
@@ -514,109 +912,97 @@ async fn run_diff(state: &AppState, req: &DiffRequest) -> Result<DiffResponse, S
     // a stop that arrives while this runs must win (UI-100).
     let epoch = state.diff_epoch.load(Ordering::SeqCst);
 
-    // Read repo_root before spawning blocking task
-    let repo_root = state.repo_root.read().await.clone();
-
-    // Resolve the head before paying for anything. The staged case can answer
-    // "there is nothing to compare", and that is a message rather than a
-    // failure — discovering it after a checkout and a full analysis would be
-    // charging the reader for the answer.
-    let head = match resolve_head(&repo_root, &req.to_ref) {
-        Ok(head) => head,
-        Err(e) => return declined(e),
+    let job = match plan_job(state, req).await {
+        Ok(job) => job,
+        Err(no) => return refused(no),
     };
 
-    // Run diff in a blocking task since it's CPU-intensive
-    let result = tokio::task::spawn_blocking({
-        let output_dir = state.output_dir.clone();
-        let from_ref = req.from_ref.clone();
-        let current_graph = if head.git_ref.is_none() {
-            Some(state.graph.clone())
-        } else {
-            None
-        };
-        // Handed over whatever the head is. Only a working-tree head *reads*
-        // its graph from here; both kinds take their analysis scope from it,
-        // which is what keeps a commit-to-commit diff looking at the same
-        // languages, docs and patterns as the tree it was asked for from.
-        let live_config = state.config.clone();
-        let base_cache = Some(state.base_cache.clone());
+    // A blocking thread, since it's CPU-intensive.
+    let result = tokio::task::spawn_blocking(move || job.run())
+        .await
+        .map_err(|e| format!("Task failed: {}", e))?;
 
-        move || {
-            compute_diff_blocking(
-                &repo_root,
-                &output_dir,
-                &live_config,
-                &from_ref,
-                &head,
-                current_graph,
-                base_cache,
-            )
-        }
-    })
-    .await
-    .map_err(|e| format!("Task failed: {}", e))?;
-
-    // Store results in memory and signal reload
     match result {
-        Ok((resp, head_graph, head_config, diff_json, base_details_str)) => {
-            if resp.success && state.diff_epoch.load(Ordering::SeqCst) != epoch {
-                // Diff mode was left while this ran. Publishing now would put
-                // the overlay back a second after the user dismissed it, and
-                // adopting the head graph would move the canvas for a
-                // comparison nobody is looking at any more.
-                eprintln!("   ⚠ Diff discarded: diff mode was left while it ran");
-                return Ok(DiffResponse {
-                    success: false,
-                    message: "Diff discarded: diff mode was left while it ran".to_string(),
-                    summary: None,
-                });
-            }
-            if resp.success {
-                // Adopt the head graph only when the head *is* what this
-                // server watches — i.e. the working tree.
-                //
-                // For a commit ref, `head_config.root_path` is a temp
-                // worktree that `remove_worktree` deleted a few lines ago,
-                // and adopting it re-roots every subsequent response at a
-                // directory that no longer exists: `/api/index` reports it,
-                // `file_path`s stop stripping to repo-relative, and the
-                // scope tree renders the user's home directory as its top
-                // folder. The next `→ WORKING` diff then takes its head root
-                // from the same poisoned config and reports every entity as
-                // added-and-removed (SRV-019).
-                //
-                // Nothing is lost by declining: the head commit's graph was
-                // only ever visible until the next file save, which the
-                // watcher answers by publishing the working tree again. A
-                // diff is an overlay on what is being watched, not a
-                // checkout of something else. `write_diff_outputs` has
-                // already written the head's own `data.json` for consumers
-                // that want it.
-                if is_working_head(req) {
-                    if let Ok(mut g) = state.graph.write() {
-                        *g = head_graph;
-                    }
-                    if let Ok(mut c) = state.config.write() {
-                        *c = head_config;
-                    }
-                }
-                if let Ok(mut d) = state.diff_result.write() {
-                    *d = Some(diff_json);
-                }
-                if let Ok(mut b) = state.base_details.write() {
-                    *b = Some(base_details_str);
-                }
-                // `Diff`, not `Graph`: the graph is either unchanged or was
-                // just published by whoever triggered this, and telling
-                // clients to re-fetch it would restart a canvas that has no
-                // reason to move (UI-067).
-                let _ = state.tx.send(ReloadKind::Diff);
-            }
-            Ok(resp)
-        }
-        Err(e) => Err(e),
+        Ok(landed) => publish_if_wanted(state, req, epoch, landed),
+        // A stop the reader asked for arrives here as `Declined`, which is
+        // exactly what it is: a `success: false` with a message, not a 500
+        // telling them their own button broke something.
+        Err(no) => refused(no),
     }
+}
+
+/// Serve a finished comparison, unless nobody is waiting for it any more.
+///
+/// The check is [`discarded`]; the publishing is [`publish`]. What sits here
+/// is the one decision between them, which is why `epoch` comes this far: the
+/// question is whether the diff mode this run was started under is still the
+/// one on screen.
+fn publish_if_wanted(
+    state: &AppState,
+    req: &DiffRequest,
+    epoch: u64,
+    landed: Landed,
+) -> Result<DiffResponse, String> {
+    let (resp, head_graph, head_config, diff_json, base_details) = landed;
+    if let Some(why) = resp.success.then(|| discarded(state, epoch)).flatten() {
+        eprintln!("   ⚠ {why}");
+        return Ok(DiffResponse {
+            success: false,
+            message: why.to_string(),
+            summary: None,
+        });
+    }
+    if resp.success {
+        publish(state, req, head_graph, head_config, diff_json, base_details);
+    }
+    Ok(resp)
+}
+
+/// Make a finished comparison the one this server serves, and tell every
+/// client looking at it.
+///
+/// Called only for a run that succeeded and that [`discarded`] still wants.
+///
+/// The head graph is adopted only when the head *is* what this server watches
+/// — the working tree. For a commit ref, `head_config.root_path` is a temp
+/// worktree that `drop_worktrees` deleted a moment ago, and adopting it
+/// re-roots every subsequent response at a directory that no longer exists:
+/// `/api/index` reports it, `file_path`s stop stripping to repo-relative, and
+/// the scope tree renders the user's home directory as its top folder. The
+/// next `→ WORKING` diff then takes its head root from the same poisoned
+/// config and reports every entity as added-and-removed (SRV-019).
+///
+/// Nothing is lost by declining: the head commit's graph was only ever
+/// visible until the next file save, which the watcher answers by publishing
+/// the working tree again. A diff is an overlay on what is being watched, not
+/// a checkout of something else, and `write_diff_outputs` has already written
+/// the head's own `data.json` for consumers that want it.
+fn publish(
+    state: &AppState,
+    req: &DiffRequest,
+    head_graph: DependencyGraph,
+    head_config: Config,
+    diff_json: String,
+    base_details: String,
+) {
+    if is_working_head(req) {
+        if let Ok(mut g) = state.graph.write() {
+            *g = head_graph;
+        }
+        if let Ok(mut c) = state.config.write() {
+            *c = head_config;
+        }
+    }
+    if let Ok(mut d) = state.diff_result.write() {
+        *d = Some(diff_json);
+    }
+    if let Ok(mut b) = state.base_details.write() {
+        *b = Some(base_details);
+    }
+    // `Diff`, not `Graph`: the graph is either unchanged or was just
+    // published by whoever triggered this, and telling clients to re-fetch it
+    // would restart a canvas that has no reason to move (UI-067).
+    let _ = state.tx.send(ReloadKind::Diff);
 }
 
 /// POST /api/root — change the analyzed root path and re-analyze.
@@ -980,5 +1366,278 @@ mod tests {
         let rooted = working_head_config(live, Path::new("/repo"));
         assert_eq!(rooted.analysis.include_tests, expected_tests);
         assert_eq!(rooted.analysis.languages, expected_langs);
+    }
+
+    // ------------------------------------------------------------------
+    //  UI-141 — stopping a comparison that is already running
+    // ------------------------------------------------------------------
+
+    fn message_of(no: NoDiff) -> String {
+        match refused(no).expect("a decline is an answer, not a 500") {
+            DiffResponse {
+                success, message, ..
+            } => {
+                assert!(!success, "a stopped comparison produced no diff");
+                message
+            }
+        }
+    }
+
+    /// The reader pressed stop. That is an answer the server gives, not a
+    /// failure it reports — the one thing they must not be told is that their
+    /// own button broke something.
+    #[test]
+    fn a_stop_is_a_decline_and_not_a_failure() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(stop_requested(&cancel).is_ok(), "nothing has been asked");
+
+        cancel.store(true, Ordering::Relaxed);
+        let no = stop_requested(&cancel).expect_err("the stop must be honoured");
+        assert_eq!(message_of(no), STOPPED);
+    }
+
+    /// The two ways an analysis ends early are told apart by the error it
+    /// ended with, not by reading the flag afterwards: a run that failed on
+    /// its own a moment before a stop landed must still be reported as failed.
+    #[test]
+    fn an_analysis_that_was_stopped_is_told_apart_from_one_that_broke() {
+        assert_eq!(
+            message_of(analysis_ended(crate::analyzer::Cancelled.into())),
+            STOPPED
+        );
+        match analysis_ended(anyhow::anyhow!("worktree is locked")) {
+            NoDiff::Failed(e) => assert_eq!(e, "worktree is locked"),
+            NoDiff::Declined(m) => panic!("a real failure was reported as a decline: {m}"),
+        }
+    }
+
+    /// The whole of what a stop has to do: end the run, say why, and leave no
+    /// checkout behind. A reader who stops three slow comparisons would
+    /// otherwise be three worktrees deeper into their temp directory, and the
+    /// next diff against the same base would find one of them already there.
+    #[test]
+    fn a_stopped_run_cleans_up_the_checkout_it_made() {
+        let dir = repo("stopped");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let head = resolve_head(&dir, "main").expect("main resolves");
+        let from_sha = diff::resolve_git_ref(&dir, "HEAD").expect("HEAD resolves");
+        let base_dir = std::env::temp_dir().join(format!("mezz-diff-base-{}", from_sha));
+
+        // Set before the run rather than raced against it: the checkpoint
+        // being tested is the one inside the base analysis, which is where a
+        // stop lands on any repository big enough for anyone to press stop on.
+        let ctx = DiffContext {
+            live_config: Arc::new(std::sync::RwLock::new(Config::for_path(&dir))),
+            current_graph: None,
+            base_cache: None,
+            cancel: Arc::new(AtomicBool::new(true)),
+        };
+
+        let outcome = compute_diff_blocking(&dir, &out, "HEAD", &head, &ctx);
+        match outcome {
+            Err(no) => assert_eq!(message_of(no), STOPPED),
+            Ok(_) => panic!("a run told to stop produced a diff anyway"),
+        }
+        assert!(
+            !base_dir.exists(),
+            "the base checkout outlived the run that made it: {}",
+            base_dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    //  SRV-020 — the change git can see, before anything is checked out
+    // ------------------------------------------------------------------
+
+    fn pair(from: &str, to: &str) -> DiffRequest {
+        DiffRequest {
+            from_ref: from.to_string(),
+            to_ref: to.to_string(),
+        }
+    }
+
+    /// The live config a server watching `dir` would hold.
+    fn watching(dir: &Path) -> Config {
+        Config {
+            root_path: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    /// Commit `files` on top of whatever the repo already has.
+    fn commit(dir: &Path, message: &str, files: &[(&str, &str)]) {
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-qm", message]);
+    }
+
+    /// A head resolved against `dir`, for a guard that only ever reads
+    /// `git_ref`.
+    fn head_of(dir: &Path, to_ref: &str) -> Head {
+        resolve_head(dir, to_ref).unwrap()
+    }
+
+    /// The report this came from: two commits apart by two `.properties`
+    /// files, on a repository whose analysis would have parsed ten thousand
+    /// files to discover that neither is one of them.
+    #[test]
+    fn a_change_of_only_unparsed_files_is_declined() {
+        let dir = repo("srv020-props");
+        commit(
+            &dir,
+            "properties only",
+            &[
+                ("project.properties", "a=1\n"),
+                ("local.properties", "b=2\n"),
+            ],
+        );
+
+        let message = analysable_change(
+            &dir,
+            &watching(&dir),
+            &pair("HEAD~1", "HEAD"),
+            &head_of(&dir, "HEAD"),
+        )
+        .expect("nothing here would have been parsed");
+
+        assert!(message.contains("project.properties"), "{message}");
+        assert!(message.contains("local.properties"), "{message}");
+        assert!(message.contains("2 files"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unanimity, not a majority: the guard exists to save an analysis nobody
+    /// needs, never to hide one somebody does.
+    #[test]
+    fn one_parsed_file_among_them_is_enough_to_run() {
+        let dir = repo("srv020-mixed");
+        commit(
+            &dir,
+            "properties and one source file",
+            &[("project.properties", "a=1\n"), ("lib.rs", "fn f() {}\n")],
+        );
+
+        assert!(
+            analysable_change(
+                &dir,
+                &watching(&dir),
+                &pair("HEAD~1", "HEAD"),
+                &head_of(&dir, "HEAD"),
+            )
+            .is_none(),
+            "one .rs file in the change is a diff worth computing",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename has two names and git reports both. Reading only the
+    /// destination would be right here and wrong for a source file renamed
+    /// *out* of the analysis.
+    #[test]
+    fn a_renamed_source_file_is_read_under_both_its_names() {
+        let dir = repo("srv020-rename");
+        commit(&dir, "add a source file", &[("lib.rs", "fn f() {}\n")]);
+        std::fs::rename(dir.join("lib.rs"), dir.join("lib.properties")).unwrap();
+        git_in(&dir, &["add", "-A"]);
+        git_in(&dir, &["commit", "-qm", "rename it out of the analysis"]);
+
+        assert!(
+            analysable_change(
+                &dir,
+                &watching(&dir),
+                &pair("HEAD~1", "HEAD"),
+                &head_of(&dir, "HEAD"),
+            )
+            .is_none(),
+            "the file left the analysis — that is a removal the diff should report",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pinned working diff recomputes on every save (UI-067). A guard there
+    /// would let a save that touched only a `.md` decline the comparison the
+    /// reader asked to keep.
+    #[test]
+    fn a_working_head_is_never_declined_by_this_guard() {
+        let dir = repo("srv020-working");
+        std::fs::write(dir.join("notes.properties"), "a=1\n").unwrap();
+
+        assert!(
+            analysable_change(
+                &dir,
+                &watching(&dir),
+                &pair("HEAD", WORKING_REF),
+                &head_of(&dir, WORKING_REF),
+            )
+            .is_none(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Git failing is not an answer about the change. Anything but `None` here
+    /// would turn a missing `git` binary into "nothing changed".
+    #[test]
+    fn a_list_git_cannot_produce_does_not_decline() {
+        let outside = std::env::temp_dir().join(format!("mezz-srv020-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert!(
+            analysable_change(
+                &outside,
+                &watching(&outside),
+                &pair("HEAD~1", "HEAD"),
+                &Head {
+                    git_ref: Some("HEAD".to_string()),
+                    label: "HEAD".to_string(),
+                },
+            )
+            .is_none(),
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn two_refs_naming_the_same_tree_say_so() {
+        assert_eq!(nothing_to_compare(&[]), NO_FILE_DIFFERS);
+    }
+
+    /// Naming every path of a 200-file change would be a wall of text; naming
+    /// none would be the `+0 −0 ~0` this replaces.
+    #[test]
+    fn a_long_change_is_named_up_to_a_point_and_then_counted() {
+        let rows: Vec<ChangedFile> = (0..5)
+            .map(|i| ChangedFile {
+                status: "M".to_string(),
+                path: format!("conf/{}.properties", i),
+                old_path: None,
+                additions: 1,
+                deletions: 0,
+                binary: false,
+                untracked: false,
+            })
+            .collect();
+
+        let message = nothing_to_compare(&rows);
+        assert!(message.contains("5 files"), "{message}");
+        assert!(message.contains("conf/0.properties"), "{message}");
+        assert!(message.contains("conf/2.properties"), "{message}");
+        assert!(!message.contains("conf/3.properties"), "{message}");
+        assert!(message.contains("and 2 more"), "{message}");
+    }
+
+    /// The decline has to reach the reader as a message, not a 500 — they can
+    /// see which files moved and pick a different pair.
+    #[test]
+    fn a_decline_is_an_answer_and_a_failure_is_not() {
+        let answered = refused(NoDiff::Declined("nothing here".to_string())).unwrap();
+        assert!(!answered.success);
+        assert_eq!(answered.message, "nothing here");
+
+        assert!(refused(NoDiff::Failed("git is gone".to_string())).is_err());
     }
 }

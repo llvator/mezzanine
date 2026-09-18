@@ -37,12 +37,12 @@ use std::process::Command;
 
 use axum::{
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
 
-use super::access::{is_webview_origin, TOKEN_QUERY_PARAM};
+use super::access;
 use super::state::AppState;
 use super::types::ScopeRequest;
 
@@ -65,48 +65,6 @@ pub(crate) struct TerminalResponse {
     pub terminal: String,
     /// Where the prompt was written, for a user who wants to inspect it.
     pub prompt_file: String,
-}
-
-/// Constant-time-ish comparison. The token is short and local, but there is no
-/// reason to leak its prefix through timing.
-fn tokens_match(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
-}
-
-/// Is this request from a page *this server itself* served?
-///
-/// The distinction the token was reaching for is not "local" — it is "mine".
-/// A browser sets `Origin` on every cross-origin POST and a page cannot forge
-/// it, so an exact match against the `Host` this request arrived on separates
-/// the bundled UI from any other page the user happens to have open. A page on
-/// `https://evil.example` gets its own origin and is refused; a different local
-/// server on another port is a different origin too, and also refused.
-///
-/// This is the check that lets the same-origin UI work at all: it is served by
-/// the engine and has no way to learn the pairing token, which is printed once
-/// in the startup banner.
-fn is_same_origin(headers: &HeaderMap) -> bool {
-    let get = |k: header::HeaderName| {
-        headers
-            .get(k)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-    };
-    let (Some(origin), Some(host)) = (get(header::ORIGIN), get(header::HOST)) else {
-        // No Origin means a non-browser client. Those must bring the token —
-        // this allowance exists for the served page, not for curl.
-        return false;
-    };
-    // Compare authorities: strip the scheme from Origin, leaving `host:port`.
-    let authority = origin
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(&origin);
-    authority.eq_ignore_ascii_case(&host)
 }
 
 /// Resolve the terminal program to launch.
@@ -220,26 +178,13 @@ pub(crate) async fn terminal_handler(
     // 1. Authenticate. The bar is "this server's own UI, or someone holding
     //    the token" — deliberately narrower than the data API's "any loopback
     //    origin", which would let any page the user has open start an agent.
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let trusted_ui = is_same_origin(&headers) || is_webview_origin(origin);
-    if !trusted_ui {
-        if let Some(expected) = state.access_token.as_deref() {
-            let given = req.token.as_deref().unwrap_or_default();
-            if !tokens_match(given, expected) {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    format!(
-                        "This route needs either a page served by this engine or the pairing \
-                         token from its startup banner. Send it as `token` in the body or \
-                         `?{TOKEN_QUERY_PARAM}=`."
-                    ),
-                ));
-            }
-        }
-    }
+    //    Stated in `access.rs` and shared with the other route that changes
+    //    the host rather than reading it (SRV-022).
+    access::require_trusted_ui(
+        &headers,
+        req.token.as_deref(),
+        state.access_token.as_deref(),
+    )?;
 
     // 2. Build the prompt through the same path the copy button uses, so the
     //    two can never disagree.
@@ -317,61 +262,6 @@ pub(crate) async fn terminal_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hdrs(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(k.clone(), v.parse().unwrap());
-        }
-        h
-    }
-
-    /// The regression that broke every click: the engine's own page is served
-    /// same-origin and cannot know the token.
-    #[test]
-    fn the_engines_own_page_is_recognised() {
-        assert!(is_same_origin(&hdrs(&[
-            (header::ORIGIN, "http://localhost:3000"),
-            (header::HOST, "localhost:3000"),
-        ])));
-    }
-
-    /// The hole the token was there to close. A page on another origin gets
-    /// its own `Origin`, which it cannot rewrite.
-    #[test]
-    fn other_pages_are_not_same_origin() {
-        // A drive-by page.
-        assert!(!is_same_origin(&hdrs(&[
-            (header::ORIGIN, "https://evil.example"),
-            (header::HOST, "localhost:3000"),
-        ])));
-        // Another local server — a different port is a different origin.
-        assert!(!is_same_origin(&hdrs(&[
-            (header::ORIGIN, "http://localhost:5199"),
-            (header::HOST, "localhost:3000"),
-        ])));
-        // Same name, different host.
-        assert!(!is_same_origin(&hdrs(&[
-            (header::ORIGIN, "http://127.0.0.1:3000"),
-            (header::HOST, "localhost:3000"),
-        ])));
-    }
-
-    /// Non-browser clients send no `Origin`. They must bring the token; this
-    /// allowance exists for the served page, not for curl.
-    #[test]
-    fn a_missing_origin_is_never_same_origin() {
-        assert!(!is_same_origin(&hdrs(&[(header::HOST, "localhost:3000")])));
-        assert!(!is_same_origin(&HeaderMap::new()));
-    }
-
-    #[test]
-    fn tokens_match_is_exact() {
-        assert!(tokens_match("abc123", "abc123"));
-        assert!(!tokens_match("abc123", "abc124"));
-        assert!(!tokens_match("abc", "abc123"));
-        assert!(!tokens_match("", "abc123"));
-    }
 
     /// The prompt must reach the agent through a file: a 94 KB `full` prompt
     /// as a command-line argument would hit `ARG_MAX` and mangle quoting.

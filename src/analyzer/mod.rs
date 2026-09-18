@@ -1,5 +1,6 @@
 //! Code analysis and dependency resolution.
 
+pub(crate) mod cache_report;
 mod dependency_resolver;
 mod file_walker;
 pub mod folder_shape;
@@ -9,10 +10,11 @@ mod markdown_links;
 mod parse_store;
 mod receiver_index;
 pub mod relayout;
+pub mod sql_cardinality;
 pub mod sql_fold;
 
 pub use dependency_resolver::DependencyResolver;
-pub use file_walker::{is_test_path, FileWalker};
+pub use file_walker::{FileWalker, TestPaths};
 pub use parse_store::ParseStore;
 pub(crate) use parse_store::cache_root;
 
@@ -132,7 +134,7 @@ impl Analyzer {
         check_cancel(cancel)?;
         let files = self.discover_files(cancel)?;
         check_cancel(cancel)?;
-        let store = ParseStore::open();
+        let store = ParseStore::open_for(&self.config.root_path);
         let mut parse_results = self.parse_files(&files, &store, cancel);
         check_cancel(cancel)?;
         self.fold_sql_schema(&mut parse_results);
@@ -172,6 +174,7 @@ impl Analyzer {
         cancel: &Arc<AtomicBool>,
     ) -> Vec<ParsedFile> {
         let progress = ProgressBar::new(files.len() as u64);
+        progress.set_draw_target(crate::activity::progress_target());
         progress.set_style(
             ProgressStyle::with_template(
                 "{spinner:.cyan} Parsing [{bar:40.cyan/dim}] {pos}/{len} {msg}",
@@ -202,7 +205,10 @@ impl Analyzer {
                     Ok(parsed) => Some(parsed),
                     Err(e) => {
                         progress.suspend(|| {
-                            eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e);
+                            crate::activity::warn(
+                                crate::activity::ANALYSIS,
+                                format!("Warning: Failed to parse {}: {}", file_path.display(), e),
+                            );
                         });
                         None
                     }
@@ -211,9 +217,9 @@ impl Analyzer {
             .collect();
         progress.finish_with_message("done");
         let (hits, misses) = store.stats();
-        eprintln!(
-            "  Parse store: {} hits, {} misses (re-parsed {} changed/new files)",
-            hits, misses, misses
+        crate::activity::step(
+            crate::activity::ANALYSIS,
+            format!("  Parse store: {hits} hits, {misses} misses (re-parsed {misses} changed/new files)"),
         );
         results
     }
@@ -401,16 +407,18 @@ impl Analyzer {
     /// Stage 4: enrich with synthetic parameter entities, resolve
     /// cross-entity dependencies, and apply configured filters.
     fn resolve_and_filter(&mut self) -> Result<()> {
-        eprintln!("  Extracting parameters...");
+        use crate::activity::{step, ANALYSIS};
+
+        step(ANALYSIS, "  Extracting parameters...");
         self.create_parameter_entities();
 
-        eprintln!("  Extracting class fields...");
+        step(ANALYSIS, "  Extracting class fields...");
         self.create_field_entities();
 
-        eprintln!("  Grouping calls by conditional branch...");
+        step(ANALYSIS, "  Grouping calls by conditional branch...");
         self.create_branch_entities();
 
-        eprintln!("  Resolving dependencies...");
+        step(ANALYSIS, "  Resolving dependencies...");
         let resolver =
             DependencyResolver::new(&self.config, &self.entities, &self.imports, &self.files);
         let dep_relationships = resolver.resolve()?;
@@ -691,10 +699,18 @@ impl Analyzer {
     }
 
     /// Parse a single file without requiring &mut self (suitable for
-    /// parallel execution). Consults the AN-003 parse store first: on a
-    /// usable hit ([`usable_hit`]) it returns the stored `ParsedFile`
-    /// verbatim, skipping tree-sitter entirely; on a miss it parses and
-    /// persists.
+    /// parallel execution). Consults the AN-003 parse store first: on a hit
+    /// it returns the stored `ParsedFile`, skipping tree-sitter entirely; on
+    /// a miss it parses and persists.
+    ///
+    /// Two paths, and they are not the same path. `abs_path` is canonical and
+    /// decides *identity* — which entry this file owns, machine-wide. `path`
+    /// is the path as walked and decides *spelling* — one physical file has
+    /// as many walked spellings as there are ways to reach it (a symlinked
+    /// spec directory, `analyze .` versus an absolute root, either side of a
+    /// comparison), and everything an entry records is written in one of
+    /// them. `ParseStore::get` rebases the stored parse onto the spelling
+    /// asked for, so a hit never puts a path this run never saw on an entity.
     fn parse_file_standalone(
         path: &Path,
         language: Language,
@@ -706,7 +722,7 @@ impl Analyzer {
         let content_hash = ParseStore::content_hash(&content);
         let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-        if let Some(parsed) = usable_hit(store, &abs_path, path, &content_hash) {
+        if let Some(parsed) = store.get(&abs_path, &content_hash, path) {
             return Ok(parsed);
         }
 
@@ -802,10 +818,18 @@ impl Analyzer {
                             | EntityKind::Enum
                     )
             })
-            .map(|e| (e.id.clone(), e.file_path.clone(), e.span, e.fields.clone()))
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    e.name.clone(),
+                    e.file_path.clone(),
+                    e.span,
+                    e.fields.clone(),
+                )
+            })
             .collect();
 
-        for (owner_id, file_path, span, fields) in containers {
+        for (owner_id, owner_name, file_path, span, fields) in containers {
             for field in &fields {
                 // Skip obviously-synthetic names the language parsers
                 // produced before we fixed the subscript / attribute-chain
@@ -826,7 +850,15 @@ impl Analyzer {
                 let mut entity =
                     CodeEntity::new(display_name, EntityKind::Variable, file_path.clone(), span);
                 entity.id = field_id.clone();
-                entity.qualified_name = entity.name.clone();
+                // `Owner.field`, not the display label. A parser spells a
+                // write to this field `Owner.field` (`self.limit = 0` inside
+                // `Owner`), and the label `member_label` builds is
+                // `limit: int` — which nothing spells, so an annotated field
+                // resolved its own write to a ghost while an unannotated one
+                // beside it resolved fine. The label stays the name, because
+                // that is what a reader sees; the qualified name is the
+                // address, and it has to be one something can address.
+                entity.qualified_name = format!("{}.{}", owner_name, field.name);
                 entity.parent_id = Some(owner_id.clone());
                 entity.tags.insert("class_field".to_string());
 
@@ -1092,7 +1124,7 @@ impl Analyzer {
     /// Analyze a specific file
     pub fn analyze_file(&mut self, path: &Path) -> Result<AnalysisResult> {
         let language = parser::detect_language(path);
-        let store = ParseStore::open();
+        let store = ParseStore::open_for(path.parent().unwrap_or(path));
         let parsed = Self::parse_file_standalone(path, language, &store)?;
         self.files
             .insert(parsed.file_info.path.clone(), parsed.file_info);
@@ -1170,34 +1202,6 @@ impl Analyzer {
             current_level
         }
     }
-}
-
-/// A stored parse that may actually be used for this walk: right content,
-/// and parsed at the path being walked *now*.
-///
-/// The second half is not belt-and-braces. The store keys on the canonical
-/// path, while everything the entry records — `file_path`, `FileInfo::path`,
-/// every entity's `file_path` — is the path as walked, and one physical file
-/// has as many walked paths as there are ways to reach it: a symlinked spec
-/// directory, `mezz analyze .` versus an absolute root, a repo checked out
-/// twice. Serving the entry regardless puts the *other* spelling on every
-/// entity, so click-to-open and `cr:` anchors name a path this run never
-/// saw — and since content is what decides a hit, it stays wrong until
-/// someone edits the file.
-///
-/// Keying on the walked path instead looks simpler and is worse: the store
-/// is machine-wide, so a bare `./src/main.rs` is not a unique name and two
-/// repos with an identical file would trade entries. Canonical for identity,
-/// walked path for validity.
-fn usable_hit(
-    store: &ParseStore,
-    abs_path: &Path,
-    walked: &Path,
-    content_hash: &str,
-) -> Option<ParsedFile> {
-    store
-        .get(abs_path, content_hash)
-        .filter(|parsed| parsed.file_path == walked)
 }
 
 /// Intermediate result from parsing a single file (used for parallel
@@ -1494,11 +1498,12 @@ mod tests {
 
     /// One physical file, two ways to reach it — which is all a symlink is,
     /// and the normal shape of a spec directory kept outside the tree it
-    /// describes. The parse store keys on the canonical path, so both
-    /// spellings land on one entry; the entry records the path it was walked
-    /// at. Serving it to the other spelling puts a path this run never saw
-    /// on every entity, and since the content is what decides a hit, it
-    /// stays wrong until someone edits the file.
+    /// describes. Both spellings land on one entry, and the entry is written
+    /// in whichever one walked it first. Serving it *verbatim* to the other
+    /// would put a path this run never saw on every entity, and since content
+    /// is what decides a hit, it would stay wrong until someone edited the
+    /// file. `ParseStore::get` rebases instead, so the entry is reused and
+    /// still describes the path asked for.
     #[cfg(unix)]
     #[test]
     fn a_second_path_to_one_file_does_not_inherit_the_first_path() {
@@ -1510,7 +1515,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
         let linked = root.join("link").join("thing.rs");
 
-        let store = ParseStore::open_at(root.join("cache"));
+        let store = ParseStore::open_at(root.join("cache"), &root);
         let first = Analyzer::parse_file_standalone(&real, Language::Rust, &store).unwrap();
         assert_eq!(first.file_path, real);
 
@@ -1535,6 +1540,162 @@ mod tests {
         assert_eq!(again.file_path, real);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run `git` in `dir`, failing loudly rather than leaving a later
+    /// assertion to explain that the fixture never happened.
+    #[cfg(unix)]
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be on PATH for this test");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A one-commit repo holding one source file, canonicalized because the
+    /// store's keys are and macOS spells `/tmp` two ways.
+    #[cfg(unix)]
+    fn one_commit_repo(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mezz-an037-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/thing.rs"), "fn thing() -> u32 { 1 }\n").unwrap();
+        git(&root, &["init", "-q", "--initial-branch=main", "."]);
+        git(&root, &["add", "-A"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.email=mezz@example.com",
+                "-c",
+                "user.name=Mezzanine",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        root.canonicalize().unwrap()
+    }
+
+    /// AN-037. The two sides of a comparison are two `git worktree`
+    /// checkouts, so the same bytes are walked at two absolute paths that
+    /// share no prefix. Keyed on the absolute path they were separate
+    /// entries, and the head side of every comparison re-parsed a whole tree
+    /// the base side had just parsed — 443 files of 443 on this repo, to
+    /// examine the 23 that had changed.
+    ///
+    /// Both halves are asserted, because either alone is a bug. Reuse
+    /// without the rebase would serve the *other* worktree's paths, which is
+    /// the reason the entry used to be rejected rather than shared.
+    #[cfg(unix)]
+    #[test]
+    fn two_worktrees_of_one_repo_share_one_parse() {
+        let root = one_commit_repo("worktrees");
+        let linked = std::env::temp_dir().join(format!("mezz-an037-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&linked);
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = linked.canonicalize().unwrap();
+        let cache = root.join("cache");
+
+        let in_main = root.join("src/thing.rs");
+        let in_linked = linked.join("src/thing.rs");
+
+        let main_store = ParseStore::open_at(cache.clone(), &root);
+        let first = Analyzer::parse_file_standalone(&in_main, Language::Rust, &main_store).unwrap();
+        assert_eq!(main_store.stats(), (0, 1), "the first walk must be a miss");
+
+        let linked_store = ParseStore::open_at(cache.clone(), &linked);
+        let second =
+            Analyzer::parse_file_standalone(&in_linked, Language::Rust, &linked_store).unwrap();
+        assert_eq!(
+            linked_store.stats(),
+            (1, 0),
+            "the other worktree must reuse the entry, not re-parse it"
+        );
+
+        // The rebase, asserted over the whole entry rather than a list of the
+        // fields that hold a path today — a field added later that carried a
+        // stale root would otherwise ship in silence.
+        let text = serde_json::to_string(&second).unwrap();
+        assert!(
+            !text.contains(root.to_str().unwrap()),
+            "the stored worktree's path survived the rebase: {text}"
+        );
+        assert_eq!(second.file_path, in_linked);
+        assert!(second.entities.iter().all(|e| e.file_path == in_linked));
+
+        // Same parse, two spellings: identical but for the path.
+        assert_eq!(first.entities.len(), second.entities.len());
+        assert_eq!(
+            first
+                .entities
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>(),
+            second
+                .entities
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        git(
+            &root,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The key carries the repository, so the relative path alone is not a
+    /// name. Two repos that both hold `src/thing.rs` — the ordinary case for
+    /// anyone with more than one checkout — must not trade entries.
+    #[cfg(unix)]
+    #[test]
+    fn two_repos_sharing_a_relative_path_do_not_collide() {
+        let one = one_commit_repo("repo-a");
+        let two = one_commit_repo("repo-b");
+        std::fs::write(two.join("src/thing.rs"), "fn other() -> u32 { 2 }\n").unwrap();
+        let cache = std::env::temp_dir().join(format!("mezz-an037-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+
+        let store_one = ParseStore::open_at(cache.clone(), &one);
+        let a =
+            Analyzer::parse_file_standalone(&one.join("src/thing.rs"), Language::Rust, &store_one)
+                .unwrap();
+
+        let store_two = ParseStore::open_at(cache.clone(), &two);
+        let b =
+            Analyzer::parse_file_standalone(&two.join("src/thing.rs"), Language::Rust, &store_two)
+                .unwrap();
+
+        assert_eq!(
+            store_two.stats(),
+            (0, 1),
+            "the second repo must not read the first's entry"
+        );
+        assert_eq!(a.entities[0].name, "thing");
+        assert_eq!(b.entities[0].name, "other");
+
+        let _ = std::fs::remove_dir_all(&one);
+        let _ = std::fs::remove_dir_all(&two);
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     /// A node label is a name, not a source excerpt. Whatever a language
@@ -1898,7 +2059,7 @@ mod tests {
         let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyzer/mod.rs");
         let cache = std::env::temp_dir().join(format!("mezz-an003-hit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
-        let store = ParseStore::open_at(cache.clone());
+        let store = ParseStore::open_at(cache.clone(), Path::new(env!("CARGO_MANIFEST_DIR")));
         let lang = parser::detect_language(&file);
 
         let cold = Analyzer::parse_file_standalone(&file, lang, &store)

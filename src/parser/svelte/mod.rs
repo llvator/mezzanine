@@ -304,6 +304,48 @@ fn closing_brace(bytes: &[u8], from: usize) -> Option<usize> {
     None
 }
 
+/// The `${…}` substitutions of the template literal whose backtick is at
+/// `at`, and the index just past its closing backtick.
+///
+/// The literal *text* between substitutions stays what a quoted string is —
+/// prose — so `` `Card ${x}` `` mentions `x` and not `Card`. Only the code
+/// inside the braces is read.
+///
+/// Nesting is handled by [`closing_brace`], which treats a nested backtick
+/// span as opaque when matching the substitution's own `}`. The recursion in
+/// [`collect_identifiers`] then re-enters that nested literal and applies the
+/// same rule, so a call inside a template inside a template is still found.
+fn template_substitutions(bytes: &[u8], at: usize) -> (Vec<(usize, usize)>, usize) {
+    let mut subs = Vec::new();
+    let mut i = at + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            return (subs, i + 1);
+        }
+        if !opens_substitution(bytes, i) {
+            i += 1;
+            continue;
+        }
+        // Unterminated: the rest is not a substitution, and pretending it is
+        // would read the remainder of the file as code.
+        let Some(end) = closing_brace(bytes, i + 2) else {
+            return (subs, bytes.len());
+        };
+        subs.push((i + 2, end));
+        i = end + 1;
+    }
+    (subs, bytes.len())
+}
+
+/// Whether a `${` substitution opens at `i`.
+fn opens_substitution(bytes: &[u8], i: usize) -> bool {
+    bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{')
+}
+
 /// Index just past the string literal opening at `at`; the end of the input
 /// if it is unterminated.
 fn end_of_string(bytes: &[u8], at: usize) -> usize {
@@ -329,7 +371,22 @@ fn collect_identifiers(src: &str, scope: &BTreeSet<String>, hits: &mut BTreeMap<
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if matches!(b, b'\'' | b'"' | b'`') {
+        // A template literal is not opaque the way a quoted string is: its
+        // `${…}` substitutions are code. Skipping the whole span lost every
+        // call written inside one — `title={`…${hint(x)}…`}` produced no
+        // edge in either direction, while the same call in a bare
+        // interpolation did (field report, 2026-09-01). A template literal
+        // is how any label with a value in it gets written, so in a Svelte
+        // repo that is a systematic shortfall with no marker on it.
+        if b == b'`' {
+            let (subs, next) = template_substitutions(bytes, i);
+            for (start, end) in subs {
+                collect_identifiers(&src[start..end], scope, hits);
+            }
+            i = next;
+            continue;
+        }
+        if matches!(b, b'\'' | b'"') {
             i = end_of_string(bytes, i);
             continue;
         }
@@ -510,6 +567,55 @@ mod tests {
         let src = "<script lang=\"ts\">import { definiteArticle } from './a';</script>\n\
                    <p>{\"definiteArticle\"}</p>";
         assert!(markup_refs(&parse(src)).is_empty());
+    }
+
+    /// Field report, 2026-09-01: `` title={`${hint(x)}`} `` produced no edge
+    /// in either direction, while `{hint(x)}` in the same file from the same
+    /// import produced one. A template literal is how any label with a value
+    /// in it is written — every `title=`, every composed `aria-label` — so
+    /// in a Svelte repo this was a systematic shortfall, and `impact`'s
+    /// "not the same as none" caveat never fired because one unrelated
+    /// caller kept the list non-empty.
+    ///
+    /// The reporter's four controls, in one component: the attribute is not
+    /// the trigger and the body is not the trigger; the backtick is.
+    #[test]
+    fn a_call_inside_a_template_literal_is_a_reference() {
+        let src = "<script lang=\"ts\">import { alpha, beta, delta, epsilon } from './lib';</script>\n\
+                   <div data-a={delta(n)} title={`${beta(n)}`}>{alpha(n)} {`${epsilon(n)}`}</div>";
+        let refs = markup_refs(&parse(src));
+        let names: Vec<&str> = refs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "delta", "epsilon"], "{refs:?}");
+    }
+
+    /// The half that must not move with it: the literal text of a template
+    /// is still prose. Only what is inside `${…}` is code.
+    #[test]
+    fn the_text_of_a_template_literal_is_not_a_reference() {
+        let src = "<script lang=\"ts\">import { Card, shown } from './a';</script>\n\
+                   <p>{`Card and Card again: ${shown}`}</p>";
+        assert_eq!(markup_refs(&parse(src)), vec![("shown".into(), 1)]);
+    }
+
+    /// A template inside a substitution inside a template. The nesting is
+    /// what makes the brace matching worth writing down rather than
+    /// scanning for the next `}`.
+    #[test]
+    fn a_template_nested_in_a_substitution_is_still_read() {
+        let src = "<script lang=\"ts\">import { outer, inner } from './a';</script>\n\
+                   <p>{`${outer(`${inner(1)}`)}`}</p>";
+        let refs = markup_refs(&parse(src));
+        let names: Vec<&str> = refs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["inner", "outer"], "{refs:?}");
+    }
+
+    /// An unterminated substitution must not read the rest of the file as
+    /// code — the same argument as the unbalanced-brace case below it.
+    #[test]
+    fn an_unterminated_substitution_does_not_swallow_the_document() {
+        let src = "<script lang=\"ts\">import { fmt } from './a';</script>\n\
+                   <p>{`${fmt}</p>\n<p>{fmt}</p>";
+        assert!(!markup_refs(&parse(src)).is_empty());
     }
 
     #[test]

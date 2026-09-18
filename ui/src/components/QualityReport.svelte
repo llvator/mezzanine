@@ -61,7 +61,7 @@
   let mode: Mode = 'entities';
 
   type SortKey =
-    | 'score' | 'name' | 'cc' | 'cognitive' | 'nest' | 'loc' | 'params'
+    | 'score' | 'name' | 'cc' | 'cognitive' | 'nest' | 'loc' | 'params' | 'working_set'
     | 'fan_in' | 'fan_out' | 'fields' | 'methods' | 'pub_ratio'
     | 'path' | 'entity_count' | 'callable_count' | 'scope_loc' | 'cohesion'
     | 'scope_fan_in' | 'scope_fan_out' | 'shape';
@@ -93,6 +93,7 @@
       case 'nest': return m.max_nesting ?? -1;
       case 'loc': return m.loc;
       case 'params': return m.param_count ?? -1;
+      case 'working_set': return m.working_set ?? -1;
       case 'fan_in': return m.fan_in;
       case 'fan_out': return m.fan_out;
       case 'fields': return m.field_count ?? -1;
@@ -118,7 +119,7 @@
     // Shape is a folder property; entities have none to be filtered on.
     if (severityFilter === 'shape') return true;
     const tiers: Tier[] = [
-      r.tiers.cc, r.tiers.cognitive, r.tiers.nest, r.tiers.loc, r.tiers.params, r.tiers.fanOut,
+      r.tiers.cc, r.tiers.cognitive, r.tiers.nest, r.tiers.loc, r.tiers.params, r.tiers.workingSet, r.tiers.fanOut,
       r.tiers.fieldCount, r.tiers.methodCount, r.tiers.publicFieldRatio,
     ];
     if (severityFilter === 'bad') return tiers.includes('bad');
@@ -192,7 +193,7 @@
   // mirrors the leaderboard exactly (minus the copy button column).
   const COPY_HEADER = [
     'Score', 'Name', 'Kind', 'Parent', 'File', 'Path',
-    'CC', 'Nest', 'LOC', 'Params',
+    'CC', 'Nest', 'LOC', 'Params', 'Working set',
     'Fan-in', 'Fan-out', 'Fields/Variants', 'Methods', 'Pub%', 'Cycle',
   ];
 
@@ -216,6 +217,7 @@
       fmtNum(m.max_nesting),
       fmtNum(m.loc),
       fmtNum(m.param_count),
+      fmtNum(m.working_set),
       fmtNum(m.fan_in),
       fmtNum(m.fan_out),
       fmtNum(m.field_count),
@@ -369,7 +371,12 @@
       `branching ${pct(shape.arborescence)} — gates fractal, not part of compliance\n` +
       `out at the bottom ${pct(shape.egress)} — gates fractal, not part of compliance\n` +
       `${shape.child_count} immediate ${shape.child_count === 1 ? 'child' : 'children'} — ` +
-      `gates fractal, not part of compliance`;
+      `gates fractal, not part of compliance\n` +
+      // The only line here reading two levels against each other rather than
+      // one against a bar, so it says so: a folder can be fractal on every
+      // gate above and still jump scale one step down (ADR 0033).
+      `uniformity ${pct(shape.uniformity)} — this folder against the level inside ` +
+      `it; gates nothing`;
     return { text: `${SHAPE_GLYPH[shape.pattern]} ${shape.pattern}`, why, cls, tip };
   }
 
@@ -419,7 +426,7 @@
   // than the files one rather than six empty cells.
   const SHAPE_COPY_HEADER = [
     'Shape', 'Held back by', 'Compliance', 'Layered', 'Branching', 'One door in',
-    'Out at the bottom',
+    'Out at the bottom', 'Uniformity',
   ];
   $: scopeCopyHeader = (mode as Mode) === 'folders'
     ? [...SCOPE_COPY_HEADER, ...SHAPE_COPY_HEADER]
@@ -434,6 +441,7 @@
       pct(s.shape.arborescence),
       pct(s.shape.entry_concentration),
       pct(s.shape.egress),
+      pct(s.shape.uniformity),
     ];
   }
   function scopeRowValues(r: ScopeRow): string[] {
@@ -776,6 +784,7 @@
           <tr><th class="help" data-tip={explain('nest')} aria-label={explain('nest')}>Nest<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('nest')}</span></th><td>{$qualitySummary.nest.ok}</td><td>{$qualitySummary.nest.warn}</td><td>{$qualitySummary.nest.bad}</td></tr>
           <tr><th class="help" data-tip={explain('loc')} aria-label={explain('loc')}>LOC<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('loc')}</span></th><td>{$qualitySummary.loc.ok}</td><td>{$qualitySummary.loc.warn}</td><td>{$qualitySummary.loc.bad}</td></tr>
           <tr><th class="help" data-tip={explain('params')} aria-label={explain('params')}>Params<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('params')}</span></th><td>{$qualitySummary.params.ok}</td><td>{$qualitySummary.params.warn}</td><td>{$qualitySummary.params.bad}</td></tr>
+          <tr><th class="help" data-tip={explain('working_set')} aria-label={explain('working_set')}>Working&nbsp;set<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('workingSet')}</span></th><td>{$qualitySummary.workingSet.ok}</td><td>{$qualitySummary.workingSet.warn}</td><td>{$qualitySummary.workingSet.bad}</td></tr>
           <tr><th class="help" data-tip={explain('fan_out')} aria-label={explain('fan_out')}>Fan-out<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('fanOut')}</span></th><td>{$qualitySummary.fanOut.ok}</td><td>{$qualitySummary.fanOut.warn}</td><td>{$qualitySummary.fanOut.bad}</td></tr>
           <tr><th class="help" data-tip={explain('field_count')} aria-label={explain('field_count')}>Fields/Var<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('fieldCount')}</span></th><td>{$qualitySummary.fieldCount.ok}</td><td>{$qualitySummary.fieldCount.warn}</td><td>{$qualitySummary.fieldCount.bad}</td></tr>
           <tr><th class="help" data-tip={explain('method_count')} aria-label={explain('method_count')}>Methods<span class="th-limits" data-probe="metric-threshold">{thresholdLabel('methodCount')}</span></th><td>{$qualitySummary.methodCount.ok}</td><td>{$qualitySummary.methodCount.warn}</td><td>{$qualitySummary.methodCount.bad}</td></tr>
@@ -889,6 +898,7 @@
             <th class="sortable num help" data-tip={explain('nest')} aria-label={explain('nest')} on:click={() => toggleSort('nest')}>Nest</th>
             <th class="sortable num help" data-tip={explain('loc')} aria-label={explain('loc')} on:click={() => toggleSort('loc')}>LOC</th>
             <th class="sortable num help" data-tip={explain('params')} aria-label={explain('params')} on:click={() => toggleSort('params')}>P</th>
+            <th class="sortable num help" data-tip={explain('working_set')} aria-label={explain('working_set')} on:click={() => toggleSort('working_set')}>WS</th>
             <th class="sortable num help" data-tip={explain('fan_in')} aria-label={explain('fan_in')} on:click={() => toggleSort('fan_in')}>Fin</th>
             <th class="sortable num help" data-tip={explain('fan_out')} aria-label={explain('fan_out')} on:click={() => toggleSort('fan_out')}>Fout</th>
             <th class="sortable num help" data-tip={explain('field_count')} aria-label={explain('field_count')} on:click={() => toggleSort('fields')}>F/V</th>
@@ -917,6 +927,7 @@
               <td class="num {tierClass(r.tiers.nest)}">{m?.max_nesting ?? '—'}</td>
               <td class="num {tierClass(r.tiers.loc)}">{m?.loc}</td>
               <td class="num {tierClass(r.tiers.params)}">{m?.param_count ?? '—'}</td>
+              <td class="num {tierClass(r.tiers.workingSet)}">{m?.working_set ?? '—'}</td>
               <td class="num">{m?.fan_in}</td>
               <td class="num {tierClass(r.tiers.fanOut)}">{m?.fan_out}</td>
               <td class="num {tierClass(r.tiers.fieldCount)}">{m?.field_count ?? '—'}</td>

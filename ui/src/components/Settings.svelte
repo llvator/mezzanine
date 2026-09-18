@@ -3,6 +3,7 @@
   import { focusExpand } from '../stores/panes';
   import { mirrorOn, mirrorPeers, openSecondWindow } from '../stores/mirror';
   import SettingsReport from './SettingsReport.svelte';
+  import CacheReport from './CacheReport.svelte';
 
   function selectTheme(id: ThemeId) {
     activeTheme.set(id);
@@ -115,12 +116,14 @@
         <span class="toggle-desc">
           Scope, level, filters, graph or tree, and the entity you select or
           point at all move together — so a pane on one screen narrates the
-          canvas on the other. Pane widths, zoom and which panes are open stay
-          each window's own; that is what makes the second screen worth having.
-          While your pointer is over this window's canvas it wins, and the
-          other window's takes over again when you leave. Works between windows
-          of this browser on this machine; it cannot reach another browser or
-          another computer.
+          canvas on the other. That includes the Spec pane: hovering an
+          Elevator entity here rings the code it claims on the other screen's
+          graph, which is the arrangement this whole thing is for. Pane widths,
+          zoom and which panes are open stay each window's own; that is what
+          makes the second screen worth having. While your pointer is over this
+          window it wins, and the other window's takes over again when you
+          leave. Works between windows of this browser on this machine; it
+          cannot reach another browser or another computer.
         </span>
       </div>
     </label>
@@ -129,6 +132,11 @@
       Open a second window
     </button>
   </div>
+
+  <!-- Last, because it is the only section that is not about this repository
+       and not a preference: it describes a directory shared by every repo on
+       the machine, and its buttons delete from it. -->
+  <CacheReport />
 </div>
 
 <style>

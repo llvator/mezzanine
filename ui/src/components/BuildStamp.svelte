@@ -12,8 +12,8 @@
    * Two placements. Standalone it is the right-hand end of the shortcut bar,
    * which is where a status line carries its build info and where it no longer
    * has to overlap anything. In the VS Code webview there is no such bar, so
-   * it stays what it was: fixed to the bottom-right corner, below
-   * `.mode-bar-bottom`, which already owns that corner at 20px.
+   * it stays what it was: fixed to the bottom-right corner of the canvas,
+   * which the webview leaves empty.
    */
   import { connection } from '../stores/connection';
   import { uiBuild, formatBuiltAt } from '../buildInfo';

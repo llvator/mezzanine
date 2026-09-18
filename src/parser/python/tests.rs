@@ -2453,7 +2453,10 @@ if typing.TYPE_CHECKING:
     };
     assert!(!type_only("os"));
     assert!(type_only("models"));
-    assert!(type_only("other"), "a qualified TYPE_CHECKING is the same gate");
+    assert!(
+        type_only("other"),
+        "a qualified TYPE_CHECKING is the same gate"
+    );
 }
 
 /// `Guarded` is broader than this ticket. A platform or version gate is
@@ -2516,4 +2519,291 @@ import os
     let result = parse(src);
     let os = result.imports.iter().find(|i| i.path == "os").unwrap();
     assert!(!os.is_type_only);
+}
+
+// ---------------------------------------------------------------------
+// PY-029: the module docstring travels as file documentation
+// ---------------------------------------------------------------------
+
+#[test]
+fn module_docstring_becomes_file_documentation() {
+    let src =
+        "\"\"\"What this module is for.\n\nA second paragraph.\n\"\"\"\n\ndef f():\n    pass\n";
+    assert_eq!(
+        parse(src).file_documentation.as_deref(),
+        Some("What this module is for.\n\nA second paragraph.")
+    );
+}
+
+#[test]
+fn a_licence_comment_above_the_docstring_does_not_hide_it() {
+    let src = "# SPDX-License-Identifier: MIT\n\"\"\"The module.\"\"\"\n";
+    assert_eq!(
+        parse(src).file_documentation.as_deref(),
+        Some("The module.")
+    );
+}
+
+#[test]
+fn a_module_that_opens_with_code_has_no_file_documentation() {
+    let src = "import os\n\n\"\"\"Not a docstring — it is the second statement.\"\"\"\n";
+    assert_eq!(parse(src).file_documentation, None);
+}
+
+#[test]
+fn a_function_docstring_is_not_the_modules() {
+    let src = "def f():\n    \"\"\"Mine, not the file's.\"\"\"\n";
+    let result = parse(src);
+    assert_eq!(result.file_documentation, None);
+    let f = result.entities.iter().find(|e| e.name == "f").expect("f");
+    assert_eq!(f.documentation.as_deref(), Some("Mine, not the file's."));
+}
+
+// ---------------------------------------------------------------------
+// PY-030: `UsesValue` edges from imported names read as values
+// ---------------------------------------------------------------------
+
+fn uses_value_targets(result: &ParseResult) -> Vec<&str> {
+    let mut targets: Vec<&str> = result
+        .relationships
+        .iter()
+        .filter(|r| r.kind == RelationshipKind::UsesValue)
+        .map(|r| r.target_id.as_str())
+        .collect();
+    targets.sort_unstable();
+    targets
+}
+
+#[test]
+fn an_imported_constant_read_in_a_body_is_a_dependency() {
+    let src = "from .config import LIMIT\n\ndef f(rows):\n    return rows[:LIMIT]\n";
+    assert_eq!(uses_value_targets(&parse(src)), vec!["config::LIMIT"]);
+}
+
+#[test]
+fn an_imported_function_passed_as_a_value_is_a_dependency() {
+    let src =
+        "from .config import normalise\n\ndef f(items):\n    return sorted(items, key=normalise)\n";
+    assert_eq!(uses_value_targets(&parse(src)), vec!["config::normalise"]);
+}
+
+#[test]
+fn a_call_to_an_imported_name_is_not_also_a_value_read() {
+    // The call is already a `Calls` edge; a second kind for the same site
+    // would double-count one dependency.
+    let src = "from .config import normalise\n\ndef f(x):\n    return normalise(x)\n";
+    let result = parse(src);
+    assert!(uses_value_targets(&result).is_empty());
+    assert!(result
+        .relationships
+        .iter()
+        .any(|r| r.kind == RelationshipKind::Calls && r.target_id == "normalise"));
+}
+
+#[test]
+fn an_absolute_import_names_nothing_this_analysis_walked() {
+    let src = "from django.conf import settings\n\ndef f():\n    return settings\n";
+    assert!(uses_value_targets(&parse(src)).is_empty());
+}
+
+#[test]
+fn a_type_checking_import_is_erased_and_carries_no_value_edge() {
+    let src = "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from .schema import ROWS\n\ndef f():\n    return ROWS\n";
+    assert!(uses_value_targets(&parse(src)).is_empty());
+}
+
+#[test]
+fn a_shadowed_import_name_is_declined_rather_than_guessed() {
+    let src = "from .config import LIMIT\n\ndef g(LIMIT):\n    return LIMIT\n\ndef f(rows):\n    return rows[:LIMIT]\n";
+    assert!(uses_value_targets(&parse(src)).is_empty());
+}
+
+#[test]
+fn a_keyword_argument_label_is_not_a_read_of_the_import() {
+    let src = "from .config import limit\n\ndef f(rows):\n    return render(rows, limit=5)\n";
+    assert!(uses_value_targets(&parse(src)).is_empty());
+}
+
+#[test]
+fn an_annotation_is_a_type_edge_not_a_value_edge() {
+    // `UsesType` already records it (PY-025); a second dependency kind for
+    // the same mention would double-count it.
+    let src = "from .store import Store\n\ndef f(s: Store) -> Store:\n    return s\n";
+    assert!(uses_value_targets(&parse(src)).is_empty());
+}
+
+#[test]
+fn a_value_read_is_sourced_from_the_callable_not_the_local_it_binds() {
+    let src = "from .config import LIMIT\n\ndef f():\n    cap = LIMIT\n    return cap\n";
+    let result = parse(src);
+    let rel = result
+        .relationships
+        .iter()
+        .find(|r| r.kind == RelationshipKind::UsesValue)
+        .expect("one value edge");
+    assert!(
+        !rel.source_id.contains("::local::"),
+        "the local is the result of the read, not the reader: {}",
+        rel.source_id
+    );
+    assert!(
+        rel.source_id.ends_with(":f"),
+        "sourced from f: {}",
+        rel.source_id
+    );
+}
+
+// ---------------------------------------------------------------------
+// PY-031: receivers resolve through their declared types
+// ---------------------------------------------------------------------
+
+fn calls_to(src: &str, target: &str) -> bool {
+    call_targets(&parse(src)).iter().any(|t| t == target)
+}
+
+#[test]
+fn a_field_copied_from_an_annotated_parameter_types_its_receiver() {
+    let src = "class Service:\n    def __init__(self, store: Store):\n        self.store = store\n\n    def place(self, order):\n        self.store.save(order)\n";
+    assert!(
+        calls_to(src, "Store.save"),
+        "expected Store.save, got {:?}",
+        call_targets(&parse(src))
+    );
+}
+
+#[test]
+fn a_class_level_annotation_types_its_receiver() {
+    let src =
+        "class Service:\n    cache: Cache\n\n    def warm(self):\n        self.cache.fill()\n";
+    assert!(calls_to(src, "Cache.fill"));
+}
+
+#[test]
+fn an_annotated_parameter_types_its_own_receiver() {
+    let src =
+        "class Service:\n    def place(self, backup: Optional[Store]):\n        backup.save(1)\n";
+    assert!(calls_to(src, "Store.save"));
+}
+
+#[test]
+fn an_unannotated_receiver_keeps_the_text_the_source_gave_it() {
+    let src = "class Service:\n    def place(self, thing):\n        thing.whatever()\n";
+    assert!(calls_to(src, "thing.whatever"));
+}
+
+#[test]
+fn a_container_annotation_types_the_receiver_as_the_container() {
+    let src = "class Service:\n    def __init__(self, rows: list[Row]):\n        self.rows = rows\n\n    def add(self, r):\n        self.rows.append(r)\n";
+    assert!(calls_to(src, "list.append"));
+}
+
+#[test]
+fn an_imported_name_called_bare_in_a_method_is_not_a_sibling_method() {
+    let src = "from .config import normalise\n\nclass Renderer:\n    def render(self, label):\n        return normalise(label)\n";
+    assert!(
+        calls_to(src, "normalise"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
+    assert!(!calls_to(src, "Renderer.normalise"));
+}
+
+#[test]
+fn a_module_level_function_called_bare_in_a_method_is_not_a_sibling_method() {
+    // Python's LEGB lookup skips class scope: `helper(label)` inside a method
+    // finds the module-level `helper`, never `Renderer.helper` — which needs
+    // `self.`. Prefixing it produced a name that exists nowhere (PY-031).
+    let src = "def helper(x):\n    return x\n\nclass Renderer:\n    def render(self, label):\n        return helper(label)\n";
+    assert!(
+        calls_to(src, "helper"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
+    assert!(!calls_to(src, "Renderer.helper"));
+}
+
+#[test]
+fn a_sibling_method_is_still_reached_through_self() {
+    let src = "class Renderer:\n    def render(self, label):\n        return self.helper(label)\n";
+    assert!(calls_to(src, "Renderer.helper"));
+}
+
+// ---------------------------------------------------------------------
+// PY-032: a receiver whose type the code shows without annotating it
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_field_built_by_a_constructor_types_its_receiver() {
+    let src = "class Facade:\n    def __init__(self):\n        self._renderer = VideoRenderer()\n\n    def play(self):\n        self._renderer.render()\n";
+    assert!(
+        calls_to(src, "VideoRenderer.render"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
+}
+
+#[test]
+fn a_dotted_constructor_is_named_by_its_last_segment() {
+    let src = "class Facade:\n    def __init__(self):\n        self._store = models.Store()\n\n    def save(self, x):\n        self._store.put(x)\n";
+    assert!(calls_to(src, "Store.put"));
+}
+
+#[test]
+fn a_lowercase_callee_is_not_a_constructor() {
+    // `json.loads` returns something the code never names, so the field
+    // stays untyped and the receiver keeps its own text.
+    let src = "class Facade:\n    def __init__(self, text):\n        self._data = json.loads(text)\n\n    def names(self):\n        return self._data.keys()\n";
+    assert!(
+        calls_to(src, "_data.keys"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
+}
+
+#[test]
+fn an_annotated_return_types_the_next_link_of_a_chain() {
+    let src = "class PizzaBuilder:\n    def set_size(self, size) -> \"PizzaBuilder\":\n        return self\n\n    def set_dough(self, d):\n        return self\n\ndef make(builder):\n    return builder.set_size(\"m\").set_dough(\"thin\")\n";
+    assert!(
+        calls_to(src, "PizzaBuilder.set_dough"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
+}
+
+#[test]
+fn an_unannotated_return_self_types_the_next_link_too() {
+    // The fluent shape is a declaration even without the annotation: the
+    // body says the call yields the class it is a method of.
+    let src = "class Builder:\n    def step(self):\n        return self\n\n    def build(self):\n        return 1\n\ndef make(b):\n    return b.step().build()\n";
+    assert!(
+        calls_to(src, "Builder.build"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
+}
+
+#[test]
+fn a_method_name_two_classes_claim_differently_is_declined() {
+    // `open` yields a `Door` in one class and a `Window` in the other, and a
+    // chain gives us only the bare name — so neither answer is emitted.
+    let src = "class A:\n    def open(self) -> Door:\n        return Door()\n\nclass B:\n    def open(self) -> Window:\n        return Window()\n\ndef use(x):\n    return x.open().shut()\n";
+    let targets = call_targets(&parse(src));
+    assert!(
+        targets.iter().any(|t| t == "open.shut"),
+        "got {:?}",
+        targets
+    );
+    assert!(!targets
+        .iter()
+        .any(|t| t == "Door.shut" || t == "Window.shut"));
+}
+
+#[test]
+fn a_chain_off_a_name_the_file_does_not_declare_keeps_its_text() {
+    let src = "def use(client):\n    return client.get(\"/\").json()\n";
+    assert!(
+        calls_to(src, "get.json"),
+        "got {:?}",
+        call_targets(&parse(src))
+    );
 }

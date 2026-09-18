@@ -32,6 +32,16 @@ export interface DescriptionEntry {
    *  and so on. Child entries are always one level down and all carry 0 —
    *  the list is flat, and `buildChildEntries` never recurses. */
   depth: number;
+  /**
+   * Who wrote the description, when it is not the rung's own (UI-141).
+   *
+   * An entity's docstring belongs to the entity, so a code rung never sets
+   * this. A *region* rung is a folder, which has no prose of its own — its
+   * description is a spec entity's `d:` reaching it through a `cr:`, and
+   * printing that unattributed would read as the folder describing itself.
+   * See `regionChainEntries`.
+   */
+  attribution?: string;
 }
 
 /** Minimal shape this module needs from `stores/details`. */

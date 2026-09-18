@@ -9,11 +9,20 @@
  * Hover wins while the pointer is over a node; when it leaves, the pane
  * falls back to the selection rather than blanking, so a pinned node stays
  * readable. `describeOnHover` off makes it selection-only.
+ *
+ * Since UI-141 a *region's name* is a subject too. A folder has no
+ * description of its own — what describes it is a spec entity's `d:`
+ * reaching it through a `cr:` — so the chain climbs directories and each
+ * rung says who wrote what is under it.
  */
 import { derived, writable } from 'svelte/store';
+import type { D3Node } from '../types/graph';
 import { hoveredNode, selectedNode, rawEntityGraph } from './graph';
+import { hoveredRegion, selectedRegion, regionClaimOf } from './region';
 import { ensureDetailsLoaded } from './details';
 import { buildChildEntries, buildDescriptionChain, type DescriptionEntry } from '../viewmodels/descriptionChain';
+import { regionChainEntries, type HoveredRegion } from '../viewmodels/regionSubject';
+import type { RegionSpecClaim } from '../viewmodels/regionSpec';
 
 /** Whether hovering a node retargets the pane. Off ⇒ selection only.
  *
@@ -41,13 +50,51 @@ export interface DescriptionState {
 
 export const description = writable<DescriptionState | null>(null);
 
+/**
+ * What the pane is about: an entity, or a region's name (UI-141).
+ *
+ * A folder is the one subject on the canvas with no entity behind it, so it
+ * cannot be squeezed into the node case — its prose is a spec entity's,
+ * reaching it through a `cr:`, and the chain that explains it climbs
+ * directories rather than `parent_id`.
+ */
+type Subject =
+  | { kind: 'node'; node: D3Node; source: 'hover' | 'selection'; nodes: D3Node[] }
+  | {
+      kind: 'region';
+      region: HoveredRegion;
+      source: 'hover' | 'selection';
+      claimOf: (path: string) => RegionSpecClaim | null;
+    };
+
 const subject = derived(
-  [hoveredNode, selectedNode, describeOnHover, rawEntityGraph],
-  ([$hovered, $selected, $onHover, $graph]) => {
-    const hovering = $onHover && $hovered !== null;
-    const node = hovering ? $hovered : $selected;
-    if (!node) return null;
-    return { node, source: (hovering ? 'hover' : 'selection') as 'hover' | 'selection', nodes: $graph.nodes };
+  [
+    hoveredNode, selectedNode, describeOnHover, rawEntityGraph,
+    hoveredRegion, selectedRegion, regionClaimOf,
+  ],
+  ([$hovered, $selected, $onHover, $graph, $region, $pinnedRegion, $claimOf]): Subject | null => {
+    // Hover before selection, which is this pane's rule and the opposite of
+    // the Details column's — reading here happens *while* skimming, and a
+    // pinned node that outranked the pointer would stop the narration. A
+    // region ranks with the node hover for the same reason: it is something
+    // the pointer is on right now.
+    if ($onHover && $hovered) {
+      return { kind: 'node', node: $hovered, source: 'hover', nodes: $graph.nodes };
+    }
+    if ($onHover && $region) {
+      return { kind: 'region', region: $region, source: 'hover', claimOf: $claimOf };
+    }
+    if ($selected) {
+      return { kind: 'node', node: $selected, source: 'selection', nodes: $graph.nodes };
+    }
+    // A pinned region falls back with the pinned node and for the same
+    // reason (UI-148): the pointer has left the canvas — typically for this
+    // very pane — and the prose a reader clicked a folder's name to read
+    // should still be here when they arrive.
+    if ($pinnedRegion) {
+      return { kind: 'region', region: $pinnedRegion, source: 'selection', claimOf: $claimOf };
+    }
+    return null;
   },
 );
 
@@ -58,6 +105,20 @@ subject.subscribe((current) => {
   const mine = ++generation;
   if (!current) {
     description.set(null);
+    return;
+  }
+  if (current.kind === 'region') {
+    // No await: the claims already carry whatever the sidecar has loaded, and
+    // `regionClaimOf` is derived from it — so a chain built before the
+    // descriptions arrived is rebuilt with them the moment they do, rather
+    // than resolving late against a region the pointer has left.
+    description.set({
+      source: current.source,
+      chain: regionChainEntries(current.region, current.claimOf),
+      // A folder's contents are the scope tree, and that pane already exists.
+      // What this one adds is the prose, which the chain carries.
+      children: [],
+    });
     return;
   }
   void ensureDetailsLoaded().then((docs) => {

@@ -8,7 +8,7 @@ use super::super::generics::collect_type_parameters;
 use crate::models::entity::Parameter;
 use crate::models::{CodeEntity, EntityKind, Visibility};
 use crate::parser::language_parser::{node_text, node_to_span};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -275,7 +275,7 @@ fn parse_class_fields(class_node: &Node, source: &str, fields: &mut Vec<Paramete
     // Class-level annotations (e.g., `name: str` in dataclasses).
     collect_class_annotations(&body, source, fields, &mut seen);
     // Instance attributes from self.xxx assignments.
-    collect_self_assignments(&body, source, fields, &mut seen);
+    collect_self_assignments(&body, source, &HashMap::new(), fields, &mut seen);
     has_slots
 }
 
@@ -363,6 +363,8 @@ fn string_literal_text(node: &Node, source: &str) -> Option<String> {
     Some(node_text(&content, source).to_string())
 }
 
+/// Class-level annotated declarations: the `name: str` lines of a dataclass,
+/// and any `LIMIT: int = 5` beside them.
 fn collect_class_annotations(
     node: &Node,
     source: &str,
@@ -371,86 +373,204 @@ fn collect_class_annotations(
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "expression_statement" {
-            let mut inner = child.walk();
-            for expr in child.children(&mut inner) {
-                if expr.kind() == "assignment" {
-                    if let Some(left) = expr.child_by_field_name("left") {
-                        if left.kind() == "identifier" {
-                            let field_name = node_text(&left, source).to_string();
-                            if seen.insert(field_name.clone()) {
-                                let type_name = expr
-                                    .child_by_field_name("type")
-                                    .map(|t| node_text(&t, source).to_string());
-                                let default_value = expr
-                                    .child_by_field_name("right")
-                                    .map(|v| node_text(&v, source).to_string());
-                                let visibility = Some(field_visibility(&field_name));
-                                fields.push(Parameter {
-                                    name: field_name,
-                                    type_name,
-                                    default_value,
-                                    visibility,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+        if child.kind() != "expression_statement" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for expr in child.children(&mut inner) {
+            record_annotation(&expr, source, fields, seen);
         }
     }
 }
 
+/// One `name: T [= default]` declaration, if that is what this expression is.
+fn record_annotation(
+    expr: &Node,
+    source: &str,
+    fields: &mut Vec<Parameter>,
+    seen: &mut HashSet<String>,
+) {
+    if expr.kind() != "assignment" {
+        return;
+    }
+    let Some(left) = expr.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(&left, source).to_string();
+    if !seen.insert(name.clone()) {
+        return;
+    }
+    fields.push(Parameter {
+        visibility: Some(field_visibility(&name)),
+        name,
+        type_name: field_text(expr, "type", source),
+        default_value: field_text(expr, "right", source),
+    });
+}
+
+/// The source text of one of an assignment's fields, when it has it.
+fn field_text(node: &Node, field: &str, source: &str) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|n| node_text(&n, source).to_string())
+}
+
+/// Instance attributes assigned onto `self` in a method body, and the types
+/// those assignments give away.
+///
+/// A type reaches a field two ways, and Python spells both:
+/// - `self.limit: int = 0` — the annotation is on the assignment itself.
+/// - `def __init__(self, store: Store): self.store = store` — the annotation
+///   is on the parameter the field is copied from. This is the shape most
+///   Python classes use to say what they hold, and reading it is what lets a
+///   call on `self.store` resolve to `Store.save` rather than to a ghost
+///   named `store.save` (PY-031).
+///
+/// `params` is the enclosing `def`'s annotated parameters, refreshed on the
+/// way into each one; at class-body level it is empty.
 fn collect_self_assignments(
     node: &Node,
     source: &str,
+    params: &HashMap<String, String>,
     fields: &mut Vec<Parameter>,
     seen: &mut HashSet<String>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "expression_statement" {
-            let mut inner = child.walk();
-            for expr in child.children(&mut inner) {
-                if expr.kind() == "assignment" {
-                    if let Some(left) = expr.child_by_field_name("left") {
-                        // Only plain `self.<identifier>` assignments are
-                        // field declarations. `self.x[k] = …` is a
-                        // subscript write on an existing dict/list and
-                        // `self.a.b = …` mutates a nested object — neither
-                        // declares a new field on this class. In
-                        // tree-sitter-python both forms have `left.kind()`
-                        // != "attribute", so we can gate on that.
-                        if left.kind() != "attribute" {
-                            continue;
-                        }
-                        let obj = left.child_by_field_name("object");
-                        let attr = left.child_by_field_name("attribute");
-                        let Some(obj) = obj else { continue };
-                        let Some(attr) = attr else { continue };
-                        if node_text(&obj, source) != "self" {
-                            continue;
-                        }
-                        let field_name = node_text(&attr, source).to_string();
-                        if !field_name.is_empty() && seen.insert(field_name.clone()) {
-                            let type_name = expr
-                                .child_by_field_name("type")
-                                .map(|t| node_text(&t, source).to_string());
-                            let visibility = Some(field_visibility(&field_name));
-                            fields.push(Parameter {
-                                name: field_name,
-                                type_name,
-                                default_value: None,
-                                visibility,
-                            });
-                        }
-                    }
-                }
+        match child.kind() {
+            "expression_statement" => record_self_assignment(&child, source, params, fields, seen),
+            "function_definition" => {
+                let inner = annotated_parameters(&child, source);
+                collect_self_assignments(&child, source, &inner, fields, seen);
             }
-        }
-        // Recurse into function definitions and blocks.
-        if child.kind() == "function_definition" || child.kind() == "block" {
-            collect_self_assignments(&child, source, fields, seen);
+            "block" => collect_self_assignments(&child, source, params, fields, seen),
+            _ => {}
         }
     }
+}
+
+/// One `self.<name> = …` statement, if that is what this is.
+fn record_self_assignment(
+    stmt: &Node,
+    source: &str,
+    params: &HashMap<String, String>,
+    fields: &mut Vec<Parameter>,
+    seen: &mut HashSet<String>,
+) {
+    let mut inner = stmt.walk();
+    for expr in stmt.children(&mut inner) {
+        let Some(name) = self_field_name(&expr, source) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        fields.push(Parameter {
+            visibility: Some(field_visibility(&name)),
+            name,
+            type_name: assigned_type(&expr, source, params),
+            default_value: None,
+        });
+    }
+}
+
+/// The field a `self.<name> = …` declares, or `None` when it declares none.
+///
+/// Only plain `self.<identifier>` assignments are field declarations.
+/// `self.x[k] = …` is a subscript write on an existing dict/list and
+/// `self.a.b = …` mutates a nested object — neither declares a new field on
+/// this class. In tree-sitter-python both forms have `left.kind()` !=
+/// "attribute", so we can gate on that.
+fn self_field_name(expr: &Node, source: &str) -> Option<String> {
+    if expr.kind() != "assignment" {
+        return None;
+    }
+    let left = expr.child_by_field_name("left")?;
+    if left.kind() != "attribute" {
+        return None;
+    }
+    let object = left.child_by_field_name("object")?;
+    if node_text(&object, source) != "self" {
+        return None;
+    }
+    let name = node_text(&left.child_by_field_name("attribute")?, source);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The type a `self.<field> = …` gives away, in the order the evidence gets
+/// weaker: its own annotation, the annotation of the parameter it copies,
+/// then the constructor it calls.
+fn assigned_type(expr: &Node, source: &str, params: &HashMap<String, String>) -> Option<String> {
+    if let Some(annotated) = field_text(expr, "type", source) {
+        return Some(annotated);
+    }
+    let right = expr.child_by_field_name("right")?;
+    match right.kind() {
+        "identifier" => params.get(node_text(&right, source)).cloned(),
+        "call" => constructed_type(&right, source),
+        _ => None,
+    }
+}
+
+/// The type `self.<field> = Renderer()` builds, if the call is a constructor.
+///
+/// "Is a constructor" is the same test call extraction already applies when
+/// it decides between `Calls` and `Instantiates`: a capitalised callee names
+/// a class. `self.x = json.loads(text)` is lowercase and declines, which is
+/// right — the type of what `loads` returns is not written anywhere here.
+/// A dotted callee keeps its last segment, so `self.x = models.Store()` is a
+/// `Store`, matching how `receiver_name` reduces a receiver.
+fn constructed_type(call: &Node, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    if !matches!(function.kind(), "identifier" | "attribute") {
+        return None;
+    }
+    let name = node_text(&function, source).rsplit('.').next()?.trim();
+    let constructs = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_uppercase() && c.is_alphabetic());
+    constructs.then(|| name.to_string())
+}
+
+/// One `def`'s annotated parameters, as name → annotation text.
+///
+/// Only the annotated forms are collected: an unannotated parameter says
+/// nothing about the type of the field it is copied into, and recording it
+/// as `None` would be indistinguishable from not being a parameter at all.
+fn annotated_parameters(function: &Node, source: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return out;
+    };
+    let mut cursor = parameters.walk();
+    for param in parameters.children(&mut cursor) {
+        if let Some((name, annotation)) = annotated_parameter(&param, source) {
+            out.insert(name, annotation);
+        }
+    }
+    out
+}
+
+/// One annotated parameter, as `(name, annotation)`.
+///
+/// A `typed_parameter` holds its name as a bare first child rather than
+/// under a field; a `typed_default_parameter` names it properly. Everything
+/// else — a bare `x`, an `*args`, a `**kwargs` — carries no annotation and
+/// answers `None`.
+fn annotated_parameter(param: &Node, source: &str) -> Option<(String, String)> {
+    if !matches!(param.kind(), "typed_parameter" | "typed_default_parameter") {
+        return None;
+    }
+    let annotation = param.child_by_field_name("type")?;
+    let name = param
+        .child_by_field_name("name")
+        .or_else(|| param.named_child(0))
+        .filter(|n| n.kind() == "identifier")?;
+    Some((
+        node_text(&name, source).to_string(),
+        node_text(&annotation, source).to_string(),
+    ))
 }

@@ -1,6 +1,7 @@
 /**
- * Edge geometry for the graph canvas: how thick a link draws, and where its
- * arrow head lands.
+ * Edge geometry for the graph canvas: how thick a link draws, where its
+ * arrow head lands, and where a mark anchored to the edge — the kind label,
+ * the order badge — can sit without a node covering it.
  *
  * Split out of `GraphView.svelte` because both decisions were wrong in a way
  * only arithmetic reveals, and arithmetic is testable without a canvas.
@@ -86,4 +87,57 @@ export function arrowHeadPoint(
   const back = Math.min(headRadius + ARROW_GAP, len - MIN_LINE);
   if (back <= 0) return { x: headX, y: headY };
   return { x: headX - (dx / len) * back, y: headY - (dy / len) * back };
+}
+
+/** Radius of the order badge's disc. Shared with the clearance arithmetic
+ *  below, which is only right while the two agree. */
+export const ORDER_BADGE_R = 8;
+
+/** Half the along-line extent of a link's kind label. The label is a pill of
+ *  text whose real width depends on the kind name, and measuring it every
+ *  tick costs a layout per edge; this is the modest constant that keeps its
+ *  anchor — and so the order number that opens the text — off a circle. */
+export const LINK_LABEL_CLEAR = 10;
+
+/** Breathing room between a node's rim and the nearest edge of a mark
+ *  anchored to the line, matching the arrow's own `ARROW_GAP` in spirit. */
+export const EDGE_MARK_GAP = 3;
+
+/** One end of a link as the anchor arithmetic needs it: where the node sits,
+ *  and how far its circle reaches at the current size encoding. */
+export interface EdgeEnd { x: number; y: number; radius: number }
+
+/**
+ * Where a mark anchored to a link should sit: `fraction` of the way from tail
+ * to head, but never so close to either end that the node's own circle covers
+ * it.
+ *
+ * The fraction alone was the bug (UI — order badges vanishing at large node
+ * sizes). A fraction is measured centre to centre, and node radius is a
+ * user-chosen channel: raise the size scale in the legend and a circle grows
+ * past the fixed 25 % mark, painting over the number that was sitting there.
+ * Nothing about the number moved, so nothing on screen explained where it
+ * went. Clamping the position into the stretch of line the two discs leave
+ * free ties the mark to the boundary the user can see instead.
+ *
+ * `clearance` is the room the mark itself needs at whichever rim it ends up
+ * against — its own half-extent along the line plus `EDGE_MARK_GAP`.
+ */
+export function edgeAnchorPoint(
+  tail: EdgeEnd, head: EdgeEnd,
+  fraction: number, clearance: number,
+): Point {
+  const dx = head.x - tail.x;
+  const dy = head.y - tail.y;
+  const len = Math.hypot(dx, dy);
+  if (len < MIN_LINE) return { x: tail.x + dx * fraction, y: tail.y + dy * fraction };
+  const lo = tail.radius + clearance;
+  const hi = len - head.radius - clearance;
+  // `lo > hi` means the two discs plus their clearance leave no free stretch
+  // at all — overlapping circles, or a hub big enough to swallow the whole
+  // link. Their midpoint is then `len/2` biased towards the *smaller* node,
+  // which is the least-covered spot on a line that has no uncovered one.
+  const want = lo > hi ? (lo + hi) / 2 : Math.min(Math.max(fraction * len, lo), hi);
+  const along = Math.min(Math.max(want, 0), len);
+  return { x: tail.x + (dx / len) * along, y: tail.y + (dy / len) * along };
 }

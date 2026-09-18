@@ -82,7 +82,7 @@ pub fn compute<'a>(
         let edges = accum.edges.get(folder).unwrap_or(&no_edges);
         let drawn = scored(edges, accum.erased_in(folder));
         let scores = graph_scores(&kids, &drawn);
-        let inside = subfolders(&kids, folders, &shapes);
+        let inside = subfolders(kids.len(), &kids, folders, &shapes);
         let (entry, busiest, arrivals) = entry_concentration(accum.entries.get(folder));
         let doors = doors_of(accum.entries.get(folder).unwrap_or(&no_entries));
         let (out, exits, middle_exits) =
@@ -96,6 +96,7 @@ pub fn compute<'a>(
             entry_concentration: entry,
             egress: out,
             child_compliance: inside.mean_compliance,
+            uniformity: inside.uniformity,
             child_count: kids.len() as u32,
             blocker: None, // replaced below
             terms: ShapeTerms {
@@ -103,6 +104,7 @@ pub fn compute<'a>(
                 arrivals,
                 exits,
                 middle_exits,
+                widest_child: inside.widest_child,
                 ..scores.terms
             },
         };
@@ -654,14 +656,31 @@ fn deeper_gate(
     None
 }
 
-/// What the subfolders directly inside this one came out at — the two
+/// What the subfolders directly inside this one came out at — the
 /// recursive facts a parent needs, gathered in one pass.
 struct Inside {
     mean_compliance: Option<f32>,
     worst_pattern: Option<ShapePattern>,
+    /// This folder's breadth against its widest subfolder's, and the
+    /// count behind it. Both `None`/zero together.
+    uniformity: Option<f32>,
+    widest_child: u32,
+}
+
+impl Inside {
+    /// A folder with no subfolder to compare itself against.
+    fn alone() -> Inside {
+        Inside {
+            mean_compliance: None,
+            worst_pattern: None,
+            uniformity: None,
+            widest_child: 0,
+        }
+    }
 }
 
 fn subfolders(
+    own_breadth: usize,
     kids: &[String],
     folders: &HashSet<String>,
     shapes: &HashMap<String, FolderShape>,
@@ -674,16 +693,49 @@ fn subfolders(
         .filter_map(|k| shapes.get(k))
         .collect();
     if inner.is_empty() {
-        return Inside {
-            mean_compliance: None,
-            worst_pattern: None,
-        };
+        return Inside::alone();
     }
     let total: f32 = inner.iter().map(|s| s.compliance).sum();
+    let (uniformity, widest_child) = breadth_step(own_breadth, &inner);
     Inside {
         mean_compliance: Some(total / inner.len() as f32),
         worst_pattern: inner.iter().map(|s| s.pattern).min(),
+        uniformity,
+        widest_child,
     }
+}
+
+/// How far the drawing changes scale between this folder and the level
+/// below it: this folder's breadth against its widest subfolder's, smaller
+/// over larger.
+///
+/// The one term on `FolderShape` that compares two zoom levels rather than
+/// reading one. Everything else grades a single level against a fixed bar
+/// — `child_compliance` included, since it averages numbers each taken
+/// against that same bar — so a tree whose every level passes separately
+/// can still jump scale between them, and nothing asked until this
+/// (ADR 0033).
+///
+/// Against the *widest* subfolder rather than the spread over all of them,
+/// because a spread is set by its extremes at both ends and one tiny leaf
+/// folder pins it near zero whatever the rest do. Measured on this repo,
+/// min-over-max put nine of twenty-two folders below 0.40 and named the
+/// small folder rather than the large one. Two numbers also keep the ratio
+/// decomposable the way `ShapeTerms` exists to keep the others, and name
+/// the subfolder a reader would go and look at.
+///
+/// A subfolder holding nothing is left out rather than scored zero: it
+/// draws no picture — `build_children` keeps declaration-only files out —
+/// and a folder cannot be marked down against a level that is not there.
+/// `None` when that leaves nothing to compare against.
+fn breadth_step(own: usize, inner: &[&FolderShape]) -> (Option<f32>, u32) {
+    let widest = inner.iter().map(|s| s.child_count).max().unwrap_or(0);
+    let own = own as u32;
+    if widest == 0 || own == 0 {
+        return (None, 0);
+    }
+    let ratio = own.min(widest) as f32 / own.max(widest) as f32;
+    (Some(ratio), widest)
 }
 
 /// Share of the traffic arriving from outside that lands on one file,
@@ -2256,6 +2308,93 @@ mod tests {
         let src = at(&shapes, "src");
         assert_eq!(src.pattern, ShapePattern::Fractal);
         assert_eq!(src.blocker, None);
+    }
+
+    /// The whole reason `uniformity` exists (ADR 0033). Every other score
+    /// grades one level against a fixed bar, so a tree can clear all of
+    /// them at every level and still change scale between two of them.
+    /// This folder is `Fractal` on the existing measure and jumps from
+    /// three children to eight one step down.
+    #[test]
+    fn a_fractal_folder_can_still_change_scale_one_level_down() {
+        let mut files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        files.extend((0..8).map(|i| format!("src/sub/f{i}.rs")));
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let shapes = run(
+            &refs,
+            &[("src/a.rs", "src/b.rs"), ("src/b.rs", "src/sub/f0.rs")],
+        );
+
+        let src = at(&shapes, "src");
+        assert_eq!(src.pattern, ShapePattern::Fractal);
+        assert_eq!(src.blocker, None);
+        // Three children here, eight in the subfolder.
+        assert_eq!(src.child_count, 3);
+        assert_eq!(src.terms.widest_child, 8);
+        assert_eq!(src.uniformity, Some(3.0 / 8.0));
+        assert!(src.uniformity.unwrap() < Thresholds::default().shape_uniformity);
+    }
+
+    #[test]
+    fn a_tree_that_holds_its_breadth_is_uniform() {
+        let shapes = run(
+            &[
+                "src/a.rs",
+                "src/b.rs",
+                "src/sub/x.rs",
+                "src/sub/y.rs",
+                "src/sub/z.rs",
+            ],
+            &[("src/a.rs", "src/b.rs"), ("src/b.rs", "src/sub/x.rs")],
+        );
+        // Three children here, three in the one subfolder.
+        assert_eq!(at(&shapes, "src").uniformity, Some(1.0));
+    }
+
+    /// Unmeasured, not perfect — the convention every other `Option` score
+    /// here follows. One level is not a comparison.
+    #[test]
+    fn a_folder_with_no_subfolder_has_no_uniformity() {
+        let shapes = run(
+            &["src/a.rs", "src/b.rs"],
+            &[("src/a.rs", "src/b.rs")],
+        );
+        let src = at(&shapes, "src");
+        assert_eq!(src.uniformity, None);
+        assert_eq!(src.terms.widest_child, 0);
+    }
+
+    /// A declaration-only file is not a child, so a subfolder holding
+    /// nothing else draws no picture. Scoring the parent against that empty
+    /// level would mark it down for a level that is not there.
+    #[test]
+    fn an_empty_subfolder_is_not_a_level_to_be_compared_against() {
+        let shapes = run_declaring(
+            &["src/a.rs", "src/b.rs", "src/sub/mod.rs"],
+            &[("src/a.rs", "src/b.rs")],
+            &["src/sub/mod.rs"],
+        );
+        assert_eq!(at(&shapes, "src").uniformity, None);
+    }
+
+    /// ADR 0033: the term is reported and gates nothing, so no folder in
+    /// any of these fixtures may be held back by it. Stated as an
+    /// invariant rather than as one example, because the day it earns a
+    /// gate this test is the one that has to be deliberately changed.
+    #[test]
+    fn uniformity_holds_no_folder_back() {
+        let mut files = vec!["src/a.rs".to_string()];
+        files.extend((0..9).map(|i| format!("src/sub/f{i}.rs")));
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let shapes = run(&refs, &[("src/a.rs", "src/sub/f0.rs")]);
+
+        let src = at(&shapes, "src");
+        assert!(src.uniformity.unwrap() < Thresholds::default().shape_uniformity);
+        // Whatever tier it lands in, the reason is never the scale jump —
+        // there is no `ShapeBlocker` that could carry it.
+        assert!(src
+            .blocker
+            .is_none_or(|b| !format!("{b:?}").contains("Uniform")));
     }
 
     #[test]

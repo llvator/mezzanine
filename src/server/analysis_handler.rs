@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use axum::{extract::State, http::StatusCode, response::Json};
 
+use crate::activity;
 use crate::config::Config;
 use crate::graph::DependencyGraph;
 use crate::models::file_info::Language;
@@ -114,12 +115,18 @@ pub(crate) async fn analysis_scope_handler(
             }
         };
 
+    // This run is the one a reader is most likely to be *watching* — they
+    // pressed the button that started it — and until UI-138 the browser had
+    // no way to know it had begun. The guard also covers the cancel path:
+    // a run aborted from another request drops it rather than ending it.
+    let run = activity::begin(activity::ANALYSIS, "🔎 Re-analyzing the new scope...");
     let result = run_analysis_blocking(
         new_config.clone(),
         state.output_dir.clone(),
         state.cancel.clone(),
     )
     .await;
+    run.end(analysis_outcome(&result));
 
     let mut in_progress = state.analysis_in_progress.lock().await;
     *in_progress = false;
@@ -222,6 +229,18 @@ fn apply_spec_dir(config: &mut Config, requested: Option<&str>) -> Result<(), St
     }
     config.analysis.spec_dir = Some(candidate);
     Ok(())
+}
+
+/// The line this run closes with, whichever way it went (UI-138).
+///
+/// A function rather than a `match` at the call site: the handler is already
+/// near the complexity the gate allows, and the two arms differ only in the
+/// sentence they format.
+fn analysis_outcome(result: &Result<(usize, usize, DependencyGraph), String>) -> String {
+    match result {
+        Ok((ents, rels, _)) => format!("   Analyzed: {ents} entities, {rels} relationships"),
+        Err(e) => format!("   ⚠ Analysis failed: {e}"),
+    }
 }
 
 /// Run the analysis on a blocking thread. Maps `Cancelled` to a

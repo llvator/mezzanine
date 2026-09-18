@@ -25,6 +25,15 @@ pub struct Thresholds {
     pub loc_callable: WarnBad,
     pub loc_container: WarnBad,
     pub params: WarnBad,
+    /// Distinct names one callable body puts in view at once — parameters,
+    /// locals and explicitly-received fields. Miller's 7±2: seven is the
+    /// point where a reader starts paging, twelve is past any of them.
+    ///
+    /// Unlike every other pair here this one also *is* the smell rule: a
+    /// working set over `bad` raises `OverfullHead` directly, with no second
+    /// cut-off in the smell block below. A separate knob could only ever
+    /// disagree with the line the same file already draws.
+    pub working_set: WarnBad,
     pub fan_out: WarnBad,
     pub fields: WarnBad,
     pub variants: WarnBad,
@@ -91,6 +100,20 @@ pub struct Thresholds {
     /// Mean compliance a folder's subfolders must reach for it to count as
     /// fractal. The recursive gate.
     pub shape_child: f32,
+    /// How close a folder's breadth must stay to its widest subfolder's
+    /// before the drawing is reported as changing scale between the two
+    /// levels.
+    ///
+    /// The one bar here that gates nothing (ADR 0033). `uniformity` is
+    /// reported against it and no tier moves, because the weights and
+    /// cut-offs above were fitted against a distribution this term was not
+    /// in, and re-ranking every repo's fractal badges on a number nobody
+    /// has yet seen across a corpus is the thing ADR 0032 forbids. Set at
+    /// `shape_layering`'s value rather than at one fitted here: four ratios
+    /// on one scale with one bar is the only arrangement that needs no
+    /// explaining, and a bar invented for this term alone would be invented
+    /// blind.
+    pub shape_uniformity: f32,
     /// Overall compliance a folder must reach to count as fractal.
     pub shape_compliance: f32,
     /// Most immediate children — files and subfolders together — a folder
@@ -133,6 +156,10 @@ impl Default for Thresholds {
             params: WarnBad {
                 warn: 4.0,
                 bad: 6.0,
+            },
+            working_set: WarnBad {
+                warn: 7.0,
+                bad: 12.0,
             },
             fan_out: WarnBad {
                 warn: 7.0,
@@ -213,6 +240,7 @@ impl Default for Thresholds {
             shape_entry: 0.6,
             shape_egress: 0.7,
             shape_child: 0.8,
+            shape_uniformity: 0.7,
             shape_compliance: 0.85,
             // Eight. It began at seven, from the span of what a reader
             // holds at once, and that first note said plainly that the

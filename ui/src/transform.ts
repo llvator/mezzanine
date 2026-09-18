@@ -1,4 +1,4 @@
-import type { GraphData, D3Node, D3Link, CodeRef } from './types/graph';
+import type { GraphData, D3Node, D3Link, CodeRef, FkFacts } from './types/graph';
 
 interface AnalysisEntity {
   id: string;
@@ -28,6 +28,8 @@ interface AnalysisEntity {
     max_nesting?: number;
     loc: number;
     param_count?: number;
+    local_count?: number;
+    working_set?: number;
     fan_in: number;
     fan_out: number;
     in_cycle: boolean;
@@ -216,6 +218,29 @@ const RELATIONSHIP_TAG_KEYS = new Set([
   'goroutine',
   'deferred',
 ]);
+
+/**
+ * Read the SQL join facts off a relationship's metadata (SQL-006).
+ *
+ * `cardinality` is the marker: the backend writes it on every schema edge and
+ * on nothing else, so its absence is what says this edge is not one. The one
+ * place in the UI that knows the backend's key spellings — everything
+ * downstream reads `link.fk`.
+ */
+function extractFkFacts(metadata: Record<string, string> | undefined): FkFacts | undefined {
+  const cardinality = metadata?.cardinality;
+  if (!cardinality) return undefined;
+  return {
+    cardinality,
+    columns: metadata.fk_columns || undefined,
+    targetColumns: metadata.fk_target_columns || undefined,
+    constraint: metadata.fk_constraint || undefined,
+    onDelete: metadata.on_delete || undefined,
+    junctionTable: metadata.junction_table || undefined,
+    junctionSourceColumns: metadata.junction_source_columns || undefined,
+    junctionTargetColumns: metadata.junction_target_columns || undefined,
+  };
+}
 
 /** Pull tag-flag keys out of a relationship's metadata. Treats
  *  `"true"` / `"1"` as truthy and ignores anything else, so a stray
@@ -457,6 +482,7 @@ export function transformAnalysisJson(analysis: AnalysisJson): GraphData {
         binds_to: r.metadata?.binds_to || undefined,
         binds_type: r.metadata?.binds_type || undefined,
         rebinds_to: r.metadata?.rebinds_to || undefined,
+        fk: extractFkFacts(r.metadata),
       };
       return link;
     })

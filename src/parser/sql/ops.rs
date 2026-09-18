@@ -23,11 +23,39 @@ pub struct ForeignKey {
     /// so `DROP CONSTRAINT` can find an inline key by the name the database
     /// would have given it.
     pub name: String,
-    pub column: String,
+    /// Every column that participates, in declaration order — `(tenant_id,
+    /// user_id)` is one key, not two. Stored as a list rather than the first
+    /// column because a reader shown `tenant_id →` for a composite key is
+    /// being told something false about how the two tables join (SQL-006).
+    pub columns: Vec<String>,
     pub target_schema: String,
     pub target_table: String,
-    pub target_column: Option<String>,
+    /// The referenced columns, positionally matched to `columns`. Empty for
+    /// the bare `REFERENCES users` form, where SQL means "the target's
+    /// primary key" — a fact only the fold can resolve, since the target is
+    /// usually declared in another file.
+    pub target_columns: Vec<String>,
     pub on_delete: Option<String>,
+}
+
+/// A uniqueness constraint — `PRIMARY KEY`, `UNIQUE`, or a `CREATE UNIQUE
+/// INDEX` — recorded because it is what separates a one-to-one from a
+/// one-to-many (SQL-006).
+///
+/// A foreign key says two tables are joined. Only uniqueness on the
+/// *referencing* side says how many rows may sit at that end, and without it
+/// every edge in the schema looks the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UniqueKey {
+    /// Constraint name, so `DROP CONSTRAINT` can remove it. Synthesised the
+    /// way Postgres would for the inline forms — see [`implicit_unique_name`]
+    /// and [`implicit_pk_name`].
+    pub name: String,
+    pub columns: Vec<String>,
+    /// Whether this is the table's primary key. Kept apart from an ordinary
+    /// unique constraint because the bare `REFERENCES users` form resolves
+    /// against the primary key specifically.
+    pub is_primary: bool,
 }
 
 /// One schema change, in the order it appeared in its file.
@@ -38,6 +66,7 @@ pub enum SchemaOp {
         name: String,
         columns: Vec<Parameter>,
         foreign_keys: Vec<ForeignKey>,
+        unique_keys: Vec<UniqueKey>,
         /// `CREATE TABLE IF NOT EXISTS` — must not clobber an existing table.
         if_not_exists: bool,
         is_view: bool,
@@ -73,6 +102,14 @@ pub enum SchemaOp {
         table: String,
         foreign_key: ForeignKey,
     },
+    /// `ADD CONSTRAINT … PRIMARY KEY/UNIQUE`, and `CREATE UNIQUE INDEX` —
+    /// which is the same statement about the schema written outside the
+    /// table, and the form migrations reach for once a table exists.
+    AddUniqueKey {
+        schema: String,
+        table: String,
+        unique_key: UniqueKey,
+    },
     DropConstraint {
         schema: String,
         table: String,
@@ -102,6 +139,7 @@ impl SchemaOp {
             | SchemaOp::DropColumn { schema, table, .. }
             | SchemaOp::RenameColumn { schema, table, .. }
             | SchemaOp::AddForeignKey { schema, table, .. }
+            | SchemaOp::AddUniqueKey { schema, table, .. }
             | SchemaOp::DropConstraint { schema, table, .. } => (schema, table),
         }
     }
@@ -110,6 +148,20 @@ impl SchemaOp {
 /// The name PostgreSQL gives an unnamed foreign key, so an inline
 /// `REFERENCES` and an explicit `ADD CONSTRAINT` share one namespace and a
 /// later `DROP CONSTRAINT` can remove either.
-pub fn implicit_fk_name(table: &str, column: &str) -> String {
-    format!("{table}_{column}_fkey")
+pub fn implicit_fk_name(table: &str, columns: &[String]) -> String {
+    format!("{table}_{}_fkey", columns.join("_"))
+}
+
+/// The name PostgreSQL gives an unnamed unique constraint, for the same
+/// reason [`implicit_fk_name`] exists: `email TEXT UNIQUE` and a later
+/// `DROP CONSTRAINT users_email_key` have to name one thing.
+pub fn implicit_unique_name(table: &str, columns: &[String]) -> String {
+    format!("{table}_{}_key", columns.join("_"))
+}
+
+/// The name PostgreSQL gives a primary key. One per table, so the columns
+/// play no part — which is also what makes a later `PRIMARY KEY` replace an
+/// earlier one in the fold's map rather than sitting beside it.
+pub fn implicit_pk_name(table: &str) -> String {
+    format!("{table}_pkey")
 }

@@ -84,11 +84,51 @@ pub struct EntityMetrics {
     /// guard clauses. Only populated for callables.
     pub cognitive_complexity: Option<u32>,
     /// Maximum control-flow nesting depth. Only populated for callables.
+    ///
+    /// **Not loop depth.** Every nesting-opening construct counts — `if`,
+    /// `match`, a match arm, a closure, a loop. Three nested `if`s score 3,
+    /// and reading that as O(n³) is the mistake [`Self::loop_nesting`]
+    /// exists to prevent.
     pub max_nesting: Option<u32>,
+    /// Deepest loop-inside-loop chain in the body, counting only the
+    /// language's actual loop constructs and counting them *through*
+    /// whatever branches sit between them: a `for` inside an `if` inside a
+    /// `for` is 2.
+    ///
+    /// This is the only metric here that is a claim about how the body
+    /// *scales* rather than how hard it is to read, and it is what
+    /// [`crate::mcp::cost`] raises to an exponent. `None` — never `0` —
+    /// where mezz carries no loop-kind table for the language, because a
+    /// zero would be the claim that the body has no loops.
+    #[serde(default)]
+    pub loop_nesting: Option<u32>,
     /// Lines of code spanned by the entity (inclusive).
     pub loc: u32,
     /// Parameter count (callables only; excludes `self`).
     pub param_count: Option<u32>,
+    /// Distinct names bound inside the body, counted once however many times
+    /// they are rebound or shadowed. Callables only.
+    #[serde(default)]
+    pub local_count: Option<u32>,
+    /// How many distinct names the body puts in front of a reader at once:
+    /// `param_count` + `local_count` + the instance fields it reaches for
+    /// through an explicit receiver. Callables only.
+    ///
+    /// This is the one metric here that is not about control flow. A body
+    /// with no branches at all scores `cyclomatic 1, cognitive 0` however
+    /// many names it juggles, which is the gap this closes — the threshold
+    /// is Miller's 7±2 and crossing the red line raises
+    /// [`SmellKind::OverfullHead`].
+    ///
+    /// **A floor, not a total.** Fields are counted only where the language
+    /// spells the receiver, so Java, Kotlin, Groovy and Go under-report; see
+    /// [`crate::parser::working_set`]. Like `ref_fan_in` on
+    /// [`ScopeMetrics`](crate::models::ScopeMetrics) it deliberately feeds no
+    /// ratio and stays out of `composite_score`: the score's weights were
+    /// tuned against a corpus this metric did not exist for, and re-ranking
+    /// every repo is a separate change from measuring a new thing.
+    #[serde(default)]
+    pub working_set: Option<u32>,
     /// Number of distinct entities depending on this one (incoming edges).
     pub fan_in: u32,
     /// Number of distinct entities this one depends on (outgoing edges).
@@ -157,6 +197,11 @@ pub enum SmellKind {
     FeatureEnvy,
     /// Entity with very high fan-in — any change ripples widely.
     ShotgunSurgery,
+    /// Callable holding more distinct names in view than a reader can keep —
+    /// parameters, locals and touched fields together over the red line.
+    /// Orthogonal to the branching smells: the archetype has no branches at
+    /// all, just twelve locals doing three unrelated jobs.
+    OverfullHead,
     /// Container with many fields but little behavior — a data bag /
     /// configuration record. Not a god class, but the grouping can
     /// usually be made more explicit with nested sub-structs.
@@ -168,30 +213,97 @@ pub enum SmellKind {
 }
 
 impl SmellKind {
+    /// Whether this is an observation rather than a red flag.
+    ///
+    /// Data Bag fires on field and method counts alone, and the standard fix
+    /// for a ten-argument function — Introduce Parameter Object — produces a
+    /// struct that trips it. Filed beside God Class, it tells a reader to undo
+    /// the improvement measured four lines above, which is what a field report
+    /// caught `assess_change` doing. The README has always called it
+    /// informational; this is where that stops being prose and a regex in one
+    /// webview, and becomes something every renderer can read.
+    pub fn is_informational(self) -> bool {
+        matches!(self, SmellKind::DataBag)
+    }
+
     /// Human-readable short label for UI display.
     pub fn label(self) -> &'static str {
-        match self {
-            SmellKind::GodClass => "God Class",
-            SmellKind::Dispatcher => "Dispatcher",
-            SmellKind::FeatureEnvy => "Feature Envy",
-            SmellKind::ShotgunSurgery => "Shotgun Surgery",
-            SmellKind::DataBag => "Data Bag",
-        }
+        self.text().0
     }
 
     /// One-sentence remediation hint.
     pub fn hint(self) -> &'static str {
+        self.text().1
+    }
+
+    /// What the smell says about the entity, as opposed to what to do about
+    /// it. A reader meeting `⚠ Feature Envy` for the first time needs this
+    /// before the hint makes sense, and `mezz explain` prints the pair.
+    pub fn meaning(self) -> &'static str {
+        self.text().2
+    }
+
+    /// Every smell, so a caller can print the whole key without knowing how
+    /// many there are.
+    pub fn all() -> [SmellKind; 6] {
+        [
+            SmellKind::GodClass,
+            SmellKind::Dispatcher,
+            SmellKind::FeatureEnvy,
+            SmellKind::ShotgunSurgery,
+            SmellKind::OverfullHead,
+            SmellKind::DataBag,
+        ]
+    }
+
+    /// Label, hint and meaning together, matched once.
+    ///
+    /// They used to be two matches over the same enum, which cost a new
+    /// variant two arms and let the pair drift — a smell could be renamed in
+    /// one and not the other. One match also keeps the per-variant cost off
+    /// `label` and `hint` themselves, which the complexity gate measures.
+    /// `meaning` was added as a third element rather than a third match for
+    /// the same reason.
+    fn text(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            SmellKind::GodClass =>
+            SmellKind::GodClass => (
+                "God Class",
                 "Split by responsibility — consider Facade, Decorator, or extracting sub-types.",
-            SmellKind::Dispatcher =>
+                "A container carrying too many fields, methods and outgoing dependencies at \
+                 once — several responsibilities sharing one name.",
+            ),
+            SmellKind::Dispatcher => (
+                "Dispatcher",
                 "Replace branching with polymorphism — Strategy, Command, or Chain of Responsibility.",
-            SmellKind::FeatureEnvy =>
+                "A callable whose branching mostly routes to other functions rather than \
+                 holding domain logic of its own.",
+            ),
+            SmellKind::FeatureEnvy => (
+                "Feature Envy",
                 "Move this method to the type it mostly interacts with, or extract shared logic.",
-            SmellKind::ShotgunSurgery =>
+                "A callable whose outgoing dependencies mostly land on one foreign type — it \
+                 is more interested in that type's data than in its own.",
+            ),
+            SmellKind::ShotgunSurgery => (
+                "Shotgun Surgery",
                 "Stabilise the interface and consider dependency inversion to reduce ripple risk.",
-            SmellKind::DataBag =>
+                "An entity with very high fan-in: a change here ripples into many places at once.",
+            ),
+            SmellKind::OverfullHead => (
+                "Overfull Head",
+                "Too many names in view at once — extract the lower-level steps behind meaningful \
+                 names, or group related parameters into one object.",
+                "A callable holding more distinct names in view than a reader can keep — `ws` \
+                 over the red line. Orthogonal to the branching smells: the archetype has no \
+                 branches at all, just twelve locals doing three unrelated jobs.",
+            ),
+            SmellKind::DataBag => (
+                "Data Bag",
                 "Group related fields into nested sub-structs to make the natural hierarchy explicit.",
+                "A container with many fields and little behaviour. The standard fix for a \
+                 ten-argument function — Introduce Parameter Object — produces a struct that \
+                 trips it, which is why it reports rather than accuses.",
+            ),
         }
     }
 }
@@ -322,6 +434,37 @@ pub enum EntityKind {
     /// ansible-deploy: a Helm chart referenced from
     /// `helm_deployment_charts`.
     HelmChart,
+    /// docker: one build stage in a Dockerfile — a `FROM … [AS name]` and
+    /// everything up to the next `FROM`. The stage, not the file, is the
+    /// container: a multi-stage Dockerfile is several independent build
+    /// units that happen to share a file, and the `COPY --from=` edges
+    /// between them are the thing worth drawing.
+    ///
+    /// Unnamed stages take their index (`stage0`), which is also how
+    /// `COPY --from=0` refers to them.
+    Stage,
+    /// docker: an image this repo consumes but does not define
+    /// (`FROM node:20`, or a Compose `image:` with no `build:`). The
+    /// equivalent of an unresolved import — a leaf that marks the edge of
+    /// what the repo controls, so "which external images are we on" is a
+    /// question the graph can answer.
+    ///
+    /// A `FROM` naming a stage declared earlier in the same file resolves
+    /// to that [`Stage`](EntityKind::Stage) instead and never becomes one
+    /// of these.
+    BaseImage,
+    /// docker: a named volume declared in a Compose file's top-level
+    /// `volumes:` block. Deliberately **not** a container — nothing has a
+    /// volume as its `parent_id`. It exists to be pointed at: two services
+    /// mounting the same volume are coupled through shared state, and that
+    /// edge is invisible in the file itself.
+    Volume,
+    /// docker: a network declared in a Compose file's top-level
+    /// `networks:` block. Same shape and same reason as
+    /// [`Volume`](EntityKind::Volume) — it is a shared resource that makes
+    /// two services reachable to each other, which is the fact a reader
+    /// wants and the YAML scatters across service blocks.
+    Network,
     /// SQL: a database table. Holds its columns as `fields` rather than as
     /// child entities, so it is deliberately **not** a container: nothing
     /// has a table as its `parent_id`. That also keeps it out of the
@@ -385,7 +528,18 @@ impl EntityKind {
         )
     }
 
-    /// Returns a display name for the entity kind
+    /// Returns a display name for the entity kind.
+    ///
+    /// Split in two along the enum's own grouping — the kinds a code
+    /// parser emits, against the spec and topology kinds below — for the
+    /// reason [`RelationshipKind::display_label`] gives for the same
+    /// split: a single flat match over forty-odd kinds cannot gain an arm
+    /// without the complexity gate charging for it, and a kind with no
+    /// display name is worse than a long function.
+    /// `every_kind_has_a_display_name` stands in for the exhaustiveness
+    /// the split gives up.
+    ///
+    /// [`RelationshipKind::display_label`]: super::RelationshipKind::display_label
     pub fn display_name(&self) -> &'static str {
         match self {
             EntityKind::File => "file",
@@ -410,6 +564,18 @@ impl EntityKind {
             EntityKind::Branch => "branch",
             EntityKind::Loop => "loop",
             EntityKind::Import => "import",
+            other => other.topology_name(),
+        }
+    }
+
+    /// The kinds that carry no code metrics: Elevator's domain vocabulary,
+    /// and the topology kinds the declarative-infra and data parsers emit
+    /// (ansible-deploy, docker, SQL, Markdown) per ADR 0003.
+    ///
+    /// A second step rather than twenty-one more arms above, for the
+    /// reason [`Self::display_name`] gives.
+    fn topology_name(&self) -> &'static str {
+        match self {
             EntityKind::Extension => "extension",
             EntityKind::Category => "category",
             EntityKind::Feature => "feature",
@@ -424,10 +590,15 @@ impl EntityKind {
             EntityKind::TemplateFile => "template",
             EntityKind::K8sResource => "k8s resource",
             EntityKind::HelmChart => "helm chart",
+            EntityKind::Stage => "build stage",
+            EntityKind::BaseImage => "base image",
+            EntityKind::Volume => "volume",
+            EntityKind::Network => "network",
             EntityKind::Table => "table",
             EntityKind::View => "view",
             EntityKind::Note => "note",
-            EntityKind::Unknown => "unknown",
+            // Only the kinds `display_name` already answered reach here.
+            _ => "unknown",
         }
     }
 }
@@ -513,5 +684,38 @@ impl CodeEntity {
     pub fn with_source_code(mut self, code: impl Into<String>) -> Self {
         self.source_code = Some(code.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntityKind::{self, *};
+
+    /// `display_name` hands the kinds it does not answer to
+    /// `topology_name`, which ends in a catch-all rather than an
+    /// exhaustive match — so the compiler no longer notices a new variant
+    /// with no arm. It would silently read "unknown" in every panel.
+    ///
+    /// This list is the exhaustiveness that split gave up. A new variant
+    /// belongs in it, and the test fails until the variant has a name.
+    /// Mirrors `every_kind_has_a_label` in `relationship.rs`.
+    #[test]
+    fn every_kind_has_a_display_name() {
+        const ALL: &[EntityKind] = &[
+            File, Module, Class, Dataclass, AbstractClass, Struct, Interface, Trait, Enum,
+            TypeAlias, Function, Method, Constant, Variable, Property, Macro, Service, Component,
+            Parameter, Branch, Loop, Import, Extension, Category, Feature, Functionality, Concept,
+            UiPage, Playbook, Role, HostGroup, DeploymentSet, DeploymentEntry, TemplateFile,
+            K8sResource, HelmChart, Stage, BaseImage, Volume, Network, Table, View, Note,
+        ];
+
+        for kind in ALL {
+            assert_ne!(
+                kind.display_name(),
+                "unknown",
+                "{kind:?} fell through to the catch-all — it needs an arm"
+            );
+        }
+        assert_eq!(EntityKind::Unknown.display_name(), "unknown");
     }
 }

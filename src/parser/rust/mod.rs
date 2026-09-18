@@ -17,7 +17,7 @@
 //! analyzer needs as much as the walk does, so it lives outside this folder in
 //! [`super::rust_type_names`] and leaves [`RustParser`] as the only way in.
 
-mod bodies;
+pub(crate) mod bodies;
 mod complexity;
 mod ctx;
 mod declarations;

@@ -22,6 +22,8 @@ import { autoLevel, drillIntoMarks } from '../stores/scope';
 // the module comment there for why that matters.
 import { goBack, goForward } from '../stores/viewHistory';
 import { clearMarks, toggleMark } from '../stores/marks';
+import { hoveredRegion, selectedRegion, pinRegion, unpinRegion } from '../stores/region';
+import { openRelate } from '../stores/relate';
 import { autoFitView } from '../stores/settings';
 import { describeOnHover } from '../stores/description';
 import {
@@ -145,25 +147,42 @@ function runSidebar(command: Command): boolean {
   switch (command) {
     case 'sidebar.tab.filters': sidebarTab.set('filters'); return true;
     case 'sidebar.tab.quality': sidebarTab.set('quality'); return true;
+    case 'sidebar.tab.changes': sidebarTab.set('changes'); return true;
     case 'sidebar.tab.settings': sidebarTab.set('settings'); return true;
     default: return false;
   }
 }
 
+/**
+ * Pin whatever the pointer is on — the keyboard half of a click.
+ *
+ * The hovered node first, which under `l` is the frozen one, so `l` then `p`
+ * reads as "hold this, then keep it". Failing that the region whose name the
+ * pointer is on (UI-141), which since UI-148 the Details column can hold just
+ * as it holds a node: a `p` that reached only half of what that column shows
+ * would be a key that works or not depending on which pixel the cursor is
+ * over.
+ *
+ * Shared by `p` in the canvas and `p` in the Details pane, which is what the
+ * keymap already promises by giving them one label — and what keeps the pair
+ * from drifting into two behaviours wearing one key.
+ */
+function pinHovered(): void {
+  const hovered = get(hoveredNode);
+  if (hovered) { selectedNode.set(hovered); return; }
+  const region = get(hoveredRegion);
+  if (region) pinRegion(region);
+}
+
 function runGraph(command: Command, ctx: KeymapContext): boolean {
   const view = ctx.graphView;
   switch (command) {
-    case 'graph.pin': {
-      // The hovered node, which under `l` is the frozen one — so the pair
-      // reads as "hold this, then keep it".
-      const hovered = get(hoveredNode);
-      if (hovered) selectedNode.set(hovered);
-      return true;
-    }
+    case 'graph.pin': pinHovered(); return true;
     // `x` means "drop what is selected" in the spec and details panes too, and
     // the marked set is a selection — leaving it behind would make the one key
-    // that promises a clean canvas the one that quietly does not.
-    case 'graph.clear': selectedNode.set(null); clearMarks(); return true;
+    // that promises a clean canvas the one that quietly does not. A pinned
+    // region is in that same list.
+    case 'graph.clear': selectedNode.set(null); unpinRegion(); clearMarks(); return true;
     case 'graph.mark': {
       // The hovered node, exactly as `graph.pin` above: the same reach, and
       // the difference between the two keys is what you meant by it.
@@ -172,6 +191,10 @@ function runGraph(command: Command, ctx: KeymapContext): boolean {
       return true;
     }
     case 'graph.markDrill': void drillIntoMarks(); return true;
+    // Declines on its own below two marked scopes, as the drill declines on an
+    // empty set — so the key is inert rather than opening a panel to say the
+    // gesture has not been made yet.
+    case 'graph.markRelate': void openRelate(); return true;
     case 'graph.fit': view?.fitView(); return true;
     case 'graph.fitWidth': view?.fitWidth(); return true;
     case 'graph.zoomIn': view?.zoomIn(); return true;
@@ -217,16 +240,15 @@ function runDetails(command: Command): boolean {
   switch (command) {
     case 'details.pin': {
       // Same toggle as the pin button, and deliberately so: two ways to reach
-      // one behaviour, not two behaviours.
-      const pinned = get(selectedNode);
-      if (pinned) selectedNode.set(null);
-      else {
-        const hovered = get(hoveredNode);
-        if (hovered) selectedNode.set(hovered);
-      }
+      // one behaviour, not two behaviours. Whichever kind of subject is
+      // pinned, `p` releases it — the column shows one at a time, so "unpin"
+      // has only ever one thing it can mean.
+      if (get(selectedNode)) { selectedNode.set(null); return true; }
+      if (get(selectedRegion)) { unpinRegion(); return true; }
+      pinHovered();
       return true;
     }
-    case 'details.clear': selectedNode.set(null); return true;
+    case 'details.clear': selectedNode.set(null); unpinRegion(); return true;
     default: return false;
   }
 }

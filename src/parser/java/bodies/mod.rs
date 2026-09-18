@@ -12,4 +12,4 @@
 
 pub(super) mod calls;
 mod flow;
-mod stdlib;
+pub(crate) mod stdlib;

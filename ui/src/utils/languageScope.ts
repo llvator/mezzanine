@@ -40,6 +40,7 @@ export const ALL_ANALYSIS_LANGUAGES: readonly string[] = [
   'svelte',
   'elevator',
   'ansible',
+  'docker',
   'sql',
   'markdown',
 ] as const;

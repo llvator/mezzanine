@@ -9,6 +9,7 @@ use super::super::helpers::{parse_generics, parse_visibility};
 use crate::models::entity::Parameter;
 use crate::models::{CodeEntity, EntityKind};
 use crate::parser::language_parser::{node_text, node_to_span};
+use crate::parser::working_set;
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -76,7 +77,8 @@ pub(super) fn parse_function(
             .filter(|p| p.name != "self" && p.name != "&self" && p.name != "&mut self")
             .count() as u32,
     );
-    if let Some(body) = node.child_by_field_name("body") {
+    let body = node.child_by_field_name("body");
+    if let Some(body) = body {
         let (cc, nesting, cog) = compute_complexity(&body);
         entity.metrics.cyclomatic = Some(cc);
         entity.metrics.max_nesting = Some(nesting);
@@ -86,6 +88,8 @@ pub(super) fn parse_function(
         entity.metrics.max_nesting = Some(0);
         entity.metrics.cognitive_complexity = Some(0);
     }
+    working_set::populate(&mut entity, body.as_ref(), source);
+    crate::parser::loops::populate(&mut entity, body.as_ref());
 
     entity.source_code = Some(node_text(node, source).to_string());
     Some(entity)

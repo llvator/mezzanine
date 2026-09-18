@@ -1,12 +1,85 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Query string of `GET /api/activity` (UI-138).
+///
+/// `since` is optional rather than defaulted to zero by the client, because
+/// the two mean different things to a reader of the request log: no `since`
+/// is a first load, `since=0` is a client that has deliberately asked to
+/// start over.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ActivityQuery {
+    pub since: Option<u64>,
+}
+
 // --- Commit info struct for the API ---
 #[derive(Clone, Serialize)]
 pub(crate) struct CommitInfo {
     pub hash: String,
     pub short_hash: String,
+    /// First parent, or `None` on a root commit (UI-151).
+    ///
+    /// The picker's `From` names the oldest commit the reader wants included,
+    /// and the tree a comparison starts from is the one before it. This is
+    /// that tree, named so the translation happens where the reader can see
+    /// what it did rather than inside the diff.
+    pub parent_hash: Option<String>,
     pub message: String,
+    pub author: String,
+    pub date: String,
+}
+
+/// Query string of `GET /api/commits` (UI-143).
+///
+/// Both fields optional, and the default is the answer the endpoint gave
+/// before they existed: the fifty most recent commits reachable from `HEAD`.
+/// `ref` is what makes a *second* branch's commits reachable at all — without
+/// it the picker could only ever list the branch the checkout happens to be
+/// on, which is the one branch a reviewer already has.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CommitsQuery {
+    /// A branch, tag, or commit to walk back from. `HEAD` when absent.
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// Query string of `GET /api/merge-base` (UI-143).
+///
+/// Named `from`/`to` rather than `a`/`b` because that is the direction the
+/// answer is *for*: the merge base is the base a comparison of `to` against
+/// `from` should use, and git's own argument order is symmetric in a way the
+/// question is not.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MergeBaseQuery {
+    pub from: String,
+    pub to: String,
+}
+
+/// One branch, as `GET /api/branches` reports it (UI-143).
+///
+/// `name` is a usable ref — `main`, `feat/chip`, `origin/main` — and is what
+/// crosses back on a comparison. A hash would be the safer choice for a
+/// *stash* (see [`StashInfo`]), where the label outlives the thing it names;
+/// here it would be the worse one, because a reviewer asking about `main` is
+/// asking about wherever main is, and the log line reads as the name they
+/// picked.
+///
+/// `remote` is derived from the ref's namespace rather than from its name: a
+/// local branch may be called `feat/chip` and a remote-tracking one
+/// `origin/main`, so a slash tells the two apart in neither direction.
+///
+/// The tip rides along so the picker can say what it would compare without a
+/// request per row, and `is_head` so the branch the checkout is already on can
+/// be marked rather than looked up separately.
+#[derive(Clone, Serialize)]
+pub(crate) struct BranchRef {
+    pub name: String,
+    pub remote: bool,
+    pub is_head: bool,
+    pub tip: String,
+    pub tip_short: String,
+    pub subject: String,
     pub author: String,
     pub date: String,
 }
@@ -47,6 +120,75 @@ pub(crate) struct StashInfo {
 pub(crate) struct StagedFile {
     pub status: String,
     pub path: String,
+}
+
+/// One path in the change, as `POST /api/changed-files` reports it (UI-134).
+///
+/// Git's answer, not the analysis's: this list is what the graph's reading of
+/// a diff is checked *against*, so it deliberately carries files no analysis
+/// would ever load — markdown, lockfiles, images.
+///
+/// `status` is git's own letter, kept as given for the reason `StagedFile`
+/// keeps it: a letter this code has not met still reaches the reader intact.
+///
+/// `additions` / `deletions` are line counts, and are 0 for a `binary` file —
+/// git spells those counts `-`, which is "cannot be counted in lines" rather
+/// than "no lines moved", and `binary` is what carries that difference.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ChangedFile {
+    pub status: String,
+    pub path: String,
+    /// Where a rename or copy came from. The pane needs it to ask for the
+    /// right base side: the file has two names, and `from_ref:<new path>` is
+    /// a path that did not exist there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub binary: bool,
+    /// Never added to the index, so `git diff` says nothing about it at all.
+    /// Marked rather than merged into `A`, because it is the one row whose
+    /// base side genuinely does not exist in any tree.
+    pub untracked: bool,
+}
+
+/// Which file the reader opened, and against what.
+///
+/// The refs ride along rather than being read from server state: the list this
+/// came from named a pair, and a second call that resolved the pair afresh
+/// could answer about a different comparison than the row that was clicked.
+#[derive(Deserialize)]
+pub(crate) struct FileDiffRequest {
+    pub from_ref: String,
+    pub to_ref: String,
+    pub path: String,
+    /// The path on the base side, when a rename means it differs.
+    #[serde(default)]
+    pub base_path: Option<String>,
+}
+
+/// One side of a file comparison.
+///
+/// `binary` and `truncated` are stated rather than left for the reader to
+/// infer from the text: a cut file renders as a diff that deletes its own
+/// tail, and a binary one as a wall of replacement characters — both look like
+/// a wrong diff rather than a limit.
+#[derive(Clone, Serialize)]
+pub(crate) struct FileSide {
+    pub text: String,
+    pub binary: bool,
+    pub truncated: bool,
+}
+
+/// Both sides of one file. A side that does not exist is absent — an addition
+/// has no base, a deletion has no head, and neither is an empty file.
+#[derive(Serialize)]
+pub(crate) struct FileDiffResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<FileSide>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<FileSide>,
+    pub binary: bool,
 }
 
 // --- Diff request/response ---

@@ -12,12 +12,58 @@ use std::sync::Arc;
 
 use super::Cancelled;
 
-/// The test-file heuristic used by `include_tests: false`. Public so
-/// consumers that need to *classify* files (rather than exclude them,
-/// e.g. the MCP `tests_for` tool) apply the identical rule.
-pub fn is_test_path(path: &Path) -> bool {
-    let path_str = path.to_string_lossy().to_lowercase();
-    path_str.contains("test") || path_str.contains("spec")
+/// The test-file heuristic used by `include_tests: false`, over a path
+/// spelled the way [`PatternBase`] spells one — relative to the repo root.
+///
+/// The spelling is the whole rule. Matched against an *absolute* path, as
+/// this was, it reads the directories above the checkout, which nobody
+/// chose as part of the project's layout and whose intent mezz cannot see.
+/// A byte-identical tree then analysed to 9 entities at `~/mezzrepro-plain`
+/// and to **0** at `~/mezzrepro-tests` (field report, 2026-08-31), and with
+/// `include_tests: false` every file in such a repo matched, so the walk
+/// returned nothing and the Stop hook went silently green — quiet-when-blind
+/// being byte-for-byte what quiet-when-clean looks like.
+///
+/// `contest` is the case that shows this was not a naming convention that
+/// got slightly too eager: `inspect`, `prospect` and `spectrum` follow from
+/// `spec`, and `latest`, `greatest` and `attestation` from `test`. A
+/// checkout at `~/clients/prospect-app` or `~/work/latest/api` analysed to
+/// nothing at all.
+///
+/// Still a substring match *within* the repo-relative spelling, and
+/// deliberately: `tests/`, `_test.rs`, `spec/` and `__tests__/` are all
+/// spellings a project chose for itself, and narrowing the rule to whole
+/// path components is a separate change with its own blast radius over
+/// every repo relying on the loose form today.
+fn names_a_test(spelled: &str) -> bool {
+    let lower = spelled.to_lowercase();
+    lower.contains("test") || lower.contains("spec")
+}
+
+/// The test-file heuristic, held against the project it is a claim about.
+///
+/// Public so consumers that need to *classify* files (rather than exclude
+/// them, e.g. the MCP `tests_for` tool) apply the identical rule.
+///
+/// Rooted rather than free-standing, because a free-standing one could not
+/// be called correctly: the answer depends on where the project starts, and
+/// the version that did not ask for a root silently emptied whole
+/// repositories. Rooted at the *repo* root [`PatternBase`] resolves, so one
+/// file is test code or not whichever subdirectory the analysis was pointed
+/// at — `mezz analyze .` and `mezz analyze src` must not disagree about
+/// `src/parser/tests.rs`.
+pub struct TestPaths(PatternBase);
+
+impl TestPaths {
+    /// The heuristic as the project at `root` spells it.
+    pub fn rooted_at(root: &Path) -> Self {
+        Self(PatternBase::of(root))
+    }
+
+    /// Whether `path` is test code by the project's own naming.
+    pub fn matches(&self, path: &Path) -> bool {
+        names_a_test(&self.0.spell(path))
+    }
 }
 
 /// What a walk is looking for. The spec directory may sit outside the
@@ -67,7 +113,10 @@ impl Glob {
                     shipped: shipped.contains(&spelling.as_str()),
                 }),
                 Err(e) => {
-                    eprintln!("   ⚠ {key}: `{spelling}` is not a valid glob ({e}) — ignoring it.");
+                    crate::activity::warn(
+                        crate::activity::ANALYSIS,
+                        format!("   ⚠ {key}: `{spelling}` is not a valid glob ({e}) — ignoring it."),
+                    );
                     None
                 }
             })
@@ -242,7 +291,7 @@ impl<'a> FileWalker<'a> {
     fn collect(&self, root: &Path, cancel: &Arc<AtomicBool>, admit: Admit) -> Result<Vec<PathBuf>> {
         let (files, unmatched) = self.collect_counting(root, cancel, admit)?;
         for line in unmatched {
-            eprintln!("   ⚠ {line}");
+            crate::activity::warn(crate::activity::ANALYSIS, format!("   ⚠ {line}"));
         }
         Ok(files)
     }
@@ -267,6 +316,7 @@ impl<'a> FileWalker<'a> {
         };
 
         let spinner = ProgressBar::new_spinner();
+        spinner.set_draw_target(crate::activity::progress_target());
         spinner.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg}")
                 .unwrap()
@@ -325,6 +375,12 @@ impl<'a> FileWalker<'a> {
         }
 
         spinner.finish_with_message(format!("Discovered {} {noun} files", files.len()));
+        // `mirror`, not `step`: the spinner above has already drawn this line
+        // in place, and printing it again would double it on the terminal.
+        crate::activity::mirror(
+            crate::activity::ANALYSIS,
+            format!("Discovered {} {noun} files", files.len()),
+        );
         Ok((files, tally.zero_matches()))
     }
 
@@ -432,10 +488,15 @@ impl<'a> FileWalker<'a> {
         // would silently swallow. The same is true of a doc: `docs/testing.md`
         // is a document *about* tests, and dropping it would tear a hole in
         // the link graph that the notes still pointing at it cannot explain.
+        // `spelled`, not `path`: the repo-relative spelling is what makes
+        // this the project's own naming rather than its owner's directory
+        // layout — see [`names_a_test`]. That string was already computed
+        // and sitting in this argument list while the match read the
+        // absolute path beside it.
         if !self.config.analysis.include_tests
             && language != Language::Elevator
             && language != Language::Markdown
-            && is_test_path(path)
+            && names_a_test(spelled)
         {
             return false;
         }
@@ -566,10 +627,13 @@ fn resolve_spec_root(config: &Config) -> Option<PathBuf> {
     if root.is_dir() {
         return Some(root);
     }
-    eprintln!(
-        "   ⚠ spec_dir: {} is not a directory — ignoring it, and treating \
-         every .elv under the root as the spec.",
-        root.display()
+    crate::activity::warn(
+        crate::activity::ANALYSIS,
+        format!(
+            "   ⚠ spec_dir: {} is not a directory — ignoring it, and treating \
+             every .elv under the root as the spec.",
+            root.display()
+        ),
     );
     None
 }
@@ -953,6 +1017,65 @@ mod tests {
         dir.write("dist/bundle.js", "console.log(1);\n");
         dir.write("build/out.go", "package main\n");
         assert_eq!(walked_names(&Config::for_path(&dir.0)), vec!["main.rs"]);
+    }
+
+    /// Field report, 2026-08-31: a byte-identical tree analysed to 9
+    /// entities at `~/mezzrepro-plain` and to **0** at `~/mezzrepro-tests`,
+    /// because the heuristic read the whole absolute path. With
+    /// `include_tests: false` every file in such a repo matched, the walk
+    /// returned nothing, and the Stop hook emitted nothing and exited 0 —
+    /// which is byte-for-byte what a clean review looks like.
+    ///
+    /// The directory names are the reporter's own table. `contest` is the
+    /// one that shows this was never a naming convention that got slightly
+    /// too eager.
+    #[test]
+    fn a_containing_directory_named_test_does_not_empty_the_repo() {
+        for tag in ["plain", "tests-leaf", "foo-test", "testing", "contest", "prospect"] {
+            let dir = TmpDir::new(tag);
+            dir.write("src/main.rs", "fn main() {}\n");
+            // The walk is rooted at a directory named after `tag`, which is
+            // exactly what the reporter varied.
+            let names = walked_names(&Config::for_path(&dir.0));
+            assert!(
+                names.contains(&"main.rs".to_string()),
+                "a repo under a directory named `{tag}` analysed to nothing: {names:?}",
+            );
+        }
+    }
+
+    /// The other direction, and the half that must not move: a project's
+    /// own `tests/` directory is still the project saying "these are
+    /// tests", and `include_tests: false` still means it.
+    #[test]
+    fn the_projects_own_test_paths_are_still_excluded() {
+        let dir = TmpDir::new("own-tests");
+        dir.write("src/main.rs", "fn main() {}\n");
+        dir.write("tests/it.rs", "fn covered() {}\n");
+        dir.write("src/parser_test.rs", "fn also_covered() {}\n");
+        let names = walked_names(&Config::for_path(&dir.0));
+        assert_eq!(names, vec!["main.rs".to_string()], "{names:?}");
+    }
+
+    /// One file is test code or not whichever subdirectory the analysis was
+    /// pointed at. Rooting at the *repo* root rather than the analyzed root
+    /// is what buys that: `mezz analyze .` and `mezz analyze src` must not
+    /// disagree about `src/tests/helper.rs`.
+    #[test]
+    fn every_root_of_one_repo_agrees_about_which_files_are_tests() {
+        let dir = TmpDir::new("roots-agree");
+        fs::create_dir_all(dir.0.join(".git")).unwrap();
+        dir.write("src/main.rs", "fn main() {}\n");
+        dir.write("src/tests/helper.rs", "fn helper() {}\n");
+        for root in [dir.0.clone(), dir.0.join("src")] {
+            let names = walked_names(&Config::for_path(&root));
+            assert_eq!(
+                names,
+                vec!["main.rs".to_string()],
+                "analyzing {}",
+                root.display()
+            );
+        }
     }
 
     /// A path that isn't there is a typo, and a typo must not read as "this
